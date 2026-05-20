@@ -191,34 +191,20 @@ existing_ns="$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf 2>/dev/nul
 existing_extra_lines="$(awk '!/^[[:space:]]*#/ && $1 != "nameserver" {print}' /etc/resolv.conf 2>/dev/null | sed '/^[[:space:]]*$/d' || true)"
 _ep_log "upstream nameservers from initial /etc/resolv.conf: ${existing_ns:-<none>}"
 resolver_ip_candidates=()
-# Prefer explicit override if provided by the host launcher, but always include
-# a small loopback pool as fallback. When running with --network host, the
-# container shares the host network namespace. If the host already has a DNS
-# daemon bound to 127.0.0.1:53, Unbound cannot bind there. Using another
-# 127.0.0.x address typically avoids touching host services.
-# Prefer 127.0.0.2+ first: in `--network host` mode, 127.0.0.1:53 is commonly
-# occupied by host DNS daemons (systemd-resolved/dnsmasq/unbound). Using another
-# loopback address avoids touching host services.
-resolver_ip_candidates=("127.0.0.2" "127.0.0.3" "127.0.0.4" "127.0.0.5" "127.0.0.1")
+# When the host launcher supplies ADSCAN_LOCAL_RESOLVER_IP it has already
+# reserved that loopback address via an exclusive file lock so no other
+# launcher instance can claim the same IP. Using only that address keeps
+# the multi-instance contract intact: falling back to a different IP would
+# silently break the reservation and could collide with a sibling container.
+#
+# Without the launcher override (manual `docker run`, tests) we fall back to
+# the legacy pool ordered from least-disruptive to most-disruptive.
 if [[ -n "${ADSCAN_LOCAL_RESOLVER_IP:-}" ]]; then
-  resolver_ip_candidates=("${ADSCAN_LOCAL_RESOLVER_IP}" "${resolver_ip_candidates[@]}")
+  resolver_ip_candidates=("${ADSCAN_LOCAL_RESOLVER_IP}")
+  _ep_log "resolver IP locked by launcher to ${ADSCAN_LOCAL_RESOLVER_IP} (no pool fallback)"
+else
+  resolver_ip_candidates=("127.0.0.2" "127.0.0.3" "127.0.0.4" "127.0.0.5" "127.0.0.1")
 fi
-
-# De-duplicate while preserving order.
-deduped_candidates=()
-for ip in "${resolver_ip_candidates[@]}"; do
-  seen=0
-  for existing in "${deduped_candidates[@]}"; do
-    if [[ "${existing}" == "${ip}" ]]; then
-      seen=1
-      break
-    fi
-  done
-  if [[ "${seen}" -eq 0 ]]; then
-    deduped_candidates+=("${ip}")
-  fi
-done
-resolver_ip_candidates=("${deduped_candidates[@]}")
 
 _is_public_resolver() {
   local candidate="$1"
@@ -456,6 +442,31 @@ _write_unbound_entrypoint_config() {
   } > "${conf_path}"
   chmod 0644 "${conf_path}" >/dev/null 2>&1 || true
   chown "${uid}:${gid}" "${conf_path}" >/dev/null 2>&1 || true
+
+  # Pin the remote-control channel to the active resolver IP only.
+  #
+  # The build-time default in 00-adscan-control.conf lists every loopback
+  # in the legacy pool (127.0.0.1-5) so `unbound-control` works regardless
+  # of which IP a single-instance launcher chose. With multi-instance
+  # launchers sharing the host network namespace via --network host, that
+  # default makes every Unbound try to bind every control IP, which works
+  # for the first container only and silently steals reload commands sent
+  # to overlapping IPs from sibling containers afterwards. Restricting the
+  # control interface to the active resolver IP keeps each container's
+  # control channel private to its own loopback claim.
+  local control_conf_path="/etc/unbound/unbound.conf.d/00-adscan-control.conf"
+  {
+    echo "# ADscan Unbound remote-control configuration (entrypoint-managed)"
+    echo "# Pinned to the active resolver IP for multi-instance safety."
+    echo ""
+    echo "remote-control:"
+    echo "  control-enable: yes"
+    echo "  control-interface: ${local_resolver_ip}"
+    echo "  control-port: 8953"
+    echo "  control-use-cert: no"
+  } > "${control_conf_path}"
+  chmod 0644 "${control_conf_path}" >/dev/null 2>&1 || true
+  chown "${uid}:${gid}" "${control_conf_path}" >/dev/null 2>&1 || true
 }
 
 # Start Unbound (no systemd in containers). Keep this script as PID 1 so we can
@@ -591,9 +602,45 @@ if [[ -n "${local_resolver_ip_selected}" ]]; then
   export ADSCAN_LOCAL_RESOLVER_IP="${local_resolver_ip_selected}"
   _write_resolv_conf_local_first "${local_resolver_ip_selected}" || true
 else
-  _ep_log "unbound did not respond on any loopback candidate (127.0.0.x:53); leaving /etc/resolv.conf unchanged"
-  # If the host launcher provided ADSCAN_LOCAL_RESOLVER_IP but Unbound couldn't
-  # start, make sure the ADscan process doesn't assume a working local resolver.
+  if [[ -n "${ADSCAN_LOCAL_RESOLVER_IP:-}" ]]; then
+    # The launcher reserved this IP via flock but Unbound could not bind to it.
+    # This is a hard failure in multi-instance mode: falling back to a different
+    # IP would violate the reservation contract and collide with another launcher.
+    _ep_log "ERROR: Unbound failed to start on launcher-reserved IP ${ADSCAN_LOCAL_RESOLVER_IP}"
+    _ep_log "       Unbound binds two ports on this IP:"
+    _ep_log "         - :53   (DNS resolver)"
+    _ep_log "         - :8953 (remote-control, used by ADscan to reload configs)"
+    _ep_log "       Either can be the source of conflict — typically :8953 when an"
+    _ep_log "       older adscan container (running an image without the per-IP"
+    _ep_log "       control fix) is still up and bound the full loopback pool."
+    _ep_log ""
+
+    # Best-effort diagnostic: show what is currently bound on those ports.
+    if command -v ss >/dev/null 2>&1; then
+      _ep_log "[diag] listeners around ${ADSCAN_LOCAL_RESOLVER_IP}:"
+      ss -Hn -tulnp 2>/dev/null \
+        | awk -v ip="${ADSCAN_LOCAL_RESOLVER_IP}" '$0 ~ ip ":(53|8953) "' \
+        | while IFS= read -r line; do
+            _ep_log "[diag] ${line}"
+          done || true
+    fi
+
+    if [[ -s "${unbound_log:-/dev/null}" ]]; then
+      _ep_log ""
+      _ep_log "[diag] last 5 lines from ${unbound_log}:"
+      tail -n 5 "${unbound_log}" 2>/dev/null \
+        | while IFS= read -r line; do
+            _ep_log "[diag]   ${line}"
+          done || true
+    fi
+    _ep_log ""
+    _ep_log "       Stop the older adscan session (or whichever process holds these"
+    _ep_log "       ports) and retry. After every running adscan container is on"
+    _ep_log "       the new image the conflict cannot recur."
+  else
+    _ep_log "unbound did not respond on any loopback candidate (127.0.0.x:53); leaving /etc/resolv.conf unchanged"
+  fi
+  # Either way, unset so ADscan does not assume a working local resolver.
   unset ADSCAN_LOCAL_RESOLVER_IP || true
 fi
 

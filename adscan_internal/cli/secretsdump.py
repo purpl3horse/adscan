@@ -32,12 +32,10 @@ from adscan_internal import (
     print_warning_debug,
     telemetry,
 )
-from adscan_internal.integrations.impacket.runner import (
-    RunCommandAdapter,
-    run_raw_impacket_command,
-)
 from adscan_internal.rich_output import mark_sensitive, print_panel
+from rich.console import Group as _RichGroup
 from rich.prompt import Confirm
+from rich.text import Text as _RichText
 
 # DCSync All UX thresholds (compact output in large environments).
 _DCSYNC_ALL_LARGE_THRESHOLD = 250
@@ -85,9 +83,7 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
             default=0,
         )
         largest_cracked_group_rows = (
-            max(cracked_reuse_groups.values(), key=len)
-            if cracked_reuse_groups
-            else []
+            max(cracked_reuse_groups.values(), key=len) if cracked_reuse_groups else []
         )
         largest_cracked_group_segment_counts = Counter(
             str(row.get("risk_segment") or "Standard")
@@ -107,7 +103,9 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
             else 0.0,
             "tier0_extracted_count": tier0_extracted,
             "tier0_cracked_count": tier0_cracked,
-            "tier0_crack_coverage_pct": round(((tier0_cracked / tier0_extracted) * 100), 2)
+            "tier0_crack_coverage_pct": round(
+                ((tier0_cracked / tier0_extracted) * 100), 2
+            )
             if tier0_extracted > 0
             else 0.0,
             "tier0_cracked_pct": round(((tier0_cracked / cracked_total) * 100), 2)
@@ -132,9 +130,7 @@ def _capture_dcsync_batch_cracking_summary_telemetry(
             )
             if standard_extracted > 0
             else 0.0,
-            "standard_cracked_pct": round(
-                ((standard_cracked / cracked_total) * 100), 2
-            )
+            "standard_cracked_pct": round(((standard_cracked / cracked_total) * 100), 2)
             if cracked_total > 0
             else 0.0,
             "reused_cracked_secret_count": len(cracked_reuse_groups),
@@ -214,379 +210,33 @@ def _resolve_dcsync_all_ui_thresholds() -> dict[str, int]:
     }
 
 
-def execute_secretsdump_with_domain(shell: Any, command: str, domain: str) -> None:
-    """Execute secretsdump command and extract credentials filtered by domain.
 
-    This function filters credentials to only include those matching the specified
-    domain, skipping machine accounts and service accounts.
+def _offer_machine_account_dump_fallback(
+    shell: Any, domain: str, failure_reason: str | None = None
+) -> None:
+    """Offer SAM/LSA/DPAPI fallback when DCSync returns no credentials.
 
-    Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        command: Full Impacket secretsdump command to execute.
-        domain: Target domain name for credential filtering.
-    """
-    try:
-        completed_process = run_raw_impacket_command(
-            command,
-            script_name="secretsdump.py",
-            timeout=300,
-            command_runner=RunCommandAdapter(shell.run_command),
-        )
-        if completed_process is None:
-            print_error("Error executing secretsdump: command did not return output.")
-            return
-
-        if completed_process.returncode == 0:
-            output_decoded = completed_process.stdout
-            if not output_decoded:
-                print_warning(
-                    "secretsdump executed successfully but produced no output."
-                )
-                return
-
-            # Extract credentials using regular expressions
-            cred_matches = re.findall(
-                r"(\S+):\d+:[^:]*:([a-f0-9]{32}):", output_decoded
-            )
-
-            if cred_matches:
-                credentials_added_count = 0
-                for user, cred in cred_matches:
-                    user = user.strip()
-
-                    if "\\" in user:
-                        domain_prefix, username = user.split("\\", 1)
-                        if domain_prefix.lower() != domain.lower():
-                            # print_info(f"Skipping user {original_user_for_log} from different domain {domain_prefix}")
-                            continue
-                        user = username
-                    elif user.lower() in ["administrator", "administrador"]:
-                        pass  # Process with the indicated domain
-                    else:
-                        # print_info(f"Skipping user {original_user_for_log} as it's not Administrator and lacks domain prefix.")
-                        continue  # Skip any user that does not have a domain and is not the exception
-
-                    from adscan_internal.principal_utils import is_machine_account
-
-                    if is_machine_account(user):
-                        # print_info(f"Skipping machine account or similar: {user}")
-                        continue
-                    if (
-                        user.startswith("MSOL_")
-                        or user.startswith("SM_")
-                        or user.startswith("HealthMailbox")
-                    ):
-                        # print_info(f"Skipping service account: {user}")
-                        continue
-
-                    shell.add_credential(domain, user, cred, verify_credential=False)
-                    credentials_added_count += 1
-
-                if credentials_added_count > 0:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_success(
-                        f"{credentials_added_count} credential(s) successfully extracted and stored for domain {marked_domain}."
-                    )
-                else:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_warning(
-                        f"No suitable credentials found in secretsdump output for domain {marked_domain} after filtering."
-                    )
-            else:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_warning(
-                    f"No credentials matching the pattern were found in the secretsdump output for domain {marked_domain}."
-                )
-        else:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(
-                f"Error executing secretsdump for domain {marked_domain}. Return code: {completed_process.returncode}"
-            )
-            error_message = (
-                completed_process.stderr.strip()
-                if completed_process.stderr
-                else completed_process.stdout.strip()
-            )
-            if error_message:
-                print_error(f"Details: {error_message}")
-            else:
-                print_error("No error output from secretsdump command.")
-
-    except Exception as e:
-        telemetry.capture_exception(e)
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(
-            f"An error occurred during secretsdump execution for domain {marked_domain}: {str(e)}"
-        )
-
-        print_exception(exception=e)
-
-
-def execute_secretsdump(shell: Any, command: str, domain: str) -> None:
-    """Execute secretsdump command and extract all credentials from output.
-
-    Run secretsdump, parse every "user:rid:lmhash:nthash" line (with or without
-    DOMAIN\\ prefix) and store credentials using shell.add_credential().
-
-    This function handles:
-    - DCSync privilege rollback errors
-    - Domain prefix trimming for -just-dc-user
-    - Retry with -use-vss on errors
-    - Hash cracking integration
-    - Credential filtering (machine accounts, service accounts, etc.)
+    Renders a structured panel that explains why DCSync yielded nothing,
+    presents the alternative path as a forward option (not an error), and
+    gives the operator an estimate of what secrets the fallback can recover.
 
     Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        command: Full Impacket secretsdump command to execute.
-        domain: Domain name that will be stored alongside every credential.
+        shell: Active PentestShell instance.
+        domain: Target domain that was replicated (or attempted).
+        failure_reason: Optional human-readable explanation of why DCSync
+            returned no credentials (e.g. "DRSUAPI access denied"). When
+            supplied it is shown in the panel to help the operator understand
+            what to expect from the alternative path.
     """
-    try:
-        # ------------------------------------------------------------------ #
-        # 1. Launch secretsdump and capture its complete stdout / stderr
-        # ------------------------------------------------------------------ #
-        completed_process = run_raw_impacket_command(
-            command,
-            script_name="secretsdump.py",
-            timeout=300,
-            command_runner=RunCommandAdapter(shell.run_command),
-        )
-        if completed_process is None:
-            print_error("Error executing credential extraction: command did not return output.")
-            return
+    from adscan_internal.services.exploitation.dump_display import (
+        ACID_GREEN,
+        AMBER,
+        GHOST,
+        ICE_BLUE,
+        LAVA,
+        MUTED,
+    )
 
-        if completed_process.returncode != 0:
-            error_message = (
-                completed_process.stderr.strip()
-                if completed_process.stderr
-                else completed_process.stdout.strip()
-            )
-            print_error(
-                f"Error executing credential extraction. Return code: {completed_process.returncode}"
-            )
-            if error_message:
-                print_error(f"Details: {error_message}")
-            else:
-                print_error("No error output from secretsdump command.")
-
-            return
-
-        error_blob = "\n".join(
-            part
-            for part in [
-                completed_process.stdout or "",
-                completed_process.stderr or "",
-            ]
-            if part
-        )
-        if "ERROR_DS_DRA_BAD_DN" in error_blob:
-            print_warning_debug(
-                "Detected ERROR_DS_DRA_BAD_DN during DCSync. "
-                "This usually means the account lost replication privileges."
-            )
-            if shell._handle_dcsync_privilege_rollback(command, domain):
-                return
-
-        if (
-            "ERROR_DS_NAME_ERROR_NOT_FOUND" in completed_process.stdout
-            and "-just-dc-user" in command
-        ):
-            # Trim domain prefix from just-dc-user argument: keep only username after slash
-            command = re.sub(r"-just-dc-user\s+\S+/(\S+)", r"-just-dc-user \1", command)
-            print_info("Re-executing secretsdump with trimmed domain prefix")
-            print_info_debug(f"Command: {command}")
-            execute_secretsdump(shell, command, domain)
-            return
-
-        if (
-            "Something went wrong" in completed_process.stdout
-            and "-just-dc-user" not in command
-        ):
-            if command.endswith("-use-vss"):
-                print_error(
-                    "Something went wrong while executing credential extraction. Canceling..."
-                )
-                return
-            print_error(
-                "Something went wrong while executing credential extraction. Reattempting with another method..."
-            )
-            command += " -use-vss"
-            execute_secretsdump(shell, command, domain)
-            return
-
-        dump: str = completed_process.stdout
-        if not dump:
-            print_warning(
-                "Credential extraction executed successfully but produced no output."
-            )
-            return
-
-        # ------------------------------------------------------------------ #
-        # 2. Extract "user-like-token" and NT-hash from every credential line
-        #    ^[^:\r\n]+  -> everything up to first ':' (DOMAIN\\user or user)
-        # ------------------------------------------------------------------ #
-        cred_matches: List[Tuple[str, str]] = re.findall(
-            r"(^[^:\r\n]+):\d+:[^:]*:([a-fA-F0-9]{32}):", dump, flags=re.M
-        )
-
-        if not cred_matches:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(
-                f"No credentials matching the pattern were found in secretsdump output for domain {marked_domain}."
-            )
-            print_info_debug(f"Secretsdump output for {domain}:\n{dump}")
-            _offer_machine_account_dump_fallback(shell, domain)
-            return
-
-        # ------------------------------------------------------------------ #
-        # 3. Store every credential, removing DOMAIN\\ prefix from username
-        # ------------------------------------------------------------------ #
-        raw_credentials: List[Tuple[str, str]] = []
-        creds_to_persist: List[Tuple[str, str]] = []
-        display_rows: List[Dict[str, str]] = []
-        context = getattr(shell, "_current_dcsync_context", None)
-        target_user = (
-            str(context.get("target_user") or "") if isinstance(context, dict) else ""
-        )
-        verify_credential = target_user.casefold() != "all"
-        for user_token, nt_hash in cred_matches:
-            # Apply same blacklist/filtering as in execute_secretsdump_with_domain for consistency
-            user_for_filtering = user_token.strip()
-
-            if "\\" in user_for_filtering:
-                domain_prefix, username_part = user_for_filtering.split("\\", 1)
-                # Optional: Check if domain_prefix matches the target 'domain' if strictness is needed
-                # if domain_prefix.lower() != domain.lower():
-                #     # print_info(f"Skipping user {original_user_for_log} from different domain {domain_prefix} in execute_secretsdump")
-                #     continue
-                username = username_part
-            elif user_for_filtering.lower() in ["administrator", "administrador"]:
-                username = user_for_filtering  # Process with the indicated domain
-            else:
-                # If no domain prefix and not a known global admin, decide if it should be skipped or associated with current domain
-                # For now, assume it's for the current domain if no prefix
-                username = user_for_filtering
-
-            # Apply blacklist
-            from adscan_internal.principal_utils import is_machine_account
-
-            if is_machine_account(username):  # machine & gMSA accounts often end with $
-                # print_info(f"Skipping account ending with $: {username}")
-                continue
-            if (
-                username.startswith("MSOL_")
-                or username.startswith("SM_")
-                or username.startswith("HealthMailbox")
-            ):  # Common service account prefixes
-                # print_info(f"Skipping service account with known prefix: {username}")
-                continue
-            if username.lower() in [
-                "guest",
-                "invitado",
-                "defaultaccount",
-            ]:  # Specific accounts to ignore
-                # print_info(f"Skipping specific blacklisted account: {username}")
-                continue
-            # ---------------------------------------------------------------- #
-
-            # Persist the credential using the *provided* domain argument
-            if verify_credential:
-                marked_domain = mark_sensitive(domain, "domain")
-                marked_username = mark_sensitive(username, "user")
-                marked_nt_hash = mark_sensitive(nt_hash, "password")
-                print_success(
-                    f"Found credential: {marked_domain}/{marked_username} with hash {marked_nt_hash}"
-                )
-
-            raw_credentials.append((username, nt_hash))
-
-        if verify_credential:
-            # Single-user DCSync keeps per-credential cracking/verify behaviour.
-            for username, nt_hash in raw_credentials:
-                cred_to_store = nt_hash
-                try:
-                    cred_to_store, _ = shell._handle_hash_cracking(
-                        domain, username, nt_hash
-                    )
-                except Exception:
-                    # _handle_hash_cracking already logs/telemeters; keep going.
-                    cred_to_store = nt_hash
-                creds_to_persist.append((username, cred_to_store))
-        else:
-            # DCSync "All": process as batch for better performance.
-            from adscan_internal.cli.creds import add_credentials_batch
-
-            creds_to_persist = add_credentials_batch(
-                shell=shell,
-                domain=domain,
-                credentials=raw_credentials,
-                skip_hash_cracking=False,
-                verify_credential=False,
-                prompt_for_user_privs_after=False,
-                ensure_fresh_kerberos_ticket=False,
-                ui_silent=False,
-            )
-            _render_dcsync_batch_cracking_summary(
-                shell=shell,
-                domain=domain,
-                credentials=creds_to_persist,
-            )
-            try:
-                created_domain_reuse_edges = _record_dcsync_domain_password_reuse(
-                    shell,
-                    domain=domain,
-                    credentials=raw_credentials,
-                )
-                if created_domain_reuse_edges > 0:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_info(
-                        "Recorded "
-                        f"{created_domain_reuse_edges} DomainPassReuse context step(s) "
-                        f"from DCSync-All credentials in {marked_domain}."
-                    )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                marked_domain = mark_sensitive(domain, "domain")
-                print_warning(
-                    "Failed to persist DomainPassReuse context steps from DCSync-All "
-                    f"credentials in {marked_domain}; continuing."
-                )
-
-        for username, cred_value in creds_to_persist:
-            display_rows.append({"User": username, "Credential": cred_value})
-
-        # Final DCSync summary
-        print_success("DCSync completed successfully.")
-
-        count = len(display_rows)
-        if count == 0:
-            print_info("No credentials were stored for this DCSync run.")
-        else:
-            print_info(f"Extracted {count} domain credentials.")
-            if verify_credential and count <= 10:
-                print_info_table(
-                    display_rows,
-                    ["User", "Credential"],
-                    title=f"Extracted credentials for domain {domain}",
-                )
-
-            if verify_credential:
-                # Persist after showing summary/table to keep output grouped.
-                for username, cred_value in creds_to_persist:
-                    shell.add_credential(
-                        domain,
-                        username,
-                        cred_value,
-                        skip_hash_cracking=True,
-                        verify_credential=True,
-                    )
-
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_error("Error executing secretsdump.")
-        print_exception(show_locals=False, exception=exc)
-
-
-def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
     context = getattr(shell, "_current_dcsync_context", None)
     if not isinstance(context, dict):
         return
@@ -599,6 +249,52 @@ def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
     auth_state = shell.domains_data.get(domain, {}).get("auth")
     if auth_state == "pwned":
         return
+
+    # Short-circuit: if a DA / high-value credential (e.g. Administrator
+    # cleartext extracted from the same backup-operators run that produced this
+    # machine account hash) is already stored, the SAM/LSA re-dump would only
+    # re-yield secrets we already have.  Re-dumping is wasteful and noisy —
+    # surface a compact notice and stop here.
+    # Uses is_user_da_or_high_value: layered fallback of graph + snapshot +
+    # cached lists + localized Administrator variants + krbtgt + persisted
+    # builtin_administrator_name.  Catches built-in DAs, custom-named DAs,
+    # localized DAs, and the early-pentest window before any LDAP collection.
+    _stored_creds = shell.domains_data.get(domain, {}).get("credentials") or {}
+    _existing_da: str | None = None
+    if isinstance(_stored_creds, dict):
+        from adscan_internal.services.high_value import is_user_da_or_high_value
+        for stored_user, stored_cred in _stored_creds.items():
+            if not stored_cred or str(stored_user).endswith("$"):
+                continue
+            try:
+                if is_user_da_or_high_value(
+                    shell, domain=domain, samaccountname=str(stored_user)
+                ):
+                    _existing_da = str(stored_user)
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    if _existing_da:
+        from rich.text import Text as _Text
+        from adscan_core.rich_output import _get_console as _gc
+        _line = _Text()
+        _line.append("  ↩ ", style="dim #6E7681")
+        _line.append("SAM/LSA fallback skipped", style="#6E7681")
+        _line.append("  ·  ", style="dim #6E7681")
+        _line.append(
+            f"high-value credential already captured: {mark_sensitive(_existing_da, 'user')}",
+            style="dim #6E7681",
+        )
+        try:
+            _gc().print(_line)
+        except Exception:  # noqa: BLE001
+            pass
+        print_info_debug(
+            f"[dcsync-fallback] Skipping SAM/LSA re-dump for {domain!r} — "
+            f"high-value credential {_existing_da!r} already in credential store."
+        )
+        return
+
     pdc_host = shell.domains_data.get(domain, {}).get(
         "pdc_hostname"
     ) or shell.domains_data.get(domain, {}).get("pdc")
@@ -607,30 +303,97 @@ def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_user = mark_sensitive(username, "user")
-    prompt = (
-        "DCSync did not return credentials. "
-        "Attempt SMB SAM/LSA/DPAPI dumps using machine delegation?"
-    )
-    if not Confirm.ask(prompt, default=True):
-        return
 
+    # Build a structured panel explaining the situation and the alternative.
+    why_line = _RichText()
+    if failure_reason:
+        why_line.append("Reason  ", style=MUTED)
+        why_line.append(str(failure_reason), style=f"bold {LAVA}")
+    else:
+        why_line.append("Reason  ", style=MUTED)
+        why_line.append("DCSync returned no credentials", style=f"bold {AMBER}")
+
+    fallback_lines = _RichText()
+    fallback_lines.append("Alternative path  ", style=MUTED)
+    fallback_lines.append(
+        "SMB SAM / LSA / DPAPI with machine-account delegation",
+        style=f"bold {ACID_GREEN}",
+    )
+    fallback_lines.append("\n")
+    fallback_lines.append("What to expect    ", style=MUTED)
+    fallback_lines.append(
+        "Local accounts (SAM)  ·  LSA secrets  ·  DPAPI master keys",
+        style=ICE_BLUE,
+    )
+    fallback_lines.append("\n")
+    fallback_lines.append("Coverage          ", style=MUTED)
+    fallback_lines.append(
+        "Covers machine-local Administrator hash + cached domain credentials",
+        style=MUTED,
+    )
+
+    domain_line = _RichText()
+    domain_line.append("Domain          ", style=MUTED)
+    domain_line.append(marked_domain, style=f"bold {ICE_BLUE}")
+    domain_line.append("   Machine      ", style=MUTED)
+    domain_line.append(marked_user, style=f"bold {ICE_BLUE}")
+
+    panel_body = _RichGroup(
+        _RichText(""),
+        why_line,
+        _RichText(""),
+        domain_line,
+        _RichText(""),
+        _RichText("─" * 48, style=GHOST),
+        _RichText(""),
+        fallback_lines,
+        _RichText(""),
+    )
     print_panel(
-        "\n".join(
-            [
-                "⚠️  DCSync did not return credentials",
-                f"Domain: {marked_domain}",
-                f"Machine Account: {marked_user}",
-                "Fallback: SMB SAM/LSA/DPAPI dumps with delegation",
-            ]
-        ),
-        title="[bold yellow]DCSync Fallback[/bold yellow]",
-        border_style="yellow",
+        panel_body,
+        title=f"[bold {AMBER}]DCSync · Alternative Path Available[/bold {AMBER}]",
+        border_style=AMBER,
         expand=False,
     )
+
+    # Disclose blast radius before asking for consent. Three consecutive
+    # SMB dumps fire authentication events (4624/4672) and registry/secret
+    # reads visible to MDI / Defender for Identity. Default flips to False
+    # so a stray Enter never auto-consents to additional noise. Auto mode
+    # bypasses the prompt to honour the engagement contract.
+    blast_line = _RichText()
+    blast_line.append("  Will fire    ", style=MUTED)
+    blast_line.append(
+        "3 SMB dumps (SAM, LSA, DPAPI) against the PDC",
+        style=f"bold {AMBER}",
+    )
+    telemetry_line = _RichText()
+    telemetry_line.append("  Telemetry    ", style=MUTED)
+    telemetry_line.append(
+        "Windows 4624/4672 on the DC. SAM/LSA registry reads logged.",
+        style=MUTED,
+    )
+    print_panel(
+        _RichGroup(
+            _RichText(""),
+            blast_line,
+            telemetry_line,
+            _RichText(""),
+        ),
+        title=f"[bold {AMBER}]Confirm Fallback[/bold {AMBER}]",
+        border_style=AMBER,
+        expand=False,
+    )
+    prompt = "Proceed with SMB SAM/LSA/DPAPI dumps via machine delegation?"
+    if getattr(shell, "auto", False):
+        print_info_debug("[dcsync] Auto mode: proceeding with SMB fallback.")
+    elif not Confirm.ask(prompt, default=False):
+        return
+
     print_info_debug("[dcsync] Falling back to SMB dumps with machine delegation.")
     from adscan_internal.cli.dumps import run_dump_dpapi, run_dump_lsa, run_dump_sam
 
-    print_info("Starting SMB SAM dump (delegated)...")
+    print_info("Starting SAM dump via machine delegation...")
     run_dump_sam(
         shell,
         domain=domain,
@@ -641,7 +404,7 @@ def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
     )
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
         return
-    print_info("Starting SMB LSA dump (delegated)...")
+    print_info("Starting LSA dump via machine delegation...")
     run_dump_lsa(
         shell,
         domain=domain,
@@ -652,7 +415,7 @@ def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
     )
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
         return
-    print_info("Starting SMB DPAPI dump (delegated)...")
+    print_info("Starting DPAPI dump via machine delegation...")
     run_dump_dpapi(
         shell,
         domain=domain,
@@ -669,7 +432,22 @@ def _render_dcsync_batch_cracking_summary(
     domain: str,
     credentials: list[tuple[str, str]],
 ) -> None:
-    """Render compact cracking summary for DCSync All batch processing."""
+    """Render compact cracking summary for DCSync All batch processing.
+
+    Presents three distinct sections — CRACKED / UNCRACKED / REUSED — with
+    visual hierarchy that elevates krbtgt and Tier-0 accounts. A progress bar
+    shows the crack rate at a glance. When krbtgt was cracked a special banner
+    emphasises the golden-ticket capability.
+    """
+    from adscan_internal.services.exploitation.dump_display import (
+        ACID_GREEN,
+        AMBER,
+        GHOST,
+        ICE_BLUE,
+        LAVA,
+        MUTED,
+    )
+
     if not credentials:
         return
 
@@ -732,6 +510,12 @@ def _render_dcsync_batch_cracking_summary(
             return "High-Value"
         return "Standard"
 
+    # Detect krbtgt in cracked list (golden ticket signal)
+    krbtgt_cracked = any(
+        str(row.get("raw_user") or "").strip().lower() == "krbtgt"
+        for row in cracked_rows
+    )
+
     for row in cracked_rows:
         row["risk_segment"] = _risk_segment_for_user(row["raw_user"])
         row["User"] = mark_sensitive(str(row["raw_user"]), "user")
@@ -781,72 +565,9 @@ def _render_dcsync_batch_cracking_summary(
     uncracked_reused_accounts = sum(
         len(rows) for rows in uncracked_reuse_groups.values()
     )
-    largest_cracked_reuse_cluster_size = max(
-        (len(rows) for rows in cracked_reuse_groups.values()),
-        default=0,
-    )
 
     total = len(cracked_rows) + len(uncracked_rows)
-    summary_rows = [
-        {"Metric": "Credentials Extracted", "Count": str(total)},
-        {
-            "Metric": "Hashes Cracked",
-            "Count": _format_count_and_percent(cracked_total, total),
-        },
-        {
-            "Metric": "Hashes Uncracked",
-            "Count": _format_count_and_percent(uncracked_total, total),
-        },
-        {
-            "Metric": "Tier-0 Cracked (share of cracked)",
-            "Count": _format_count_and_percent(tier0_cracked, cracked_total),
-        },
-        {"Metric": "Tier-0 Extracted", "Count": str(tier0_extracted)},
-        {
-            "Metric": "Tier-0 Crack Coverage",
-            "Count": _format_ratio_with_percent(tier0_cracked, tier0_extracted),
-        },
-        {
-            "Metric": "High-Value Cracked (share of cracked)",
-            "Count": _format_count_and_percent(high_value_cracked, cracked_total),
-        },
-        {"Metric": "High-Value Extracted", "Count": str(high_value_extracted)},
-        {
-            "Metric": "High-Value Crack Coverage",
-            "Count": _format_ratio_with_percent(
-                high_value_cracked, high_value_extracted
-            ),
-        },
-        {
-            "Metric": "Standard Cracked (share of cracked)",
-            "Count": _format_count_and_percent(standard_cracked, cracked_total),
-        },
-        {"Metric": "Standard Extracted", "Count": str(standard_extracted)},
-        {
-            "Metric": "Standard Crack Coverage",
-            "Count": _format_ratio_with_percent(standard_cracked, standard_extracted),
-        },
-        {
-            "Metric": "Reused Cracked Passwords",
-            "Count": (
-                f"{len(cracked_reuse_groups)} secret(s), {cracked_reused_accounts} account(s)"
-            ),
-        },
-        {
-            "Metric": "Cracked Accounts Using Reused Passwords",
-            "Count": _format_count_and_percent(cracked_reused_accounts, cracked_total),
-        },
-        {
-            "Metric": "Largest Reuse Cluster (Cracked)",
-            "Count": f"{largest_cracked_reuse_cluster_size} account(s)",
-        },
-        {
-            "Metric": "Reused Uncracked Hashes",
-            "Count": (
-                f"{len(uncracked_reuse_groups)} hash(es), {uncracked_reused_accounts} account(s)"
-            ),
-        },
-    ]
+
     _capture_dcsync_batch_cracking_summary_telemetry(
         shell,
         domain=domain,
@@ -862,11 +583,158 @@ def _render_dcsync_batch_cracking_summary(
         cracked_reuse_groups=cracked_reuse_groups,
         uncracked_reuse_groups=uncracked_reuse_groups,
     )
-    print_info_table(
-        summary_rows,
-        ["Metric", "Count"],
-        title=f"DCSync Cracking Summary ({mark_sensitive(domain, 'domain')})",
+
+    marked_domain = mark_sensitive(domain, "domain")
+
+    # ------------------------------------------------------------------
+    # Visual crack-rate progress bar (ASCII, always visible)
+    # ------------------------------------------------------------------
+    BAR_WIDTH = 40
+    filled = round((cracked_total / total) * BAR_WIDTH) if total > 0 else 0
+    unfilled = BAR_WIDTH - filled
+    crack_pct = (cracked_total / total * 100) if total > 0 else 0.0
+    bar_text = _RichText()
+    bar_text.append("  [", style=MUTED)
+    bar_text.append("█" * filled, style=f"bold {ACID_GREEN}")
+    bar_text.append("░" * unfilled, style=GHOST)
+    bar_text.append("]", style=MUTED)
+    bar_text.append(f"  {cracked_total}/{total} cracked", style=f"bold {ACID_GREEN}")
+    bar_text.append(f"  ({crack_pct:.1f}%)", style=MUTED)
+
+    # ------------------------------------------------------------------
+    # Tier breakdown rows
+    # ------------------------------------------------------------------
+    def _tier_summary_line(
+        label: str,
+        label_style: str,
+        cracked: int,
+        extracted: int,
+    ) -> _RichText:
+        line = _RichText()
+        seg_filled = round((cracked / extracted) * 20) if extracted > 0 else 0
+        seg_bar = "█" * seg_filled + "░" * (20 - seg_filled)
+        crack_rate = f"{(cracked / extracted * 100):.0f}%" if extracted > 0 else "—"
+        line.append(f"  {label:<14}", style=label_style)
+        line.append(f"  {cracked}/{extracted}", style=f"bold {label_style}")
+        line.append(f"  [{seg_bar}]", style=MUTED)
+        line.append(f"  {crack_rate}", style=label_style)
+        return line
+
+    tier0_line = _tier_summary_line("Tier-0", LAVA, tier0_cracked, tier0_extracted)
+    hv_line = _tier_summary_line("High-Value", AMBER, high_value_cracked, high_value_extracted)
+    std_line = _tier_summary_line("Standard", MUTED, standard_cracked, standard_extracted)
+
+    # ------------------------------------------------------------------
+    # CRACKED / UNCRACKED / REUSED section headers
+    # ------------------------------------------------------------------
+    cracked_header = _RichText()
+    cracked_header.append(" ● CRACKED ", style=f"bold white on {ACID_GREEN}")
+    cracked_header.append(f"  {cracked_total} credentials", style=f"bold {ACID_GREEN}")
+
+    uncracked_header = _RichText()
+    uncracked_header.append(" ○ UNCRACKED ", style=f"bold white on {LAVA}")
+    uncracked_header.append(f"  {uncracked_total} hashes retained", style=MUTED)
+
+    reuse_groups_total = len(cracked_reuse_groups) + len(uncracked_reuse_groups)
+    reuse_accounts_total = cracked_reused_accounts + uncracked_reused_accounts
+    reused_header = _RichText()
+    reused_header.append(" ↺ REUSED ", style=f"bold white on {AMBER}")
+    if reuse_groups_total:
+        reused_header.append(
+            f"  {reuse_accounts_total} accounts across {reuse_groups_total} shared secret(s)",
+            style=f"bold {AMBER}",
+        )
+    else:
+        reused_header.append("  no reuse detected", style=MUTED)
+
+    # ------------------------------------------------------------------
+    # Top-value account line
+    # ------------------------------------------------------------------
+    top_value_line = _RichText()
+    top_value_user: str | None = None
+    top_value_style = MUTED
+    if krbtgt_cracked:
+        top_value_user = "krbtgt"
+        top_value_style = LAVA
+    elif tier0_cracked > 0:
+        for row in cracked_rows:
+            if row.get("risk_segment") == "Tier-0":
+                top_value_user = str(row.get("raw_user") or "")
+                top_value_style = AMBER
+                break
+    elif high_value_cracked > 0:
+        for row in cracked_rows:
+            if row.get("risk_segment") == "High-Value":
+                top_value_user = str(row.get("raw_user") or "")
+                top_value_style = ICE_BLUE
+                break
+
+    if top_value_user:
+        top_value_line.append("  Top value  ", style=MUTED)
+        top_value_line.append(
+            mark_sensitive(top_value_user, "user"), style=f"bold {top_value_style}"
+        )
+
+    summary_body = _RichGroup(
+        _RichText(""),
+        bar_text,
+        _RichText(""),
+        _RichText("─" * 48, style=GHOST),
+        _RichText(""),
+        tier0_line,
+        hv_line,
+        std_line,
+        _RichText(""),
+        _RichText("─" * 48, style=GHOST),
+        _RichText(""),
+        cracked_header,
+        _RichText(""),
+        uncracked_header,
+        _RichText(""),
+        reused_header,
+        *((_RichText(""), top_value_line) if top_value_user else ()),
+        _RichText(""),
     )
+    print_panel(
+        summary_body,
+        title=f"[bold {ICE_BLUE}]DCSync Cracking Summary  {marked_domain}[/bold {ICE_BLUE}]",
+        border_style=ICE_BLUE,
+        expand=False,
+    )
+
+    # ------------------------------------------------------------------
+    # Golden ticket banner — only when krbtgt was cracked
+    # ------------------------------------------------------------------
+    if krbtgt_cracked:
+        gt_line1 = _RichText()
+        gt_line1.append("  krbtgt CRACKED", style=f"bold {LAVA}")
+        gt_line1.append(
+            ": Golden Ticket forging is now possible", style="bold white"
+        )
+        gt_line2 = _RichText()
+        gt_line2.append(
+            "  Forge a TGT for any account, any group, any lifetime.",
+            style=MUTED,
+        )
+        gt_line3 = _RichText()
+        gt_line3.append(
+            "  Rotate the krbtgt password twice on the DC to invalidate all forged tickets.",
+            style=MUTED,
+        )
+        gt_body = _RichGroup(
+            _RichText(""),
+            gt_line1,
+            gt_line2,
+            _RichText(""),
+            gt_line3,
+            _RichText(""),
+        )
+        print_panel(
+            gt_body,
+            title=f"[bold white on {LAVA}] GOLDEN TICKET CAPABILITY [/bold white on {LAVA}]",
+            border_style=LAVA,
+            expand=False,
+        )
 
     thresholds = _resolve_dcsync_all_ui_thresholds()
     large_threshold = thresholds["large_threshold"]
@@ -936,9 +804,7 @@ def _render_dcsync_batch_cracking_summary(
             title="Uncracked Hashes",
         )
     elif uncracked_rows:
-        print_info(
-            f"Uncracked hashes retained for {len(uncracked_rows)} account(s)."
-        )
+        print_info(f"Uncracked hashes retained for {len(uncracked_rows)} account(s).")
 
     reuse_rows: list[dict[str, str]] = []
 
@@ -952,7 +818,9 @@ def _render_dcsync_batch_cracking_summary(
             key=lambda item: (-len(item[1]), str(item[0]).casefold()),
         )
         for secret_value, rows in ordered[:5]:
-            segment_counts = Counter(str(row.get("risk_segment") or "Standard") for row in rows)
+            segment_counts = Counter(
+                str(row.get("risk_segment") or "Standard") for row in rows
+            )
             reuse_rows.append(
                 {
                     "Secret Type": secret_label,
@@ -973,6 +841,794 @@ def _render_dcsync_batch_cracking_summary(
             ["Secret Type", "Secret", "Accounts", "Tier-0", "High-Value", "Standard"],
             title="Top Reused Secrets",
         )
+
+
+def execute_dcsync_native(
+    shell: Any,
+    domain: str,
+    auth_domain: str | None = None,
+    target_users: list[str] | None = None,
+) -> dict | None:
+    """Execute DCSync via native DRSUAPI — streaming live display.
+
+    Returns:
+        ``None`` when the run aborted before secrets could be evaluated
+        (missing context, missing PDC, transport failure). Otherwise a dict
+        ``{"krbtgt": bool, "tier0_count": int, "total": int}`` summarising
+        what was extracted, so callers (notably the attack-graph step
+        executor) can decide whether the DCSync edge should be marked as
+        ``success`` or ``failed``.
+
+
+    Streams DRSUAPI secrets via the native dump service and runs the standard
+    credential persistence + post-processing pipeline.
+
+    Args:
+        shell: The active ``PentestShell`` instance.
+        domain: Target domain being replicated (enumeration target).
+        auth_domain: Domain the credential belongs to. Defaults to ``domain``
+            when the authenticating user lives in the same domain.
+        target_users: List of sAMAccountNames to replicate. ``None`` / empty
+            means "all users" (full DRSUAPI walk).
+    """
+    from adscan_internal.services.async_bridge import run_async_sync
+    import time
+
+    from adscan_internal.services.exploitation.native_dump_service import (
+        NativeDumpService,
+    )
+    from adscan_internal.services.exploitation.dump_display import (
+        DumpDisplay,
+    )
+    from adscan_internal.services.smb_transport import SMBConfig
+    from adscan_internal.principal_utils import is_machine_account
+
+    # ------------------------------------------------------------------ #
+    # 1. Build SMBConfig from _current_dcsync_context + domains_data
+    # ------------------------------------------------------------------ #
+    context = getattr(shell, "_current_dcsync_context", None)
+    if not isinstance(context, dict):
+        print_error("execute_dcsync_native: missing DCSync context. Cannot proceed.")
+        return None
+
+    username: str = str(context.get("username") or "")
+    password: str = str(context.get("password") or "")
+    target_user: str = str(context.get("target_user") or "")
+
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {})
+    pdc_ip: str = str(domain_data.get("pdc") or "")
+    pdc_hostname: str | None = domain_data.get("pdc_hostname") or None
+
+    if not pdc_ip:
+        print_error(
+            f"execute_dcsync_native: no PDC IP for domain {mark_sensitive(domain, 'domain')}."
+        )
+        return None
+
+    effective_auth_domain: str = auth_domain or domain
+
+    # ------------------------------------------------------------------
+    # Context panel — who, what, where (shown before the stream starts)
+    # ------------------------------------------------------------------
+    from adscan_internal.services.exploitation.dump_display import (
+        ACID_GREEN,
+        AMBER,
+        GHOST,
+        ICE_BLUE,
+        MUTED,
+    )
+
+    _scope_label = "All accounts (DRSUAPI full walk)" if not target_users else (
+        f"{len(target_users)} targeted account(s)"
+    )
+    _auth_label = f"{mark_sensitive(username, 'user')}@{mark_sensitive(effective_auth_domain, 'domain')}"
+    _target_label = mark_sensitive(pdc_hostname or pdc_ip, "domain")
+
+    _ctx_line1 = _RichText()
+    _ctx_line1.append("  Operation    ", style=MUTED)
+    _ctx_line1.append("DCSync via native DRSUAPI", style=f"bold {ICE_BLUE}")
+
+    _ctx_line2 = _RichText()
+    _ctx_line2.append("  Credential   ", style=MUTED)
+    _ctx_line2.append(_auth_label, style=f"bold {ACID_GREEN}")
+
+    _ctx_line3 = _RichText()
+    _ctx_line3.append("  Target DC    ", style=MUTED)
+    _ctx_line3.append(_target_label, style=f"bold {ICE_BLUE}")
+    if pdc_ip and pdc_hostname and pdc_ip != pdc_hostname:
+        _ctx_line3.append(f"  ({pdc_ip})", style=MUTED)
+
+    _ctx_line4 = _RichText()
+    _ctx_line4.append("  Scope        ", style=MUTED)
+    _ctx_line4.append(_scope_label, style=MUTED)
+
+    _ctx_opsec = _RichText()
+    _ctx_opsec.append("  Detection    ", style=MUTED)
+    _ctx_opsec.append(
+        "MDI Event 4662, high severity. Source IP visible in DC security log.",
+        style=f"bold {AMBER}",
+    )
+
+    _ctx_body = _RichGroup(
+        _RichText(""),
+        _ctx_line1,
+        _ctx_line2,
+        _ctx_line3,
+        _ctx_line4,
+        _RichText(""),
+        _RichText("─" * 48, style=GHOST),
+        _RichText(""),
+        _ctx_opsec,
+        _RichText(""),
+    )
+    print_panel(
+        _ctx_body,
+        title=f"[bold {ICE_BLUE}]Initiating DCSync[/bold {ICE_BLUE}]",
+        border_style=ICE_BLUE,
+        expand=False,
+    )
+
+    is_hash = len(password) == 32 and all(
+        c in "0123456789abcdef" for c in password.lower()
+    )
+    is_ccache = password.lower().endswith(".ccache")
+
+    # Always use an explicit ccache for DCSync — never rely on KRB5CCNAME or
+    # plaintext NTLM.  bind_workspace_ticket_for_user() (called by the LDAP
+    # adminCount check just before) mutates KRB5CCNAME to the adscan service
+    # account.  If the DCERPC auth layer (from_smb_gssapi) later picks up the
+    # contaminated global cache it authenticates as the wrong user, causing
+    # ERROR_DS_DRA_BAD_DN on DRSGetNCChanges.  Passing ccache_path explicitly
+    # forces smb+kerberos-ccache, which reads the path directly and is immune
+    # to KRB5CCNAME global state.
+    #
+    # Priority:
+    #   1. Explicit ccache in password field
+    #   2. Workspace ccache already on disk for this user (NT hash or password)
+    #   3. Freshly obtained TGT (plaintext password → kerbad get_tgt)
+    #   4. NT hash with NTLM (last resort, only if kerbad fails)
+    _workspace_ccache: str | None = None
+    _tickets: dict = (domain_data.get("kerberos_tickets") or {})
+    for _ukey, _upath in _tickets.items():
+        if isinstance(_ukey, str) and _ukey.casefold() == username.casefold():
+            _candidate = str(_upath or "").strip()
+            if _candidate and os.path.exists(_candidate):
+                _workspace_ccache = _candidate
+                print_info_debug(
+                    f"[dcsync-native] found workspace ccache for "
+                    f"{mark_sensitive(username, 'user')}: "
+                    f"{mark_sensitive(_candidate, 'path')}"
+                )
+            break
+
+    # For plaintext passwords: obtain a TGT now and use it as the explicit
+    # ccache so the DCERPC auth layer never touches KRB5CCNAME.
+    if not is_hash and not is_ccache and not _workspace_ccache:
+        import tempfile
+        try:
+            from adscan_internal.services.kerberos_transport import (
+                KerberosConfig, get_tgt,
+            )
+            _tgt_ccache = tempfile.mktemp(suffix=".ccache", prefix="adscan_dcsync_")
+            _kr_cfg = KerberosConfig(
+                domain=effective_auth_domain,
+                kdc_ip=pdc_ip,
+                username=username,
+                password=password,
+                ccache_path=_tgt_ccache,
+            )
+            import asyncio as _asyncio
+            _asyncio.get_event_loop().run_until_complete(get_tgt(_kr_cfg))
+            if os.path.exists(_tgt_ccache):
+                _workspace_ccache = _tgt_ccache
+                print_info_debug(
+                    f"[dcsync-native] obtained fresh TGT for "
+                    f"{mark_sensitive(username, 'user')} → using explicit ccache"
+                )
+        except Exception as _tgt_exc:  # noqa: BLE001
+            print_info_debug(
+                f"[dcsync-native] TGT acquisition failed for "
+                f"{mark_sensitive(username, 'user')} ({type(_tgt_exc).__name__}: {_tgt_exc}); "
+                "falling back to NTLM plaintext — KRB5CCNAME contamination risk"
+            )
+
+    _krb5ccname_at_dcsync = os.environ.get("KRB5CCNAME", "<unset>")
+    print_info_debug(
+        f"[dcsync-native] KRB5CCNAME at DCSync entry: "
+        f"{mark_sensitive(_krb5ccname_at_dcsync, 'path')} | "
+        f"workspace_ccache={'yes' if _workspace_ccache else 'no'} | "
+        f"is_hash={is_hash} is_ccache={is_ccache}"
+    )
+
+    _use_ccache = _workspace_ccache or (password if is_ccache else None)
+    smb_config = SMBConfig(
+        target_ip=pdc_ip,
+        target_hostname=pdc_hostname,
+        domain=domain,
+        auth_domain=effective_auth_domain,
+        username=username,
+        # Pass plaintext only when no ccache available (NTLM last resort).
+        password=None if (is_hash or is_ccache or _workspace_ccache) else password,
+        nt_hash=password if (is_hash and not _workspace_ccache) else None,
+        ccache_path=_use_ccache,
+        use_kerberos=bool(_use_ccache),
+        kdc_ip=pdc_ip,
+    )
+    print_info_debug(
+        f"[dcsync-native] SMBConfig: use_kerberos={smb_config.use_kerberos} "
+        f"has_hash={bool(smb_config.nt_hash)} has_ccache={bool(smb_config.ccache_path)} "
+        f"target={smb_config.target_ip} hostname={smb_config.target_hostname}"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2. Stream DRSUAPI secrets via NativeDumpService.dcsync()
+    # ------------------------------------------------------------------ #
+    display = DumpDisplay()
+    marked_domain = mark_sensitive(domain, "domain")
+    display.operation_header("DCSync (native DRSUAPI)", pdc_hostname or pdc_ip, 1)
+    display.phase_start(1, 1, f"Replicating secrets from {marked_domain}")
+    display.start_credential_stream(f"NTDS · {marked_domain}")
+
+    raw_credentials: List[Tuple[str, str]] = []
+    raw_secrets_for_meta: list = []  # full DcsyncSecret objects — needed later for AES persistence
+    aes_credentials: dict[str, str] = {}  # acct → aes256_key
+    rid_by_account: dict[str, int] = {}  # acct (lowercased) → RID parsed from SID
+    sid_by_account: dict[str, str] = {}  # acct (lowercased) → SID (DCSync inventory)
+    enabled_by_account: dict[
+        str, bool
+    ] = {}  # acct (lowercased) → is_enabled (UAC bit 0x0002 inverted)
+    privileged_accounts: set[str] = set()
+    krbtgt_found: bool = False
+    builtin_admin_account: str | None = None  # populated when RID==500 row arrives
+    errors_seen: int = 0
+    _stream_error_types: list[str] = []  # track error class names to distinguish timeout vs access denied
+    start_time = time.monotonic()
+
+    def _extract_rid(sid: str | None) -> int | None:
+        """Return the trailing RID component of ``sid`` or ``None``.
+
+        Universal across locales (es-ES "Administrador", de-DE "Administrator",
+        renamed builtin admins) — RID 500 / 502 are stable.
+        """
+        if not sid:
+            return None
+        try:
+            return int(str(sid).rsplit("-", 1)[1])
+        except (ValueError, IndexError):
+            return None
+
+    _PRIVILEGED_PREFIXES = ("administrator", "admin", "krbtgt")
+    _PRIVILEGED_SUFFIXES = ("-admin", "_admin", "adm")
+
+    def _is_privileged(acct: str) -> bool:
+        low = acct.lower()
+        return any(low.startswith(p) for p in _PRIVILEGED_PREFIXES) or any(
+            low.endswith(s) for s in _PRIVILEGED_SUFFIXES
+        )
+
+    async def _collect() -> None:
+        nonlocal errors_seen, krbtgt_found, builtin_admin_account
+        svc = NativeDumpService()
+        print_info_debug(
+            f"[dcsync-native] config: target={smb_config.target_ip} "
+            f"domain={smb_config.domain} auth_domain={smb_config.auth_domain} "
+            f"user={smb_config.username} "
+            f"has_hash={bool(smb_config.nt_hash)} has_pass={bool(smb_config.password)} "
+            f"use_kerberos={smb_config.use_kerberos} kdc={smb_config.kdc_ip}"
+        )
+        async for secret, err in svc.dcsync(
+            smb_config,
+            target_domain=domain,
+            target_users=target_users or [],
+        ):
+            if err is not None:
+                errors_seen += 1
+                _stream_error_types.append(type(err).__name__)
+                print_info_debug(
+                    f"[dcsync-native] stream error: {type(err).__name__}: {err}"
+                )
+                continue
+            if secret is None:
+                continue
+
+            acct = str(secret.username or "")
+            nt = str(secret.nt_hash or "")
+
+            # Filter: skip machine accounts and common noise accounts
+            if is_machine_account(acct):
+                continue
+            if (
+                acct.startswith("MSOL_")
+                or acct.startswith("SM_")
+                or acct.startswith("HealthMailbox")
+            ):
+                continue
+            if acct.lower() in ("guest", "invitado", "defaultaccount"):
+                continue
+
+            if not nt:
+                continue
+
+            # Track AES256 keys — high value for pass-the-key when RC4 disabled
+            aes256 = str(secret.aes256_key or "")
+            if aes256:
+                aes_credentials[acct] = aes256
+
+            sid_value = getattr(secret, "sid", None)
+            rid = _extract_rid(sid_value)
+            if rid is not None:
+                rid_by_account[acct.lower()] = rid
+            if sid_value:
+                sid_by_account[acct.lower()] = str(sid_value)
+            try:
+                enabled_by_account[acct.lower()] = bool(
+                    getattr(secret, "is_enabled", True)
+                )
+            except Exception:
+                enabled_by_account[acct.lower()] = True
+
+            # RID-based detection — locale-agnostic.
+            is_krbtgt = rid == 502 or acct.lower() == "krbtgt"
+            if is_krbtgt:
+                krbtgt_found = True
+            if rid == 500 and builtin_admin_account is None:
+                builtin_admin_account = acct
+            is_priv = is_krbtgt or rid in (500, 512, 518, 519) or _is_privileged(acct)
+            if is_priv:
+                privileged_accounts.add(acct)
+
+            raw_credentials.append((acct, nt))
+            raw_secrets_for_meta.append(secret)
+            display.stream_dcsync_credential(
+                account=acct,
+                nt_hash=nt,
+                aes256=aes256 or None,
+                is_krbtgt=is_krbtgt,
+                is_privileged=is_priv,
+                count=len(raw_credentials),
+            )
+
+    try:
+        run_async_sync(_collect())
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        display.stop_credential_stream()
+
+        # Map known DCERPC / SMB error strings to a human-readable cause so
+        # the operator understands what to fix without reading raw exception text.
+        _exc_str = str(exc).lower()
+        if "access_denied" in _exc_str or "access denied" in _exc_str:
+            _cause = (
+                f"DRSUAPI access denied. Verify DCSync rights for "
+                f"{mark_sensitive(username, 'user')} on {mark_sensitive(domain, 'domain')}."
+            )
+        elif "logon_failure" in _exc_str or "invalid credentials" in _exc_str:
+            _cause = (
+                f"Authentication failed. Check credential for "
+                f"{mark_sensitive(username, 'user')} (hash expired or password changed?)."
+            )
+        elif "bad_network_name" in _exc_str or "connection refused" in _exc_str:
+            _cause = (
+                f"Cannot reach PDC {mark_sensitive(pdc_hostname or pdc_ip, 'domain')}. "
+                "Verify network connectivity and DC availability."
+            )
+        elif "kerberos" in _exc_str or "krb" in _exc_str:
+            _cause = (
+                "Kerberos authentication error. Check clock skew, realm, and SPN. "
+                "Run with --debug for the full KRB error code."
+            )
+        else:
+            _cause = f"Transport error ({type(exc).__name__})"
+
+        print_error(f"DCSync failed: {_cause}")
+        print_exception(show_locals=False, exception=exc)
+        return None
+
+    elapsed = time.monotonic() - start_time
+    display.stop_credential_stream()
+    display.dcsync_summary(
+        total=len(raw_credentials),
+        privileged_count=len(privileged_accounts),
+        aes_count=len(aes_credentials),
+        has_krbtgt=krbtgt_found,
+        host=pdc_hostname or pdc_ip,
+        elapsed=elapsed,
+    )
+
+    if errors_seen > 0:
+        _stream_errors_lower = " ".join(_stream_error_types).lower()
+        _is_network_block = "timeout" in _stream_errors_lower
+        if _is_network_block:
+            # tui-design: semantic color + glyph — amber ⚠ (network constraint)
+            # not crimson ✗ (permission error). Contextual intelligence: distinguish
+            # "not an ADscan bug" from "operator needs to fix rights".
+            # impeccable: verdict-first, no hedging, actionable.
+            from rich.console import Group as _Group
+            from rich.panel import Panel as _Panel
+            from rich.text import Text as _Text
+            from adscan_core.theme import COLOR_AMBER, COLOR_MUTED
+            _diag = _Group(
+                _Text.from_markup(
+                    f"[bold {COLOR_AMBER}]⚠  DRSUAPI dynamic ports unreachable[/bold {COLOR_AMBER}]"
+                ),
+                _Text(""),
+                _Text.from_markup(
+                    f"[{COLOR_MUTED}]DRSUAPI (MS-DRSR) is TCP-only — it uses dynamic RPC ports\n"
+                    f"(49152-65535) discovered via the endpoint mapper on port 135.\n"
+                    f"Those ports are not reachable from this host to the DC.[/{COLOR_MUTED}]"
+                ),
+                _Text(""),
+                _Text.from_markup(
+                    f"[bold]DC[/bold]      {mark_sensitive(pdc_hostname or pdc_ip, 'hostname')}\n"
+                    f"[bold]Port 135[/bold]  reachable (EPM responded)\n"
+                    f"[bold]Ports 49152+[/bold]  [bold {COLOR_AMBER}]filtered[/bold {COLOR_AMBER}] (timeout after "
+                    f"{errors_seen} attempt(s))"
+                ),
+                _Text(""),
+                _Text.from_markup(
+                    f"[{COLOR_MUTED}]This is a network constraint, not an ADscan bug or a\n"
+                    f"permissions error. DCSync works correctly in production\n"
+                    f"domain networks where those ports are accessible.\n\n"
+                    f"[bold]Fix:[/bold] verify that ports 49152-65535 are open from\n"
+                    f"this host to {mark_sensitive(pdc_hostname or pdc_ip, 'hostname')} (check host/network firewall).\n"
+                    f"In restricted VPNs (HTB, some audits) only well-known\n"
+                    f"ports are routed — DCSync is not possible from there.[/{COLOR_MUTED}]"
+                ),
+            )
+            from adscan_core.output._state import get_console as _gc
+            _gc().print(_Panel(
+                _diag,
+                title=f"[bold {COLOR_AMBER}]DCSync blocked by network[/bold {COLOR_AMBER}]",
+                title_align="left",
+                border_style=COLOR_AMBER,
+                padding=(1, 2),
+            ))
+        else:
+            print_warning(f"DCSync native: {errors_seen} stream error(s) encountered.")
+
+    if not raw_credentials:
+        if errors_seen > 0 and "timeout" in " ".join(_stream_error_types).lower():
+            _no_cred_reason = (
+                "Dynamic RPC ports (49152-65535) unreachable. "
+                "DCSync requires open access to the DC's dynamic port range."
+            )
+        else:
+            _no_cred_reason = (
+                f"{errors_seen} stream error(s). Check DCSync rights on "
+                f"{mark_sensitive(username, 'user')}."
+                if errors_seen > 0
+                else None
+            )
+        if not ("timeout" in " ".join(_stream_error_types).lower() and errors_seen > 0):
+            print_warning(
+                f"No credentials returned by native DCSync for domain {marked_domain}."
+            )
+        _offer_machine_account_dump_fallback(
+            shell, domain, failure_reason=_no_cred_reason
+        )
+        return {"krbtgt": False, "tier0_count": 0, "total": 0}
+
+    # ------------------------------------------------------------------ #
+    # 3. Post-processing pipeline (credential persistence + cracking + display)
+    # ------------------------------------------------------------------ #
+    verify_credential = target_user.casefold() != "all"
+    creds_to_persist: List[Tuple[str, str]] = []
+    display_rows: List[Dict[str, str]] = []
+
+    if verify_credential:
+        for acct, nt in raw_credentials:
+            md = mark_sensitive(domain, "domain")
+            mu = mark_sensitive(acct, "user")
+            mh = mark_sensitive(nt, "password")
+            print_success(f"Found credential: {md}/{mu} with hash {mh}")
+
+        for acct, nt in raw_credentials:
+            cred_to_store = nt
+            try:
+                cred_to_store, _ = shell._handle_hash_cracking(domain, acct, nt)
+            except Exception:
+                cred_to_store = nt
+            creds_to_persist.append((acct, cred_to_store))
+    else:
+        from adscan_internal.cli.creds import add_credentials_batch
+        from adscan_internal.services.credentials import CredentialMetadata
+
+        # Build per-user metadata up-front so add_credentials_batch can
+        # persist privilege-role + Kerberos-key material centrally,
+        # rather than every credential source re-implementing tagging.
+        metadata_by_user: dict[str, CredentialMetadata] = {}
+        for sec in raw_secrets_for_meta:
+            try:
+                user = (getattr(sec, "username", "") or "").strip()
+                if not user:
+                    continue
+                kkeys = tuple(getattr(sec, "kerberos_keys", ()) or ())
+                metadata_by_user[user.lower()] = CredentialMetadata(
+                    aes256_key=(getattr(sec, "aes256_key", None) or None),
+                    aes128_key=(getattr(sec, "aes128_key", None) or None),
+                    kerberos_keys=kkeys,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+
+        creds_to_persist = add_credentials_batch(
+            shell=shell,
+            domain=domain,
+            credentials=raw_credentials,
+            skip_hash_cracking=False,
+            verify_credential=False,
+            prompt_for_user_privs_after=False,
+            ensure_fresh_kerberos_ticket=False,
+            ui_silent=False,
+            metadata_by_user=metadata_by_user,
+        )
+        _render_dcsync_batch_cracking_summary(
+            shell=shell,
+            domain=domain,
+            credentials=creds_to_persist,
+        )
+        try:
+            created_domain_reuse_edges = _record_dcsync_domain_password_reuse(
+                shell,
+                domain=domain,
+                credentials=raw_credentials,
+            )
+            if created_domain_reuse_edges > 0:
+                md = mark_sensitive(domain, "domain")
+                print_info(
+                    f"Recorded {created_domain_reuse_edges} DomainPassReuse context step(s) "
+                    f"from DCSync-All credentials in {md}."
+                )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            md = mark_sensitive(domain, "domain")
+            print_warning(
+                f"Failed to persist DomainPassReuse context steps from DCSync-All credentials in {md}; continuing."
+            )
+
+    # Surface disabled accounts in the summary panel so the operator sees them
+    # even though the picker will filter them out at consumption time.
+    # krbtgt is excluded from this count — its ACCOUNTDISABLE bit is set by
+    # Microsoft design and the account is operationally active.
+    disabled_count = sum(
+        1
+        for acct_key, v in enabled_by_account.items()
+        if not v and acct_key != "krbtgt" and rid_by_account.get(acct_key) != 502
+    )
+    if disabled_count > 0:
+        print_info(
+            f"   {disabled_count} of {len(enabled_by_account)} extracted accounts "
+            "are disabled (filtered from credential picker)"
+        )
+
+    for acct, cred_value in creds_to_persist:
+        display_rows.append(
+            {
+                "User": mark_sensitive(acct, "user"),
+                "Credential": mark_sensitive(cred_value, "password"),
+            }
+        )
+
+    # Show the credential table immediately after the success banner so it
+    # appears as part of the DCSync narrative — before promote_to_pwned fires
+    # the post-compromise flow (which may trigger flag collection and push this
+    # output after the flags panel).
+    count = len(display_rows)
+    if count == 0:
+        print_info("No credentials were stored for this DCSync run.")
+    else:
+        from adscan_internal.services.exploitation.dump_display import (
+            ACID_GREEN as _ACID_GREEN_S,
+            AMBER as _AMBER_S,
+            LAVA as _LAVA_S,
+            MUTED as _MUTED_S,
+        )
+        _priv_count = len(privileged_accounts)
+        _aes_count = len(aes_credentials)
+
+        _s_line1 = _RichText()
+        _s_line1.append("  Accounts replicated  ", style=_MUTED_S)
+        _s_line1.append(str(count), style=f"bold {_ACID_GREEN_S}")
+
+        _s_line2 = _RichText()
+        _s_line2.append("  Privileged accounts  ", style=_MUTED_S)
+        _s_line2.append(str(_priv_count), style=f"bold {_AMBER_S}")
+
+        _s_line3 = _RichText()
+        _s_line3.append("  AES256 keys captured ", style=_MUTED_S)
+        _s_line3.append(str(_aes_count), style=_MUTED_S)
+
+        _s_krbtgt = _RichText()
+        if krbtgt_found:
+            _s_krbtgt.append("  krbtgt hash obtained ", style=_MUTED_S)
+            _s_krbtgt.append("YES", style=f"bold {_LAVA_S}")
+            _s_krbtgt.append("  (golden ticket forging possible)", style=_MUTED_S)
+
+        _success_body = _RichGroup(
+            _RichText(""),
+            _s_line1,
+            _s_line2,
+            _s_line3,
+            *((_RichText(""), _s_krbtgt) if krbtgt_found else ()),
+            _RichText(""),
+        )
+        print_panel(
+            _success_body,
+            title=f"[bold white on {_ACID_GREEN_S}] DCSync Complete [/bold white on {_ACID_GREEN_S}]",
+            border_style=_ACID_GREEN_S,
+            expand=False,
+        )
+
+        if verify_credential and count <= 10:
+            print_info_table(
+                display_rows,
+                ["User", "Credential"],
+                title=f"Extracted credentials for domain {mark_sensitive(domain, 'domain')}",
+            )
+
+    # Persist credentials into the workspace store BEFORE calling
+    # promote_to_pwned.  promote_to_pwned fires _flush_ctf_post_compromise_queue
+    # which calls pick_credential_for_local_admin to choose the best credential
+    # for flag collection.  If add_credential runs after promote_to_pwned (the
+    # old order), the just-extracted Administrator/krbtgt hash is not yet in the
+    # map and the picker falls back to a lower-privilege account (wrong creds →
+    # ACCESS_DENIED on C$).  Calling add_credential first ensures the picker
+    # finds the DA credential and uses it for flags.
+    if verify_credential:
+        for acct, cred_value in creds_to_persist:
+            try:
+                shell.add_credential(
+                    domain,
+                    acct,
+                    cred_value,
+                    skip_hash_cracking=True,
+                    verify_credential=True,
+                    # DCSync already announced the credential — suppress the
+                    # duplicate verification panel and TGT-generation messages.
+                    ui_silent=True,
+                    credential_origin="dcsync",
+                )
+            except Exception as _ac_exc:  # noqa: BLE001
+                telemetry.capture_exception(_ac_exc)
+
+    # Screenshot moment: krbtgt hash extracted = full domain compromise.
+    # Augments (does not replace) the print_success above so logs stay
+    # backwards-compatible.
+    if krbtgt_found:
+        try:
+            from adscan_core.rich_output_collection import print_da_owned_card
+
+            krbtgt_nt = ""
+            for _acct, _nt in raw_credentials:
+                if _acct.lower() == "krbtgt":
+                    krbtgt_nt = _nt
+                    break
+            evidence_lines: list[str] = ["Hash extracted via native DCSync (DRSUAPI)"]
+            if krbtgt_nt:
+                preview = (
+                    f"{krbtgt_nt[:8]}…{krbtgt_nt[-4:]}"
+                    if len(krbtgt_nt) > 12
+                    else krbtgt_nt
+                )
+                evidence_lines.append(f"NT: {mark_sensitive(preview, 'password')}")
+            if "krbtgt" in aes_credentials:
+                evidence_lines.append("RC4 + AES256 keys captured")
+            evidence_lines.append(
+                f"{len(raw_credentials)} accounts replicated "
+                f"({len(privileged_accounts)} privileged)"
+            )
+            print_da_owned_card(
+                account="krbtgt",
+                domain=domain,
+                evidence=evidence_lines,
+                method="DCSync (DRSUAPI)",
+            )
+        except Exception as exc:  # pragma: no cover - presentation must never fail dump
+            telemetry.capture_exception(exc)
+
+        # Centralised domain compromise promotion. Idempotent: a no-op
+        # when the domain was already promoted via a different vector
+        # (Domain Admin membership, NTDS dump, etc.).
+        try:
+            from adscan_internal.services.domain_compromise_promotion import (
+                CompromiseEvidence,
+                promote_to_pwned,
+            )
+
+            krbtgt_nt_value = ""
+            for _a, _n in raw_credentials:
+                if _a.lower() == "krbtgt":
+                    krbtgt_nt_value = _n
+                    break
+            promote_to_pwned(
+                shell,
+                domain=domain,
+                evidence=CompromiseEvidence.KRBTGT_HASH_EXTRACTED,
+                username="krbtgt",
+                credential=krbtgt_nt_value or None,
+                evidence_ref="native_dcsync",
+            )
+        except Exception as _exc:  # noqa: BLE001
+            telemetry.capture_exception(_exc)
+
+    # Built-in Administrator hash extracted: Tier 0 evidence even if
+    # krbtgt was filtered out. Detection is RID-based (RID 500) so it
+    # works in renamed-admin and non-English directories ("Administrador",
+    # "Administrateur"). Falls back to a name match only when no SID was
+    # available on any row (older parser paths).
+    admin_acct_value: str | None = builtin_admin_account
+    if admin_acct_value is None and not rid_by_account:
+        for _a, _ in raw_credentials:
+            if _a.lower() == "administrator":
+                admin_acct_value = _a
+                break
+
+    admin_nt_value = ""
+    if admin_acct_value:
+        for _a, _n in raw_credentials:
+            if _a == admin_acct_value:
+                admin_nt_value = _n
+                break
+
+    if admin_acct_value and admin_nt_value:
+        try:
+            from adscan_internal.services.domain_compromise_promotion import (
+                CompromiseEvidence,
+                promote_to_pwned,
+            )
+
+            promote_to_pwned(
+                shell,
+                domain=domain,
+                evidence=CompromiseEvidence.TIER0_HASH_EXTRACTED,
+                username=admin_acct_value,
+                credential=admin_nt_value,
+                evidence_ref="native_dcsync",
+            )
+        except Exception as _exc:  # noqa: BLE001
+            telemetry.capture_exception(_exc)
+
+    # ── Persist DCSync dump as workspace inventory artefact ─────────────
+    # Drives the web app's DCSync Intelligence KPIs (recovery rate,
+    # Tier 0 exposure, password reuse clusters, armed attack paths).
+    # Plaintext is never persisted — only the boolean recovery flag.
+    try:
+        from adscan_internal.services.dcsync_inventory_persistence import (
+            write_dcsync_dump_file,
+        )
+
+        nt_by_acct = {a.lower(): n for a, n in raw_credentials}
+        plaintext_users: list[str] = []
+        for acct, cred_value in creds_to_persist:
+            stored = str(cred_value or "").strip().lower()
+            original_nt = nt_by_acct.get(acct.lower(), "").strip().lower()
+            # creds_to_persist may have replaced the NT hash with the
+            # cracked plaintext — when the stored value differs from
+            # the dumped NT hash, we treat plaintext as recovered.
+            if stored and original_nt and stored != original_nt:
+                plaintext_users.append(acct)
+        write_dcsync_dump_file(
+            shell,
+            domain=domain,
+            raw_credentials=raw_credentials,
+            plaintext_recovered_users=plaintext_users,
+            sid_by_account=sid_by_account,
+        )
+    except Exception as _exc:  # noqa: BLE001
+        telemetry.capture_exception(_exc)
+        print_info_debug(f"[dcsync-native] inventory dump failed: {_exc}")
+
+    tier0_rids = {500, 512, 518, 519}
+    tier0_count = sum(
+        1
+        for acct, _ in raw_credentials
+        if rid_by_account.get(acct.lower()) in tier0_rids
+    )
+    return {
+        "krbtgt": bool(krbtgt_found),
+        "tier0_count": int(tier0_count),
+        "total": len(raw_credentials),
+    }
 
 
 def _record_dcsync_domain_password_reuse(

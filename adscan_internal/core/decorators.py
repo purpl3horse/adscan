@@ -6,13 +6,10 @@ authentication requirements, and operation validation.
 
 from functools import wraps
 from typing import Callable, Any
-import logging
 
+from adscan_core.rich_output import print_info_debug
 from .enums import AuthMode
 from .exceptions import AuthenticationError
-
-
-logger = logging.getLogger(__name__)
 
 
 def requires_auth(min_auth_mode: AuthMode) -> Callable:
@@ -50,7 +47,7 @@ def requires_auth(min_auth_mode: AuthMode) -> Callable:
 
             # If no auth mode available, assume authenticated (for backward compatibility)
             if current_auth_mode is None:
-                logger.warning(
+                print_info_debug(
                     f"{func.__name__} called without auth_mode. Assuming authenticated."
                 )
                 return func(self, *args, **kwargs)
@@ -60,7 +57,6 @@ def requires_auth(min_auth_mode: AuthMode) -> Callable:
                 try:
                     current_auth_mode = AuthMode(current_auth_mode)
                 except ValueError:
-                    logger.error(f"Invalid auth_mode: {current_auth_mode}")
                     raise AuthenticationError(
                         operation=func.__name__,
                         required_auth_mode=min_auth_mode.value,
@@ -72,10 +68,6 @@ def requires_auth(min_auth_mode: AuthMode) -> Callable:
             current_level = AUTH_HIERARCHY[current_auth_mode]
 
             if current_level < required_level:
-                logger.error(
-                    f"Insufficient authentication for {func.__name__}: "
-                    f"requires {min_auth_mode.value}, got {current_auth_mode.value}"
-                )
                 raise AuthenticationError(
                     operation=func.__name__,
                     required_auth_mode=min_auth_mode.value,
@@ -121,13 +113,10 @@ def requires_tool(tool_name: str, install_hint: str = None) -> Callable:
             if hasattr(self, tool_check_method):
                 is_available = getattr(self, tool_check_method)()
                 if not is_available:
-                    logger.error(f"Required tool '{tool_name}' not found")
                     raise ToolNotFoundError(tool_name, install_hint)
             else:
-                # No check method available, log warning and continue
-                logger.warning(
-                    f"No availability check for tool '{tool_name}'. "
-                    f"Assuming it's available."
+                print_info_debug(
+                    f"No availability check for tool '{tool_name}'. Assuming it's available."
                 )
 
             return func(self, *args, **kwargs)

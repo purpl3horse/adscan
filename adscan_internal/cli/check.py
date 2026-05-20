@@ -22,6 +22,10 @@ import signal
 from typing import Any, Dict, List
 
 from adscan_core.path_utils import get_adscan_state_dir
+from adscan_core.theme import (
+    COLOR_WARNING,
+    ADSCAN_PRIMARY,
+)
 from adscan_core.version_context import get_telemetry_version_fields
 from adscan_launcher.update_manager import (
     get_local_update_recency_summary,
@@ -58,10 +62,9 @@ _REQUIRED_JOHN_CONVERTERS = (
 )
 _RUNTIME_PYTHON_DEPENDENCIES = (
     ("netifaces", "netifaces", "required for ADscan network/runtime startup flows"),
-    ("certihound", "CertiHound", "used for ADCS BloodHound collection"),
-    ("gssapi", "gssapi", "required for CertiHound Kerberos authentication"),
+    ("gssapi", "gssapi", "required for Kerberos runtime authentication"),
     ("krb5", "krb5", "required for WinRM Kerberos (pyspnego backend)"),
-    ("Crypto", "pycryptodome", "required for CertiHound password authentication"),
+    ("Crypto", "pycryptodome", "required for cryptographic runtime operations"),
     ("pykeepass", "pykeepass", "used for KeePass artifact parsing"),
     ("impacket", "impacket", "used by SMB/DCERPC/Kerberos-backed runtime services"),
     ("markitdown", "markitdown", "used for runtime document content extraction"),
@@ -79,12 +82,10 @@ _RUNTIME_PYTHON_DEPENDENCIES = (
     ("textual", "textual", "required for the ADscan TUI runtime"),
     ("magic", "python-magic", "used for runtime file type detection"),
     ("rustworkx", "rustworkx", "used for runtime attack-graph processing"),
-    ("neo4j", "neo4j", "used for BloodHound/Neo4j-backed runtime integrations"),
     ("redis", "redis", "used for web service interactive prompt delegation"),
 )
 _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "netifaces": "netifaces",
-    "certihound": "certihound",
     "gssapi": "gssapi",
     "krb5": "krb5",
     "Crypto": "pycryptodome",
@@ -101,7 +102,6 @@ _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "textual": "textual",
     "magic": "python-magic",
     "rustworkx": "rustworkx",
-    "neo4j": "neo4j",
     "redis": "redis",
 }
 
@@ -144,24 +144,24 @@ def _check_container_runtime_version_alignment(deps: Any) -> bool:
                 Group(
                     Text(
                         f"Launcher contract: {launcher_contract}",
-                        style="bold yellow",
+                        style=f"bold {COLOR_WARNING}",
                     ),
                     Text(
                         f"Runtime contract: {runtime_contract}",
-                        style="bold yellow",
+                        style=f"bold {COLOR_WARNING}",
                     ),
                     Text(
                         "The host launcher and Docker runtime do not agree on the "
                         "runtime control contract.",
-                        style="cyan",
+                        style=ADSCAN_PRIMARY,
                     ),
                     Text(
                         "Action: Use a matching ADscan launcher/runtime delivery.",
-                        style="bold white",
+                        style="bold",
                     ),
                 ),
                 title="Runtime Compatibility",
-                border_style="yellow",
+                border_style=COLOR_WARNING,
                 padding=(1, 2),
             )
         deps.print_instruction("Use a matching ADscan launcher/runtime delivery.")
@@ -188,25 +188,25 @@ def _check_container_runtime_version_alignment(deps: Any) -> bool:
             Group(
                 Text(
                     f"Launcher: {launcher_version} ({launcher_source})",
-                    style="bold yellow",
+                    style=f"bold {COLOR_WARNING}",
                 ),
                 Text(
                     f"Runtime: {runtime_version} ({runtime_source})",
-                    style="bold yellow",
+                    style=f"bold {COLOR_WARNING}",
                 ),
                 Text(
                     "The launcher and Docker runtime are contract-compatible, but "
                     "they were built from different product versions.",
-                    style="cyan",
+                    style=ADSCAN_PRIMARY,
                 ),
                 Text(
                     "Continuing. For reproducible results, use the launcher/runtime "
                     "pair from the same delivery.",
-                    style="bold white",
+                    style="bold",
                 ),
             ),
             title="Version Alignment",
-            border_style="yellow",
+            border_style=COLOR_WARNING,
             padding=(1, 2),
         )
     deps.print_info(
@@ -255,16 +255,16 @@ def _emit_local_update_recency_guidance(deps: Any) -> None:
     if callable(print_panel):
         print_panel(
             Group(
-                Text(recency_message, style="bold yellow"),
+                Text(recency_message, style=f"bold {COLOR_WARNING}"),
                 Text(
                     "Older launcher/runtime state can leave bug fixes, new attack coverage, "
                     "and escalation improvements unapplied.",
-                    style="cyan",
+                    style=ADSCAN_PRIMARY,
                 ),
-                Text("Action: Run on the host: adscan update", style="bold white"),
+                Text("Action: Run on the host: adscan update", style="bold"),
             ),
             title="Maintenance",
-            border_style="yellow",
+            border_style=COLOR_WARNING,
             padding=(1, 2),
         )
     deps.print_instruction("Run on the host: adscan update")
@@ -926,7 +926,7 @@ def check_external_tools(
                 f"Missing venv for {tool_dir_name} at {tool_specific_venv_path}"
             )
             if config.fix_mode and deps.fix_isolated_python_tool_venv(tool_dir_name):
-                deps.print_success(f"{tool_dir_name}: venv recreated successfully.")
+                deps.print_success(f"{tool_dir_name} · venv recreated")
             else:
                 missing_tools.append(f"{tool_dir_name} (venv missing)")
                 all_ok = False
@@ -1656,47 +1656,15 @@ def _normalize_missing_system_packages_for_runtime(
                         f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
                     )
 
-    if "medusa" in normalized_missing:
-        medusa_executable = shutil.which("medusa")
-        if medusa_executable:
-            medusa_executable = os.path.realpath(medusa_executable)
-            try:
-                result = deps.run_command(
-                    [medusa_executable, "-d"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-            except Exception as exc:  # noqa: BLE001
-                deps.telemetry_capture_exception(exc)
-                deps.print_info_debug(
-                    f"[check] Failed to probe Medusa candidate {medusa_executable}: {exc}"
-                )
-            else:
-                combined_output = "\n".join(
-                    [
-                        getattr(result, "stdout", "") or "",
-                        getattr(result, "stderr", "") or "",
-                    ]
-                ).strip()
-                if (
-                    result
-                    and getattr(result, "returncode", 1) == 0
-                    and "rdp" in combined_output.lower()
-                ):
-                    deps.print_success(
-                        "Medusa is available via PATH "
-                        f"({medusa_executable}, RDP module detected)"
-                    )
-                    normalized_missing.remove("medusa")
-                else:
-                    deps.print_info_debug(
-                        "[check] Medusa candidate did not pass module probe: "
-                        f"path={medusa_executable}, returncode={getattr(result, 'returncode', None)}, "
-                        f"stdout={(getattr(result, 'stdout', '') or '').strip()[:200]!r}, "
-                        f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
-                    )
+    if "aardwolf" in normalized_missing:
+        try:
+            import aardwolf  # noqa: F401 - presence check only
+            from aardwolf.commons.factory import RDPConnectionFactory  # noqa: F401
+
+            deps.print_success("aardwolf RDP backend is available (vendored skelsec stack)")
+            normalized_missing.remove("aardwolf")
+        except ImportError as exc:
+            deps.print_info_debug(f"[check] aardwolf import failed: {exc}")
 
     return normalized_missing, issues
 
@@ -2312,213 +2280,6 @@ def check_dns_resolver(
     return all_ok
 
 
-# ─── Docker/Compose Check (BloodHound CE) ────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class DockerComposeCheckConfig:
-    """Configuration for Docker/Compose checks (BloodHound CE)."""
-
-    bh_mode: str  # "ce" or other
-    fix_mode: bool
-    full_container_runtime: bool
-    bloodhound_ce_dir: str
-
-
-@dataclass(frozen=True)
-class DockerComposeCheckDeps:
-    """Dependency bundle for Docker/Compose checks."""
-
-    # Docker/BloodHound helpers
-    is_docker_official_installed: Callable[[], tuple[bool, str]]
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
-    check_bloodhound_ce_running: Callable[[], bool]
-    start_bloodhound_ce: Callable[[], bool]
-    get_bloodhound_cli_executable_path: Callable[[], str | None]
-
-    # System helpers
-    is_docker_env: Callable[[], bool]
-    expand_effective_user_path: Callable[[str], str]
-    path_exists: Callable[[str], bool]
-    path_access: Callable[[str, int], bool]
-
-    # Output
-    print_info: Callable[[str], None]
-    print_info_verbose: Callable[[str], None]
-    print_success: Callable[[str], None]
-    print_success_verbose: Callable[[str], None]
-    print_warning: Callable[[str], None]
-    print_error: Callable[[str], None]
-    print_instruction: Callable[[str], None]
-    print_panel: Callable[..., None]
-    print_exception: Callable[..., None]
-    telemetry_capture_exception: Callable[[BaseException], None]
-
-
-def check_docker_compose(
-    *, config: DockerComposeCheckConfig, deps: DockerComposeCheckDeps
-) -> bool:
-    """Check Docker/Compose for BloodHound CE and fix if needed.
-
-    Returns:
-        bool: True if all checks pass, False otherwise.
-    """
-    # Only check if BloodHound CE mode is enabled
-    if config.bh_mode != "ce":
-        return True
-
-    all_ok = True
-    deps.print_info("Checking Docker and Docker Compose for BloodHound CE...")
-    in_docker_container = deps.is_docker_env()
-
-    if in_docker_container:
-        deps.print_warning(
-            "Running inside a Docker container - BloodHound CE checks will be informational only"
-        )
-        deps.print_info(
-            "Docker-in-Docker (DinD) is not supported in most CI/CD environments"
-        )
-
-    # Check official Docker Engine
-    docker_installed, docker_version = deps.is_docker_official_installed()
-    if docker_installed:
-        deps.print_success(f"Official Docker Engine found: {docker_version}")
-    else:
-        if in_docker_container:
-            deps.print_warning(
-                f"Docker not found (expected in container environment): {docker_version}"
-            )
-        else:
-            deps.print_error(
-                "Docker not found or not official. BloodHound CE requires official Docker Engine."
-            )
-            deps.print_instruction("Run: adscan install --only bloodhound")
-            all_ok = False
-
-    # Check Docker Compose plugin
-    compose_available, compose_version = deps.is_docker_compose_plugin_available()
-    if compose_available:
-        deps.print_success(f"Docker Compose plugin found: {compose_version}")
-    else:
-        if in_docker_container:
-            deps.print_warning(
-                f"Docker Compose not found (expected in container environment): {compose_version}"
-            )
-        else:
-            deps.print_error(
-                "Docker Compose plugin not found. BloodHound CE requires Docker Compose plugin."
-            )
-            deps.print_instruction("Run: adscan install --only bloodhound")
-            all_ok = False
-
-    # Check BloodHound CE configuration (managed path first, legacy fallback)
-    managed_compose_path = deps.expand_effective_user_path(
-        "~/.adscan/bloodhound/bloodhound-ce/docker-compose.yml"
-    )
-    legacy_compose_path = deps.expand_effective_user_path(
-        "~/.config/bloodhound/docker-compose.yml"
-    )
-    if deps.path_exists(managed_compose_path):
-        deps.print_success(
-            f"BloodHound CE managed configuration found: {managed_compose_path}"
-        )
-    elif deps.path_exists(legacy_compose_path):
-        deps.print_warning(
-            f"BloodHound CE legacy configuration found: {legacy_compose_path}"
-        )
-        deps.print_info(
-            "ADscan now uses the managed isolated BloodHound CE stack under ~/.adscan."
-        )
-    else:
-        deps.print_warning(
-            "BloodHound CE configuration not found in managed or legacy locations"
-        )
-        deps.print_info("This will be created automatically when needed.")
-
-    # Check bloodhound-cli installation
-    deps.print_info("Checking bloodhound-cli installation...")
-    bloodhound_cli_path = os.path.join(config.bloodhound_ce_dir, "bloodhound-ce-cli")
-    if deps.path_exists(bloodhound_cli_path) and deps.path_access(
-        bloodhound_cli_path, os.X_OK
-    ):
-        deps.print_success(f"bloodhound-cli found at: {bloodhound_cli_path}")
-    else:
-        deps.print_warning("bloodhound-cli not found or not executable")
-        if not in_docker_container:
-            if config.fix_mode:
-                deps.print_info("Installing bloodhound-cli (--fix)...")
-                try:
-                    # Reuse the same resolution logic used during installation:
-                    # prefer venv-installed bloodhound-cli, then bundled CLI in
-                    # BLOODHOUND_CE_DIR, and finally PATH. If it is still not
-                    # found, instruct the user to install it manually.
-                    cli_path = deps.get_bloodhound_cli_executable_path()
-                    if not cli_path:
-                        deps.print_warning(
-                            "bloodhound-cli executable not found; install it via "
-                            "`pip install bloodhound-cli` or rerun `adscan install`."
-                        )
-                    if deps.path_exists(bloodhound_cli_path) and deps.path_access(
-                        bloodhound_cli_path, os.X_OK
-                    ):
-                        deps.print_success("bloodhound-cli installed successfully")
-                    else:
-                        deps.print_error("Failed to install bloodhound-cli")
-                        all_ok = False
-                except Exception as e:
-                    deps.telemetry_capture_exception(e)
-                    deps.print_error("Failed to install bloodhound-cli.")
-                    deps.print_exception(show_locals=False, exception=e)
-                    all_ok = False
-            else:
-                deps.print_info(
-                    "Run `adscan check --fix` to install bloodhound-cli automatically."
-                )
-                all_ok = False
-        else:
-            deps.print_info(
-                "Skipping bloodhound-cli installation (running in container)"
-            )
-
-    # Check BloodHound CE containers status
-    deps.print_info("Checking BloodHound CE containers status...")
-    if deps.check_bloodhound_ce_running():
-        deps.print_success("All 3 BloodHound CE containers are running")
-    else:
-        if in_docker_container:
-            deps.print_warning(
-                "BloodHound CE containers are not running (expected in container environment)"
-            )
-            deps.print_info(
-                "BloodHound CE requires Docker-in-Docker which is not available in this environment"
-            )
-        else:
-            deps.print_warning("BloodHound CE containers are not running")
-            try:
-                if config.fix_mode:
-                    if deps.start_bloodhound_ce():
-                        deps.print_success_verbose(
-                            "BloodHound CE containers started successfully"
-                        )
-                    else:
-                        deps.print_error("Failed to start BloodHound CE containers")
-                        deps.print_info("Try running: adscan install --only bloodhound")
-                        all_ok = False
-                else:
-                    deps.print_info(
-                        "Run `adscan check --fix` to attempt starting BloodHound CE containers automatically."
-                    )
-                    all_ok = False
-            except Exception as e:
-                deps.telemetry_capture_exception(e)
-                deps.print_error("Error starting BloodHound CE containers.")
-                deps.print_exception(show_locals=False, exception=e)
-                deps.print_info("Try running: adscan install --only bloodhound")
-                all_ok = False
-
-    return all_ok
-
-
 # ─── Go Toolchain and htb-cli Check ────────────────────────────────────────
 
 
@@ -2877,7 +2638,7 @@ def check_pyenv_status(*, config: PyenvCheckConfig, deps: PyenvCheckDeps) -> boo
             if config.fix_mode:
                 deps.print_info("Installing pyenv (--fix)...")
                 deps.print_instruction(
-                    "Please install pyenv manually: curl https://pyenv.run | bash"
+                    "Install pyenv manually: curl https://pyenv.run | bash"
                 )
                 return False
             else:
@@ -2914,7 +2675,6 @@ class CheckConfig:
         wordlists_install_dir: Directory for wordlists.
         tool_venvs_base_dir: Base directory for tool virtual environments.
         venv_path: Path to the main virtual environment.
-        bloodhound_ce_dir: Path to BloodHound CE directory.
         core_requirements: Core Python requirements.
         pip_tools_config: Configuration for pip tools.
         external_tools_config: Configuration for external tools.
@@ -2928,7 +2688,6 @@ class CheckConfig:
     wordlists_install_dir: str
     tool_venvs_base_dir: str
     venv_path: str
-    bloodhound_ce_dir: str
     core_requirements: List[str]
     pip_tools_config: Dict[str, Any]
     external_tools_config: Dict[str, Any]
@@ -2949,7 +2708,6 @@ class CheckDeps:
     # Environment detection
     is_full_adscan_container_runtime: Callable[[], bool]
     determine_session_environment: Callable[[], str]
-    get_bloodhound_mode: Callable[[], str]
 
     # Directory operations
     ensure_dir_writable: Callable[..., bool]
@@ -2961,7 +2719,6 @@ class CheckDeps:
     check_system_packages: Callable[..., tuple[bool, List[str]]]
     check_dns_resolver: Callable[..., bool]
     check_external_binary_tools: Callable[..., tuple[bool, List[str]]]
-    check_docker_compose: Callable[..., bool]
     check_rust_tools: Callable[..., bool]
     check_go_toolchain: Callable[..., bool]
     check_pyenv_status: Callable[..., bool]
@@ -3005,9 +2762,6 @@ class CheckDeps:
     setup_external_tool: Callable[..., bool]
     is_docker_official_installed: Callable[[], tuple[bool, str]]
     is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
-    check_bloodhound_ce_running: Callable[[], bool]
-    start_bloodhound_ce: Callable[[], bool]
-    get_bloodhound_cli_executable_path: Callable[[], str]
     is_docker_env: Callable[[], bool]
     is_rustup_available: Callable[[], tuple[bool, str]]
     get_rusthound_verification_status: Callable[[], Dict[str, Any]]
@@ -3282,10 +3036,7 @@ def run_check(
         SystemPackagesCheckDeps,
     )
 
-    bh_mode = deps.get_bloodhound_mode()
     system_packages_to_verify = config.system_packages_config.copy()
-    if bh_mode == "ce":
-        system_packages_to_verify.pop("neo4j", None)
 
     sp_ok, sp_missing = deps.check_system_packages(
         config=SystemPackagesCheckConfig(
@@ -3409,70 +3160,6 @@ def run_check(
     if not w_all_ok:
         all_ok = False
 
-    # 8. Check Docker and Docker Compose (if BloodHound CE is used) - delegated helper
-    from adscan_internal.cli.check import (
-        DockerComposeCheckConfig,
-        DockerComposeCheckDeps,
-    )
-
-    if not (compact_ci_preflight and full_container_runtime):
-        docker_ok = deps.check_docker_compose(
-            config=DockerComposeCheckConfig(
-                bh_mode=bh_mode,
-                fix_mode=fix_mode,
-                full_container_runtime=full_container_runtime,
-                bloodhound_ce_dir=config.bloodhound_ce_dir,
-            ),
-            deps=DockerComposeCheckDeps(
-                is_docker_official_installed=deps.is_docker_official_installed,
-                is_docker_compose_plugin_available=deps.is_docker_compose_plugin_available,
-                check_bloodhound_ce_running=deps.check_bloodhound_ce_running,
-                start_bloodhound_ce=deps.start_bloodhound_ce,
-                get_bloodhound_cli_executable_path=deps.get_bloodhound_cli_executable_path,
-                is_docker_env=deps.is_docker_env,
-                expand_effective_user_path=deps.expand_effective_user_path,
-                path_exists=deps.os_path_exists,
-                path_access=deps.os_path_access,
-                print_info=deps.print_info,
-                print_info_verbose=deps.print_info_verbose,
-                print_success=deps.print_success,
-                print_success_verbose=deps.print_success_verbose,
-                print_warning=deps.print_warning,
-                print_error=deps.print_error,
-                print_instruction=deps.print_instruction,
-                print_panel=deps.print_panel,
-                print_exception=deps.print_exception,
-                telemetry_capture_exception=deps.telemetry_capture_exception,
-            ),
-        )
-        if not docker_ok:
-            all_ok = False
-
-    # 9. Check Rust tools (rusthound-ce) - delegated helper
-    from adscan_internal.cli.check import (
-        RustToolsCheckConfig,
-        RustToolsCheckDeps,
-    )
-
-    rust_ok = deps.check_rust_tools(
-        config=RustToolsCheckConfig(
-            full_container_runtime=full_container_runtime,
-            fix_mode=fix_mode,
-        ),
-        deps=RustToolsCheckDeps(
-            is_rustup_available=deps.is_rustup_available,
-            get_rusthound_verification_status=deps.get_rusthound_verification_status,
-            configure_cargo_path=deps.configure_cargo_path,
-            shutil_which=deps.shutil_which,
-            os_environ=deps.os_environ,
-            print_info=deps.print_info,
-            print_success=deps.print_success,
-            print_warning=deps.print_warning,
-            print_error=deps.print_error,
-        ),
-    )
-    if not rust_ok:
-        all_ok = False
 
     # 10. Check Go toolchain (always) and htb-cli (CI-only) - delegated helper
     from adscan_internal.cli.check import (
@@ -3547,9 +3234,9 @@ def run_check(
             deps.print_success("CI runtime preflight passed.")
         else:
             deps.print_success(
-                "All checks passed! adscan installation appears to be complete."
+                "HEALTHY: all checks passed. ADscan is ready."
             )
-            deps.print_instruction("Now you can start the tool with adscan start")
+            deps.print_instruction("Start the tool: adscan start")
 
             # Final consolidated summary table
             deps.print_check_summary(all_ok)
@@ -3597,13 +3284,13 @@ def run_check(
         recovery_guidance = get_check_failure_recovery_guidance(
             full_container_runtime=full_container_runtime
         )
-        deps.print_error("Some checks failed. Please review the messages above.")
+        deps.print_error("NOT READY: one or more checks failed. Review the failures above.")
         deps.print_instruction(recovery_guidance.instruction)
         if recovery_guidance.follow_up_message:
             deps.print_info(recovery_guidance.follow_up_message)
         docs_url = "https://www.adscanpro.com/docs/guides/troubleshooting?utm_source=cli&utm_medium=check_failed"
         deps.print_info(
-            f"💡 Troubleshooting guide: [link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
+            f"Troubleshooting guide: [link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
         )
         deps.track_docs_link_shown("check_failed", docs_url)
         deps.print_check_summary(False)
@@ -3732,7 +3419,6 @@ def build_check_config_deps(
     wordlists_install_dir: str,
     tool_venvs_base_dir: str,
     venv_path: str,
-    bloodhound_ce_dir: str,
     core_requirements: List[str],
     pip_tools_config: Dict[str, Any],
     external_tools_config: Dict[str, Any],
@@ -3741,7 +3427,6 @@ def build_check_config_deps(
     # All the dependency functions
     is_full_adscan_container_runtime: Callable[[], bool],
     determine_session_environment: Callable[[], str],
-    get_bloodhound_mode: Callable[[], str],
     ensure_dir_writable: Callable[..., bool],
     check_virtual_environment_fn: Callable[..., tuple[bool, bool]],
     check_core_dependencies_fn: Callable[..., bool],
@@ -3749,7 +3434,6 @@ def build_check_config_deps(
     check_system_packages_fn: Callable[..., tuple[bool, List[str]]],
     check_dns_resolver_fn: Callable[..., bool],
     check_external_binary_tools_fn: Callable[..., tuple[bool, List[str]]],
-    check_docker_compose_fn: Callable[..., bool],
     check_rust_tools_fn: Callable[..., bool],
     check_go_toolchain_fn: Callable[..., bool],
     check_pyenv_status_fn: Callable[..., bool],
@@ -3787,9 +3471,6 @@ def build_check_config_deps(
     setup_external_tool: Callable[..., bool],
     is_docker_official_installed: Callable[[], tuple[bool, str]],
     is_docker_compose_plugin_available: Callable[[], tuple[bool, str]],
-    check_bloodhound_ce_running: Callable[[], bool],
-    start_bloodhound_ce: Callable[[], bool],
-    get_bloodhound_cli_executable_path: Callable[[], str],
     is_docker_env: Callable[[], bool],
     is_rustup_available: Callable[[], tuple[bool, str]],
     get_rusthound_verification_status: Callable[[], Dict[str, Any]],
@@ -3845,7 +3526,6 @@ def build_check_config_deps(
         wordlists_install_dir=wordlists_install_dir,
         tool_venvs_base_dir=tool_venvs_base_dir,
         venv_path=venv_path,
-        bloodhound_ce_dir=bloodhound_ce_dir,
         core_requirements=core_requirements,
         pip_tools_config=pip_tools_config,
         external_tools_config=external_tools_config,
@@ -3856,7 +3536,6 @@ def build_check_config_deps(
     deps = CheckDeps(
         is_full_adscan_container_runtime=is_full_adscan_container_runtime,
         determine_session_environment=determine_session_environment,
-        get_bloodhound_mode=get_bloodhound_mode,
         ensure_dir_writable=ensure_dir_writable,
         check_virtual_environment=check_virtual_environment_fn,
         check_core_dependencies=check_core_dependencies_fn,
@@ -3864,7 +3543,6 @@ def build_check_config_deps(
         check_system_packages=check_system_packages_fn,
         check_dns_resolver=check_dns_resolver_fn,
         check_external_binary_tools=check_external_binary_tools_fn,
-        check_docker_compose=check_docker_compose_fn,
         check_rust_tools=check_rust_tools_fn,
         check_go_toolchain=check_go_toolchain_fn,
         check_pyenv_status=check_pyenv_status_fn,
@@ -3902,9 +3580,6 @@ def build_check_config_deps(
         setup_external_tool=setup_external_tool,
         is_docker_official_installed=is_docker_official_installed,
         is_docker_compose_plugin_available=is_docker_compose_plugin_available,
-        check_bloodhound_ce_running=check_bloodhound_ce_running,
-        start_bloodhound_ce=start_bloodhound_ce,
-        get_bloodhound_cli_executable_path=get_bloodhound_cli_executable_path,
         is_docker_env=is_docker_env,
         is_rustup_available=is_rustup_available,
         get_rusthound_verification_status=get_rusthound_verification_status,
@@ -3963,7 +3638,6 @@ class AdscanCheckContext:
     wordlists_install_dir: str
     tool_venvs_base_dir: str
     venv_path: str
-    bloodhound_ce_dir: str
     core_requirements: List[str]
     pip_tools_config: Dict[str, Any]
     external_tools_config: Dict[str, Any]
@@ -3973,7 +3647,6 @@ class AdscanCheckContext:
     # Functions from adscan.py
     is_full_adscan_container_runtime: Callable[[], bool]
     determine_session_environment: Callable[[], str]
-    get_bloodhound_mode: Callable[[], str]
     ensure_dir_writable: Callable[..., bool]
     check_virtual_environment_fn: Callable[..., tuple[bool, bool]]
     check_core_dependencies_fn: Callable[..., bool]
@@ -3981,7 +3654,6 @@ class AdscanCheckContext:
     check_system_packages_fn: Callable[..., tuple[bool, List[str]]]
     check_dns_resolver_fn: Callable[..., bool]
     check_external_binary_tools_fn: Callable[..., tuple[bool, List[str]]]
-    check_docker_compose_fn: Callable[..., bool]
     check_rust_tools_fn: Callable[..., bool]
     check_go_toolchain_fn: Callable[..., bool]
     check_pyenv_status_fn: Callable[..., bool]
@@ -4019,9 +3691,6 @@ class AdscanCheckContext:
     setup_external_tool: Callable[..., bool]
     is_docker_official_installed: Callable[[], tuple[bool, str]]
     is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
-    check_bloodhound_ce_running: Callable[[], bool]
-    start_bloodhound_ce: Callable[[], bool]
-    get_bloodhound_cli_executable_path: Callable[[], str]
     is_docker_env: Callable[[], bool]
     is_rustup_available: Callable[[], tuple[bool, str]]
     get_rusthound_verification_status: Callable[[], Dict[str, Any]]
@@ -4070,7 +3739,6 @@ def build_adscan_check_context(
     wordlists_install_dir: str,
     tool_venvs_base_dir: str,
     venv_path: str,
-    bloodhound_ce_dir: str,
     core_requirements: List[str],
     pip_tools_config: Dict[str, Any],
     external_tools_config: Dict[str, Any],
@@ -4078,7 +3746,6 @@ def build_adscan_check_context(
     python_version: str,
     is_full_adscan_container_runtime: Callable[[], bool],
     determine_session_environment: Callable[[], str],
-    get_bloodhound_mode: Callable[[], str],
     ensure_dir_writable: Callable[..., bool],
     check_virtual_environment_fn: Callable[..., tuple[bool, bool]],
     check_core_dependencies_fn: Callable[..., bool],
@@ -4086,7 +3753,6 @@ def build_adscan_check_context(
     check_system_packages_fn: Callable[..., tuple[bool, List[str]]],
     check_dns_resolver_fn: Callable[..., bool],
     check_external_binary_tools_fn: Callable[..., tuple[bool, List[str]]],
-    check_docker_compose_fn: Callable[..., bool],
     check_rust_tools_fn: Callable[..., bool],
     check_go_toolchain_fn: Callable[..., bool],
     check_pyenv_status_fn: Callable[..., bool],
@@ -4124,9 +3790,6 @@ def build_adscan_check_context(
     setup_external_tool: Callable[..., bool],
     is_docker_official_installed: Callable[[], tuple[bool, str]],
     is_docker_compose_plugin_available: Callable[[], tuple[bool, str]],
-    check_bloodhound_ce_running: Callable[[], bool],
-    start_bloodhound_ce: Callable[[], bool],
-    get_bloodhound_cli_executable_path: Callable[[], str],
     is_docker_env: Callable[[], bool],
     is_rustup_available: Callable[[], tuple[bool, str]],
     get_rusthound_verification_status: Callable[[], Dict[str, Any]],
@@ -4181,7 +3844,6 @@ def build_adscan_check_context(
         wordlists_install_dir=wordlists_install_dir,
         tool_venvs_base_dir=tool_venvs_base_dir,
         venv_path=venv_path,
-        bloodhound_ce_dir=bloodhound_ce_dir,
         core_requirements=core_requirements,
         pip_tools_config=pip_tools_config,
         external_tools_config=external_tools_config,
@@ -4189,7 +3851,6 @@ def build_adscan_check_context(
         python_version=python_version,
         is_full_adscan_container_runtime=is_full_adscan_container_runtime,
         determine_session_environment=determine_session_environment,
-        get_bloodhound_mode=get_bloodhound_mode,
         ensure_dir_writable=ensure_dir_writable,
         check_virtual_environment_fn=check_virtual_environment_fn,
         check_core_dependencies_fn=check_core_dependencies_fn,
@@ -4197,7 +3858,6 @@ def build_adscan_check_context(
         check_system_packages_fn=check_system_packages_fn,
         check_dns_resolver_fn=check_dns_resolver_fn,
         check_external_binary_tools_fn=check_external_binary_tools_fn,
-        check_docker_compose_fn=check_docker_compose_fn,
         check_rust_tools_fn=check_rust_tools_fn,
         check_go_toolchain_fn=check_go_toolchain_fn,
         check_pyenv_status_fn=check_pyenv_status_fn,
@@ -4235,9 +3895,6 @@ def build_adscan_check_context(
         setup_external_tool=setup_external_tool,
         is_docker_official_installed=is_docker_official_installed,
         is_docker_compose_plugin_available=is_docker_compose_plugin_available,
-        check_bloodhound_ce_running=check_bloodhound_ce_running,
-        start_bloodhound_ce=start_bloodhound_ce,
-        get_bloodhound_cli_executable_path=get_bloodhound_cli_executable_path,
         is_docker_env=is_docker_env,
         is_rustup_available=is_rustup_available,
         get_rusthound_verification_status=get_rusthound_verification_status,
@@ -4305,7 +3962,6 @@ def build_check_from_adscan_context(
         wordlists_install_dir=context.wordlists_install_dir,
         tool_venvs_base_dir=context.tool_venvs_base_dir,
         venv_path=context.venv_path,
-        bloodhound_ce_dir=context.bloodhound_ce_dir,
         core_requirements=context.core_requirements,
         pip_tools_config=context.pip_tools_config,
         external_tools_config=context.external_tools_config,
@@ -4313,7 +3969,6 @@ def build_check_from_adscan_context(
         python_version=context.python_version,
         is_full_adscan_container_runtime=context.is_full_adscan_container_runtime,
         determine_session_environment=context.determine_session_environment,
-        get_bloodhound_mode=context.get_bloodhound_mode,
         ensure_dir_writable=context.ensure_dir_writable,
         check_virtual_environment_fn=context.check_virtual_environment_fn,
         check_core_dependencies_fn=context.check_core_dependencies_fn,
@@ -4321,7 +3976,6 @@ def build_check_from_adscan_context(
         check_system_packages_fn=context.check_system_packages_fn,
         check_dns_resolver_fn=context.check_dns_resolver_fn,
         check_external_binary_tools_fn=context.check_external_binary_tools_fn,
-        check_docker_compose_fn=context.check_docker_compose_fn,
         check_rust_tools_fn=context.check_rust_tools_fn,
         check_go_toolchain_fn=context.check_go_toolchain_fn,
         check_pyenv_status_fn=context.check_pyenv_status_fn,
@@ -4359,9 +4013,6 @@ def build_check_from_adscan_context(
         setup_external_tool=context.setup_external_tool,
         is_docker_official_installed=context.is_docker_official_installed,
         is_docker_compose_plugin_available=context.is_docker_compose_plugin_available,
-        check_bloodhound_ce_running=context.check_bloodhound_ce_running,
-        start_bloodhound_ce=context.start_bloodhound_ce,
-        get_bloodhound_cli_executable_path=context.get_bloodhound_cli_executable_path,
         is_docker_env=context.is_docker_env,
         is_rustup_available=context.is_rustup_available,
         get_rusthound_verification_status=context.get_rusthound_verification_status,

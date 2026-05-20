@@ -202,7 +202,7 @@ def _iter_workspace_list_usernames(
 
 def _iter_bloodhound_usernames(shell: Any, *, domain: str) -> list[str]:
     """Return usernames inferred from the active BloodHound service."""
-    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    service_getter = getattr(shell, "_get_graph_service", None)
     if not callable(service_getter):
         return []
 

@@ -120,7 +120,9 @@ class WorkspaceLoaderShell(Protocol):
     def _clean_netexec_workspaces(self, *, use_sudo_if_needed: bool = True) -> bool: ...
     def do_cd(self, path: str) -> None: ...
     def do_update_resolv_conf(self, domain_pdc: str) -> bool: ...
-    def convert_hostnames_to_ips_and_scan(self, domain: str, computers_file: str, nmap_dir: str) -> Any: ...
+    def convert_hostnames_to_ips_and_scan(
+        self, domain: str, computers_file: str, nmap_dir: str
+    ) -> Any: ...
     def add_to_hosts(self, domain: str) -> None: ...
     def _clean_domain_entries(self, domain: str) -> None: ...
     def _get_dns_discovery_service(self) -> Any: ...
@@ -189,7 +191,11 @@ def _refresh_domain_dc_metadata(
     from adscan_internal.cli.dns import is_domain_best_effort_mode
 
     domain_data = shell.domains_data.setdefault(domain, {})
-    old_dcs = list(domain_data.get("dcs", [])) if isinstance(domain_data.get("dcs"), list) else []
+    old_dcs = (
+        list(domain_data.get("dcs", []))
+        if isinstance(domain_data.get("dcs"), list)
+        else []
+    )
     old_hosts = (
         list(domain_data.get("dcs_hostnames", []))
         if isinstance(domain_data.get("dcs_hostnames"), list)
@@ -204,25 +210,37 @@ def _refresh_domain_dc_metadata(
             service_getter = getattr(shell, "_get_dns_discovery_service", None)
             if callable(service_getter):
                 service = service_getter()
-                if service is not None and hasattr(service, "discover_domain_controllers"):
-                    dc_ips, dc_hostnames, ip_to_host = service.discover_domain_controllers(
-                        domain=(domain or "").strip().rstrip("."),
-                        pdc_ip=pdc_ip,
-                        preferred_ips=[pdc_ip],
+                if service is not None and hasattr(
+                    service, "discover_domain_controllers"
+                ):
+                    dc_ips, dc_hostnames, ip_to_host = (
+                        service.discover_domain_controllers(
+                            domain=(domain or "").strip().rstrip("."),
+                            pdc_ip=pdc_ip,
+                            preferred_ips=[pdc_ip],
+                        )
                     )
                     if isinstance(dc_ips, list):
-                        discovered_ips = [str(ip).strip() for ip in dc_ips if str(ip).strip()]
+                        discovered_ips = [
+                            str(ip).strip() for ip in dc_ips if str(ip).strip()
+                        ]
                     if isinstance(dc_hostnames, list):
                         discovered_hosts = [
-                            str(host).strip() for host in dc_hostnames if str(host).strip()
+                            str(host).strip()
+                            for host in dc_hostnames
+                            if str(host).strip()
                         ]
                     if isinstance(ip_to_host, dict):
                         dc_ip_to_hostname = {
-                            str(k): str(v) for k, v in ip_to_host.items() if str(k).strip()
+                            str(k): str(v)
+                            for k, v in ip_to_host.items()
+                            if str(k).strip()
                         }
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_info_debug(f"[workspace_load] Failed to refresh DC metadata for {mark_sensitive(domain, 'domain')}: {exc}")
+            print_info_debug(
+                f"[workspace_load] Failed to refresh DC metadata for {mark_sensitive(domain, 'domain')}: {exc}"
+            )
     else:
         print_info_debug(
             f"[workspace_load] Best-effort DNS mode active for {mark_sensitive(domain, 'domain')}; "
@@ -278,7 +296,9 @@ def _refresh_domain_dc_metadata(
             )
     except Exception as exc:
         telemetry.capture_exception(exc)
-        print_info_debug(f"[workspace_load] Failed writing dcs.txt for {mark_sensitive(domain, 'domain')}: {exc}")
+        print_info_debug(
+            f"[workspace_load] Failed writing dcs.txt for {mark_sensitive(domain, 'domain')}: {exc}"
+        )
 
     print_info_debug(
         "[workspace_load] Refreshed DC metadata: "
@@ -286,6 +306,124 @@ def _refresh_domain_dc_metadata(
         f"dcs_old={len(old_dcs)} dcs_new={len(dcs)} "
         f"dcs_hostnames_old={len(old_hosts)} dcs_hostnames_new={len(dcs_hostnames)}"
     )
+
+
+def _replace_ip_in_json_file(path: str, old_ip: str, new_ip: str) -> bool:
+    """Replace all occurrences of *old_ip* with *new_ip* inside a JSON file.
+
+    Returns True if at least one replacement was made.  Safe to call on
+    non-existent paths (returns False silently).
+    """
+    if not os.path.exists(path):
+        return False
+
+    def _walk(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _walk(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_walk(v) for v in obj]
+        if isinstance(obj, str):
+            return obj.replace(old_ip, new_ip)
+        return obj
+
+    with open(path, encoding="utf-8") as fh:
+        original = fh.read()
+    if old_ip not in original:
+        return False
+    data = json.loads(original)
+    patched = _walk(data)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(patched, fh, indent=2)
+    return True
+
+
+def _sync_tunnel_pivot_host_ip(
+    shell: Any,
+    *,
+    domain: str,
+    old_ip: str,
+    new_ip: str,
+) -> None:
+    """Propagate a PDC IP change across all workspace artifacts that reference it.
+
+    Called whenever a domain's PDC IP is confirmed to have changed (DNS repair
+    or normal resolution returning a different address).  Updates:
+
+    * Tunnel records (``tunnels_state.json``) — ``pivot_host`` field only;
+      hostname-based fields (``pivot_kerberos_spn_host``, etc.) are stable.
+    * Network reachability report — so the pivot reachability check finds the
+      host without needing a live TCP probe fallback.
+    * Pivot-runtime-state snapshot of the reachability report (if present).
+    """
+    old_ip = str(old_ip or "").strip()
+    new_ip = str(new_ip or "").strip()
+    if not old_ip or not new_ip or old_ip == new_ip:
+        return
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if not workspace_dir:
+        return
+    domains_dir = str(getattr(shell, "domains_dir", "domains") or "domains")
+    domain_root = os.path.join(workspace_dir, domains_dir, domain)
+
+    # ── 1. Tunnel records ────────────────────────────────────────────────────
+    try:
+        from adscan_internal.services.ligolo_service import LigoloProxyService
+
+        service = LigoloProxyService(workspace_dir=workspace_dir, current_domain=domain)
+        records = service.load_tunnels_state()
+        updated = 0
+        has_id_less = False
+        for record in records:
+            if str(record.get("domain") or "").strip().lower() != domain.lower():
+                continue
+            if str(record.get("pivot_host") or "").strip() != old_ip:
+                continue
+            tunnel_id = str(record.get("tunnel_id") or "").strip()
+            if tunnel_id:
+                service.update_tunnel_record(
+                    tunnel_id=tunnel_id,
+                    updates={"pivot_host": new_ip},
+                )
+            else:
+                record["pivot_host"] = new_ip
+                has_id_less = True
+            updated += 1
+        if has_id_less:
+            service.save_tunnels_state(records)
+        if updated:
+            print_info_debug(
+                f"[workspace_load] Updated {updated} tunnel record(s) for {mark_sensitive(domain, 'domain')}: "
+                f"pivot_host {mark_sensitive(old_ip, 'ip')} → {mark_sensitive(new_ip, 'ip')}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[workspace_load] Failed to sync tunnel pivot_host for {mark_sensitive(domain, 'domain')}: {exc}"
+        )
+
+    # ── 2. Reachability reports ──────────────────────────────────────────────
+    report_paths = [
+        os.path.join(domain_root, "network_reachability_report.json"),
+        os.path.join(
+            domain_root,
+            ".pivot_runtime_state",
+            "direct_vantage_snapshot",
+            "network_reachability_report.json",
+        ),
+    ]
+    for rpath in report_paths:
+        try:
+            if _replace_ip_in_json_file(rpath, old_ip, new_ip):
+                print_info_debug(
+                    f"[workspace_load] Updated IP in {mark_sensitive(os.path.basename(rpath), 'path')} "
+                    f"for {mark_sensitive(domain, 'domain')}: "
+                    f"{mark_sensitive(old_ip, 'ip')} → {mark_sensitive(new_ip, 'ip')}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[workspace_load] Failed to update IP in {mark_sensitive(rpath, 'path')}: {exc}"
+            )
 
 
 def _restore_saved_domain_dns_context(
@@ -348,6 +486,12 @@ def _restore_saved_domain_dns_context(
             domain=domain,
             pdc_ip=resolved_pdc_ip,
             pdc_hostname=resolved_pdc_hostname,
+        )
+        _sync_tunnel_pivot_host_ip(
+            shell,
+            domain=domain,
+            old_ip=pdc_ip,
+            new_ip=resolved_pdc_ip,
         )
         return True
 
@@ -413,7 +557,9 @@ def _build_workspace_dns_repair_network_context(shell: WorkspaceLoaderShell) -> 
     try:
         from adscan_internal.services.myip_staleness import detect_myip_staleness
 
-        staleness = detect_myip_staleness(interface=interface, stored_ip=stored_myip or None)
+        staleness = detect_myip_staleness(
+            interface=interface, stored_ip=stored_myip or None
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_info_debug(f"[workspace_dns_repair] network context check failed: {exc}")
@@ -561,7 +707,9 @@ def _attempt_workspace_dns_repair_interactive(
         resolved_hostname = (shell.pdc_hostname or "").strip() or saved_pdc_hostname
         shell.domains_data.setdefault(domain, {})["pdc"] = validated_pdc_ip
         if resolved_hostname:
-            shell.domains_data.setdefault(domain, {})["pdc_hostname"] = resolved_hostname
+            shell.domains_data.setdefault(domain, {})["pdc_hostname"] = (
+                resolved_hostname
+            )
         _refresh_domain_dc_metadata(
             shell,
             domain=domain,
@@ -573,6 +721,12 @@ def _attempt_workspace_dns_repair_interactive(
             domain=domain,
             pdc_ip=validated_pdc_ip,
             pdc_hostname=resolved_hostname,
+        )
+        _sync_tunnel_pivot_host_ip(
+            shell,
+            domain=domain,
+            old_ip=saved_pdc_ip,
+            new_ip=validated_pdc_ip,
         )
         print_success(f"Workspace DNS repaired for {marked_domain}.")
         _capture_workspace_dns_repair_event(
@@ -596,6 +750,103 @@ def _attempt_workspace_dns_repair_interactive(
             reason=f"exception:{type(exc).__name__}",
         )
         return False
+
+
+def _classify_workspace_pivot_domains(
+    shell: Any,
+    *,
+    workspace_path: str,
+    reconciliation_results: list[Any],
+) -> tuple[set[str], set[str]]:
+    """Return ``(relaunch_domains, pivot_dns_domains)``.
+
+    ``relaunch_domains``  — domains for which a pivot relaunch should be offered
+                           (Phase 2).  These are the domains that own the WinRM
+                           or MSSQL credential used to reach the pivot host.
+
+    ``pivot_dns_domains`` — domains whose PDC IP is only reachable through an
+                           active Ligolo tunnel (Phase 3 DNS).  e.g. pong.htb
+                           when 192.168.2.2 is behind the Ligolo routes.
+
+    The classification uses two independent signals so it is robust against the
+    case where ``network_vantage.mode`` was already persisted as ``"direct"``
+    from a previous session's reconciliation (losing the pivot history):
+
+    1. Live reconciliation results (stale pivot detected in *this* session).
+    2. Persisted tunnel records — if a record exists and Ligolo is currently
+       down, the domain still needs a relaunch regardless of persisted mode.
+       Domains whose PDC IP falls within any inactive tunnel's routes are
+       classified as pivot-DNS-dependent.
+    """
+    # Seed from live reconciliation (most authoritative signal).
+    relaunch_domains: set[str] = {
+        result.domain
+        for result in reconciliation_results
+        if result.restored_direct_vantage
+    }
+    pivot_dns_domains: set[str] = set(relaunch_domains)
+
+    try:
+        from adscan_internal.services.pivot_relaunch_service import (
+            list_relaunch_candidates,
+        )
+        from adscan_internal.services.pivot_runtime_state_service import (
+            has_active_ligolo_tunnel_for_domain,
+        )
+
+        candidates = list_relaunch_candidates(shell)
+        inactive_routes: list[ipaddress.IPv4Network] = []
+
+        for candidate in candidates:
+            try:
+                tunnel_active = has_active_ligolo_tunnel_for_domain(
+                    workspace_dir=workspace_path,
+                    domain=candidate.domain,
+                )
+            except Exception:  # noqa: BLE001
+                # Connection refused / API unreachable → Ligolo is not running.
+                tunnel_active = False
+            if tunnel_active:
+                continue
+            # Tunnel record exists but Ligolo is not running — relaunch needed.
+            relaunch_domains.add(candidate.domain)
+            for route_str in candidate.routes:
+                try:
+                    inactive_routes.append(
+                        ipaddress.IPv4Network(route_str, strict=False)
+                    )
+                except ValueError:
+                    pass
+
+        # Any domain whose PDC IP falls inside an inactive tunnel's routed
+        # subnets is only reachable through that tunnel → defer its DNS.
+        if inactive_routes:
+            domains_data = getattr(shell, "domains_data", {}) or {}
+            for domain_name, domain_info in domains_data.items():
+                if not isinstance(domain_info, dict):
+                    continue
+                pdc_str = str(domain_info.get("pdc") or "").strip()
+                if not pdc_str:
+                    continue
+                try:
+                    pdc_addr = ipaddress.IPv4Address(pdc_str)
+                except ValueError:
+                    continue
+                if any(pdc_addr in route for route in inactive_routes):
+                    pivot_dns_domains.add(domain_name)
+
+        if relaunch_domains or pivot_dns_domains:
+            print_info_debug(
+                "[workspace_load] pivot classification: "
+                f"relaunch={sorted(relaunch_domains)} "
+                f"pivot_dns={sorted(pivot_dns_domains)}"
+            )
+
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[workspace_load] pivot domain classification failed: {exc}")
+
+    return relaunch_domains, pivot_dns_domains
 
 
 def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> None:
@@ -737,12 +988,10 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                     for domain_hist in spraying_history.values():
                         if not isinstance(domain_hist, dict):
                             continue
-                        password_section = domain_hist.get("password")
-                        if not isinstance(password_section, dict):
-                            continue
-                        passwords_dict = password_section.get("passwords")
-                        if isinstance(passwords_dict, dict):
-                            for pwd in passwords_dict.keys():
+                        for user_passwords in domain_hist.values():
+                            if not isinstance(user_passwords, dict):
+                                continue
+                            for pwd in user_passwords.keys():
                                 if isinstance(pwd, str) and pwd:
                                     password_candidates.append(pwd)
                 telemetry.set_workspace_users(user_candidates)
@@ -799,7 +1048,9 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                 }
                 if shell.domains_data:
                     for domain_name in list(shell.domains_data.keys()):
-                        counts = refresh_attack_graph_execution_support(shell, domain_name)
+                        counts = refresh_attack_graph_execution_support(
+                            shell, domain_name
+                        )
                         total_changed += int(counts.get("changed", 0))
                         for key in list(totals.keys()):
                             totals[key] += int(counts.get(key, 0))
@@ -818,7 +1069,9 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                         f"[attack-graph] Edge execution support up-to-date (elapsed_s={elapsed})."
                     )
             except Exception as exc:  # pragma: no cover - best effort
-                print_info_debug(f"[attack-graph] Refresh failed: {type(exc).__name__}: {exc}")
+                print_info_debug(
+                    f"[attack-graph] Refresh failed: {type(exc).__name__}: {exc}"
+                )
 
             # Clean DNS entries for loaded domains to ensure clean state
             # This prevents stale entries from previous sessions with different IPs
@@ -848,68 +1101,117 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                     f"Restored KRB5_CONFIG from workspace krb5.conf: {marked_krb5}"
                 )
 
-            # Automatically reconfigure DNS for domains with complete data
-            # This ensures the workspace is functional immediately after loading
-            domains_to_reconfigure = []
+            # DNS restore uses a 3-phase strategy to handle pivot-dependent domains
+            # robustly even when the primary domain IP has rotated:
+            #
+            #   Phase 1 — DNS for directly reachable domains (e.g. ping.htb).
+            #             Configured (and interactively repaired) without any tunnel.
+            #             Kerberos auth for the pivot relaunch depends on these first.
+            #
+            #   Phase 2 — Pivot relaunch.
+            #             Primary DNS is now correct; WinRM+Kerberos can authenticate.
+            #             Offered for any domain with a persisted tunnel record that is
+            #             currently inactive — regardless of network_vantage.mode.
+            #
+            #   Phase 3 — DNS for pivot-dependent domains (e.g. pong.htb).
+            #             Only reachable through the Ligolo tunnel from Phase 2.
 
-            # Always prefer domains_data to avoid stale top-level values.
+            relaunch_domains, pivot_dns_domains = _classify_workspace_pivot_domains(
+                shell,
+                workspace_path=workspace_path,
+                reconciliation_results=reconciliation_results,
+            )
+
+            # Collect all domains with a stored PDC IP and split by reachability.
+            direct_domains: list[dict] = []
+            pivot_domains: list[dict] = []
+
             if shell.domains_data:
                 for domain_name, domain_info in shell.domains_data.items():
-                    if domain_info.get("pdc"):
-                        domains_to_reconfigure.append(
-                            {
-                                "domain": domain_name,
-                                "pdc": domain_info.get("pdc"),
-                                "pdc_hostname": domain_info.get("pdc_hostname"),
-                            }
-                        )
+                    if not domain_info.get("pdc"):
+                        continue
+                    entry = {
+                        "domain": domain_name,
+                        "pdc": domain_info.get("pdc"),
+                        "pdc_hostname": domain_info.get("pdc_hostname"),
+                    }
+                    if domain_name in pivot_dns_domains:
+                        pivot_domains.append(entry)
+                    else:
+                        direct_domains.append(entry)
             else:
                 print_warning_verbose(
                     "No domains_data found in workspace variables; skipping DNS reconfiguration."
                 )
 
-            # Reconfigure DNS for each domain with complete data
-            if domains_to_reconfigure:
-                for domain_info in domains_to_reconfigure:
-                    domain = domain_info["domain"]
-                    pdc = domain_info["pdc"]
-                    pdc_hostname = domain_info.get("pdc_hostname")
-                    _restore_saved_domain_dns_context(
-                        shell,
-                        domain=domain,
-                        pdc_ip=pdc,
-                        pdc_hostname=pdc_hostname,
-                    )
+            # ── Phase 1: DNS for directly reachable domains ──────────────────────
+            if pivot_dns_domains:
+                print_info_debug(
+                    "[workspace_load] DNS phase 1: configuring direct domains; "
+                    f"pivot-dependent deferred: {sorted(pivot_dns_domains)}"
+                )
+            for domain_info in direct_domains:
+                _restore_saved_domain_dns_context(
+                    shell,
+                    domain=domain_info["domain"],
+                    pdc_ip=domain_info["pdc"],
+                    pdc_hostname=domain_info.get("pdc_hostname"),
+                )
 
-            # Check whether the stored myip is still valid on the configured
-            # interface.  DHCP may have assigned a new IP after a reboot or
-            # VPN reconnect, causing reverse-connection operations to silently
-            # fail.  This surfaces the change immediately and auto-corrects it.
-            try:
-                from adscan_internal.services.myip_staleness import check_and_refresh_myip
-                check_and_refresh_myip(shell, context="workspace load")
-            except Exception as _myip_exc:
-                print_info_debug(f"[workspace_load] myip staleness check failed: {_myip_exc}")
-
+            # ── Phase 2: Pivot relaunch ───────────────────────────────────────────
+            # Uses relaunch_domains (tunnel-record-based), NOT pivot_dns_domains.
+            # This correctly handles the case where network_vantage.mode was already
+            # reset to "direct" from a previous session's reconciliation save.
+            if relaunch_domains:
+                print_info_debug(
+                    "[workspace_load] DNS phase 2: offering pivot relaunch for: "
+                    f"{sorted(relaunch_domains)}"
+                )
             try:
                 from adscan_internal.services.pivot_relaunch_service import (
                     maybe_offer_previous_pivot_relaunch,
                 )
 
                 interactive_relaunch = not bool(getattr(shell, "auto", False))
-                for result in reconciliation_results:
-                    if not result.restored_direct_vantage:
-                        continue
+                for domain in sorted(relaunch_domains):
                     maybe_offer_previous_pivot_relaunch(
                         shell,
-                        domain=result.domain,
+                        domain=domain,
                         interactive=interactive_relaunch,
                         trigger="workspace_load",
                     )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+                print_info_debug(f"[workspace_load] pivot relaunch offer failed: {exc}")
+
+            # ── Phase 3: DNS for pivot-dependent domains ─────────────────────────
+            # Tunnel is now up (or user declined). Attempt DNS regardless — if the
+            # tunnel is still down, the repair flow will prompt as usual.
+            if pivot_domains:
                 print_info_debug(
-                    f"[workspace_load] pivot relaunch offer failed: {exc}"
+                    "[workspace_load] DNS phase 3: configuring pivot-dependent domains"
+                )
+            for domain_info in pivot_domains:
+                _restore_saved_domain_dns_context(
+                    shell,
+                    domain=domain_info["domain"],
+                    pdc_ip=domain_info["pdc"],
+                    pdc_hostname=domain_info.get("pdc_hostname"),
+                )
+
+            # Check whether the stored myip is still valid on the configured
+            # interface.  DHCP may have assigned a new IP after a reboot or
+            # VPN reconnect, causing reverse-connection operations to silently
+            # fail.  This surfaces the change immediately and auto-corrects it.
+            try:
+                from adscan_internal.services.myip_staleness import (
+                    check_and_refresh_myip,
+                )
+
+                check_and_refresh_myip(shell, context="workspace load")
+            except Exception as _myip_exc:
+                print_info_debug(
+                    f"[workspace_load] myip staleness check failed: {_myip_exc}"
                 )
 
             try:

@@ -22,6 +22,9 @@ CertipyCallback = Callable[[str, str], bool]
 KeePassArtifactCallback = Callable[
     [str, str, list[str] | None, list[str] | None, str | None], int
 ]
+OfficeArtifactCallback = Callable[
+    [str, str, list[str] | None, list[str] | None, str | None], int
+]
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,7 @@ class ShareFileFindingActionService(BaseService):
         cpassword_callback: CPasswordCallback | None = None,
         certipy_callback: CertipyCallback | None = None,
         keepass_artifact_callback: KeePassArtifactCallback | None = None,
+        office_artifact_callback: OfficeArtifactCallback | None = None,
     ) -> None:
         """Initialize callbacks used to apply deterministic findings."""
         super().__init__()
@@ -52,6 +56,7 @@ class ShareFileFindingActionService(BaseService):
         self._cpassword_callback = cpassword_callback
         self._certipy_callback = certipy_callback
         self._keepass_artifact_callback = keepass_artifact_callback
+        self._office_artifact_callback = office_artifact_callback
 
     def apply_pfx_artifact(
         self,
@@ -88,6 +93,32 @@ class ShareFileFindingActionService(BaseService):
             return 0
         return int(
             self._keepass_artifact_callback(
+                domain,
+                source_path,
+                source_hosts,
+                source_shares,
+                auth_username,
+            )
+            or 0
+        )
+
+    def apply_office_artifact(
+        self,
+        *,
+        domain: str,
+        source_path: str,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+    ) -> int:
+        """Process one encrypted Office artifact through the configured callback."""
+        if not self._office_artifact_callback:
+            print_warning(
+                "No Office artifact callback configured; skipping Office artifact cracking."
+            )
+            return 0
+        return int(
+            self._office_artifact_callback(
                 domain,
                 source_path,
                 source_hosts,

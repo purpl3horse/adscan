@@ -156,31 +156,38 @@ def _try_user_node_from_bloodhound(
     domain: str,
     samaccountname: str,
 ) -> dict[str, Any] | None:
-    """Best-effort: resolve a user node via the BloodHound service if available."""
+    """Best-effort: resolve a user node via the graph service if available."""
     normalized_sam = normalize_samaccountname(samaccountname)
     if not normalized_sam:
         return None
     try:
-        service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if not callable(service_getter):
+            return None
+        service = service_getter()
         resolver = getattr(service, "get_user_node_by_samaccountname", None)
         if callable(resolver):
             node = resolver(domain, normalized_sam)
             if isinstance(node, dict):
                 _debug_resolve_source(
-                    domain=domain, samaccountname=normalized_sam, source="bloodhound_ce"
+                    domain=domain, samaccountname=normalized_sam, source="graph_collection"
                 )
                 return node
             _debug_resolve_source(
                 domain=domain,
                 samaccountname=normalized_sam,
-                source="bloodhound_ce",
+                source="graph_collection",
                 detail="resolver returned non-dict",
             )
             return None
         _debug_resolve_source(
             domain=domain,
             samaccountname=normalized_sam,
-            source="bloodhound_ce",
+            source="graph_collection",
             detail="resolver unavailable",
         )
     except Exception as exc:  # noqa: BLE001
@@ -188,7 +195,7 @@ def _try_user_node_from_bloodhound(
         _debug_resolve_source(
             domain=domain,
             samaccountname=normalized_sam,
-            source="bloodhound_ce",
+            source="graph_collection",
             detail=f"exception={type(exc).__name__}",
         )
     return None
@@ -405,11 +412,93 @@ def is_user_tier0_or_high_value(
             detail="control_exposure_identities hit",
         )
         return True
+    cached_admin_hit = _is_user_in_cached_user_list_file(
+        shell,
+        domain=domain,
+        samaccountname=normalized_sam,
+        filename="admins.txt",
+    )
+    if cached_admin_hit is True:
+        _debug_resolve_source(
+            domain=domain,
+            samaccountname=normalized_sam,
+            source="user_list_files",
+            detail="admins.txt hit",
+        )
+        return True
 
     return bool(
         is_user_tier0(shell, domain=domain, samaccountname=normalized_sam)
         or is_user_high_value(shell, domain=domain, samaccountname=normalized_sam)
     )
+
+
+def is_well_known_da_name(samaccountname: str, *, shell: Any = None, domain: str | None = None) -> bool:
+    """Return True if *samaccountname* matches a well-known Domain Admin name.
+
+    Pure-name check used as a fallback when graph / membership data is not yet
+    available (e.g. very early in the pentest, before any LDAP collection).
+    Uses exact-match comparison against:
+
+    - ``krbtgt`` (KDC service account, always RID 502)
+    - Localized "Administrator" variants from
+      ``_ADMIN_VARIANT_TO_LANGUAGE`` (en/es/fr/de/it/pt/nl/pl/ru/tr/cs/hu/sv)
+    - The persisted ``builtin_administrator_name`` for *domain* when available
+      (real built-in admin name observed for this domain, even if renamed)
+
+    Exact match — not substring — to avoid false positives like
+    ``MyAdministratorAssistant``.
+    """
+    normalized = str(samaccountname or "").strip().casefold()
+    if not normalized:
+        return False
+
+    if normalized == "krbtgt":
+        return True
+
+    try:
+        from adscan_internal.services.environment_language_service import (
+            _ADMIN_VARIANT_TO_LANGUAGE,
+        )
+        if normalized in _ADMIN_VARIANT_TO_LANGUAGE:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    if shell is not None and domain:
+        try:
+            domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain) or {}
+            persisted = str(domain_data.get("builtin_administrator_name") or "").strip().casefold()
+            if persisted and persisted == normalized:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+
+    return False
+
+
+def is_user_da_or_high_value(
+    shell: Any, *, domain: str, samaccountname: str
+) -> bool:
+    """Robust "is this user a DA / high-value principal?" check.
+
+    Layered fallback resolution order:
+    1. ``is_user_tier0_or_high_value`` — canonical: control-exposure list,
+       admins.txt, attack-graph user nodes, membership-snapshot RID checks
+       (512/518/519), highvalue flags.
+    2. ``is_well_known_da_name`` — pure-name fallback for the early-pentest
+       window before any graph/snapshot data exists (recognizes krbtgt,
+       localized Administrator variants, and the per-domain persisted
+       built-in admin name).
+
+    Use this wrapper from credential-flow logic when you need a robust answer
+    that does not depend on collection state.
+    """
+    if is_user_tier0_or_high_value(
+        shell, domain=domain, samaccountname=samaccountname
+    ):
+        return True
+    return is_well_known_da_name(samaccountname, shell=shell, domain=domain)
 
 
 def classify_users_tier0_high_value(
@@ -457,8 +546,12 @@ def classify_users_tier0_high_value(
             continue
         results[user]["is_tier0"] = bool(
             identity_record.get("has_direct_domain_control")
+            or identity_record.get("is_tier0")
         )
-        results[user]["is_high_value"] = bool(identity_record.get("is_control_exposed"))
+        results[user]["is_high_value"] = bool(
+            identity_record.get("is_control_exposed")
+            or identity_record.get("is_high_value")
+        )
 
     # Pass 1: attack_graph.json (single load) for unresolved users.
     try:
@@ -553,6 +646,12 @@ def classify_users_tier0_high_value(
             domain=domain,
             filename=CONTROL_EXPOSURE_IDENTITIES_FILENAME,
         )
+        if not cached_admins:
+            cached_admins = _load_cached_user_list_file(
+                shell,
+                domain=domain,
+                filename="admins.txt",
+            )
         if cached_admins:
             for user in unresolved_high_value:
                 if user in cached_admins:

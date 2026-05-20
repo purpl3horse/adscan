@@ -43,6 +43,13 @@ from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.questionary_prompts import prompt_questionary_select
 from adscan_internal.rich_output import mark_sensitive, print_exception, print_panel
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_core.theme import (
+    COLOR_AMBER,
+    COLOR_CRIMSON,
+    COLOR_MUTED,
+    COLOR_SAGE,
+    COLOR_STEEL,
+)
 
 # Import services directly to avoid circular dependencies
 try:
@@ -61,9 +68,10 @@ from adscan_internal.services.cracking_history_service import (
     register_cracking_attempt,
 )
 import rich.box
+from rich.console import Group
 from rich.table import Table
-from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
+from rich.text import Text
 from adscan_internal.interaction import is_non_interactive
 
 _MINIMUM_TIMEROAST_HASHCAT_VERSION = (7, 1, 2)
@@ -79,6 +87,71 @@ _HASHCAT_BENIGN_STDERR_PATTERNS = (
     "nvmlDeviceGetFanSpeed(): Not Supported",
     "Mixing --show with --username or --dynamic-x can cause exponential delay in output.",
 )
+
+# Symbols used in cracked / not-cracked rows. Glyphs pair with color so the
+# panels stay legible under NO_COLOR.
+_GLYPH_CRACKED = "★"
+_GLYPH_FAILED = "✗"
+_GLYPH_INFO = "•"
+
+
+def _count_hashes_in_file(hash_file: str) -> int:
+    """Best-effort count of non-empty hash lines for the pre-flight panel."""
+    if not hash_file or not os.path.exists(hash_file):
+        return 0
+    try:
+        with open(hash_file, "r", encoding="utf-8", errors="ignore") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def _classify_hashcat_failure(combined_output: str, returncode: int | None) -> str:
+    """Return a short label for the most likely failure cause.
+
+    Returns one of: ``no_device``, ``exhausted``, ``hash_format``, ``runtime``,
+    ``unknown``.
+    """
+    lowered = (combined_output or "").lower()
+    if _HASHCAT_NO_DEVICE_TEXT.lower() in lowered:
+        return "no_device"
+    if "no hashes loaded" in lowered or "separator unmatched" in lowered:
+        return "hash_format"
+    if "salt-length exception" in lowered or "token length exception" in lowered:
+        return "hash_format"
+    if _is_fatal_hashcat_runtime_error(combined_output):
+        return "runtime"
+    if int(returncode or 0) == _HASHCAT_EXHAUSTED_EXIT_CODE:
+        return "exhausted"
+    return "unknown"
+
+
+def _next_action_for_failure(cause: str, hash_type: str) -> str:
+    """Human-readable next action paired with a failure cause."""
+    if cause == "exhausted":
+        return (
+            "Wordlist exhausted without a match. "
+            "Retry with a larger wordlist (kaonashi14M, hashmob medium) "
+            "or a targeted ruleset."
+        )
+    if cause == "no_device":
+        return _hashcat_no_device_guidance()
+    if cause == "hash_format":
+        return (
+            "Hash file did not parse as expected for this mode. "
+            "Confirm the hash type and that the file format matches hashcat "
+            "(one hash per line, no extra prefixes)."
+        )
+    if cause == "runtime":
+        return (
+            "Hashcat hit a fatal runtime error before any candidates were tried. "
+            "Re-run with ADSCAN_HASHCAT_FORCE_CPU=1 to bypass an unstable GPU stack."
+        )
+    if hash_type == "asreproast":
+        return "Try a Kerberos-specific wordlist or AS-REP rule set."
+    if hash_type == "kerberoast":
+        return "Service accounts often use long passphrases; consider kerberoast_pws or kaonashi14M."
+    return "Try a different wordlist or add hashcat rules."
 
 
 @dataclass(frozen=True)
@@ -592,6 +665,78 @@ def _extract_hash_users(hash_file: str) -> list[str]:
         return []
 
 
+def _render_cracking_preflight(
+    shell: CrackingShell,
+    *,
+    domain: str,
+    hash_type: str,
+    hash_description: str,
+    hashcat_mode: str,
+    backend_label: str,
+    backend_is_gpu: bool,
+    wordlist_name: str,
+    hash_count: int,
+    failed_retry: bool,
+) -> None:
+    """Render a premium pre-flight panel before hashcat starts.
+
+    Shows the operator the inputs at a glance, the compute mode, and a brief
+    note on what to expect while waiting. Uses tabular layout over paragraph
+    copy so eyes can scan the row that changed since the last attempt.
+    """
+    table = Table(
+        show_header=False,
+        show_edge=False,
+        box=None,
+        padding=(0, 1),
+        expand=False,
+    )
+    table.add_column("label", style=f"bold {COLOR_STEEL}", no_wrap=True)
+    table.add_column("value", overflow="fold")
+
+    marked_domain = mark_sensitive(domain, "domain")
+    backend_style = COLOR_SAGE if backend_is_gpu else COLOR_AMBER
+    backend_glyph = "▲" if backend_is_gpu else "△"
+    backend_value = f"[{backend_style}]{backend_glyph} {backend_label}[/{backend_style}]"
+
+    count_text = (
+        f"[bold]{hash_count}[/bold] hash{'es' if hash_count != 1 else ''}"
+        if hash_count > 0
+        else "[dim]unknown[/dim]"
+    )
+
+    table.add_row("Domain", marked_domain)
+    table.add_row("Hash type", f"{hash_description} [dim](mode {hashcat_mode})[/dim]")
+    table.add_row("Hashes queued", count_text)
+    table.add_row("Wordlist", wordlist_name)
+    table.add_row("Compute", backend_value)
+    if failed_retry:
+        table.add_row("Mode", f"[{COLOR_AMBER}]retry with a different wordlist[/]")
+
+    if backend_is_gpu:
+        eta_hint = "Hashcat will stream progress and ETA. Press q in the hashcat window for status."
+    else:
+        eta_hint = (
+            "CPU mode is slower than GPU. Consider a focused wordlist or relaunch with "
+            "GPU passthrough for production workloads."
+        )
+
+    body = Group(
+        table,
+        Text(""),
+        Text.from_markup(f"[{COLOR_MUTED}]{_GLYPH_INFO} {eta_hint}[/]"),
+    )
+
+    print_panel(
+        body,
+        title=f"[bold]Hash Cracking[/bold] [{COLOR_MUTED}]· preparing[/]",
+        title_align="left",
+        border_style=COLOR_STEEL,
+        box=rich.box.ROUNDED,
+        padding=(1, 2),
+    )
+
+
 def run_cracking(
     shell: CrackingShell,
     *,
@@ -612,8 +757,15 @@ def run_cracking(
         else HashcatBackendSelection(args=(), label="N/A", is_available=True)
     )
     if hashcat_mode != "Unknown" and not backend_selection.is_available:
-        print_error("hashcat could not find a usable compute device for cracking.")
-        print_warning(_hashcat_no_device_guidance())
+        print_error("Hashcat could not find a usable compute device for cracking.")
+        print_panel(
+            f"[{COLOR_AMBER}]{_GLYPH_FAILED} {_hashcat_no_device_guidance()}[/]\n\n"
+            f"[bold]Next:[/bold] verify hashcat sees a device with [code]hashcat -I[/code], "
+            f"then re-run the cracking step.",
+            title=f"[bold]Cracking cannot start[/bold] [{COLOR_MUTED}]· no compute device[/]",
+            title_align="left",
+            border_style=COLOR_CRIMSON,
+        )
         print_info_debug(
             "hashcat -I output (first 40 lines):\n"
             + "\n".join(backend_selection.probe_output.splitlines()[:40])
@@ -629,19 +781,20 @@ def run_cracking(
     )
 
     wordlist_name = os.path.basename(wordlist) if wordlist else "N/A"
+    hash_count = _count_hashes_in_file(hash_file)
+    backend_is_gpu = "GPU" in backend_selection.label
 
-    print_operation_header(
-        "Hash Cracking Operation",
-        details={
-            "Domain": domain,
-            "Hash Type": hash_description,
-            "Hashcat Mode": hashcat_mode,
-            "Backend": backend_selection.label,
-            "Wordlist": wordlist_name,
-            "Retry Attempt": "Yes" if failed else "No",
-            "Hash File": hash_file,
-        },
-        icon="🔨",
+    _render_cracking_preflight(
+        shell,
+        domain=domain,
+        hash_type=hash_type,
+        hash_description=hash_description,
+        hashcat_mode=hashcat_mode,
+        backend_label=backend_selection.label,
+        backend_is_gpu=backend_is_gpu,
+        wordlist_name=wordlist_name,
+        hash_count=hash_count,
+        failed_retry=failed,
     )
 
     command = None
@@ -654,9 +807,6 @@ def run_cracking(
     elif "NTLMv2" in hash_type:
         command = _build_hashcat_cmd(hash_file, wordlist, "5600", shell)
 
-    print_warning(
-        f"Cracking {hash_type} hashes. Please be patient (this may take a while)"
-    )
     if hashcat_mode != "Unknown":
         print_info_debug(
             f"[cracking] hashcat backend selected: {backend_selection.label}"
@@ -988,7 +1138,7 @@ def run_password_spraying(
         username = cred["username"]
         password = cred["password"]
         print_success(f"[!] VALID LOGIN: {username}@{domain}:{password}")
-        shell.add_credential(domain, username, password)
+        shell.add_credential(domain, username, password, credential_origin="spray")
 
 
 def handle_hash_cracking(
@@ -1191,9 +1341,9 @@ def run_cracking_history(
     if not isinstance(attempts, list) or not attempts:
         marked_domain = mark_sensitive(domain, "domain")
         print_panel(
-            f"[yellow]No cracking history found for {marked_domain}.[/yellow]",
+            f"[{COLOR_AMBER}]No cracking history found for {marked_domain}.[/]",
             title="Cracking History",
-            border_style="yellow",
+            border_style=COLOR_AMBER,
         )
         return
 
@@ -1201,15 +1351,15 @@ def run_cracking_history(
     table = Table(
         title="Cracking History",
         show_header=True,
-        header_style="bold magenta",
+        header_style=f"bold {COLOR_STEEL}",
         box=rich.box.ROUNDED,
     )
     table.add_column("#", style="dim", justify="right", width=4)
-    table.add_column("Tool", style="cyan")
+    table.add_column("Tool", style=COLOR_STEEL)
     table.add_column("Type", style="bold")
     table.add_column("Wordlist", style="white", overflow="fold")
     table.add_column("Result", style="bold")
-    table.add_column("Cracked", style="green", justify="right")
+    table.add_column("Cracked", style=COLOR_SAGE, justify="right")
     table.add_column("Targets", style="white", overflow="fold")
     table.add_column("When", style="dim")
 
@@ -1232,17 +1382,17 @@ def run_cracking_history(
             attempt.get("wordlist_name") or attempt.get("wordlist_path") or "-"
         )
         result = str(attempt.get("result") or "unknown")
-        result_style = {
-            "success": "green",
-            "no_match": "yellow",
-            "error": "red",
-        }.get(result, "white")
+        result_style, result_glyph = {
+            "success": (COLOR_SAGE, _GLYPH_CRACKED),
+            "no_match": (COLOR_AMBER, _GLYPH_FAILED),
+            "error": (COLOR_CRIMSON, _GLYPH_FAILED),
+        }.get(result, ("white", _GLYPH_INFO))
         table.add_row(
             str(idx),
             str(attempt.get("tool") or "-"),
             str(attempt.get("crack_type") or "-"),
             mark_sensitive(wordlist, "path"),
-            f"[{result_style}]{result}[/{result_style}]",
+            f"[{result_style}]{result_glyph} {result}[/{result_style}]",
             str(int(attempt.get("cracked_count") or 0)),
             mark_sensitive(targets, "user"),
             str(attempt.get("timestamp") or "-"),
@@ -1260,6 +1410,146 @@ def run_cracking_history(
     shell.console.print(table)
 
 
+def _render_cracked_credentials_panel(
+    shell: CrackingShell,
+    *,
+    creds: dict[str, str],
+    hash_type: str,
+    hash_description: str,
+    wordlist_name: str | None,
+    total_hashes: int,
+) -> None:
+    """Render the 'moment of value' panel when one or more hashes crack.
+
+    The panel deliberately uses a celebratory framing (star glyph, sage rows,
+    crimson border on the title for visceral feedback) without leaning on color
+    alone, so it still reads under NO_COLOR.
+    """
+    cracked_count = len(creds)
+    coverage = (
+        f"{cracked_count}/{total_hashes}" if total_hashes else f"{cracked_count}"
+    )
+    title_markup = (
+        f"[bold {COLOR_SAGE}]{_GLYPH_CRACKED} Cracked Credentials[/] "
+        f"[{COLOR_MUTED}]· {coverage} · {hash_description}[/]"
+    )
+
+    table = Table(
+        show_header=True,
+        header_style=f"bold {COLOR_STEEL}",
+        box=rich.box.ROUNDED,
+        expand=False,
+        padding=(0, 1),
+    )
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("Username", style=COLOR_STEEL, overflow="fold")
+    table.add_column("Password", style=f"bold {COLOR_SAGE}", overflow="fold")
+
+    for username, password in creds.items():
+        marked_username = mark_sensitive(username, "user")
+        marked_password = mark_sensitive(password, "password")
+        table.add_row(
+            f"[{COLOR_SAGE}]{_GLYPH_CRACKED}[/]",
+            marked_username,
+            marked_password,
+        )
+
+    next_lines = []
+    if hash_type in {"kerberoast", "asreproast"}:
+        next_lines.append(
+            f"[bold]Next:[/bold] use these credentials with [code]use {hash_type}[/code] "
+            "or move directly to authenticated enumeration."
+        )
+    elif hash_type == "timeroast":
+        next_lines.append(
+            "[bold]Next:[/bold] machine account passwords unlock silver tickets and "
+            "RBCD primitives against the corresponding host."
+        )
+    elif "NTLMv2" in hash_type:
+        next_lines.append(
+            "[bold]Next:[/bold] try the cracked passwords across the domain "
+            "with password spraying, watching for reused credentials."
+        )
+    if wordlist_name:
+        next_lines.append(
+            f"[{COLOR_MUTED}]{_GLYPH_INFO} Wordlist used: {wordlist_name}[/]"
+        )
+
+    body_items: list[Any] = [table]
+    if next_lines:
+        body_items.append(Text(""))
+        body_items.extend(Text.from_markup(line) for line in next_lines)
+
+    print_panel(
+        Group(*body_items),
+        title=title_markup,
+        title_align="left",
+        border_style=COLOR_SAGE,
+        box=rich.box.HEAVY,
+        padding=(1, 2),
+    )
+
+
+def _render_cracking_failure_panel(
+    *,
+    hash_type: str,
+    hash_description: str,
+    wordlist_name: str | None,
+    cause: str,
+    total_hashes: int,
+) -> None:
+    """Render a clear verdict panel when nothing cracked.
+
+    The body separates the diagnosis from the next action so the operator can
+    decide whether to relaunch with a different wordlist or escalate the
+    problem to the underlying tooling.
+    """
+    cause_label = {
+        "exhausted": "Wordlist exhausted without a match",
+        "no_device": "No usable hashcat compute device",
+        "hash_format": "Hash format did not match the selected mode",
+        "runtime": "Hashcat hit a fatal runtime error",
+        "unknown": "Hashcat finished without recovering any password",
+    }.get(cause, "Hashcat finished without recovering any password")
+
+    diag_lines: list[str] = [
+        f"[bold]Diagnosis:[/bold] {cause_label}.",
+    ]
+    coverage = (
+        f"{total_hashes} hash{'es' if total_hashes != 1 else ''}"
+        if total_hashes
+        else "the hash file"
+    )
+    if wordlist_name:
+        diag_lines.append(
+            f"[{COLOR_MUTED}]{_GLYPH_INFO} Wordlist used: {wordlist_name} "
+            f"against {coverage}.[/]"
+        )
+
+    next_text = _next_action_for_failure(cause, hash_type)
+    diag_lines.append("")
+    diag_lines.append(f"[bold]Next:[/bold] {next_text}")
+
+    body = Group(
+        Text.from_markup(
+            f"[{COLOR_CRIMSON}]{_GLYPH_FAILED}[/] "
+            f"[bold]{hash_description}[/bold] "
+            f"[{COLOR_MUTED}]· no hash recovered[/]"
+        ),
+        Text(""),
+        *(Text.from_markup(line) for line in diag_lines),
+    )
+    border = COLOR_CRIMSON if cause in {"no_device", "runtime", "hash_format"} else COLOR_AMBER
+    print_panel(
+        body,
+        title=f"[bold]Hash Cracking[/bold] [{COLOR_MUTED}]· no match[/]",
+        title_align="left",
+        border_style=border,
+        box=rich.box.ROUNDED,
+        padding=(1, 2),
+    )
+
+
 def execute_cracking(
     shell: CrackingShell,
     command: str,
@@ -1270,9 +1560,10 @@ def execute_cracking(
 ) -> dict[str, object]:
     """Execute the cracking command and process results."""
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
-    import sys
 
-    hashcat_mode, _hash_description = _resolve_hashcat_mode_and_description(hash_type)
+    hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(hash_type)
+    total_hashes = _count_hashes_in_file(hash)
+    initial_failure_cause = "unknown"
 
     try:
         # First phase: execute the initial cracking command
@@ -1303,7 +1594,7 @@ def execute_cracking(
                     )
                 if _HASHCAT_NO_DEVICE_TEXT in combined_output:
                     print_warning(
-                        "hashcat could not find a usable compute device (CUDA/OpenCL backend). "
+                        "Hashcat could not find a usable compute device (CUDA/OpenCL backend). "
                         "This can happen in containers/VMs with limited GPU or OpenCL support."
                     )
                     print_warning(_hashcat_no_device_guidance())
@@ -1324,10 +1615,11 @@ def execute_cracking(
                     return {"status": "unavailable", "cracked_count": 0}
                 if _is_fatal_hashcat_runtime_error(combined_output):
                     print_warning(
-                        "hashcat hit a fatal runtime error before cracking could begin."
+                        "Hashcat hit a fatal runtime error before cracking could begin."
                     )
                     return {"status": "error", "cracked_count": 0}
             elif completed_process_initial.returncode == _HASHCAT_EXHAUSTED_EXIT_CODE:
+                initial_failure_cause = "exhausted"
                 print_info_debug(
                     "hashcat finished with exit code 1 (candidate space exhausted). "
                     "Checking the potfile for recovered credentials."
@@ -1337,6 +1629,13 @@ def execute_cracking(
                         "hashcat emitted additional stderr during the exhausted run:\n"
                         f"{initial_stderr}"
                     )
+            # Record failure cause hint for the no-match panel later.
+            cause_from_output = _classify_hashcat_failure(
+                combined_output,
+                completed_process_initial.returncode,
+            )
+            if cause_from_output != "unknown":
+                initial_failure_cause = cause_from_output
 
         # Second phase: hashcat --show to extract cracked passwords
         file_name = f"cracked_{hash_type}.txt"
@@ -1466,20 +1765,13 @@ def execute_cracking(
                 except Exception as exc:  # pragma: no cover - telemetry best effort
                     telemetry.capture_exception(exc)
 
-                table = Table(
-                    title="[bold green]🔓 Cracked Credentials[/bold green]",
-                    show_header=True,
-                    header_style="bold magenta",
-                    box=rich.box.ROUNDED,
-                )
-                table.add_column("Username", style="cyan")
-                table.add_column("Password", style="green")
-                for username, password in creds.items():
-                    marked_username = mark_sensitive(username, "user")
-                    marked_password = mark_sensitive(password, "password")
-                    table.add_row(marked_username, marked_password)
-                shell.console.print(
-                    Panel(table, title="Hash Cracked", border_style="green")
+                _render_cracked_credentials_panel(
+                    shell,
+                    creds=creds,
+                    hash_type=hash_type,
+                    hash_description=hash_description,
+                    wordlist_name=wordlist_name,
+                    total_hashes=total_hashes,
                 )
                 # Persist credentials after displaying them
                 attempted_users = set(_extract_hash_users(hash))
@@ -1504,7 +1796,30 @@ def execute_cracking(
                             )
                         except Exception as exc:  # pragma: no cover
                             telemetry.capture_exception(exc)
-                    shell.add_credential(domain, username, password)
+                    # Centralized metadata: a cracked TGS/AS-REP is by
+                    # definition a kerberoastable / asrep-roastable principal.
+                    # Tag it so the privilege-role picker can rank it.
+                    cred_metadata = None
+                    try:
+                        from adscan_internal.services.credentials import (
+                            CredentialKind,
+                            CredentialMetadata,
+                        )
+
+                        if hash_type in ("kerberoast", "asreproast"):
+                            # Cracked roast hashes are always cleartext
+                            # passwords; record secret_kind so downstream
+                            # consumers don't have to infer it.
+                            cred_metadata = CredentialMetadata(
+                                secret_kind=CredentialKind.PASSWORD,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    shell.add_credential(
+                        domain, username, password, metadata=cred_metadata,
+                        credential_origin=hash_type,
+                    )
 
                 # Mark remaining attempted users as failed for this wordlist.
                 if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
@@ -1530,9 +1845,12 @@ def execute_cracking(
                             telemetry.capture_exception(exc)
                 return {"status": "success", "cracked_count": len(creds)}
             else:
-                print_panel(
-                    "[red]No valid credentials were found in the file.[/red]",
-                    border_style="red",
+                _render_cracking_failure_panel(
+                    hash_type=hash_type,
+                    hash_description=hash_description,
+                    wordlist_name=wordlist_name,
+                    cause=initial_failure_cause,
+                    total_hashes=total_hashes,
                 )
                 return {"status": "no_match", "cracked_count": 0}
         else:
@@ -1552,7 +1870,13 @@ def execute_cracking(
             except Exception as e:
                 telemetry.capture_exception(e)
 
-            print_panel("[red]Hash not cracked[/red]", border_style="red")
+            _render_cracking_failure_panel(
+                hash_type=hash_type,
+                hash_description=hash_description,
+                wordlist_name=wordlist_name,
+                cause=initial_failure_cause,
+                total_hashes=total_hashes,
+            )
             if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
                 try:
                     from adscan_internal.services.attack_graph_service import (
@@ -1571,12 +1895,12 @@ def execute_cracking(
                         )
                 except Exception as exc:  # pragma: no cover
                     telemetry.capture_exception(exc)
+            from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+            _non_interactive = _is_non_interactive(shell)
             if hash_type == "asreproast":
                 marked_domain = mark_sensitive(domain, "domain")
-                is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
                 if (
-                    sys.stdin.isatty()
-                    and not is_ci
+                    not _non_interactive
                     and Confirm.ask(
                         f"Do you want to crack the asreproast hashes for domain {marked_domain} with another wordlist?",
                         default=False,
@@ -1590,10 +1914,8 @@ def execute_cracking(
                 shell.ask_for_kerberoast_preauth(domain, shell.username or "")
             if hash_type == "kerberoast":
                 marked_domain = mark_sensitive(domain, "domain")
-                is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
                 if (
-                    sys.stdin.isatty()
-                    and not is_ci
+                    not _non_interactive
                     and Confirm.ask(
                         f"Do you want to crack the kerberoast hashes for domain {marked_domain} with another wordlist?",
                         default=False,
@@ -1602,10 +1924,8 @@ def execute_cracking(
                     shell.cracking("kerberoast", domain, hash, failed=True)
             if hash_type == "timeroast":
                 marked_domain = mark_sensitive(domain, "domain")
-                is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
                 if (
-                    sys.stdin.isatty()
-                    and not is_ci
+                    not _non_interactive
                     and Confirm.ask(
                         f"Do you want to crack the timeroast hashes for domain {marked_domain} with another wordlist?",
                         default=False,

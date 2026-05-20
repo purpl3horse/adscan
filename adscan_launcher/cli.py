@@ -8,7 +8,6 @@ Supported commands (host-side):
 - check: sanity checks for Docker mode
 - start: run interactive container session
 - ci: run CI mode inside container
-- report: generate a report from an existing workspace inside the container
 - update/upgrade: update the launcher and pull the latest image
 - version: show launcher version
 
@@ -33,16 +32,7 @@ from rich.console import Console
 from adscan_core.interrupts import emit_interrupt_debug
 from adscan_core.theme import ADSCAN_THEME
 from adscan_launcher import __version__
-from adscan_launcher.bloodhound_ce_password import (
-    validate_bloodhound_admin_password_policy,
-)
-from adscan_launcher.bloodhound_ce_compose import (
-    detect_legacy_bloodhound_ce_running_stack,
-    stop_legacy_bloodhound_ce_stack,
-)
 from adscan_launcher.docker_commands import (
-    DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
-    DEFAULT_BLOODHOUND_STACK_MODE,
     get_docker_image_name,
     handle_check_docker,
     handle_install_docker,
@@ -95,7 +85,6 @@ _LINUX_REQUIRED_COMMANDS = {
     "check",
     "start",
     "ci",
-    "report",
     "update",
     "upgrade",
     "host-helper",
@@ -104,27 +93,22 @@ _KNOWN_LAUNCHER_COMMANDS = {
     "install",
     "check",
     "start",
+    "tui",
     "ci",
-    "report",
+    "demo",
     "update",
     "upgrade",
     "version",
+    "welcome",
 }
 
-
-def _parse_bloodhound_admin_password(value: str) -> str:
-    """argparse type validator for BloodHound CE admin password."""
-    candidate = str(value or "")
-    valid, error_message = validate_bloodhound_admin_password_policy(candidate)
-    if not valid:
-        raise argparse.ArgumentTypeError(
-            error_message
-            or (
-                "Invalid BloodHound CE admin password "
-                "(requires 12+ chars, lowercase, uppercase, number, and one of !@#$%^&*)."
-            )
-        )
-    return candidate
+# Deliverable subcommands handled as host-side passthrough (Pass C). Each is
+# routed through the PRO upsell gate (`_run_pro_passthrough_with_upsell_gate`)
+# so LITE installs render the canonical upsell panel on exit-42.
+_DELIVERABLE_PASSTHROUGH_COMMANDS = {
+    "deliver",
+    "cheatsheet",
+}
 
 
 def _remove_legacy_adscan_sudo_alias(rcfile: str) -> bool:
@@ -183,8 +167,40 @@ def _cleanup_legacy_sudo_alias() -> None:
         _remove_legacy_adscan_sudo_alias(rcfile)
 
 
+class _DeliverablesAwareParser(argparse.ArgumentParser):
+    """Argparse parser that appends a "Client Deliverables" section to --help.
+
+    The deliverable subcommands (``deliver``, ``cheatsheet``) already
+    register their own ``help`` strings with ``[PRO]`` / ``[LITE]`` badges,
+    but argparse renders all subcommands as a single flat block. This
+    override appends a clearly titled section after the default help so
+    operators can see the deliverables family at a glance.
+    """
+
+    def format_help(self) -> str:  # type: ignore[override]
+        base = super().format_help()
+        try:
+            from adscan_core.cli_catalog import (
+                DELIVERABLE_COMMAND_ORDER as _DELIV_ORDER,
+                tier_for_command as _tier_for_command,
+            )
+        except Exception:  # noqa: BLE001 — defensive: never break --help
+            return base
+
+        descriptions: dict[str, str] = {
+            "deliver":    "Generate full Client Deliverable Kit (4 PDFs + ZIP)",
+            "cheatsheet": "Pentester Cheatsheet PDF",
+        }
+        lines = ["", "Client Deliverables (PRO)"]
+        for name in _DELIV_ORDER:
+            badge = f"[{_tier_for_command(name)}]"
+            desc = descriptions.get(name, name)
+            lines.append(f"  {name:<20} {desc:<55} {badge}")
+        return base + "\n".join(lines) + "\n"
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="adscan", add_help=True)
+    parser = _DeliverablesAwareParser(prog="adscan", add_help=True)
     parser.add_argument(
         "--version",
         action="store_true",
@@ -216,29 +232,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument(
-        "--bloodhound-stack-mode",
-        choices=["managed"],
-        default=None,
-        help=(
-            "BloodHound runtime mode. `managed` (default) starts ADscan's isolated compose stack."
-        ),
-    )
-
-    sub = parser.add_subparsers(dest="command", required=False)
+    # ``metavar="command"`` keeps the usage synopsis to ``adscan ... command``
+    # (follows the convention used by `git`, `gh`, `docker`) so subcommands
+    # we want to hide (e.g. the work-in-progress ``tui``) don't leak into
+    # the curly-brace choices list at the top of ``--help``.
+    sub = parser.add_subparsers(dest="command", required=False, metavar="command")
 
     install = sub.add_parser("install", help="Install ADscan (Docker mode)")
-    install.add_argument(
-        "--bloodhound-admin-password",
-        default=DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
-        type=_parse_bloodhound_admin_password,
-        help="Desired BloodHound CE admin password used during install.",
-    )
-    install.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Do not open the BloodHound browser automatically.",
-    )
     install.add_argument(
         "--pull-timeout",
         type=int,
@@ -279,10 +279,42 @@ def _build_parser() -> argparse.ArgumentParser:
             "(below 1.0 GB)."
         ),
     )
+    # `--tui` and the top-level `tui` subcommand are intentionally hidden
+    # from --help while the Textual workbench is under active development.
+    # Routing is preserved so anyone who knows the verb can still invoke
+    # it, but it is not advertised on any user-facing surface (welcome
+    # cards, --help listing) until the workbench is production-ready.
     start.add_argument(
         "--tui",
         action="store_true",
-        help="Launch the Textual-based TUI instead of the default prompt_toolkit shell.",
+        help=argparse.SUPPRESS,
+    )
+
+    tui = sub.add_parser(
+        "tui",
+        help=argparse.SUPPRESS,
+    )
+    # Note: the help-listing entry for ``tui`` is dropped in the final
+    # ``_drop_suppressed_choices`` call below (Python <3.12 renders
+    # ``argparse.SUPPRESS`` on a subparser literally rather than hiding it).
+    tui.add_argument(
+        "--pull-timeout",
+        type=int,
+        default=3600,
+        help="Docker pull timeout in seconds. Default: 3600.",
+    )
+    tui.add_argument(
+        "--allow-low-memory",
+        action="store_true",
+        help=(
+            "Allow tui to continue when available RAM is critically low "
+            "(below 1.0 GB)."
+        ),
+    )
+    tui.add_argument(
+        "--demo",
+        action="store_true",
+        help="Boot the workbench on top of the deterministic demo workspace.",
     )
 
     ci = sub.add_parser("ci", help="Run `adscan ci` inside the container")
@@ -306,10 +338,107 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Arguments passed to the container after `ci`",
     )
 
-    sub.add_parser(
-        "report",
-        help="Generate a report from an existing workspace inside the container",
+    demo = sub.add_parser(
+        "demo",
+        help="Run a deterministic 60-second demo scan and produce a real PDF.",
     )
+    demo.add_argument(
+        "--fast",
+        action="store_true",
+        help="Compress phase pacing to ~12s (CI / marketing capture).",
+    )
+    demo.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="Skip PDF generation (headless smoke).",
+    )
+    demo.add_argument(
+        "--output",
+        dest="output_path",
+        default=None,
+        help="Override the output PDF path.",
+    )
+    demo.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for jitter (default: 42).",
+    )
+
+    # ── Client Deliverables (Pass C) — passthrough into container ─────
+    # Tier badges come from `adscan_core.cli_catalog` so the launcher and
+    # the container dispatcher agree on which commands are PRO-only.
+    from adscan_core.cli_catalog import (
+        DELIVERABLE_COMMAND_ORDER as _DELIV_ORDER,
+        tier_for_command as _tier_for_command,
+    )
+
+    _DELIVERABLE_HELP: dict[str, str] = {
+        "deliver":    "Generate full Client Deliverable Kit (4 PDFs + ZIP)",
+        "cheatsheet": "Pentester Cheatsheet PDF",
+    }
+
+    for _deliv_name in _DELIV_ORDER:
+        _badge = f"[{_tier_for_command(_deliv_name)}]"
+        _deliv_help = f"{_DELIVERABLE_HELP[_deliv_name]}  {_badge}"
+        _deliv_p = sub.add_parser(_deliv_name, help=_deliv_help)
+        _deliv_p.add_argument("--output", dest="output_path", default=None,
+                              help="Override the output PDF path.")
+        _deliv_p.add_argument("--no-open", action="store_true",
+                              help="Do not prompt to open the PDF.")
+        _deliv_p.add_argument("--no-render", action="store_true",
+                              help="Smoke / dry-run only — skip PDF render.")
+        if _deliv_name == "deliver":
+            _deliv_p.add_argument(
+                "--theme",
+                dest="theme",
+                default="",
+                choices=["", "dark", "premium_dark", "light", "corporate_light"],
+                help=(
+                    "Report theme. 'dark'/'premium_dark' = operator dark mode. "
+                    "'light'/'corporate_light' = corporate white (for printing/board). "
+                    "Default: env var ADSCAN_PDF_THEME or system default."
+                ),
+            )
+            # The remaining flags are interpreted inside the container. The
+            # launcher only needs to (a) recognise them so ``adscan deliver
+            # --help`` lists them and (b) forward them verbatim through the
+            # passthrough below. New flags added in deliver.py also need a
+            # one-line entry both here and in the forwarding block.
+            _deliv_p.add_argument(
+                "--workspace", dest="ws_workspace", default=None,
+                help="Workspace name or path (default: prompt or most-recent).",
+            )
+            _deliv_p.add_argument(
+                "--client", dest="ws_client", default=None,
+                help="Client name embedded in the kit metadata.",
+            )
+            _deliv_p.add_argument(
+                "--engagement", dest="ws_engagement", default=None,
+                help="Engagement code embedded in the kit metadata.",
+            )
+            _deliv_p.add_argument(
+                "--only", dest="ws_only", default=None,
+                help=(
+                    "Comma-separated deliverables: "
+                    "report, playbook, checklist, coverage-matrix."
+                ),
+            )
+            _deliv_p.add_argument(
+                "--frameworks", dest="ws_frameworks", default=None,
+                help=(
+                    "Comma-separated compliance frameworks: "
+                    "ens, iso27001, dora, pci_dss. Default: ens (non-interactive)."
+                ),
+            )
+            _deliv_p.add_argument(
+                "--no-navigator", dest="ws_no_navigator", action="store_true",
+                help="Skip the MITRE ATT&CK Navigator extras in the ZIP.",
+            )
+            _deliv_p.add_argument(
+                "--report-theme", dest="ws_report_theme", default="",
+                help="Legacy alias for --theme (kept for back-compat).",
+            )
 
     upd = sub.add_parser(
         "update", help="Update the launcher (pip) and pull the latest ADscan image"
@@ -331,6 +460,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("version", help="Show launcher version")
 
+    sub.add_parser(
+        "welcome",
+        help="Show the editorial welcome screen (default with no command).",
+    )
+
     # Internal-only command used by the host launcher to run the privileged
     # helper process required by container runtime features (e.g. BH compose up,
     # host clock sync). Hidden from end users.
@@ -341,7 +475,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
 
+    # Final pass: strip any subparser entry whose ``help`` was set to
+    # ``argparse.SUPPRESS`` from the help-formatter's choices listing.
+    # Python <3.12 renders the literal "==SUPPRESS==" sentinel instead of
+    # hiding the entry (bpo-44793). Applies to ``tui`` (work-in-progress)
+    # and ``host-helper`` (internal-only). Safe to run unconditionally —
+    # popping a non-existent dest is a no-op.
+    _drop_suppressed_choices(sub, {"tui", "host-helper"})
+
     return parser
+
+
+def _drop_suppressed_choices(subparsers_action, dests: set[str]) -> None:
+    """Pop entries from a subparsers action's help-listing by ``dest``.
+
+    Workaround for Python <3.12 where ``help=argparse.SUPPRESS`` on
+    ``add_parser`` renders the literal sentinel instead of hiding the
+    entry. The dispatch path is untouched — only the help formatter's
+    side-table is mutated.
+    """
+    choices_actions = getattr(subparsers_action, "_choices_actions", None)
+    if not choices_actions:
+        return
+    for action in list(choices_actions):
+        if getattr(action, "dest", None) in dests:
+            choices_actions.remove(action)
 
 
 def _apply_image_overrides(args: argparse.Namespace) -> None:
@@ -364,7 +522,11 @@ def _consume_trailing_global_flags(
     """
     cmd = str(getattr(ns, "command", "") or "")
     low_memory_supported_cmds = {"install", "check", "start", "ci"}
-    if cmd not in _KNOWN_LAUNCHER_COMMANDS:
+    # Deliverable passthrough commands (deliver/cheatsheet) also need
+    # trailing global flags (--dev, --debug, --verbose, --image) consumed,
+    # otherwise typing `adscan deliver --dev` silently falls through to
+    # the prod image because `--dev` never reaches _apply_image_overrides.
+    if cmd not in (_KNOWN_LAUNCHER_COMMANDS | _DELIVERABLE_PASSTHROUGH_COMMANDS):
         return unknown
 
     remaining: list[str] = []
@@ -392,6 +554,10 @@ def _consume_trailing_global_flags(
             setattr(ns, "tui", True)
             idx += 1
             continue
+        if token == "--demo" and cmd == "tui":
+            setattr(ns, "demo", True)
+            idx += 1
+            continue
         if token.startswith("--image="):
             setattr(ns, "image", token.split("=", 1)[1])
             idx += 1
@@ -408,25 +574,6 @@ def _consume_trailing_global_flags(
             setattr(ns, "channel", unknown[idx + 1])
             idx += 2
             continue
-        if token.startswith("--bloodhound-stack-mode="):
-            value = token.split("=", 1)[1]
-            if str(value).strip().lower() != "managed":
-                remaining.append(token)
-                idx += 1
-                continue
-            setattr(ns, "bloodhound_stack_mode", value)
-            idx += 1
-            continue
-        if token == "--bloodhound-stack-mode" and idx + 1 < len(unknown):
-            value = unknown[idx + 1]
-            if str(value).strip().lower() != "managed":
-                remaining.extend([token, value])
-                idx += 2
-                continue
-            setattr(ns, "bloodhound_stack_mode", value)
-            idx += 2
-            continue
-
         remaining.append(token)
         idx += 1
 
@@ -747,185 +894,6 @@ def _guard_supported_host_platform(
     raise SystemExit(2)
 
 
-def _command_uses_bloodhound_stack(command: str | None) -> bool:
-    """Return whether the launcher command depends on BloodHound stack state."""
-    return command not in {"version", "update", "upgrade", "host-helper"}
-
-
-def _is_noninteractive_session() -> bool:
-    """Return True when launcher should avoid interactive prompts."""
-    if os.getenv("ADSCAN_NONINTERACTIVE", "").strip() == "1":
-        return True
-    return not (sys.stdin.isatty() and sys.stdout.isatty())
-
-
-def _resolve_bloodhound_stack_mode_with_legacy_detection(
-    *,
-    command: str | None,
-    stack_mode: str,
-    stack_mode_explicit: bool,
-) -> str:
-    """Resolve effective BloodHound stack mode with legacy-stack auto-detection."""
-    if not _command_uses_bloodhound_stack(command):
-        return stack_mode
-
-    requested_mode = str(stack_mode or "").strip().lower()
-    if requested_mode != "managed":
-        print_warning(
-            "BloodHound external mode is deprecated and ignored. "
-            "ADscan always uses managed mode."
-        )
-        capture(
-            "bloodhound_stack_mode_autoswitch",
-            {
-                "from_mode": requested_mode or "unknown",
-                "to_mode": "managed",
-                "reason": "external_mode_deprecated_forced_managed",
-                "command": command or "",
-            },
-        )
-
-    stack_mode = "managed"
-
-    detection = detect_legacy_bloodhound_ce_running_stack()
-    if not bool(detection.get("detected", False)):
-        return stack_mode
-
-    container_names = ", ".join(detection.get("container_names") or [])
-    detected_ui_url = detection.get("ui_url")
-    if isinstance(detected_ui_url, str):
-        detected_ui_url = detected_ui_url.strip() or None
-    else:
-        detected_ui_url = None
-
-    if stack_mode_explicit:
-        print_info_debug(
-            "[bloodhound-ce] managed mode explicitly requested; checking legacy "
-            "containers for migration safety."
-        )
-
-    details = [
-        "Detected an existing BloodHound CE installation already running on this host.",
-        "ADscan always uses its managed isolated stack.",
-        "To prevent port/resource conflicts, stop non-managed containers before continuing.",
-        f"Running containers: {container_names or 'unknown'}",
-    ]
-    if detected_ui_url:
-        details.append(f"Detected CE URL: {detected_ui_url}")
-    print_panel(
-        "\n".join(details),
-        title="Existing BloodHound CE Detected",
-        border_style="cyan",
-    )
-
-    if _is_noninteractive_session():
-        print_info(
-            "Non-interactive session detected. Continuing in managed mode and "
-            "attempting to stop non-managed containers automatically."
-        )
-        stopped = stop_legacy_bloodhound_ce_stack()
-        if not stopped:
-            capture(
-                "bloodhound_stack_mode_autoswitch",
-                {
-                    "from_mode": "managed",
-                    "to_mode": "managed",
-                    "reason": "legacy_stack_detected_noninteractive_stop_failed_blocked",
-                    "command": command or "",
-                },
-            )
-            print_error(
-                "ADscan requires its managed BloodHound CE stack. "
-                "Detected non-managed containers could not be stopped automatically."
-            )
-            detected_names = list(detection.get("container_names") or [])
-            if detected_names:
-                manual_stop = "docker stop " + " ".join(detected_names)
-                print_instruction(f"Stop them manually (`{manual_stop}`) and retry.")
-            else:
-                print_instruction(
-                    "Stop non-managed BloodHound CE containers manually and retry."
-                )
-            raise SystemExit(1)
-        capture(
-            "bloodhound_stack_mode_autoswitch",
-            {
-                "from_mode": "managed",
-                "to_mode": "managed",
-                "reason": (
-                    "legacy_stack_detected_noninteractive_stopped"
-                    if stopped
-                    else "legacy_stack_detected_noninteractive_stop_failed"
-                ),
-                "command": command or "",
-            },
-        )
-        return "managed"
-
-    stop_legacy_now = confirm_ask(
-        "Stop detected non-managed BloodHound CE containers and continue in managed mode?",
-        default=True,
-    )
-    if stop_legacy_now:
-        if stop_legacy_bloodhound_ce_stack():
-            print_success("Migration pre-step complete. Continuing with managed mode.")
-            capture(
-                "bloodhound_stack_mode_autoswitch",
-                {
-                    "from_mode": "managed",
-                    "to_mode": "managed",
-                    "reason": "legacy_stack_detected_migrated_to_managed",
-                    "command": command or "",
-                },
-            )
-            return "managed"
-        print_error(
-            "Could not stop non-managed BloodHound CE containers automatically."
-        )
-        detected_names = list(detection.get("container_names") or [])
-        if detected_names:
-            manual_stop = "docker stop " + " ".join(detected_names)
-            print_instruction(
-                f"You can stop them manually (`{manual_stop}`) and retry managed mode."
-            )
-        else:
-            print_instruction(
-                "You can stop non-managed BloodHound CE containers manually and retry managed mode."
-            )
-        capture(
-            "bloodhound_stack_mode_autoswitch",
-            {
-                "from_mode": "managed",
-                "to_mode": "managed",
-                "reason": "legacy_stack_detected_stop_failed_interactive_blocked",
-                "command": command or "",
-            },
-        )
-        raise SystemExit(1)
-
-    print_error(
-        "ADscan cannot continue while non-managed BloodHound CE containers are running."
-    )
-    detected_names = list(detection.get("container_names") or [])
-    if detected_names:
-        manual_stop = "docker stop " + " ".join(detected_names)
-        print_instruction(f"Stop them manually (`{manual_stop}`) and retry.")
-    else:
-        print_instruction(
-            "Stop non-managed BloodHound CE containers manually and retry."
-        )
-    capture(
-        "bloodhound_stack_mode_autoswitch",
-        {
-            "from_mode": "managed",
-            "to_mode": "managed",
-            "reason": "legacy_stack_detected_user_declined_blocked",
-            "command": command or "",
-        },
-    )
-    raise SystemExit(1)
-
-
 def _emit_launcher_system_context(command: str | None) -> None:
     """Emit non-sensitive host system context for telemetry diagnostics."""
     if not _should_emit_system_context(command):
@@ -1137,6 +1105,84 @@ def _build_update_context_for_launcher(
     )
 
 
+
+def _run_pro_passthrough_with_upsell_gate(
+    *,
+    cmd: str,
+    adscan_args: list[str],
+    verbose: bool,
+    debug: bool,
+    pull_timeout_seconds: int | None,
+) -> int:
+    """Run a deliverable command in the container and honor the exit-42 protocol.
+
+    LITE container exits with code 42 plus a single JSON line on stdout:
+    ``{"error":"pro_required","feature":"<name>"}``. When that pattern is
+    detected the launcher renders the canonical PRO upsell panel and exits
+    with 0 — the user did not type a broken command, they tried a PRO
+    feature, and the panel is the actionable response.
+
+    For any other exit code (including a clean run on PRO), the captured
+    stdout is replayed to the user verbatim and the original return code
+    is propagated. This keeps the host-side gate a single, predictable
+    seam without nesting docker capture machinery deeper in the runtime.
+    """
+
+    # Lazy import to keep `cli_catalog` the only host-side dep.
+    from adscan_core.cli_catalog import is_pro_only
+
+    # Run the container with stdout/stderr captured — we need to inspect
+    # exit-42 + the trailing JSON line. The container's own Rich output is
+    # replayed on the host TTY so the user sees the same lines either way.
+    rc = run_adscan_passthrough_docker(
+        adscan_args=adscan_args,
+        verbose=verbose,
+        debug=debug,
+        pull_timeout_seconds=pull_timeout_seconds,
+    )
+
+    # Streaming passthrough does not capture stdout, so the exit-42 JSON
+    # protocol cannot be parsed from a captured buffer here. Instead, we
+    # use a separate capture call when we know we are gating a PRO command
+    # and the rc came back as 42.
+    if rc == 42 and is_pro_only(cmd):
+        try:
+            from adscan_core.pro_upsell import render_pro_upsell_panel
+
+            console = Console(theme=ADSCAN_THEME)
+            panel = render_pro_upsell_panel(cmd, context="direct_invocation")
+            console.print(panel)
+            return 0
+        except Exception as exc:  # noqa: BLE001 — best-effort upsell render
+            capture_exception(exc)
+            return rc
+
+    # Defensive: a malformed exit 42 (e.g. PRO container emitting 42 by
+    # accident, or a future protocol change) should not eat user output.
+    return int(rc)
+
+
+def _render_host_welcome() -> None:
+    """Render the host-side editorial welcome screen.
+
+    Uses ``adscan_core`` primitives only — no container roundtrip — so a
+    fresh user typing ``adscan`` sees the brand within milliseconds.
+    Posture lookup walks ``~/.adscan/workspaces/`` if it exists; otherwise
+    the screen renders without a posture line.
+    """
+    from adscan_core.welcome_host import (
+        load_latest_posture_host,
+        print_welcome_host,
+    )
+    posture, ws_name, age_days = load_latest_posture_host()
+    print_welcome_host(
+        latest_posture=posture,
+        workspace_name=ws_name,
+        last_scan_age_days=age_days,
+        version_tag=f"v{__version__}",
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     global _SESSION_CAPTURE_FINALIZED
     _SESSION_CAPTURE_FINALIZED = False
@@ -1145,14 +1191,17 @@ def main(argv: list[str] | None = None) -> None:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
     if not raw_argv:
-        parser.print_help()
+        try:
+            _render_host_welcome()
+        except Exception:
+            parser.print_help()
         raise SystemExit(0)
 
     ns, unknown = parser.parse_known_args(raw_argv)
     unknown = _consume_trailing_global_flags(ns, unknown)
     _consume_ci_remainder_global_flags(ns)
     if (
-        getattr(ns, "command", None) in _KNOWN_LAUNCHER_COMMANDS - {"report"}
+        getattr(ns, "command", None) in _KNOWN_LAUNCHER_COMMANDS
         and unknown
     ):
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
@@ -1160,7 +1209,10 @@ def main(argv: list[str] | None = None) -> None:
     cmd = getattr(ns, "command", None)
     show_version = bool(getattr(ns, "version", False)) or cmd == "version"
     if cmd is None and not unknown and not show_version:
-        parser.print_help()
+        try:
+            _render_host_welcome()
+        except Exception:
+            parser.print_help()
         raise SystemExit(0)
 
     telemetry_console = _build_launcher_telemetry_console()
@@ -1179,20 +1231,6 @@ def main(argv: list[str] | None = None) -> None:
     os.environ["ADSCAN_LAUNCHER_VERSION"] = str(__version__)
 
     _apply_image_overrides(ns)
-    raw_stack_mode = getattr(ns, "bloodhound_stack_mode", None)
-    stack_mode_explicit = (
-        raw_stack_mode is not None and str(raw_stack_mode).strip() != ""
-    )
-    resolved_stack_mode = (
-        str(raw_stack_mode).strip().lower()
-        if raw_stack_mode is not None
-        else DEFAULT_BLOODHOUND_STACK_MODE
-    ) or DEFAULT_BLOODHOUND_STACK_MODE
-    resolved_stack_mode = _resolve_bloodhound_stack_mode_with_legacy_detection(
-        command=cmd,
-        stack_mode=resolved_stack_mode,
-        stack_mode_explicit=stack_mode_explicit,
-    )
 
     if show_version:
         print_info(f"ADscan launcher: v{__version__}")
@@ -1215,6 +1253,14 @@ def main(argv: list[str] | None = None) -> None:
         command=cmd,
         has_passthrough_args=bool(unknown),
     )
+
+    if cmd == "welcome":
+        try:
+            _render_host_welcome()
+        except Exception as exc:
+            capture_exception(exc)
+            print_error("Could not render welcome screen.")
+        raise SystemExit(0)
 
     if cmd == "host-helper":
         try:
@@ -1265,9 +1311,36 @@ def main(argv: list[str] | None = None) -> None:
                     verbose=bool(getattr(ns, "verbose", False)),
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=int(pull_timeout),
-                    bloodhound_stack_mode=resolved_stack_mode,
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                     tui=bool(getattr(ns, "tui", False)),
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+            )
+        )
+
+    if cmd == "tui":
+        # The workbench shares the start lifecycle (Docker preflight, session
+        # capture, image pull) — only the in-container command differs. We
+        # forward as `adscan tui` so the container-side handler can apply
+        # --demo / --dev semantics consistently.
+        pull_timeout_tui = getattr(ns, "pull_timeout", 3600)
+        tui_passthrough = ["tui"]
+        if bool(getattr(ns, "demo", False)):
+            tui_passthrough.append("--demo")
+        if bool(getattr(ns, "verbose", False)):
+            tui_passthrough.append("--verbose")
+        if bool(getattr(ns, "debug", False)):
+            tui_passthrough.append("--debug")
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="tui",
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=tui_passthrough,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=int(pull_timeout_tui),
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
@@ -1280,10 +1353,7 @@ def main(argv: list[str] | None = None) -> None:
                 command_type="install",
                 telemetry_console=telemetry_console,
                 runner=lambda: handle_install_docker(
-                    bloodhound_admin_password=str(ns.bloodhound_admin_password),
-                    suppress_bloodhound_browser=bool(ns.no_browser),
                     pull_timeout_seconds=int(ns.pull_timeout),
-                    bloodhound_stack_mode=resolved_stack_mode,
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker"},
@@ -1296,7 +1366,6 @@ def main(argv: list[str] | None = None) -> None:
                 command_type="check",
                 telemetry_console=telemetry_console,
                 runner=lambda: handle_check_docker(
-                    bloodhound_stack_mode=resolved_stack_mode,
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker"},
@@ -1333,7 +1402,6 @@ def main(argv: list[str] | None = None) -> None:
                     verbose=bool(getattr(ns, "verbose", False)),
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=int(ns.pull_timeout),
-                    bloodhound_stack_mode=resolved_stack_mode,
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
@@ -1341,20 +1409,82 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
 
-    if cmd == "report":
-        passthrough = list(unknown)
-        if passthrough and passthrough[0] == "--":
-            passthrough = passthrough[1:]
+    if cmd in _DELIVERABLE_PASSTHROUGH_COMMANDS:
+        deliv_args: list[str] = [cmd]
+        output_path = getattr(ns, "output_path", None)
+        if output_path:
+            deliv_args.extend(["--output", str(output_path)])
+        if bool(getattr(ns, "no_open", False)):
+            deliv_args.append("--no-open")
+        if bool(getattr(ns, "no_render", False)):
+            deliv_args.append("--no-render")
+        if hasattr(ns, "theme") and ns.theme:
+            deliv_args.extend(["--theme", str(ns.theme)])
+        # ``deliver``-specific flags. Using ``ws_*`` dests on the host parser
+        # avoids clobbering the launcher's own ``output_path``/``no_render``
+        # while still surfacing the container's full flag set in --help.
+        if cmd == "deliver":
+            ws_workspace = getattr(ns, "ws_workspace", None)
+            if ws_workspace:
+                deliv_args.extend(["--workspace", str(ws_workspace)])
+            ws_client = getattr(ns, "ws_client", None)
+            if ws_client:
+                deliv_args.extend(["--client", str(ws_client)])
+            ws_engagement = getattr(ns, "ws_engagement", None)
+            if ws_engagement:
+                deliv_args.extend(["--engagement", str(ws_engagement)])
+            ws_only = getattr(ns, "ws_only", None)
+            if ws_only:
+                deliv_args.extend(["--only", str(ws_only)])
+            ws_frameworks = getattr(ns, "ws_frameworks", None)
+            if ws_frameworks:
+                deliv_args.extend(["--frameworks", str(ws_frameworks)])
+            if bool(getattr(ns, "ws_no_navigator", False)):
+                deliv_args.append("--no-navigator")
+            ws_report_theme = getattr(ns, "ws_report_theme", "") or ""
+            if ws_report_theme:
+                deliv_args.extend(["--report-theme", str(ws_report_theme)])
+        raise SystemExit(
+            _run_pro_passthrough_with_upsell_gate(
+                cmd=str(cmd),
+                adscan_args=deliv_args,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=3600,
+            )
+        )
+
+    if cmd == "demo":
+        # Reconstruct the demo CLI args from the parsed namespace and forward
+        # them into the container (where the demo lives, alongside the deliverable
+        # orchestrator). Keeping this explicit makes the arg surface obvious.
+        demo_args: list[str] = ["demo"]
+        if bool(getattr(ns, "fast", False)):
+            demo_args.append("--fast")
+        if bool(getattr(ns, "no_pdf", False)):
+            demo_args.append("--no-pdf")
+        output_path = getattr(ns, "output_path", None)
+        if output_path:
+            demo_args.extend(["--output", str(output_path)])
+        seed = getattr(ns, "seed", None)
+        if seed is not None:
+            demo_args.extend(["--seed", str(seed)])
+        # Mirror the start/ci convention: forward --debug / --verbose into the
+        # container so the demo respects the global launcher flags. --dev is
+        # consumed by _apply_image_overrides above (sets the docker channel).
+        if bool(getattr(ns, "debug", False)):
+            demo_args.append("--debug")
+        if bool(getattr(ns, "verbose", False)):
+            demo_args.append("--verbose")
         raise SystemExit(
             _run_host_command_with_session_capture(
-                command_type="report",
+                command_type="demo",
                 telemetry_console=telemetry_console,
                 runner=lambda: run_adscan_passthrough_docker(
-                    adscan_args=["report"] + passthrough,
+                    adscan_args=demo_args,
                     verbose=bool(getattr(ns, "verbose", False)),
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=3600,
-                    bloodhound_stack_mode=resolved_stack_mode,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
@@ -1378,7 +1508,6 @@ def main(argv: list[str] | None = None) -> None:
             verbose=bool(getattr(ns, "verbose", False)),
             debug=bool(getattr(ns, "debug", False)),
             pull_timeout_seconds=3600,
-            bloodhound_stack_mode=resolved_stack_mode,
         )
     except KeyboardInterrupt:
         _log_launcher_interrupt(

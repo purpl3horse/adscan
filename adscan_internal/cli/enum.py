@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from adscan_internal import telemetry
@@ -28,6 +28,12 @@ from adscan_internal.rich_output import (
     confirm_operation,
     mark_sensitive,
     ScanProgressTracker,
+)
+from adscan_core.rich_output_collection import (
+    SessionHeader,
+    SessionLootCard,
+    print_session_header,
+    print_session_loot_card,
 )
 
 
@@ -75,12 +81,12 @@ def ask_for_enum_domain_auth(self, domain: str) -> None:
 
         if confirm_operation(
             operation_name="Authenticated Domain Enumeration",
-            description="Performs BloodHound data collection and comprehensive domain analysis",
+            description="Performs domain intelligence collection and comprehensive domain analysis",
             context={
                 "Domain": domain,
                 "PDC": pdc,
                 "Username": username,
-                "Collection": "BloodHound (All objects, ACLs, Sessions)",
+                "Collection": "Domain Intelligence (All objects, ACLs, Sessions)",
                 "Phase": "Primary reconnaissance",
             },
             default=True,
@@ -95,12 +101,24 @@ def ask_for_enum_configs(self, domain: str) -> None:
     if self.auto:
         do_enum_configs(self, domain)
     else:
-        marked_domain = mark_sensitive(domain, "domain")
-        respuesta = Confirm.ask(
-            f"Do you want to perform configuration enumeration in domain {marked_domain}?",
+        pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
+        username = self.domains_data.get(domain, {}).get("username", "N/A")
+        if confirm_operation(
+            operation_name="Configuration Enumeration",
+            description=(
+                "Audits domain configuration: relay posture, password policies, "
+                "obsolete OS, LDAP signing, SMBv1 exposure, and privileged-identity sprawl"
+            ),
+            context={
+                "Domain": domain,
+                "PDC": pdc,
+                "Username": username,
+                "Steps": "12 checks",
+            },
             default=True,
-        )
-        if respuesta:
+            icon="⚙",
+            show_panel=True,
+        ):
             do_enum_configs(self, domain)
 
 
@@ -109,6 +127,28 @@ def do_enum_configs(self, domain: str) -> None:
 
     username = self.domains_data.get(domain, {}).get("username", "N/A")
     pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
+
+    # --- Premium session header ---
+    try:
+        _en_domain = str(domain or "")
+        _en_dc = str(pdc or "") if pdc and pdc != "N/A" else ""
+        _en_user = str(username or "") if username and username != "N/A" else ""
+        _en_cred = (
+            f"{_en_user} / {_en_domain.upper()}"
+            if _en_user and _en_domain
+            else _en_user
+        )
+        print_session_header(
+            SessionHeader(
+                workspace=str(getattr(self, "current_workspace", "") or ""),
+                target_domain=_en_domain,
+                dc_ip=_en_dc,
+                credential_label=_en_cred,
+                scan_mode="enum",
+            )
+        )
+    except Exception:  # noqa: BLE001 - cosmetic header must never block enum
+        pass
 
     tracker = ScanProgressTracker(
         "Domain Configuration Enumeration",
@@ -132,7 +172,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Finding accounts with weak password policies",
     )
     try:
-        self.do_bloodhound_passnotreq(domain)
+        self.do_passnotreq(domain)
         tracker.complete_step(details="Password policy check completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Password check error: {str(e)[:50]}")
@@ -143,7 +183,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Finding accounts with non-expiring passwords",
     )
     try:
-        self.do_bloodhound_pwdneverexpires(domain)
+        self.do_pwdneverexpires(domain)
         tracker.complete_step(details="Password expiry check completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Expiry check error: {str(e)[:50]}")
@@ -154,7 +194,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Finding enabled identities with prolonged inactivity",
     )
     try:
-        self.do_bloodhound_stale_enabled_users(domain)
+        self.do_stale_enabled_users(domain)
         tracker.complete_step(details="Stale enabled user hygiene check completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Stale user check error: {str(e)[:50]}")
@@ -165,7 +205,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Measuring privileged identity concentration against enabled-user baseline",
     )
     try:
-        self.do_bloodhound_tier0_highvalue_sprawl(domain)
+        self.do_tier0_highvalue_sprawl(domain)
         tracker.complete_step(details="Privileged identity concentration assessed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Identity sprawl error: {str(e)[:50]}")
@@ -176,7 +216,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Analyzing krbtgt privileges and exposure",
     )
     try:
-        self.do_bloodhound_krbtgt(domain)
+        self.do_krbtgt(domain)
         tracker.complete_step(details="Krbtgt analysis completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"Krbtgt analysis error: {str(e)[:50]}")
@@ -187,7 +227,7 @@ def do_enum_configs(self, domain: str) -> None:
         details="Checking non-admin DC access paths",
     )
     try:
-        self.do_bloodhound_dc_access(domain)
+        self.do_dc_access(domain)
         tracker.complete_step(details="DC access analysis completed")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"DC access error: {str(e)[:50]}")
@@ -214,8 +254,8 @@ def do_enum_configs(self, domain: str) -> None:
         if os.path.exists(with_laps) and os.path.exists(without_laps):
             tracker.complete_step(details="Phase 1 LAPS inventory already available")
         else:
-            self.do_bloodhound_computers_with_laps(domain)
-            self.do_bloodhound_computers_without_laps(domain)
+            self.do_computers_with_laps(domain)
+            self.do_computers_without_laps(domain)
             tracker.complete_step(details="LAPS fallback inventory generated")
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"LAPS fallback error: {str(e)[:50]}")
@@ -249,7 +289,9 @@ def do_enum_configs(self, domain: str) -> None:
     )
     try:
         self.do_netexec_ldap_security(domain)
-        tracker.complete_step(details="LDAP signing and channel binding posture captured")
+        tracker.complete_step(
+            details="LDAP signing and channel binding posture captured"
+        )
     except Exception as e:  # noqa: BLE001
         tracker.fail_step(details=f"LDAP posture audit error: {str(e)[:50]}")
 
@@ -265,6 +307,25 @@ def do_enum_configs(self, domain: str) -> None:
         tracker.fail_step(details=f"SMBv1 audit error: {str(e)[:50]}")
 
     tracker.print_summary()
+
+    # --- End-of-run loot card ---
+    try:
+        _loot_domain = str(domain or getattr(self, "current_domain", "") or "")
+        _domains_data = getattr(self, "domains_data", {}) or {}
+        _domain_info = (
+            _domains_data.get(_loot_domain, {})
+            if isinstance(_domains_data, dict)
+            else {}
+        ) or {}
+        _owned = list(_domain_info.get("owned_accounts", []) or [])
+        print_session_loot_card(
+            SessionLootCard(
+                domain=_loot_domain,
+                owned_accounts=_owned,
+            )
+        )
+    except Exception:  # noqa: BLE001 - loot card is cosmetic, never block exit
+        pass
 
 
 _RELAY_LIST_ENUM_TIMEOUT_SECONDS = 1800
@@ -282,7 +343,9 @@ def _is_dc_relay_target(self, domain: str, host: str) -> bool:
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
 
-    domain_data = self.domains_data.get(domain, {}) if hasattr(self, "domains_data") else {}
+    domain_data = (
+        self.domains_data.get(domain, {}) if hasattr(self, "domains_data") else {}
+    )
     dc_candidates: set[str] = set()
     for key in ("pdc_hostname", "pdc", "pdc_fqdn"):
         value = str(domain_data.get(key) or "").strip().lower()
@@ -342,22 +405,30 @@ def _render_smb_signing_summary_panel(
     )
     risk_border = BRAND_COLORS["error"] if dc_count else BRAND_COLORS["warning"]
 
+    next_step = (
+        "Next: coerce a DC toward a relay listener to escalate to SYSTEM / DA."
+        if dc_count
+        else "Next: use relay targets for lateral movement or credential re-use."
+    )
     print_panel(
         "\n".join(
             [
-                f"Domain: {marked_domain}",
-                f"Relay posture: {risk_label}",
+                f"[bold]{risk_label}[/bold]",
+                "",
                 f"Unsigned SMB targets: {total_targets}",
-                f"Domain Controllers: {dc_count} ({dc_ratio:.1f}%)",
-                f"Non-DC hosts: {non_dc_count} ({non_dc_ratio:.1f}%)",
+                f"  Domain Controllers : {dc_count} ({dc_ratio:.1f}%)",
+                f"  Non-DC hosts       : {non_dc_count} ({non_dc_ratio:.1f}%)",
+                f"  Domain             : {marked_domain}",
                 "",
                 "Artifacts",
-                f"- Full target list: {marked_main_file}",
-                f"- DC subset: {marked_dc_file}",
-                f"- Non-DC subset: {marked_non_dc_file}",
+                f"  Full target list : {marked_main_file}",
+                f"  DC subset        : {marked_dc_file}",
+                f"  Non-DC subset    : {marked_non_dc_file}",
+                "",
+                f"[dim]{next_step}[/dim]",
             ]
         ),
-        title="SMB Signing Exposure Summary",
+        title="SMB Signing Exposure",
         border_style=risk_border,
         fit=True,
     )
@@ -365,7 +436,7 @@ def _render_smb_signing_summary_panel(
     table = Table(
         title="SMB Relay Target Breakdown",
         show_header=True,
-        header_style="bold magenta",
+        header_style="bold " + BRAND_COLORS["info"],
     )
     table.add_column("Scope", style="cyan")
     table.add_column("Count", justify="right", style="white")
@@ -438,7 +509,9 @@ def execute_generate_relay_list(self, command: str, domain: str) -> None:
                         comps = [line.strip() for line in file if line.strip()]
                     count = len(comps)
                     dc_targets = [
-                        host for host in comps if _is_dc_relay_target(self, domain, host)
+                        host
+                        for host in comps
+                        if _is_dc_relay_target(self, domain, host)
                     ]
                     non_dc_targets = [
                         host
@@ -590,32 +663,6 @@ def execute_generate_relay_list(self, command: str, domain: str) -> None:
         telemetry.capture_exception(e)
         print_error("Error generating relay list.")
         print_exception(show_locals=False, exception=e)
-
-
-def execute_neo4j_config_and_continue(self, cmd: str, domain: str) -> None:
-    """Execute legacy Neo4j CLI configuration and continue enumeration."""
-    try:
-        print_info_verbose(f"Executing Neo4j configuration: {cmd}")
-        completed_process = self.run_command(cmd, timeout=300)
-        if completed_process.returncode == 0:
-            print_success("Neo4j configuration executed successfully.")
-            if completed_process.stdout:
-                print_info(completed_process.stdout.strip())
-        else:
-            print_error("Error in neo4j configuration:")
-            if completed_process.stderr:
-                print_error(completed_process.stderr.strip())
-            elif (
-                completed_process.stdout
-            ):  # Sometimes errors go to stdout for shell commands
-                print_error(completed_process.stdout.strip())
-    except Exception as e:  # noqa: BLE001
-        telemetry.capture_exception(e)
-        print_error("Exception executing neo4j configuration.")
-        print_exception(show_locals=False, exception=e)
-
-    # Once configuration is finished (or attempted), continue with enumeration
-    self.run_enumeration(domain)
 
 
 def ask_for_enum_cve(self, target_domain: str) -> None:

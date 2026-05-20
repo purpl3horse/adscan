@@ -34,14 +34,17 @@ from adscan_internal.cli.privileges import run_service_access_sweep
 from adscan_internal.cli.privileged_target_selection import (
     resolve_privileged_target_user,
 )
-from adscan_internal.cli.smb import run_auth_shares
+from adscan_internal.cli.smb_shares_view import SharesViewMode, run_native_shares_view
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
     print_panel,
     strip_sensitive_markers,
 )
-from adscan_internal.services.attack_graph_runtime_service import active_step_followup
+from adscan_internal.services.attack_graph_runtime_service import (
+    active_step_followup,
+    get_attack_path_step_context,
+)
 from adscan_internal.services.pivot_opportunity_service import (
     ensure_host_bound_workflow_target_viable,
 )
@@ -78,12 +81,15 @@ from adscan_internal.services.rodc_followup_state_service import (
     RodcFollowupStateService,
 )
 from adscan_internal.services.attack_graph_service import (
+    load_attack_graph,
+    persist_rodc_followup_chain_edges,
     resolve_domain_node_record_for_domain,
     resolve_user_sid,
     rodc_followup_state_label,
     update_edge_status_by_labels,
 )
 from adscan_internal.services.credential_store_service import CredentialStoreService
+from adscan_internal.models.domain import resolve_dc_ip
 
 
 _RODC_KRBTGT_RE = re.compile(r"^krbtgt[_-](\d+)$", re.IGNORECASE)
@@ -284,7 +290,7 @@ def _refresh_group_membership_ticket(
             f"Kerberos ticket refresh helper is unavailable for {marked_user}@{marked_domain}."
         )
         return
-    dc_ip = getattr(shell, "domains_data", {}).get(domain, {}).get("dc_ip")
+    dc_ip = resolve_dc_ip(getattr(shell, "domains_data", {}).get(domain, {}) or {})
     print_info(
         f"Refreshing Kerberos ticket for {marked_user}@{marked_domain} "
         "after the group membership change."
@@ -369,7 +375,12 @@ def _run_user_share_followup(
     username: str,
     credential: str,
 ) -> None:
-    """Enumerate SMB shares reachable by a newly empowered or compromised user."""
+    """Enumerate SMB shares reachable by a newly empowered or compromised user.
+
+    Uses the native aiosmb stack via :func:`run_native_shares_view` — no nxc.
+    """
+    from adscan_internal.cli.smb_shares_view import SharesViewMode, run_native_shares_view
+
     marked_user = mark_sensitive(username, "user")
     marked_domain = mark_sensitive(domain, "domain")
     print_info(
@@ -386,11 +397,18 @@ def _run_user_share_followup(
         title="Enumerate SMB Shares",
     ):
         try:
-            run_auth_shares(
+            view_set = run_native_shares_view(
                 shell,
                 domain=domain,
+                mode=SharesViewMode.LIVE,
                 username=username,
-                password=credential,
+                credential=credential,
+            )
+            # If readable/writable shares were found, offer the credential-hunt
+            # follow-up (rclone + credsweeper) via the centralised helper.
+            from adscan_internal.cli.smb import _offer_share_credential_hunt  # noqa: PLC0415
+            _offer_share_credential_hunt(
+                shell, domain=domain, username=username, credential=credential, view_set=view_set
             )
         finally:
             print_info_debug(
@@ -398,6 +416,22 @@ def _run_user_share_followup(
                 "title='Enumerate SMB Shares' "
                 f"user={marked_user} domain={marked_domain}"
             )
+
+
+def _run_user_dcsync_followup(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+) -> None:
+    """Run DCSync against ``domain`` using the freshly compromised credential."""
+    dcsync = getattr(shell, "dcsync", None)
+    if not callable(dcsync):
+        print_warning("DCSync helper is unavailable on this shell.")
+        return
+    with active_step_followup(shell, source="user_credential_obtained", title="DCSync"):
+        dcsync(domain, username, credential)
 
 
 def _build_user_credential_followups(
@@ -411,35 +445,65 @@ def _build_user_credential_followups(
     marked_user = mark_sensitive(username, "user")
     marked_domain = mark_sensitive(domain, "domain")
 
-    return [
-        FollowupAction(
-            key="check_new_host_access",
-            title="Check New Host Access",
-            description=(
-                f"Probe SMB/WinRM/RDP/MSSQL access for {marked_user} "
-                f"after compromising {marked_user}@{marked_domain}."
+    step_context = get_attack_path_step_context(shell)
+    terminal_class = (
+        str(step_context.get("target_terminal_class") or "").strip().lower()
+    )
+    is_tier_zero_target = terminal_class == "direct_compromise"
+
+    followups: list[FollowupAction] = []
+
+    if is_tier_zero_target:
+        followups.append(
+            FollowupAction(
+                key="dcsync_domain",
+                title="DCSync Domain Hashes",
+                description=(
+                    f"Replicate NTLM hashes from {marked_domain} using "
+                    f"{marked_user} (tier-0 target reached — krbtgt + all users)."
+                ),
+                handler=lambda: _run_user_dcsync_followup(
+                    shell,
+                    domain=domain,
+                    username=username,
+                    credential=credential,
+                ),
+            )
+        )
+
+    followups.extend(
+        [
+            FollowupAction(
+                key="check_new_host_access",
+                title="Check New Host Access",
+                description=(
+                    f"Probe SMB/WinRM/RDP/MSSQL access for {marked_user} "
+                    f"after compromising {marked_user}@{marked_domain}."
+                ),
+                handler=lambda: _run_user_host_access_followup(
+                    shell,
+                    domain=domain,
+                    username=username,
+                    credential=credential,
+                ),
             ),
-            handler=lambda: _run_user_host_access_followup(
-                shell,
-                domain=domain,
-                username=username,
-                credential=credential,
+            FollowupAction(
+                key="enumerate_smb_shares",
+                title="Enumerate SMB Shares",
+                description=(
+                    f"Enumerate authenticated SMB shares now reachable by {marked_user}."
+                ),
+                handler=lambda: _run_user_share_followup(
+                    shell,
+                    domain=domain,
+                    username=username,
+                    credential=credential,
+                ),
             ),
-        ),
-        FollowupAction(
-            key="enumerate_smb_shares",
-            title="Enumerate SMB Shares",
-            description=(
-                f"Enumerate authenticated SMB shares now reachable by {marked_user}."
-            ),
-            handler=lambda: _run_user_share_followup(
-                shell,
-                domain=domain,
-                username=username,
-                credential=credential,
-            ),
-        ),
-    ]
+        ]
+    )
+
+    return followups
 
 
 def _render_rbcd_prepared_context(
@@ -595,11 +659,12 @@ def _run_rbcd_share_followup(
         source="attack_path_runtime_followup",
         title="Enumerate SMB Shares via RBCD Ticket",
     ):
-        run_auth_shares(
+        run_native_shares_view(
             shell,
             domain=domain,
+            mode=SharesViewMode.LIVE,
             username=delegated_user,
-            password=ticket_path,
+            credential=ticket_path,
         )
 
 
@@ -646,7 +711,9 @@ def _normalize_rodc_krbtgt_candidate(value: object) -> str | None:
     return f"krbtgt_{match.group(1)}"
 
 
-def _iter_rodc_krbtgt_candidates_from_domain_data(shell: Any, *, domain: str) -> list[str]:
+def _iter_rodc_krbtgt_candidates_from_domain_data(
+    shell: Any, *, domain: str
+) -> list[str]:
     """Return per-RODC krbtgt usernames already present in ``domains_data``."""
     domain_data = getattr(shell, "domains_data", {}).get(domain, {})
     if not isinstance(domain_data, dict):
@@ -654,7 +721,7 @@ def _iter_rodc_krbtgt_candidates_from_domain_data(shell: Any, *, domain: str) ->
 
     seen: set[str] = set()
     ordered: list[str] = []
-    for key in (domain_data.get("credentials", {}) or {}):
+    for key in domain_data.get("credentials", {}) or {}:
         username = str(key).split("\\")[-1].strip()
         normalized = _normalize_rodc_krbtgt_candidate(username)
         if not normalized or normalized in seen:
@@ -664,7 +731,9 @@ def _iter_rodc_krbtgt_candidates_from_domain_data(shell: Any, *, domain: str) ->
     return ordered
 
 
-def _iter_rodc_krbtgt_candidates_from_workspace_graph(shell: Any, *, domain: str) -> list[str]:
+def _iter_rodc_krbtgt_candidates_from_workspace_graph(
+    shell: Any, *, domain: str
+) -> list[str]:
     """Return per-RODC krbtgt usernames already persisted in local workspace graphs."""
     from adscan_internal.services.attack_graph_service import load_attack_graph
     from adscan_internal.services.membership_snapshot import load_membership_snapshot
@@ -678,7 +747,11 @@ def _iter_rodc_krbtgt_candidates_from_workspace_graph(shell: Any, *, domain: str
         for node in nodes_map.values():
             if not isinstance(node, dict):
                 continue
-            props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            props = (
+                node.get("properties")
+                if isinstance(node.get("properties"), dict)
+                else {}
+            )
             normalized = _normalize_rodc_krbtgt_candidate(
                 props.get("samaccountname")
                 or props.get("samAccountName")
@@ -698,7 +771,11 @@ def _iter_rodc_krbtgt_candidates_from_workspace_graph(shell: Any, *, domain: str
         for node in nodes.values():
             if not isinstance(node, dict):
                 continue
-            props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            props = (
+                node.get("properties")
+                if isinstance(node.get("properties"), dict)
+                else {}
+            )
             normalized = _normalize_rodc_krbtgt_candidate(
                 props.get("samaccountname")
                 or props.get("samAccountName")
@@ -715,7 +792,9 @@ def _iter_rodc_krbtgt_candidates_from_workspace_graph(shell: Any, *, domain: str
     return candidates
 
 
-def _iter_rodc_krbtgt_candidates_from_workspace_files(shell: Any, *, domain: str) -> list[str]:
+def _iter_rodc_krbtgt_candidates_from_workspace_files(
+    shell: Any, *, domain: str
+) -> list[str]:
     """Return per-RODC krbtgt usernames parsed from workspace artefacts."""
     from pathlib import Path
 
@@ -747,9 +826,11 @@ def _iter_rodc_krbtgt_candidates_from_workspace_files(shell: Any, *, domain: str
     return ordered
 
 
-def _iter_rodc_krbtgt_candidates_from_bloodhound(shell: Any, *, domain: str) -> list[str]:
+def _iter_rodc_krbtgt_candidates_from_bloodhound(
+    shell: Any, *, domain: str
+) -> list[str]:
     """Return per-RODC krbtgt usernames via a focused BloodHound query."""
-    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    service_getter = getattr(shell, "_get_graph_service", None)
     if not callable(service_getter):
         return []
 
@@ -844,11 +925,36 @@ def _detect_rodc_krbtgt_account_name(shell: Any, *, domain: str) -> str | None:
     6. Interactive selector/prompt handled by the caller.
     """
     sources: tuple[tuple[str, Callable[[Any], list[str]]], ...] = (
-        ("domains_data", lambda current_shell: _iter_rodc_krbtgt_candidates_from_domain_data(current_shell, domain=domain)),
-        ("workspace_graph", lambda current_shell: _iter_rodc_krbtgt_candidates_from_workspace_graph(current_shell, domain=domain)),
-        ("workspace_files", lambda current_shell: _iter_rodc_krbtgt_candidates_from_workspace_files(current_shell, domain=domain)),
-        ("bloodhound", lambda current_shell: _iter_rodc_krbtgt_candidates_from_bloodhound(current_shell, domain=domain)),
-        ("ldap", lambda current_shell: _iter_rodc_krbtgt_candidates_from_ldap(current_shell, domain=domain)),
+        (
+            "domains_data",
+            lambda current_shell: _iter_rodc_krbtgt_candidates_from_domain_data(
+                current_shell, domain=domain
+            ),
+        ),
+        (
+            "workspace_graph",
+            lambda current_shell: _iter_rodc_krbtgt_candidates_from_workspace_graph(
+                current_shell, domain=domain
+            ),
+        ),
+        (
+            "workspace_files",
+            lambda current_shell: _iter_rodc_krbtgt_candidates_from_workspace_files(
+                current_shell, domain=domain
+            ),
+        ),
+        (
+            "bloodhound",
+            lambda current_shell: _iter_rodc_krbtgt_candidates_from_bloodhound(
+                current_shell, domain=domain
+            ),
+        ),
+        (
+            "ldap",
+            lambda current_shell: _iter_rodc_krbtgt_candidates_from_ldap(
+                current_shell, domain=domain
+            ),
+        ),
     )
 
     seen: set[str] = set()
@@ -904,6 +1010,7 @@ def _run_rodc_krbtgt_followup(
     nxc_auth: str | None = None,
     auth_kind_label: str = "host access credential",
     winrm_secret: str | None = None,
+    kdc_ip: str | None = None,
 ) -> None:
     """Run the common RODC per-krbtgt extraction follow-up.
 
@@ -936,6 +1043,9 @@ def _run_rodc_krbtgt_followup(
         domain=effective_domain,
         target_host=host_target,
         workflow_label="RODC krbtgt live extraction",
+        service="winrm"
+        if winrm_secret or preferred_transport.lower() == "winrm"
+        else "smb",
         resume_after_pivot=True,
     )
     if viability is None:
@@ -1053,6 +1163,16 @@ def _run_rodc_krbtgt_followup(
         icon="🔑",
     )
 
+    # Ensure followup-chain graph nodes exist before attempting edge updates.
+    # persist_rodc_followup_chain_edges is never called from the RBCD path,
+    # so the synthetic FollowupState nodes are absent and edge updates silently
+    # fail with edge_nodes_not_found.  Idempotent — safe to call each time.
+    try:
+        _graph = load_attack_graph(shell, effective_domain)
+        persist_rodc_followup_chain_edges(shell, effective_domain, _graph)
+    except Exception:
+        pass
+
     service = RodcKrbtgtExtractionService(shell)
     with active_step_followup(
         shell,
@@ -1066,7 +1186,10 @@ def _run_rodc_krbtgt_followup(
             relation="ExtractRodcKrbtgtSecret",
             to_label=krbtgt_ready_label,
             status="attempted",
-            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+            notes={
+                "source": "rodc_followup_chain_runtime",
+                "rodc_target": rodc_graph_label,
+            },
         )
         outcome = service.extract(
             RodcKrbtgtExtractionRequest(
@@ -1080,6 +1203,7 @@ def _run_rodc_krbtgt_followup(
                 nxc_auth=nxc_auth,
                 preferred_transport=preferred_transport,
                 winrm_secret=winrm_secret or None,
+                kdc_ip=kdc_ip or None,
             )
         )
 
@@ -1090,7 +1214,10 @@ def _run_rodc_krbtgt_followup(
         relation="ExtractRodcKrbtgtSecret",
         to_label=krbtgt_ready_label,
         status="success" if bool(outcome.success and outcome.credentials) else "failed",
-        notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        notes={
+            "source": "rodc_followup_chain_runtime",
+            "rodc_target": rodc_graph_label,
+        },
     )
 
     _persist_rodc_krbtgt_outcome(
@@ -1172,6 +1299,10 @@ def _run_rbcd_rodc_krbtgt_followup(
     # If we have an http/ ticket, prefer WinRM for exec (better token for SW4)
     # and keep SMB for file transfer (upload/download always via SMB share).
     preferred = "auto" if http_ticket_path else "smb"
+    effective_domain = target_domain or domain
+    kdc_ip = resolve_dc_ip(
+        getattr(shell, "domains_data", {}).get(effective_domain) or {}
+    )
     _run_rodc_krbtgt_followup(
         shell,
         domain=domain,
@@ -1183,6 +1314,7 @@ def _run_rbcd_rodc_krbtgt_followup(
         nxc_auth=nxc_auth,
         auth_kind_label=f"Kerberos ccache ({delegated_user}@cifs_{target_computer})",
         winrm_secret=http_ticket_path or None,
+        kdc_ip=kdc_ip or None,
     )
 
 
@@ -1622,6 +1754,24 @@ def _forge_rodc_golden_ticket(
         target_user=target_user,
         ticket_path=outcome.ccache_path,
     )
+    # Forged golden tickets contain a real TGT for ``target_user`` (server is
+    # ``krbtgt/<REALM>@<REALM>``).  Register it under kerberos_tickets so any
+    # downstream Kerberos consumer (LDAP, SMB) can find it by username.
+    try:
+        CredentialStoreService().store_kerberos_ticket(
+            domains_data=getattr(shell, "domains_data", {}),
+            domain=plan.domain,
+            username=target_user,
+            ticket_path=outcome.ccache_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from adscan_internal import telemetry as _telemetry  # noqa: PLC0415
+
+        _telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[rodc-golden] failed to register golden ticket for "
+            f"{mark_sensitive(target_user, 'user')}: {type(exc).__name__}: {exc}"
+        )
     return outcome.ccache_path
 
 
@@ -1656,7 +1806,10 @@ def _run_rodc_golden_ticket_followup(
             relation="ForgeRodcGoldenTicket",
             to_label=golden_ticket_label,
             status="attempted",
-            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+            notes={
+                "source": "rodc_followup_chain_runtime",
+                "rodc_target": rodc_graph_label,
+            },
         )
         ticket_path = _forge_rodc_golden_ticket(
             shell,
@@ -1670,7 +1823,10 @@ def _run_rodc_golden_ticket_followup(
         relation="ForgeRodcGoldenTicket",
         to_label=golden_ticket_label,
         status="success" if bool(ticket_path) else "failed",
-        notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        notes={
+            "source": "rodc_followup_chain_runtime",
+            "rodc_target": rodc_graph_label,
+        },
     )
 
 
@@ -1700,7 +1856,9 @@ def _run_rodc_key_list_followup(
         stage="forge_golden_ticket",
     )
     domain_record = resolve_domain_node_record_for_domain(shell, plan.domain)
-    domain_label = str(domain_record.get("label") or domain_record.get("name") or plan.domain)
+    domain_label = str(
+        domain_record.get("label") or domain_record.get("name") or plan.domain
+    )
     material = _resolve_rodc_key_material(shell, plan=plan)
     if material is None:
         print_error(
@@ -1756,14 +1914,10 @@ def _run_rodc_key_list_followup(
         rodc_number=rodc_number,
         rodc_aes_key=rodc_aes_key,
         targets=(target_user,),
-        ccache_path=ticket_path,
-        use_kerberos=True,
-        dc_ip=str(
-            getattr(shell, "domains_data", {}).get(plan.domain, {}).get("dc_ip") or ""
-        ).strip()
-        or None,
-        impacket_scripts_dir=str(getattr(shell, "impacket_scripts_dir", "") or "").strip()
-        or None,
+        forged_ticket_ccache=ticket_path,
+        dc_ip=resolve_dc_ip(
+            getattr(shell, "domains_data", {}).get(plan.domain, {}) or {}
+        ),
     )
 
     with active_step_followup(
@@ -1778,12 +1932,12 @@ def _run_rodc_key_list_followup(
             relation="KerberosKeyList",
             to_label=domain_label,
             status="attempted",
-            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+            notes={
+                "source": "rodc_followup_chain_runtime",
+                "rodc_target": rodc_graph_label,
+            },
         )
-        outcome = KerberosKeyListService().run(
-            request,
-            run_command=getattr(shell, "run_command", None),
-        )
+        outcome = KerberosKeyListService().run(request)
 
     if outcome.raw_output:
         _save_rodc_key_list_output(
@@ -1801,7 +1955,10 @@ def _run_rodc_key_list_followup(
             relation="KerberosKeyList",
             to_label=domain_label,
             status="failed",
-            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+            notes={
+                "source": "rodc_followup_chain_runtime",
+                "rodc_target": rodc_graph_label,
+            },
         )
         error_detail = str(outcome.error_message or "unknown error")
         print_warning(
@@ -1820,7 +1977,8 @@ def _run_rodc_key_list_followup(
         add_credential = getattr(shell, "add_credential", None)
         if callable(add_credential):
             add_credential(
-                credential.domain.lower(), credential.username, credential.nt_hash
+                credential.domain.lower(), credential.username, credential.nt_hash,
+                credential_origin="rodc_key_list",
             )
 
     recovered = ", ".join(
@@ -1839,7 +1997,10 @@ def _run_rodc_key_list_followup(
         relation="KerberosKeyList",
         to_label=domain_label,
         status="success",
-        notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        notes={
+            "source": "rodc_followup_chain_runtime",
+            "rodc_target": rodc_graph_label,
+        },
     )
     print_success(f"Kerberos Key List recovered NTLM material for {recovered}.")
 
@@ -1905,7 +2066,9 @@ def _build_rodc_golden_ticket_execution_options(
 ) -> list[FollowupExecutionOption]:
     """Return reuse/rerun/review options for one stored RODC golden ticket."""
     state = getattr(plan, "state", None)
-    target_user = str(getattr(state, "current_target_user", "") or "").strip() or "Administrator"
+    target_user = (
+        str(getattr(state, "current_target_user", "") or "").strip() or "Administrator"
+    )
     ticket_path = _resolve_existing_rodc_golden_ticket_path(
         shell,
         domain=key_plan.domain,
@@ -1967,7 +2130,9 @@ def _build_rodc_key_list_execution_options(
 ) -> list[FollowupExecutionOption]:
     """Return reuse/rerun/review options for one Key List-capable RODC state."""
     state = getattr(plan, "state", None)
-    target_user = str(getattr(state, "current_target_user", "") or "").strip() or "Administrator"
+    target_user = (
+        str(getattr(state, "current_target_user", "") or "").strip() or "Administrator"
+    )
     output_path = _resolve_rodc_key_list_output_path(
         shell,
         domain=key_plan.domain,
@@ -1994,9 +2159,7 @@ def _build_rodc_key_list_execution_options(
         FollowupExecutionOption(
             key="rerun_rodc_key_list",
             label="Re-run Kerberos Key List",
-            description=(
-                "Repeat the Key List request now against a writable DC."
-            ),
+            description=("Repeat the Key List request now against a writable DC."),
             handler=lambda key_plan=key_plan: _run_rodc_key_list_followup(
                 shell,
                 plan=_resolve_required_rodc_key_plan(
@@ -2179,13 +2342,11 @@ def _build_rodc_host_access_followups(
                         else "Forge RODC Golden Ticket"
                     ),
                     description=(
-                        (
-                            f"Reuse or re-forge the RODC golden ticket for {marked_target} "
-                            "using the stored per-RODC krbtgt material."
-                            if has_stored_ticket
-                            else f"Forge a reusable RODC golden ticket for {marked_target} "
-                            "using the stored per-RODC krbtgt material."
-                        )
+                        f"Reuse or re-forge the RODC golden ticket for {marked_target} "
+                        "using the stored per-RODC krbtgt material."
+                        if has_stored_ticket
+                        else f"Forge a reusable RODC golden ticket for {marked_target} "
+                        "using the stored per-RODC krbtgt material."
                     ),
                     handler=lambda key_plan=key_plan: _run_rodc_golden_ticket_followup(
                         shell,
@@ -2196,7 +2357,8 @@ def _build_rodc_host_access_followups(
                             fallback=key_plan,
                         ),
                     ),
-                    execution_options_factory=lambda key_plan=key_plan, plan=plan: _build_rodc_golden_ticket_execution_options(
+                    execution_options_factory=lambda key_plan=key_plan,
+                    plan=plan: _build_rodc_golden_ticket_execution_options(
                         shell,
                         plan=plan,
                         key_plan=_resolve_required_rodc_key_plan(
@@ -2224,13 +2386,11 @@ def _build_rodc_host_access_followups(
                         else "Run Kerberos Key List"
                     ),
                     description=(
-                        (
-                            f"Review or re-run Kerberos Key List for {marked_target} "
-                            "using the stored per-RODC AES material."
-                            if has_stored_key_list
-                            else f"Use the stored per-RODC AES material for {marked_target} "
-                            "to request Key List secrets from a writable DC."
-                        )
+                        f"Review or re-run Kerberos Key List for {marked_target} "
+                        "using the stored per-RODC AES material."
+                        if has_stored_key_list
+                        else f"Use the stored per-RODC AES material for {marked_target} "
+                        "to request Key List secrets from a writable DC."
                     ),
                     handler=lambda key_plan=key_plan: _run_rodc_key_list_followup(
                         shell,
@@ -2241,7 +2401,8 @@ def _build_rodc_host_access_followups(
                             fallback=key_plan,
                         ),
                     ),
-                    execution_options_factory=lambda key_plan=key_plan, plan=plan: _build_rodc_key_list_execution_options(
+                    execution_options_factory=lambda key_plan=key_plan,
+                    plan=plan: _build_rodc_key_list_execution_options(
                         shell,
                         plan=plan,
                         key_plan=_resolve_required_rodc_key_plan(
@@ -2273,7 +2434,8 @@ def _build_rodc_host_access_followups(
                         else extract_description
                     ),
                     handler=extract_handler,
-                    execution_options_factory=lambda plan=plan, extract_handler=extract_handler: _build_rodc_extract_execution_options(
+                    execution_options_factory=lambda plan=plan,
+                    extract_handler=extract_handler: _build_rodc_extract_execution_options(
                         shell,
                         plan=plan,
                         extract_handler=extract_handler,

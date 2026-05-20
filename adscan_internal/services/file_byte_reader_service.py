@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from adscan_internal.services.base_service import BaseService
-from adscan_internal.services.impacket_smb_byte_reader_service import (
-    ImpacketSMBByteReaderService,
+from adscan_internal.services.smb_byte_reader_service import (
+    SMBByteReaderService,
 )
 
 
@@ -96,11 +96,11 @@ class SMBFileByteReaderService(BaseService):
     def __init__(
         self,
         *,
-        smb_reader: ImpacketSMBByteReaderService | None = None,
+        smb_reader: SMBByteReaderService | None = None,
     ) -> None:
-        """Initialize adapter with the concrete Impacket SMB reader."""
+        """Initialize adapter with the concrete aiosmb SMB reader."""
         super().__init__()
-        self._smb_reader = smb_reader or ImpacketSMBByteReaderService()
+        self._smb_reader = smb_reader or SMBByteReaderService()
 
     def read_file_bytes(
         self,
@@ -133,7 +133,7 @@ class SMBFileByteReaderService(BaseService):
             success=smb_result.success,
             data=smb_result.data,
             truncated=smb_result.truncated,
-            backend="smb_impacket",
+            backend="smb_aiosmb",
             source_path=smb_result.source_path or source_path,
             error_message=smb_result.error_message,
             auth_username=smb_result.auth_username,

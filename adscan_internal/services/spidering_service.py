@@ -48,6 +48,10 @@ from adscan_internal.services.credsweeper_service import (
 from adscan_internal.services.share_file_analyzer_service import (
     ShareFileAnalyzerService,
 )
+from adscan_internal.services.office_artifact_service import (
+    OfficeArtifactService,
+    OFFICE_ENCRYPTED_EXTENSIONS,
+)
 from adscan_internal.services.share_file_finding_action_service import (
     ShareFileFindingActionService,
 )
@@ -132,6 +136,10 @@ class SpideringService(BaseService):
             [str, str, list[str] | None, list[str] | None, str | None], int
         ]
         | None = None,
+        office_artifact_callback: Callable[
+            [str, str, list[str] | None, list[str] | None, str | None], int
+        ]
+        | None = None,
         handle_found_credentials_callback: HandleFoundCredentialsCallback | None = None,
         credsweeper_path: str | None = None,
         pypykatz_path: str | None = None,
@@ -156,6 +164,7 @@ class SpideringService(BaseService):
         self._add_credential_callback = add_credential_callback
         self._cpassword_callback = cpassword_callback
         self._keepass_artifact_callback = keepass_artifact_callback
+        self._office_artifact_callback = office_artifact_callback
         self._handle_found_credentials_callback = handle_found_credentials_callback
         self._credsweeper_path = str(credsweeper_path or "").strip()
         self._pypykatz_path = pypykatz_path
@@ -174,6 +183,7 @@ class SpideringService(BaseService):
                 cpassword_callback=self._cpassword_callback,
                 certipy_callback=self._certipy_callback,
                 keepass_artifact_callback=self._keepass_artifact_callback,
+                office_artifact_callback=self._office_artifact_callback,
             )
         )
 
@@ -686,6 +696,18 @@ class SpideringService(BaseService):
                 auth_username=auth_username,
                 apply_actions=apply_actions,
             )
+
+        if effective_suffix in OFFICE_ENCRYPTED_EXTENSIONS and scan_type == "ext":
+            if OfficeArtifactService.is_encrypted_path(file_path):
+                print_info_verbose(f"Found encrypted Office artifact: {filename}")
+                return self._process_office_file(
+                    file_path=file_path,
+                    domain=domain,
+                    source_hosts=source_hosts,
+                    source_shares=source_shares,
+                    auth_username=auth_username,
+                    apply_actions=apply_actions,
+                )
 
         if effective_suffix == ".zip" and scan_type == "ext":
             print_info_verbose(f"Found .zip file: {filename}")
@@ -1727,6 +1749,57 @@ class SpideringService(BaseService):
                 artifact_type=Path(file_path).suffix.lstrip(".") or "kdbx",
                 status="failed",
                 note=f"KeePass processing failed: {type(exc).__name__}.",
+            )
+
+
+    def _process_office_file(
+        self,
+        *,
+        file_path: str,
+        domain: str,
+        source_hosts: list[str] | None,
+        source_shares: list[str] | None,
+        auth_username: str | None,
+        apply_actions: bool,
+    ) -> ArtifactProcessingRecord:
+        """Process encrypted Office artifacts via shared action dispatcher."""
+        try:
+            if apply_actions:
+                extracted = self._share_file_finding_action_service.apply_office_artifact(
+                    domain=domain,
+                    source_path=file_path,
+                    source_hosts=source_hosts,
+                    source_shares=source_shares,
+                    auth_username=auth_username,
+                )
+                note = (
+                    "Office artifact cracked — password recovered."
+                    if extracted > 0
+                    else "Office artifact processed but password was not recovered."
+                )
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=Path(file_path).name,
+                    artifact_type=Path(file_path).suffix.lstrip(".") or "xlsx",
+                    status="processed" if extracted > 0 else "processed_no_findings",
+                    note=note,
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=Path(file_path).name,
+                artifact_type=Path(file_path).suffix.lstrip(".") or "xlsx",
+                status="skipped",
+                note="Office artifact cracking skipped because follow-up actions are disabled.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error("Error processing encrypted Office artifact.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=Path(file_path).name,
+                artifact_type=Path(file_path).suffix.lstrip(".") or "xlsx",
+                status="failed",
+                note=f"Office artifact processing failed: {type(exc).__name__}.",
             )
 
 

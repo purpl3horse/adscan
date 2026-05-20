@@ -19,7 +19,6 @@ import os
 from typing import Any
 
 from rich.prompt import Confirm
-from rich.table import Table
 
 from adscan_internal import (
     print_info,
@@ -30,10 +29,22 @@ from adscan_internal import (
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.domain_connectivity_service import (
+    normalize_domain_connectivity_entry,
     reconcile_domain_connectivity_from_current_vantage_report,
+    reconcile_domain_connectivity_from_pivot_targets,
 )
 from adscan_internal.services.pivot_runtime_state_service import (
     snapshot_direct_vantage_artifacts,
+)
+from adscan_internal.services.inventory_timeline_service import (
+    TRIGGER_POST_PIVOT,
+    compute_inventory_diff,
+    is_timeline_enabled,
+    list_snapshots,
+    load_snapshot_payload,
+    mark_diff_seen,
+    record_inventory_snapshot,
+    render_inventory_diff,
 )
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.layout import DEFAULT_DOMAIN_LAYOUT
@@ -172,7 +183,7 @@ def render_post_pivot_reachability_delta(
     context: PivotExecutionContext,
     refresh_result: PostPivotRefreshResult,
 ) -> None:
-    """Render a concise UX summary for hosts unlocked by one successful pivot."""
+    """Render the structured reachability diff unlocked by one successful pivot."""
     new_hosts = refresh_result.newly_reachable_hosts or []
     new_ips = refresh_result.newly_reachable_ips or []
     if not new_hosts:
@@ -187,45 +198,54 @@ def render_post_pivot_reachability_delta(
         f"{len(new_hosts)} newly reachable host(s) / {len(new_ips)} IP(s) in "
         f"{mark_sensitive(context.domain, 'domain')}."
     )
-    if getattr(shell, "console", None):
-        table = Table(title="Newly Reachable Hosts After Pivot", box=None)
-        table.add_column("Host")
-        table.add_column("New IPs")
-        table.add_column("Open Ports")
-        table.add_column("Status")
-        for host_entry in new_hosts[:10]:
-            ips = host_entry.get("ips", [])
-            ip_values = ", ".join(
-                mark_sensitive(str(item.get("ip") or ""), "ip")
-                for item in ips
-                if str(item.get("ip") or "").strip()
-            ) or "-"
-            open_ports = sorted(
-                {
-                    str(port)
-                    for item in ips
-                    for port in (item.get("open_ports") or [])
-                    if str(port).strip()
-                }
-            )
-            statuses = sorted(
-                {
-                    str(item.get("classification") or item.get("status") or "").strip()
-                    for item in ips
-                    if str(item.get("classification") or item.get("status") or "").strip()
-                }
-            )
-            table.add_row(
-                mark_sensitive(str(host_entry.get("display_name") or ""), "hostname"),
-                ip_values,
-                ", ".join(open_ports) or "-",
-                ", ".join(mark_sensitive(status, "text") for status in statuses) or "-",
-            )
-        shell.console.print(table)
-    if len(new_hosts) > 10:
-        print_info(
-            f"Showing the first 10 unlocked hosts. Total newly reachable hosts: {len(new_hosts)}."
+
+    if not is_timeline_enabled(shell):
+        print_info_debug(
+            "[post-pivot] inventory timeline disabled; skipping detailed diff rendering."
         )
+        return
+
+    entries = list_snapshots(shell, domain=context.domain)
+    if not entries:
+        print_info_debug(
+            "[post-pivot] no inventory snapshots recorded yet; skipping detailed diff rendering."
+        )
+        return
+
+    after_entry = entries[-1]
+    before_entry = entries[-2] if len(entries) >= 2 else None
+    after_payload = load_snapshot_payload(
+        shell, domain=context.domain, snapshot_id=after_entry.id
+    )
+    if not isinstance(after_payload, dict):
+        return
+    before_payload = (
+        load_snapshot_payload(shell, domain=context.domain, snapshot_id=before_entry.id)
+        if before_entry is not None
+        else None
+    )
+    diff = compute_inventory_diff(
+        domain=context.domain,
+        before_payload=before_payload,
+        before_id=before_entry.id if before_entry else None,
+        before_at=before_entry.at if before_entry else None,
+        after_payload=after_payload,
+        after_id=after_entry.id,
+        after_at=after_entry.at,
+    )
+    context_lines = [
+        f"Pivot via {mark_sensitive(context.pivot_tool, 'text')} "
+        f"({mark_sensitive(context.pivot_method, 'text')}) through "
+        f"{mark_sensitive(context.pivot_host, 'hostname')}",
+        f"Source service: {mark_sensitive(context.source_service, 'text')}",
+    ]
+    render_inventory_diff(
+        shell,
+        diff=diff,
+        title="Newly Reachable Through Pivot",
+        context_lines=context_lines,
+    )
+    mark_diff_seen(shell, domain=context.domain, snapshot_id=after_entry.id)
     print_info_debug(
         "[post-pivot] reachability delta: "
         f"domain={mark_sensitive(context.domain, 'domain')} "
@@ -264,7 +284,8 @@ def _run_owned_user_followup_after_pivot(shell: Any, *, domain: str) -> None:
         max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
         max_display=20,
         target="all",
-        target_mode="tier0",
+        target_mode="object",
+        display_friendly=True,
     )
 
     eligible_users: list[tuple[str, str]] = []
@@ -388,9 +409,9 @@ def maybe_offer_trust_followup_for_newly_reachable_domains(
         domain
         for domain in newly_reachable_domains
         if not bool(
-            (domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}).get(
-                "phase1_complete"
-            )
+            (
+                domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+            ).get("phase1_complete")
         )
     ]
     if not pending_domains:
@@ -401,7 +422,9 @@ def maybe_offer_trust_followup_for_newly_reachable_domains(
         return
 
     marked_source = mark_sensitive(source_domain, "domain")
-    domain_lines = [f"• {mark_sensitive(domain, 'domain')}" for domain in pending_domains[:8]]
+    domain_lines = [
+        f"• {mark_sensitive(domain, 'domain')}" for domain in pending_domains[:8]
+    ]
     if len(pending_domains) > 8:
         domain_lines.append(f"• ... +{len(pending_domains) - 8} more")
 
@@ -429,6 +452,48 @@ def maybe_offer_trust_followup_for_newly_reachable_domains(
         return
     if Confirm.ask(prompt, default=prompt_default):
         trust_runner(source_domain)
+
+
+def maybe_offer_post_pivot_trust_followup_from_targets(
+    shell: Any,
+    *,
+    context: PivotExecutionContext,
+    confirmed_targets: list[dict[str, Any]],
+) -> list[str]:
+    """Reconcile and offer trusted-domain follow-up from direct pivot probe evidence.
+
+    Args:
+        shell: Active ADscan shell.
+        context: Successful pivot execution context.
+        confirmed_targets: Reachable targets confirmed from the pivot host before tunnel creation.
+
+    Returns:
+        Trusted domains that became reachable through this pivot.
+    """
+    newly_reachable_domains = reconcile_domain_connectivity_from_pivot_targets(
+        shell,
+        source_domain=context.domain,
+        targets=confirmed_targets,
+        pivot_host=context.pivot_host,
+        pivot_method=context.pivot_method,
+        pivot_tool=context.pivot_tool,
+        source_service=context.source_service,
+    )
+    if not newly_reachable_domains:
+        return []
+
+    print_info_debug(
+        "[post-pivot] reconciled trusted-domain connectivity from pivot targets: "
+        f"domain={mark_sensitive(context.domain, 'domain')} "
+        f"pivot_host={mark_sensitive(context.pivot_host, 'hostname')} "
+        f"updated={len(newly_reachable_domains)}"
+    )
+    _maybe_offer_post_pivot_trust_followup(
+        shell,
+        context=context,
+        newly_reachable_domains=newly_reachable_domains,
+    )
+    return newly_reachable_domains
 
 
 def refresh_network_inventory_after_pivot(
@@ -519,6 +584,21 @@ def refresh_network_inventory_after_pivot(
     after_payload = _load_workspace_network_reachability_report(
         shell, domain=context.domain
     )
+    try:
+        record_inventory_snapshot(
+            shell,
+            domain=context.domain,
+            trigger=TRIGGER_POST_PIVOT,
+            trigger_detail=(
+                f"{context.pivot_tool}:{context.source_service}:{context.pivot_host}"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[post-pivot] failed to record inventory timeline snapshot: "
+            f"{mark_sensitive(str(exc), 'detail')}"
+        )
     newly_reachable_ips, newly_reachable_hosts = _compute_post_pivot_reachability_delta(
         before_payload=before_payload,
         after_payload=after_payload,
@@ -558,10 +638,12 @@ def refresh_network_inventory_after_pivot(
                 with open(report_path, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle, indent=2, sort_keys=False)
                     handle.write("\n")
-                newly_reachable_domains = reconcile_domain_connectivity_from_current_vantage_report(
-                    shell,
-                    source_domain=context.domain,
-                    payload=payload,
+                newly_reachable_domains = (
+                    reconcile_domain_connectivity_from_current_vantage_report(
+                        shell,
+                        source_domain=context.domain,
+                        payload=payload,
+                    )
                 )
                 if newly_reachable_domains:
                     print_info_debug(
@@ -607,17 +689,53 @@ def _maybe_offer_post_pivot_trust_followup(
     newly_reachable_domains: list[str],
 ) -> None:
     """Offer trust follow-up when pivoting unlocks new trusted domains."""
+    domain_details: list[str] = []
+    raw_connectivity = getattr(shell, "domain_connectivity", {})
+    for domain in newly_reachable_domains[:8]:
+        entry = (
+            raw_connectivity.get(domain, {})
+            if isinstance(raw_connectivity, dict)
+            else {}
+        )
+        normalized = normalize_domain_connectivity_entry(entry)
+        summary = normalized.get("summary", {})
+        if not isinstance(summary, dict):
+            domain_details.append(f"• {mark_sensitive(domain, 'domain')}")
+            continue
+        pdc_ip = str(summary.get("pdc_ip") or summary.get("host") or "").strip()
+        open_ports = ", ".join(
+            str(port) for port in summary.get("open_ports", []) if str(port).strip()
+        )
+        previous = "previously unreachable from the direct vantage"
+        direct_vantage = normalized.get("vantages", {}).get("direct:local", {})
+        if isinstance(direct_vantage, dict):
+            direct_status = str(direct_vantage.get("status") or "").strip()
+            if direct_status:
+                previous = f"previous direct status: {direct_status}"
+        detail_parts = [mark_sensitive(domain, "domain")]
+        if pdc_ip:
+            detail_parts.append(f"PDC {mark_sensitive(pdc_ip, 'ip')}")
+        if open_ports:
+            detail_parts.append(f"AD ports {mark_sensitive(open_ports, 'text')}")
+        detail_parts.append(mark_sensitive(previous, "text"))
+        domain_details.append("• " + " | ".join(detail_parts))
+
     maybe_offer_trust_followup_for_newly_reachable_domains(
         shell,
         source_domain=context.domain,
         newly_reachable_domains=newly_reachable_domains,
         title="New Trusted Domains Reachable",
         lead_lines=[
-            "The pivot changed your current vantage and unlocked additional trusted-domain reachability.",
+            "High-value pivot discovery: the tunnel made previously unreachable trusted-domain infrastructure reachable.",
             f"Pivot host: {mark_sensitive(context.pivot_host, 'hostname')}",
+            "",
+            "Why this matters: ADscan may now be able to authenticate, enumerate BloodHound data, inspect trusts from the newly reachable domain, and discover cross-domain attack paths that were invisible before the pivot.",
+            "",
+            "Unlocked trusted-domain evidence:",
+            *domain_details,
         ],
         prompt=(
-            "Do you want ADscan to continue trust-driven authenticated enumeration "
+            "Do you want ADscan to prioritize trust-driven authenticated enumeration "
             f"from {mark_sensitive(context.domain, 'domain')} now?"
         ),
     )

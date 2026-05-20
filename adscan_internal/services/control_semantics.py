@@ -1,9 +1,21 @@
-"""Central ADscan control semantics for privileged groups and principals."""
+"""Central ADscan control semantics for privileged groups and principals.
+
+Group → compromise-class mapping is documented in:
+- ``adscan-private-tool/CLAUDE.md`` (§ Nomenclature Standard)
+- ``adscan-obsidian/business/12_nomenclature_standard.md``
+
+The canonical exposed field is ``compromise_class`` (see
+``adscan_internal.services.compromise_class``). The legacy
+``is_direct_control`` / ``is_enabler`` / ``is_high_impact`` flags are
+kept on the returned dict during the migration period so existing call
+sites continue to work without change.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
+from adscan_internal.services.compromise_class import derive_compromise_class
 from adscan_internal.services.privileged_group_classifier import (
     PrivilegedGroupMembership,
     classify_privileged_membership,
@@ -23,12 +35,12 @@ def _equivalence_class_for_membership(membership: PrivilegedGroupMembership) -> 
             membership.schema_admins,
             membership.administrators,
             membership.read_only_domain_controllers,
-            membership.backup_operators,
         )
     ):
         return "critical_control"
     if any(
         (
+            membership.backup_operators,
             membership.account_operators,
             membership.cert_publishers,
             membership.key_admins,
@@ -56,7 +68,15 @@ def classify_membership_control_semantics(
     membership: PrivilegedGroupMembership,
     group_sids: list[str],
 ) -> dict[str, Any]:
-    """Return ADscan control semantics for one principal or group."""
+    """Return ADscan control semantics for one principal or group.
+
+    Backup Operators is intentionally classified as ``is_enabler`` (a
+    Privileged Escalator) rather than ``is_direct_control``: membership
+    by itself is not domain compromise, it requires the explicit
+    BackupOperatorsEscalation step against a Domain Controller. This
+    matches the pre-existing ADscan compromise-flow logic — see
+    ``test_backup_operators_membership_does_not_trigger_ctf_domain_compromise``.
+    """
     normalized_group_sids = [
         sid for sid in (normalize_sid(value) for value in group_sids) if sid
     ]
@@ -69,11 +89,11 @@ def classify_membership_control_semantics(
             membership.schema_admins,
             membership.administrators,
             membership.read_only_domain_controllers,
-            membership.backup_operators,
         )
     )
-    is_enabler = any(
+    is_privileged_escalator = any(
         (
+            membership.backup_operators,
             membership.account_operators,
             membership.cert_publishers,
             membership.key_admins,
@@ -97,7 +117,7 @@ def classify_membership_control_semantics(
     if is_direct_control:
         control_level = "direct_domain_control"
         terminality = "direct"
-    elif is_enabler:
+    elif is_privileged_escalator:
         control_level = "domain_control_enabler"
         terminality = "indirect"
     elif is_high_impact:
@@ -111,19 +131,27 @@ def classify_membership_control_semantics(
         "forest"
         if membership.enterprise_admins or membership.schema_admins
         else "domain"
-        if is_direct_control or is_enabler
+        if is_direct_control or is_privileged_escalator
         else "contextual"
         if is_high_impact
         else "none"
     )
+
+    compromise_class = derive_compromise_class(
+        is_direct_control=is_direct_control,
+        is_privileged_escalator=is_privileged_escalator,
+    )
+
     return {
         "control_level": control_level,
         "terminality": terminality,
         "scope": scope,
         "equivalence_class": _equivalence_class_for_membership(membership),
         "is_direct_control": is_direct_control,
-        "is_enabler": is_enabler,
+        "is_privileged_escalator": is_privileged_escalator,
+        "is_enabler": is_privileged_escalator,  # legacy alias — do not extend
         "is_high_impact": is_high_impact,
+        "compromise_class": compromise_class.value,
     }
 
 

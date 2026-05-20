@@ -9,10 +9,8 @@ available from another transport such as ``rclone cat``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import logging
-import sys
 
 from adscan_internal import print_warning, print_warning_debug, telemetry
 from adscan_internal.services.base_service import BaseService
@@ -39,37 +37,15 @@ class InMemoryCredSweeperTarget:
     info: str = ""
 
 
-def _get_vendored_credsweeper_root() -> Path:
-    """Return the source-tree root for vendored CredSweeper fallback code."""
-    project_root = Path(__file__).resolve().parents[2]
-    return project_root / "external_tools" / "CredSweeper"
-
-
 def _load_credsweeper_library() -> tuple[Any, Any, Any]:
-    """Load CredSweeper library classes from the installed package.
+    """Load CredSweeper library classes from the installed PyPI package."""
+    from credsweeper import (  # type: ignore  # pylint: disable=import-error
+        ByteContentProvider,
+        CredSweeper,
+        DataContentProvider,
+    )
 
-    Falls back to the vendored source tree only in development environments
-    where the pinned package is not installed in the active interpreter.
-    """
-    try:
-        from credsweeper import (  # type: ignore
-            ByteContentProvider,
-            CredSweeper,
-            DataContentProvider,
-        )
-
-        return CredSweeper, ByteContentProvider, DataContentProvider
-    except ModuleNotFoundError:
-        vendored_root = _get_vendored_credsweeper_root()
-        if str(vendored_root) not in sys.path:
-            sys.path.insert(0, str(vendored_root))
-        from credsweeper import (  # type: ignore
-            ByteContentProvider,
-            CredSweeper,
-            DataContentProvider,
-        )
-
-        return CredSweeper, ByteContentProvider, DataContentProvider
+    return CredSweeper, ByteContentProvider, DataContentProvider
 
 
 class CredSweeperLibraryService(BaseService):
@@ -204,11 +180,24 @@ class CredSweeperLibraryService(BaseService):
         doc: bool,
         depth: bool,
     ) -> Any:
-        """Build the correct CredSweeper content provider for one target."""
+        """Build the correct CredSweeper content provider for one target.
+
+        DataContentProvider is for actual binary documents (PDF, DOCX, etc.).
+        For plain-text content — .txt, .log, .yaml, or anything not in
+        DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS — ByteContentProvider reads lines
+        correctly and is always preferred.
+
+        The `doc` flag in CredSweeper controls RULE SELECTION (target=[doc]
+        rules vs target=[code] rules), not the content provider. We honour the
+        distinction here: doc=True selects doc rules but still uses
+        ByteContentProvider for non-binary content so the rules can actually
+        read the lines.  DataContentProvider is reserved for the genuine binary
+        formats it was built for.
+        """
         normalized_type = str(target.file_type or "").strip().lower()
-        use_data_provider = bool(doc or depth)
-        if not use_data_provider and normalized_type in DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS:
-            use_data_provider = True
+        is_binary_doc = normalized_type in DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS
+        # depth always needs DataContentProvider (archive/nested scanning)
+        use_data_provider = depth or is_binary_doc
         if use_data_provider:
             return data_provider_cls(
                 data=target.content,

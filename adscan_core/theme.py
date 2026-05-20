@@ -33,6 +33,18 @@ COLOR_ERROR = "red"
 COLOR_INFO = ADSCAN_PRIMARY
 COLOR_DIM = "dim"
 
+# Tactical / findings palette — shared by collection panels and Textual TUI
+COLOR_AMBER = "#FF9500"  # warnings, ACL edges, kerberoast
+COLOR_STEEL = "#4A9EBA"  # structural info, DC names, edge counts
+COLOR_SAGE = "#4ADE80"  # success, reachable, authenticated
+COLOR_CRIMSON = "#DC2626"  # critical severity, failures, DA paths
+COLOR_MUTED = "grey50"  # secondary labels, pending states
+
+# Phase-tracker styles (used by print_phase_dashboard and Textual header)
+PHASE_DONE = "bold green"
+PHASE_ACTIVE = f"bold {COLOR_AMBER}"
+PHASE_PENDING = COLOR_MUTED
+
 # ============================================================================
 # Rich Theme Configuration
 # ============================================================================

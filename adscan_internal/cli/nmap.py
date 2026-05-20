@@ -419,10 +419,8 @@ def _run_nmap_port_scan_with_timeout_recovery(
     )
     print_info("This is common on very large domains or slow VPN links.")
 
-    is_non_interactive = bool(os.getenv("CI")) or bool(
-        getattr(shell, "non_interactive", False)
-    )
-    if is_non_interactive:
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive_check
+    if _is_non_interactive_check(shell):
         print_warning("Non-interactive mode detected; skipping retry without timeout.")
         return None
 
@@ -542,10 +540,16 @@ def _flatten_massdns_unique_ips(
     host_to_ips: dict[str, list[str]],
 ) -> list[str]:
     """Return unique IPs preserving hostname/input order from a massdns mapping."""
+    normalized_host_to_ips = {
+        str(hostname or "").strip().rstrip(".").lower(): list(ips)
+        for hostname, ips in host_to_ips.items()
+        if str(hostname or "").strip()
+    }
     unique_ips: list[str] = []
     seen_ips: set[str] = set()
     for hostname in hostnames:
-        for ip_value in host_to_ips.get(hostname, []):
+        normalized_hostname = str(hostname or "").strip().rstrip(".").lower()
+        for ip_value in normalized_host_to_ips.get(normalized_hostname, []):
             if ip_value in seen_ips:
                 continue
             seen_ips.add(ip_value)
@@ -622,26 +626,28 @@ def _apply_persisted_pdc_ip_fallback(
     collapsing to an empty target list when hostname resolution is unavailable.
     """
     domain_data = (
-        shell.domains_data.get(domain, {})
-        if hasattr(shell, "domains_data")
-        else {}
+        shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
     )
     pdc_ip = str(domain_data.get("pdc") or "").strip()
     if not pdc_ip:
         return host_to_ips, False, None
     validation_mode = str(domain_data.get("dns_validation_mode", "")).strip().lower()
     fallback_reason = (
-        "best_effort_pdc"
-        if validation_mode == "best_effort"
-        else "persisted_pdc"
+        "best_effort_pdc" if validation_mode == "best_effort" else "persisted_pdc"
     )
 
-    updated = {str(k).strip().rstrip(".").lower(): list(v) for k, v in host_to_ips.items()}
-    pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip().rstrip(".").lower()
+    updated = {
+        str(k).strip().rstrip(".").lower(): list(v) for k, v in host_to_ips.items()
+    }
+    pdc_hostname = (
+        str(domain_data.get("pdc_hostname") or "").strip().rstrip(".").lower()
+    )
     candidate_hosts = []
     if pdc_hostname:
         candidate_hosts.append(pdc_hostname)
-        candidate_hosts.append(f"{pdc_hostname}.{str(domain or '').strip().rstrip('.').lower()}")
+        candidate_hosts.append(
+            f"{pdc_hostname}.{str(domain or '').strip().rstrip('.').lower()}"
+        )
 
     injected = False
     for candidate in candidate_hosts:
@@ -721,9 +727,13 @@ def _filter_massdns_resolution_payload(
         payload.get("resolved", []) if isinstance(payload.get("resolved"), list) else []
     )
     unresolved_entries = (
-        payload.get("unresolved", []) if isinstance(payload.get("unresolved"), list) else []
+        payload.get("unresolved", [])
+        if isinstance(payload.get("unresolved"), list)
+        else []
     )
-    context = payload.get("context", {}) if isinstance(payload.get("context"), dict) else {}
+    context = (
+        payload.get("context", {}) if isinstance(payload.get("context"), dict) else {}
+    )
 
     filtered_resolved = resolved_entries if only in {None, "resolved"} else []
     filtered_unresolved = unresolved_entries if only in {None, "unresolved"} else []
@@ -932,7 +942,9 @@ def _show_massdns_resolution_summary(
         return
 
     show_all = total_hosts <= _MASSDNS_FULL_DETAIL_LIMIT
-    resolved_preview = ordered_resolved if show_all else ordered_resolved[:_MASSDNS_PREVIEW_LIMIT]
+    resolved_preview = (
+        ordered_resolved if show_all else ordered_resolved[:_MASSDNS_PREVIEW_LIMIT]
+    )
     unresolved_preview = unresolved if show_all else unresolved[:_MASSDNS_PREVIEW_LIMIT]
 
     if resolved_preview:
@@ -1019,9 +1031,7 @@ def run_massdns_report(
     reachability_payload = _load_network_reachability_report(reachability_report_path)
     if not payload:
         marked_domain = mark_sensitive(domain, "domain")
-        print_error(
-            f"No massdns resolution report found for domain {marked_domain}."
-        )
+        print_error(f"No massdns resolution report found for domain {marked_domain}.")
         return
     filtered_payload = _sort_massdns_resolution_payload(
         _filter_massdns_resolution_payload(payload, only=only),
@@ -1074,13 +1084,18 @@ def run_massdns_report(
     )
 
     total_hostnames = int(
-        summary.get("total_hostnames") or len(resolved_entries) + len(unresolved_entries)
+        summary.get("total_hostnames")
+        or len(resolved_entries) + len(unresolved_entries)
     )
     resolved_count = int(summary.get("resolved_hostnames") or len(resolved_entries))
-    unresolved_count = int(summary.get("unresolved_hostnames") or len(unresolved_entries))
+    unresolved_count = int(
+        summary.get("unresolved_hostnames") or len(unresolved_entries)
+    )
     unique_ip_count = int(summary.get("unique_ip_count") or 0)
     multi_ip_hostnames = summary.get("multi_ip_hostnames", [])
-    multi_ip_count = len(multi_ip_hostnames) if isinstance(multi_ip_hostnames, list) else 0
+    multi_ip_count = (
+        len(multi_ip_hostnames) if isinstance(multi_ip_hostnames, list) else 0
+    )
 
     print_operation_header(
         "MassDNS Resolution Report",
@@ -1104,9 +1119,13 @@ def run_massdns_report(
     if input_file:
         context_lines.append(f"Input file: {mark_sensitive(input_file, 'path')}")
     if resolved_ip_file:
-        context_lines.append(f"Resolved IP file: {mark_sensitive(resolved_ip_file, 'path')}")
+        context_lines.append(
+            f"Resolved IP file: {mark_sensitive(resolved_ip_file, 'path')}"
+        )
     if raw_output_file:
-        context_lines.append(f"Raw massdns output: {mark_sensitive(raw_output_file, 'path')}")
+        context_lines.append(
+            f"Raw massdns output: {mark_sensitive(raw_output_file, 'path')}"
+        )
     if isinstance(resolver_sources, list) and resolver_sources:
         preview = resolver_sources[:5]
         resolver_text = ", ".join(mark_sensitive(str(item), "ip") for item in preview)
@@ -1138,7 +1157,11 @@ def run_massdns_report(
         ips = entry.get("ips", [])
         if not hostname:
             continue
-        ip_values = [str(ip).strip() for ip in ips if str(ip).strip()] if isinstance(ips, list) else []
+        ip_values = (
+            [str(ip).strip() for ip in ips if str(ip).strip()]
+            if isinstance(ips, list)
+            else []
+        )
         resolved_table.add_row(
             mark_sensitive(hostname, "hostname"),
             ", ".join(mark_sensitive(ip, "ip") for ip in ip_values) or "-",
@@ -1173,18 +1196,14 @@ def run_massdns_report(
             f"Unresolved view truncated: {unresolved_count - unresolved_limit} more hostname(s) are present in the JSON report."
         )
     if multi_ip_count:
-        print_info(
-            f"{multi_ip_count} hostname(s) resolved to multiple IPv4 addresses."
-        )
+        print_info(f"{multi_ip_count} hostname(s) resolved to multiple IPv4 addresses.")
     if reachability_payload:
         _show_network_reachability_summary(
             shell,
             payload=reachability_payload,
             report_file=reachability_report_path,
         )
-    print_info(
-        f"JSON report path: {mark_sensitive(report_path, 'path')}."
-    )
+    print_info(f"JSON report path: {mark_sensitive(report_path, 'path')}.")
 
 
 def _nmap_output_indicates_missing_privileges(output: str) -> bool:
@@ -1357,12 +1376,17 @@ def _build_ip_to_hostnames_map(
     host_to_ips: dict[str, list[str]],
 ) -> dict[str, list[str]]:
     """Return a stable IP -> hostnames mapping from massdns results."""
+    normalized_host_to_ips = {
+        str(hostname or "").strip().rstrip(".").lower(): list(ips)
+        for hostname, ips in host_to_ips.items()
+        if str(hostname or "").strip()
+    }
     ip_to_hostnames: dict[str, list[str]] = {}
     for hostname in hostnames:
         key = str(hostname or "").strip().rstrip(".").lower()
         if not key:
             continue
-        for ip_value in host_to_ips.get(key, []):
+        for ip_value in normalized_host_to_ips.get(key, []):
             if not ip_value:
                 continue
             existing = ip_to_hostnames.setdefault(ip_value, [])
@@ -1423,7 +1447,9 @@ def _build_network_reachability_report(
         prefix_hint = _prefix_hint_from_ipv4(ip_value)
         if not prefix_hint:
             continue
-        stats = prefix_stats.setdefault(prefix_hint, {"responsive": 0, "no_response": 0})
+        stats = prefix_stats.setdefault(
+            prefix_hint, {"responsive": 0, "no_response": 0}
+        )
         if ip_value in discovery_up_ips:
             stats["responsive"] += 1
         else:
@@ -1466,7 +1492,9 @@ def _build_network_reachability_report(
 
     for ip_value in ordered_unique_ips:
         prefix_hint = _prefix_hint_from_ipv4(ip_value)
-        same_prefix_stats = prefix_stats.get(prefix_hint or "", {"responsive": 0, "no_response": 0})
+        same_prefix_stats = prefix_stats.get(
+            prefix_hint or "", {"responsive": 0, "no_response": 0}
+        )
         open_ports = sorted(open_ports_map.get(ip_value, set()))
         if port_scan_performed:
             if open_ports:
@@ -1515,7 +1543,9 @@ def _build_network_reachability_report(
         ips = []
         statuses: set[str] = set()
         for ip_value in normalized_host_to_ips.get(key, []):
-            ip_entry = next((entry for entry in ip_entries if entry.get("ip") == ip_value), None)
+            ip_entry = next(
+                (entry for entry in ip_entries if entry.get("ip") == ip_value), None
+            )
             if not isinstance(ip_entry, dict):
                 continue
             statuses.add(str(ip_entry.get("status") or "").strip())
@@ -1569,14 +1599,18 @@ def _build_network_reachability_report(
         "hosts": host_entries,
         "ips": ip_entries,
         "possible_segment_clusters": possible_segment_clusters,
-        "mixed_reachability_hostnames": sorted(mixed_reachability_hostnames, key=str.lower),
+        "mixed_reachability_hostnames": sorted(
+            mixed_reachability_hostnames, key=str.lower
+        ),
     }
     if generated_at:
         payload["generated_at"] = generated_at
     return payload
 
 
-def _write_network_reachability_report(report_path: str, payload: dict[str, object]) -> bool:
+def _write_network_reachability_report(
+    report_path: str, payload: dict[str, object]
+) -> bool:
     """Persist the structured reachability report to disk."""
     try:
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
@@ -1607,7 +1641,9 @@ def _show_network_reachability_summary(
     report_file: str | None = None,
 ) -> None:
     """Render a concise current-vantage reachability summary."""
-    summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    summary = (
+        payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    )
     ip_entries = payload.get("ips", []) if isinstance(payload.get("ips"), list) else []
     possible_segment_clusters = (
         payload.get("possible_segment_clusters", [])
@@ -1689,8 +1725,11 @@ def _show_network_reachability_summary(
         return
 
     no_response_preview = [
-        entry for entry in ip_entries if isinstance(entry, dict) and str(entry.get("status") or "").strip() == "no_response_from_current_vantage"
-    ][: _REACHABILITY_PREVIEW_LIMIT]
+        entry
+        for entry in ip_entries
+        if isinstance(entry, dict)
+        and str(entry.get("status") or "").strip() == "no_response_from_current_vantage"
+    ][:_REACHABILITY_PREVIEW_LIMIT]
     if no_response_preview:
         table = Table(
             title=(
@@ -1711,7 +1750,10 @@ def _show_network_reachability_summary(
                 mark_sensitive(str(entry.get("ip") or ""), "ip"),
                 str(entry.get("classification") or "-"),
                 str(entry.get("prefix_hint") or "-"),
-                ", ".join(mark_sensitive(str(hostname), "hostname") for hostname in entry.get("hostname_candidates", [])[:2])
+                ", ".join(
+                    mark_sensitive(str(hostname), "hostname")
+                    for hostname in entry.get("hostname_candidates", [])[:2]
+                )
                 if isinstance(entry.get("hostname_candidates"), list)
                 else "-",
             )
@@ -1734,7 +1776,10 @@ def _show_network_reachability_summary(
             cluster_table.add_row(
                 str(cluster.get("prefix_hint") or "-"),
                 str(cluster.get("no_response_ips") or "-"),
-                ", ".join(mark_sensitive(str(hostname), "hostname") for hostname in host_preview)
+                ", ".join(
+                    mark_sensitive(str(hostname), "hostname")
+                    for hostname in host_preview
+                )
                 if isinstance(host_preview, list)
                 else "-",
             )
@@ -1744,7 +1789,9 @@ def _show_network_reachability_summary(
         mixed_preview = mixed_reachability_hostnames[:_REACHABILITY_PREVIEW_LIMIT]
         print_info(
             "Mixed reachability hostnames: "
-            + ", ".join(mark_sensitive(str(hostname), "hostname") for hostname in mixed_preview)
+            + ", ".join(
+                mark_sensitive(str(hostname), "hostname") for hostname in mixed_preview
+            )
             + (
                 f", +{len(mixed_reachability_hostnames) - len(mixed_preview)} more"
                 if len(mixed_reachability_hostnames) > len(mixed_preview)
@@ -1975,7 +2022,9 @@ def convert_hostnames_to_ips_and_scan(
             for hostname in cleaned_hosts
         }
         unique_ips = _flatten_massdns_unique_ips(cleaned_hosts, hostname_ip_map)
-        resolved_count = sum(1 for hostname in cleaned_hosts if hostname_ip_map.get(hostname))
+        resolved_count = sum(
+            1 for hostname in cleaned_hosts if hostname_ip_map.get(hostname)
+        )
         fallback_used = False
         fallback_reason = None
         if not unique_ips:
@@ -2003,7 +2052,11 @@ def convert_hostnames_to_ips_and_scan(
                 )
                 if not unique_ips:
                     fallback_pdc_ip = str(
-                        (shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}).get("pdc")
+                        (
+                            shell.domains_data.get(domain, {})
+                            if hasattr(shell, "domains_data")
+                            else {}
+                        ).get("pdc")
                         or ""
                     ).strip()
                     if fallback_pdc_ip:
@@ -2073,7 +2126,7 @@ def convert_hostnames_to_ips_and_scan(
             for ip in unique_ips:
                 f.write(f"{ip}\n")
         shell.consolidate_domain_computers("")
-        important_ports = [22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985]
+        important_ports = [21, 22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985]
         important_ports_csv = ",".join(str(port) for port in important_ports)
         ip_count = len(unique_ips)
         marked_domain = mark_sensitive(domain, "domain")
@@ -2081,7 +2134,8 @@ def convert_hostnames_to_ips_and_scan(
         is_ctf_workspace = workspace_type == "ctf"
         is_small_scope = ip_count <= _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD
         is_medium_scope = (
-            _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD < ip_count
+            _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD
+            < ip_count
             <= _MEDIUM_IMPORTANT_PORT_SCAN_IP_THRESHOLD
         )
         auto_run_small_scope = is_ctf_workspace and is_small_scope
@@ -2117,9 +2171,7 @@ def convert_hostnames_to_ips_and_scan(
                 "This is still active network traffic, but the scope is small enough that the value is usually worth it.",
             ]
             panel_title = "Recommended Important Port Scan"
-            prompt_text = (
-                f"Run the recommended important-port Nmap scan for domain {marked_domain}?"
-            )
+            prompt_text = f"Run the recommended important-port Nmap scan for domain {marked_domain}?"
             prompt_default = True
         elif is_medium_scope:
             decision_lines = [
@@ -2233,7 +2285,9 @@ def convert_hostnames_to_ips_and_scan(
                 normal_text = _read_text_file_best_effort(scan_output_path)
                 discovery_up_ips = _parse_gnmap_up_hosts(gnmap_text)
                 reachable_ips = [ip for ip in unique_ips if ip in discovery_up_ips]
-                no_response_ips = [ip for ip in unique_ips if ip not in discovery_up_ips]
+                no_response_ips = [
+                    ip for ip in unique_ips if ip not in discovery_up_ips
+                ]
                 _write_ip_list_file(reachable_ip_file, reachable_ips)
                 _write_ip_list_file(no_response_ip_file, no_response_ips)
 
@@ -2285,7 +2339,9 @@ def convert_hostnames_to_ips_and_scan(
                 print_success(
                     f"Important port scan for the domain completed (hosts_with_open_ports={discovered_hosts}, open_tcp_ports={discovered_ports})."
                 )
-                generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                generated_at = (
+                    datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                )
                 reachability_payload = _build_network_reachability_report(
                     cleaned_hosts,
                     {

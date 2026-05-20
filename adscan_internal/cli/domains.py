@@ -240,41 +240,65 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
         )
         return
 
+    # Initialised at function scope so the outer finally can close the span
+    # safely no matter where execution leaves the function.
+    _trust_phase_cm = None
     try:
-        if not shell.netexec_path:
-            print_error(
-                "NetExec (nxc) executable not found. Please ensure NetExec is installed and configured."
-            )
-            return
-
-        # Professional operation header
-        from adscan_internal import print_operation_header
+        from adscan_internal import get_console, print_operation_header
+        from adscan_internal.cli.widgets.trust_enum_live import (
+            TrustEnumLiveView,
+            render_trust_summary_panel,
+        )
+        from adscan_internal.cli.widgets.intelligence_update import (
+            render_intelligence_update,
+        )
+        from adscan_internal.services.domain_posture import get_posture
         from adscan_internal.services.domain_service import DomainService
+        from adscan_internal.services.posture_sink import (
+            make_workspace_posture_sink,
+        )
 
         username = shell.domains_data[domain]["username"]
         password = shell.domains_data[domain]["password"]
         pdc = shell.domains_data[domain]["pdc"]
+        domain_state = shell.domains_data.get(domain, {}) or {}
+        auth_domain = str(domain_state.get("auth_domain") or domain)
+        auth_kdc = str(domain_state.get("auth_kdc") or pdc)
 
         emit_phase("trust_enumeration")
+        # Surface this as a top-level chapter so it shares the numbered
+        # phase strip with Domain Collection and the analysis pipeline.
+        # The timeline span is opened here and closed in the function-level
+        # finally so the row is written even on the error path.
+        try:
+            from adscan_internal.services.scan_phases import emit_chapter
+            from adscan_internal.services.scan_timeline import phase_span
+
+            scan_type = getattr(shell, "type", "default")
+            emit_chapter("topology_and_trusts", scan_type=scan_type)
+            _trust_phase_cm = phase_span(
+                shell,
+                domain,
+                phase_id="topology_and_trusts",
+                phase_title="Topology & Trusts",
+            )
+            _trust_phase_cm.__enter__()
+        except Exception:  # noqa: BLE001 — chapter/timeline must never block the scan
+            _trust_phase_cm = None
+
         print_operation_header(
             "Trust Enumeration",
             details={
                 "Domain": domain,
                 "PDC": pdc,
                 "Username": username,
+                "Auth": "Kerberos (LDAPS w/ fallback)",
             },
             icon="🔗",
         )
-
-        marked_domain = mark_sensitive(domain, "domain")
-        marked_user = mark_sensitive(username, "user")
-        marked_password = mark_sensitive(password, "password")
-        marked_pdc = mark_sensitive(pdc, "ip")
-        cmd_preview = (
-            f"{shell.netexec_path} ldap {marked_pdc} -u {marked_user} "
-            f"-p {marked_password} -d {marked_domain} --dc-list"
+        print_info_debug(
+            "Native badldap recursive trust enumeration · BFS · timeout=60s/domain"
         )
-        print_info_debug(f"Recursive trust enumeration via NetExec: {cmd_preview}")
 
         dns_service = None
         try:
@@ -282,28 +306,28 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
         except Exception:
             dns_service = None
 
-        def _execute(
-            command: str, timeout_seconds: int
-        ) -> subprocess.CompletedProcess[str] | None:
-            netexec_runner = getattr(shell, "_run_netexec", None)
-            if callable(netexec_runner):
-                return netexec_runner(
-                    command,
-                    domain=domain,
-                    timeout=timeout_seconds,
-                )
-            return shell.run_command(command, timeout=timeout_seconds)
+        partner_hostname_cache: dict[str, str] = {}
 
         def _resolve_pdc_ip(trusted_domain: str, resolver_ip: str) -> str | None:
             if not dns_service or not hasattr(dns_service, "find_pdc_with_selection"):
                 return None
-            selected_ip, _ = dns_service.find_pdc_with_selection(
+            selected_ip, hostname = dns_service.find_pdc_with_selection(
                 domain=trusted_domain,
                 resolver_ip=resolver_ip,
                 preferred_ips=[resolver_ip],
                 reference_ip=resolver_ip,
             )
+            if hostname:
+                fqdn = (
+                    hostname
+                    if "." in hostname
+                    else f"{hostname}.{trusted_domain.strip().lower()}"
+                )
+                partner_hostname_cache[trusted_domain.strip().lower()] = fqdn
             return selected_ip
+
+        def _resolve_dc_hostname(trusted_domain: str, _resolver_ip: str) -> str | None:
+            return partner_hostname_cache.get(trusted_domain.strip().lower())
 
         def _check_trusted_domain_reachability(
             trusted_domain: str,
@@ -322,17 +346,42 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             probe_result["pdc_ip"] = trusted_pdc_ip
             return probe_result
 
-        service = DomainService()
-        result = service.enumerate_trusts(
-            domain=domain,
-            pdc=pdc,
-            username=username,
-            password=password,
-            netexec_path=shell.netexec_path,
-            executor=_execute,
-            resolve_pdc_ip=_resolve_pdc_ip,
-            check_domain_reachability=_check_trusted_domain_reachability,
+        posture_sink = make_workspace_posture_sink(
+            shell.domains_data,
+            on_finding=lambda finding: get_console().print(
+                render_intelligence_update(finding)
+            ),
         )
+        posture_snapshot = get_posture(shell.domains_data, domain=domain)
+
+        service = DomainService()
+        with TrustEnumLiveView(
+            source_domain=domain,
+            source_pdc=pdc,
+            username=username,
+        ) as live_view:
+            result = service.enumerate_trusts(
+                domain=domain,
+                pdc=pdc,
+                username=username,
+                password=password,
+                auth_domain=auth_domain,
+                auth_kdc=auth_kdc,
+                use_kerberos=True,
+                dc_hostname=(
+                    shell.domains_data.get(domain, {}).get("dc_fqdn")
+                    or shell.domains_data.get(domain, {}).get("pdc_hostname")
+                ),
+                resolve_pdc_ip=_resolve_pdc_ip,
+                resolve_dc_hostname=_resolve_dc_hostname,
+                check_domain_reachability=_check_trusted_domain_reachability,
+                progress_cb=live_view.on_event,
+                posture_sink=posture_sink,
+                posture_snapshot=posture_snapshot,
+            )
+
+        # Premium summary card.
+        get_console().print(render_trust_summary_panel(result, source_domain=domain))
 
         merge_domain_connectivity(
             shell,
@@ -368,11 +417,19 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             suggestions=[
                 "Verify domain credentials are correct",
                 "Check network connectivity to PDC",
-                "Ensure NetExec is properly installed",
+                "Confirm LDAP (389) or LDAPS (636) is reachable on the PDC",
             ],
             show_exception=True,
             exception=exc,
         )
+    finally:
+        # Always close the timeline span so the row + delta footer are
+        # emitted even when the trust enumeration failed.
+        try:
+            if _trust_phase_cm is not None:
+                _trust_phase_cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def order_domains_for_scan(source_domain: str, domains: list[str]) -> list[str]:
@@ -422,6 +479,169 @@ def order_domains_for_scan(source_domain: str, domains: list[str]) -> list[str]:
     return [normalized_to_original.get(dom, dom) for dom in ordered_norm]
 
 
+def _prompt_scope_selection(
+    candidates: list[str],
+    source_domain: str,
+    phase1_complete_domains: set[str] | None = None,
+) -> list[str]:
+    """Ask the user which trusted domains to include in scope.
+
+    Domains with Phase 1 already completed are shown with a re-run label so the
+    operator understands only the attack graph is rebuilt, not the full BH collection.
+    In non-interactive environments the full list is returned unchanged.
+
+    Args:
+        candidates: All reachable domains to offer (including source).
+        source_domain: The domain trust enumeration was launched from.
+        phase1_complete_domains: Domains whose BH collection is already done.
+
+    Returns:
+        Subset of candidates selected by the user, preserving original order.
+    """
+    done = phase1_complete_domains or set()
+    new_domains = [d for d in candidates if d not in done]
+    rerun_domains = [d for d in candidates if d in done]
+
+    # Nothing to offer if every candidate is already fully enumerated
+    # and there are no new domains at all.
+    if not new_domains and not rerun_domains:
+        return candidates
+
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    if _is_non_interactive():
+        return candidates
+
+    try:
+        from adscan_core import prompting
+        from adscan_internal import get_console
+
+        console = get_console()
+
+        # Context panel — tactical intel aesthetic: dark background, sharp borders
+        has_rerun = bool(rerun_domains)
+        has_new = bool(new_domains)
+
+        legend_lines: list[str] = []
+        if has_new:
+            legend_lines.append(
+                "  [bold green]★[/bold green]  [dim]Full enumeration[/dim]   "
+                "[dim]→ BH collection · attack graph · attack paths[/dim]"
+            )
+        if has_rerun:
+            legend_lines.append(
+                "  [bold yellow]↺[/bold yellow]  [dim]Attack paths only[/dim]  "
+                "[dim]→ skip BH collection · rebuild graph with cross-domain context[/dim]"
+            )
+
+        from rich.panel import Panel
+        from rich.padding import Padding
+
+        panel_body = "\n".join(legend_lines)
+        console.print(
+            Panel(
+                Padding(panel_body, (1, 2)),
+                title="[bold]Trust Scope Selection[/bold]",
+                border_style="dim cyan",
+                expand=False,
+            )
+        )
+
+        options: list[str] = []
+        labels_by_value: dict[str, str] = {}
+        for d in candidates:
+            if d in done:
+                label = f"↺  {d}   [already enumerated — rebuild attack graph only]"
+            else:
+                label = f"★  {d}   [full enumeration]"
+            labels_by_value[d] = label
+            options.append(d)
+
+        selected = prompting.questionary_checkbox_values_raw(
+            title="Select domains to include in scope:",
+            options=options,
+            default_values=options,
+            labels_by_value=labels_by_value,
+        )
+
+        if selected is None:
+            # Ctrl-C / cancelled — fall back to full list to avoid silent data loss
+            return candidates
+
+        return [d for d in candidates if d in set(selected)]
+    except Exception:
+        return candidates
+
+
+def _persist_scope_selection(
+    shell: DomainShell,
+    *,
+    source_domain: str,
+    candidates: list[str],
+    selected_domains: list[str],
+    domain_pdc_mapping: dict[str, str],
+) -> None:
+    """Persist selected trusted-domain scope to the workspace scope.json."""
+    try:
+        from adscan_internal.services.collector.scope import (
+            ScopeEntry,
+            ScopeResult,
+            save_scope,
+        )
+
+        workspace_cwd = (
+            getattr(shell, "current_workspace_dir", None)
+            or getattr(shell, "current_workspace", None)
+            or os.getcwd()
+        )
+        selected = {item.lower().strip() for item in selected_domains}
+        source_data = shell.domains_data.get(source_domain, {})
+        auth_domain = str(source_data.get("auth_domain") or source_domain)
+        auth_kdc = str(source_data.get("auth_kdc") or source_data.get("pdc") or "")
+        entries: list[ScopeEntry] = []
+        for candidate in candidates:
+            candidate_data = shell.domains_data.get(candidate, {})
+            connectivity = candidate_data.get("connectivity", {})
+            summary = (
+                connectivity.get("summary", {})
+                if isinstance(connectivity, dict)
+                and isinstance(connectivity.get("summary", {}), dict)
+                else {}
+            )
+            reachability = "reachable_ldap"
+            degraded_reason = None
+            if isinstance(summary, dict) and summary.get("reachable") is False:
+                reachability = "unreachable"
+                degraded_reason = str(summary.get("reason") or "") or None
+            entries.append(
+                ScopeEntry(
+                    domain=candidate,
+                    dc_address=str(
+                        candidate_data.get("pdc")
+                        or domain_pdc_mapping.get(candidate)
+                        or ""
+                    ),
+                    auth_domain=auth_domain,
+                    auth_kdc=auth_kdc,
+                    reachability=reachability,
+                    in_scope=candidate.lower().strip() in selected,
+                    kerberos_target_hostname=str(
+                        candidate_data.get("pdc_hostname") or ""
+                    )
+                    or None,
+                    degraded_reason=degraded_reason,
+                )
+            )
+
+        scope_path = os.path.join(workspace_cwd, "scope.json")
+        save_scope(ScopeResult(entries=entries), scope_path)
+        print_info_debug(
+            f"[scope] Persisted trust scope to {mark_sensitive(scope_path, 'path')}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[scope] Failed to persist scope.json: {exc}")
+
+
 def _handle_trust_enumeration_result(
     shell: DomainShell,
     *,
@@ -432,6 +652,7 @@ def _handle_trust_enumeration_result(
 ) -> None:
     """Process recursive trust enumeration results and update domain state."""
     try:
+
         def _domain_reachable_from_current_vantage(candidate_domain: str) -> bool:
             """Return whether one trusted domain is currently reachable."""
             if candidate_domain == domain:
@@ -489,11 +710,7 @@ def _handle_trust_enumeration_result(
                 )
                 print_warning(
                     f"Trusted domain discovered but not currently reachable: {marked_domain}"
-                    + (
-                        f" (PDC/DC {marked_pdc})"
-                        if str(marked_pdc).strip()
-                        else ""
-                    )
+                    + (f" (PDC/DC {marked_pdc})" if str(marked_pdc).strip() else "")
                 )
                 continue
             pdc_ip = domain_pdc_mapping.get(main_domain)
@@ -604,22 +821,25 @@ def _handle_trust_enumeration_result(
             }
 
         if trusts:
-            print_results_summary(
-                "Trust Enumeration Results",
-                {
-                    "Source Domain": domain,
-                    "Trusted Domains Found": max(len(ordered_domains) - 1, 0),
-                    "Trust Relationships Found": len(trusts),
-                    "Status": "Completed Successfully",
-                },
-            )
-            if discovered_domains_data:
-                console = get_console()
-                table = create_domains_table(
-                    discovered_domains_data,
-                    title="Discovered Trust Relationships",
+            # Legacy verbose-only summary; the new summary panel is rendered
+            # in run_enum_trusts() before this handler. Keep as a debug aid.
+            if getattr(shell, "verbose", False):
+                print_results_summary(
+                    "Trust Enumeration Results",
+                    {
+                        "Source Domain": domain,
+                        "Trusted Domains Found": max(len(ordered_domains) - 1, 0),
+                        "Trust Relationships Found": len(trusts),
+                        "Status": "Completed Successfully",
+                    },
                 )
-                console.print(table)
+                if discovered_domains_data:
+                    console = get_console()
+                    table = create_domains_table(
+                        discovered_domains_data,
+                        title="Discovered Trust Relationships",
+                    )
+                    console.print(table)
             for trusted_domain, connectivity in sorted(
                 (
                     (name, data)
@@ -655,29 +875,89 @@ def _handle_trust_enumeration_result(
                     f"PDC/DC {marked_pdc} is not reachable from the current vantage."
                 )
 
-            pending_auth_domains = [
+            # All reachable domains — including those with Phase 1 already done.
+            # Domains with Phase 1 complete are still included because they need
+            # their attack graph rebuilt with the new cross-domain context.
+            all_reachable = [
                 main_domain
                 for main_domain in ordered_domains
                 if _domain_reachable_from_current_vantage(main_domain)
-                if not bool(
-                    shell.domains_data.get(main_domain, {}).get("phase1_complete")
-                )
             ]
 
-            if not pending_auth_domains:
+            # Track which domains already have BH data collected.
+            phase1_complete_set: set[str] = {
+                d
+                for d in all_reachable
+                if bool(shell.domains_data.get(d, {}).get("phase1_complete"))
+            }
+
+            # Exclude domains fully enumerated with no new cross-domain peers.
+            # If every reachable domain already ran Phase 1 AND there are no new
+            # domains to add context, there is nothing to do.
+            new_domains = [d for d in all_reachable if d not in phase1_complete_set]
+            if all_reachable == [domain] and any(
+                candidate != domain for candidate in ordered_domains
+            ):
                 print_info(
-                    "Trust analysis completed, but all reachable trusted domains were already authenticated and analyzed."
+                    "Trust analysis found no reachable trusted domains from the current vantage."
+                )
+                shell.domains_data.setdefault(domain, {})["auth"] = "auth"
+                shell.ask_for_enum_domain_auth(domain)
+                return
+            if not all_reachable or (not new_domains and len(all_reachable) <= 1):
+                print_info(
+                    "Trust analysis completed, but all reachable trusted domains "
+                    "were already fully enumerated."
                 )
                 return
 
-            if len(pending_auth_domains) > 1:
-                for main_domain in pending_auth_domains:
-                    shell.do_enum_domain_auth_phase1(main_domain)
-                for main_domain in pending_auth_domains:
-                    shell.ask_for_enum_domain_auth(main_domain)
+            selected_domains = _prompt_scope_selection(
+                all_reachable,
+                source_domain=domain,
+                phase1_complete_domains=phase1_complete_set,
+            )
+            _persist_scope_selection(
+                shell,
+                source_domain=domain,
+                candidates=all_reachable,
+                selected_domains=selected_domains,
+                domain_pdc_mapping=domain_pdc_mapping,
+            )
+
+            if not selected_domains:
+                print_info("No trusted domains selected for enumeration.")
+                return
+
+            # Separate domains by what work they need.
+            phase1_needed = [
+                d for d in selected_domains if d not in phase1_complete_set
+            ]
+            phase2_all = selected_domains  # every selected domain needs graph rebuilt
+
+            from adscan_internal.cli.intelligence import (
+                run_attack_path_discovery,
+                run_cross_domain_attack_path_discovery,
+            )
+
+            # Phase 1: native collection only for domains that haven't been collected yet.
+            for main_domain in phase1_needed:
+                shell.do_enum_domain_auth_phase1(main_domain)
+
+            if len(phase2_all) > 1:
+                # Phase 2 build-only for all: populate every attack_graph.json
+                # before computing paths so multi-hop cross-domain edges are present.
+                for main_domain in phase2_all:
+                    run_attack_path_discovery(shell, main_domain, build_only=True)
+                # Single merged cross-domain path display.
+                run_cross_domain_attack_path_discovery(shell, phase2_all)
             else:
-                for main_domain in pending_auth_domains:
-                    shell.ask_for_enum_domain_auth(main_domain)
+                # Single domain — build + display in one pass (no merge needed).
+                run_attack_path_discovery(shell, phase2_all[0])
+
+            # Phase 3+: only for new domains (credential spraying, share scan, etc.)
+            # Already-enumerated domains completed these phases before the pivot.
+            for main_domain in phase1_needed:
+                shell.run_enumeration(main_domain, start_from_phase=3)
         else:
             print_info("No trust relationships found.")
             shell.domains_data[domain]["auth"] = "auth"

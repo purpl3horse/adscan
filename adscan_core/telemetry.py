@@ -811,7 +811,7 @@ def _is_session_capture_enabled() -> bool:
 
 
 SESSION_CAPTURE_ALLOWED_COMMANDS = frozenset(
-    {"install", "ci", "start", "check", "update", "upgrade"}
+    {"install", "ci", "start", "tui", "check", "update", "upgrade"}
 )
 HOST_SESSION_CAPTURE_COMMANDS = frozenset({"install", "check", "update", "upgrade"})
 CONTAINER_SESSION_CAPTURE_COMMANDS = frozenset({"start", "ci"})
@@ -4932,3 +4932,67 @@ def _capture_user_property_event(event_name: str, property_key: str, new_value):
         capture(event_name, {"$set": {property_key: new_value}})
         cached_props[property_key] = new_value
         _save_local_user_properties_cache(cached_props)
+
+
+# ---------------------------------------------------------------------------
+# Post-exploitation telemetry shortcuts (Phase 5 of attack-graph refactor).
+#
+# These exist so call sites do not have to remember property field names
+# and so Phase 7 (data-driven scoring) has a stable, queryable event set.
+# ---------------------------------------------------------------------------
+
+
+def capture_post_ex_menu_viewed(
+    *, path_class: str, num_techniques_offered: int
+) -> None:
+    """Operator inspected a path and saw the post-ex technique menu."""
+    capture(
+        "post_ex_menu_viewed",
+        {
+            "path_class": str(path_class or "unknown"),
+            "num_techniques_offered": int(num_techniques_offered),
+        },
+    )
+
+
+def capture_post_ex_technique_selected(
+    *, technique_id: str, path_class: str
+) -> None:
+    """Operator selected a specific technique from the menu."""
+    capture(
+        "post_ex_technique_selected",
+        {
+            "technique_id": str(technique_id),
+            "path_class": str(path_class or "unknown"),
+        },
+    )
+
+
+def capture_post_ex_dry_run_executed(
+    *, technique_id: str, outcome: str
+) -> None:
+    """A technique dry_run completed (precondition check)."""
+    capture(
+        "post_ex_dry_run_executed",
+        {
+            "technique_id": str(technique_id),
+            "outcome": str(outcome),
+        },
+    )
+
+
+def capture_post_ex_execute_invoked(
+    *,
+    technique_id: str,
+    outcome: str,
+    duration_seconds: float,
+) -> None:
+    """A technique execute() finished. Phase 6 wires the real call site."""
+    capture(
+        "post_ex_execute_invoked",
+        {
+            "technique_id": str(technique_id),
+            "outcome": str(outcome),
+            "duration_seconds": float(duration_seconds),
+        },
+    )

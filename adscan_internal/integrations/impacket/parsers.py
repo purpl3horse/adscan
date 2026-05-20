@@ -17,7 +17,14 @@ from typing import List, Optional
 
 
 # Regex patterns for hash extraction
-_KERBEROAST_HASH_RE = re.compile(r"\$krb5tgs\$23\$\*([^\$]*)\$", re.MULTILINE)
+_KERBEROAST_RC4_HASH_RE = re.compile(
+    r"\$krb5tgs\$(?:23|3)\$\*([^\$]*)\$",
+    re.MULTILINE,
+)
+_KERBEROAST_AES_HASH_RE = re.compile(
+    r"\$krb5tgs\$(?:17|18)\$([^\$*]+)\$",
+    re.MULTILINE,
+)
 _ASREP_HASH_RE = re.compile(r"\$krb5asrep\$23\$([^@]+)@", re.MULTILINE)
 _NTLM_HASH_RE = re.compile(r"([a-fA-F0-9]{32})", re.MULTILINE)
 _USERNAME_ONLY_RE = re.compile(r"^[A-Za-z0-9_.\-]+\$?$")
@@ -76,7 +83,26 @@ def parse_kerberoast_output(output: str) -> List[KerberoastHash]:
             continue
 
         # Extract username from hash
-        match = _KERBEROAST_HASH_RE.search(line)
+        match = _KERBEROAST_RC4_HASH_RE.search(line)
+        if match:
+            username = match.group(1)
+            # Get the full hash (from $ to end of line or next whitespace)
+            hash_start = line.find("$krb5tgs$")
+            if hash_start >= 0:
+                # Find end of hash (usually end of line or whitespace)
+                hash_end = len(line)
+                for end_char in [" ", "\t", "\n"]:
+                    pos = line.find(end_char, hash_start)
+                    if pos > 0 and pos < hash_end:
+                        hash_end = pos
+
+                full_hash = line[hash_start:hash_end].strip()
+                hashes.append(
+                    KerberoastHash(username=username, hash_value=full_hash)
+                )
+                continue
+
+        match = _KERBEROAST_AES_HASH_RE.search(line)
         if match:
             username = match.group(1)
             # Get the full hash (from $ to end of line or next whitespace)

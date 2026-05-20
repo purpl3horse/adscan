@@ -23,14 +23,21 @@ from typing import Any
 from adscan_internal.services.attack_graph_core import (  # noqa: PLC2701
     AttackPath,
     AttackPathStep,
+    attack_path_step_signature,
+    _build_implicit_dumplsa_overlay,
     _build_local_reuse_virtual_state,
     _build_local_reuse_useful_node_ids,
+    _count_actionable_edges,
+    _edges_chain_ok,
+    _is_excluded_share_access_edge,
     _is_same_local_reuse_cluster_chain,
     _LOCAL_REUSE_RELATION_KEY,
+    _MAX_STRUCTURAL_HOPS,
     _node_is_enabled_user,
     _node_is_effectively_high_value,
     _node_is_tier0,
     _node_is_impact_high_value,
+    _node_is_domain,
 )
 
 try:
@@ -53,6 +60,7 @@ def _build_rustworkx_graph(
     local_reuse_by_node: dict[str, list[dict[str, Any]]],
     local_reuse_existing_pairs: set[tuple[str, str]],
     local_reuse_useful_nodes: set[str],
+    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[Any, dict[str, int], dict[int, str]]:
     """Build a rustworkx.PyDiGraph from graph data.
 
@@ -78,6 +86,8 @@ def _build_rustworkx_graph(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
+        if _is_excluded_share_access_edge(edge):
+            continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
         if not from_id or not to_id:
@@ -85,7 +95,10 @@ def _build_rustworkx_graph(
         if from_id not in node_id_to_idx or to_id not in node_id_to_idx:
             continue
         relation_key = str(edge.get("relation") or "").strip().lower()
-        if relation_key == _LOCAL_REUSE_RELATION_KEY and to_id not in local_reuse_useful_nodes:
+        if (
+            relation_key == _LOCAL_REUSE_RELATION_KEY
+            and to_id not in local_reuse_useful_nodes
+        ):
             continue
         rw_graph.add_edge(node_id_to_idx[from_id], node_id_to_idx[to_id], edge)
 
@@ -124,6 +137,14 @@ def _build_rustworkx_graph(
                     },
                 )
 
+    # Pre-materialise implicit DumpLSASS self-loops.
+    for computer_id, virtual_edges in (implicit_dumplsa_overlay or {}).items():
+        if computer_id not in node_id_to_idx:
+            continue
+        idx = node_id_to_idx[computer_id]
+        for ve in virtual_edges:
+            rw_graph.add_edge(idx, idx, ve)
+
     return rw_graph, node_id_to_idx, idx_to_node_id
 
 
@@ -133,7 +154,7 @@ def compute_maximal_attack_paths_rustworkx(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    terminal_mode: str = "tier0",
+    terminal_mode: str = "domain",
     start_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal attack paths for a full-domain graph using rustworkx adjacency.
@@ -142,7 +163,9 @@ def compute_maximal_attack_paths_rustworkx(
     Falls back to the Python implementation when rustworkx is not available.
     """
     if not _RUSTWORKX_AVAILABLE or max_depth <= 0:
-        from adscan_internal.services.attack_graph_core import compute_maximal_attack_paths
+        from adscan_internal.services.attack_graph_core import (
+            compute_maximal_attack_paths,
+        )
 
         return compute_maximal_attack_paths(
             graph,
@@ -176,6 +199,7 @@ def compute_maximal_attack_paths_rustworkx(
         local_reuse_by_node,
         local_reuse_existing_pairs,
         local_reuse_useful_nodes,
+        implicit_dumplsa_overlay=_build_implicit_dumplsa_overlay(graph),
     )
 
     # Domain scope should start from every low-priv principal with outgoing
@@ -183,6 +207,8 @@ def compute_maximal_attack_paths_rustworkx(
     outgoing: dict[str, int] = {}
     for edge in edges:
         if not isinstance(edge, dict):
+            continue
+        if _is_excluded_share_access_edge(edge):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
@@ -211,20 +237,24 @@ def compute_maximal_attack_paths_rustworkx(
             continue
         sources.append(node_id)
 
-    mode = (terminal_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = (terminal_mode or "domain").strip().lower()
+    if mode not in {"tier0", "impact", "domain"}:
+        mode = "domain"
 
     def is_terminal(node_id: str) -> bool:
         node = nodes_map.get(node_id)
         if not isinstance(node, dict):
             return False
+        if mode == "domain":
+            return _node_is_domain(node)
         return (
-            _node_is_impact_high_value(node) if mode == "impact" else _node_is_tier0(node)
+            _node_is_impact_high_value(node)
+            if mode == "impact"
+            else _node_is_tier0(node)
         )
 
     paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -235,7 +265,7 @@ def compute_maximal_attack_paths_rustworkx(
             target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
         ):
             return
-        signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
+        signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
             return
         seen_signatures.add(signature)
@@ -255,8 +285,13 @@ def compute_maximal_attack_paths_rustworkx(
     ) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        depth = len(acc_steps)
-        if depth >= max_depth or (depth > 0 and is_terminal(current)):
+        actionable_depth = _count_actionable_edges(acc_steps)
+        structural_depth = len(acc_steps) - actionable_depth
+        if (
+            actionable_depth >= max_depth
+            or structural_depth >= _MAX_STRUCTURAL_HOPS
+            or (acc_steps and is_terminal(current))
+        ):
             emit(acc_steps)
             return
 
@@ -266,14 +301,25 @@ def compute_maximal_attack_paths_rustworkx(
             return
 
         extended = False
+        _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for _, tgt_idx, edge_data in out_edges:
             if not isinstance(edge_data, dict):
                 continue
             last_step = acc_steps[-1] if acc_steps else None
             if _is_same_local_reuse_cluster_chain(last_step, edge_data):
                 continue
+
+            # ── Credential-context guard ────────────────────────────────────
+            _cand_rel = str(edge_data.get("relation") or "").strip().lower()
+            if not _edges_chain_ok(_path_rels, _cand_rel):
+                continue
+            # ── End guard ────────────────────────────────────────────────────
+
             to_id = idx_to_node_id.get(tgt_idx)
-            if not to_id or to_id in visited:
+            if not to_id:
+                continue
+            is_self_loop = to_id == current
+            if not is_self_loop and to_id in visited:
                 continue
             step = AttackPathStep(
                 from_id=current,
@@ -286,11 +332,13 @@ def compute_maximal_attack_paths_rustworkx(
                     else {}
                 ),
             )
-            visited.add(to_id)
+            if not is_self_loop:
+                visited.add(to_id)
             acc_steps.append(step)
             dfs(to_id, tgt_idx, visited, acc_steps)
             acc_steps.pop()
-            visited.remove(to_id)
+            if not is_self_loop:
+                visited.remove(to_id)
             extended = True
 
         if not extended:
@@ -314,7 +362,7 @@ def compute_maximal_attack_paths_from_start_rustworkx(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    terminal_mode: str = "tier0",
+    terminal_mode: str = "domain",
 ) -> list[AttackPath]:
     """Compute maximal paths from a specific start node using rustworkx adjacency.
 
@@ -358,22 +406,27 @@ def compute_maximal_attack_paths_from_start_rustworkx(
         local_reuse_by_node,
         local_reuse_existing_pairs,
         local_reuse_useful_nodes,
+        implicit_dumplsa_overlay=_build_implicit_dumplsa_overlay(graph),
     )
 
-    mode = (terminal_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = (terminal_mode or "domain").strip().lower()
+    if mode not in {"tier0", "impact", "domain"}:
+        mode = "domain"
 
     def is_terminal(node_id: str) -> bool:
         node = nodes_map.get(node_id)
         if not isinstance(node, dict):
             return False
+        if mode == "domain":
+            return _node_is_domain(node)
         return (
-            _node_is_impact_high_value(node) if mode == "impact" else _node_is_tier0(node)
+            _node_is_impact_high_value(node)
+            if mode == "impact"
+            else _node_is_tier0(node)
         )
 
     paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -384,7 +437,7 @@ def compute_maximal_attack_paths_from_start_rustworkx(
             target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
         ):
             return
-        signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
+        signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
             return
         seen_signatures.add(signature)
@@ -404,8 +457,13 @@ def compute_maximal_attack_paths_from_start_rustworkx(
     ) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        depth = len(acc_steps)
-        if depth >= max_depth or (depth > 0 and is_terminal(current)):
+        actionable_depth = _count_actionable_edges(acc_steps)
+        structural_depth = len(acc_steps) - actionable_depth
+        if (
+            actionable_depth >= max_depth
+            or structural_depth >= _MAX_STRUCTURAL_HOPS
+            or (acc_steps and is_terminal(current))
+        ):
             emit(acc_steps)
             return
 
@@ -415,14 +473,25 @@ def compute_maximal_attack_paths_from_start_rustworkx(
             return
 
         extended = False
+        _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for _, tgt_idx, edge_data in out_edges:
             if not isinstance(edge_data, dict):
                 continue
             last_step = acc_steps[-1] if acc_steps else None
             if _is_same_local_reuse_cluster_chain(last_step, edge_data):
                 continue
+
+            # ── Credential-context guard ────────────────────────────────────
+            _cand_rel = str(edge_data.get("relation") or "").strip().lower()
+            if not _edges_chain_ok(_path_rels, _cand_rel):
+                continue
+            # ── End guard ────────────────────────────────────────────────────
+
             to_id = idx_to_node_id.get(tgt_idx)
-            if not to_id or to_id in visited:
+            if not to_id:
+                continue
+            is_self_loop = to_id == current
+            if not is_self_loop and to_id in visited:
                 continue
             step = AttackPathStep(
                 from_id=current,
@@ -435,11 +504,13 @@ def compute_maximal_attack_paths_from_start_rustworkx(
                     else {}
                 ),
             )
-            visited.add(to_id)
+            if not is_self_loop:
+                visited.add(to_id)
             acc_steps.append(step)
             dfs(to_id, tgt_idx, visited, acc_steps)
             acc_steps.pop()
-            visited.remove(to_id)
+            if not is_self_loop:
+                visited.remove(to_id)
             extended = True
 
         if not extended:

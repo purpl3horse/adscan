@@ -79,7 +79,7 @@ class JohnArtifactCrackingService(BaseService):
             candidates.extend(
                 [
                     "/opt/adscan/tools/keepass2john/keepass2john.py",
-                    "external_tools/keepass2john/keepass2john.py",
+                    "reference/keepass2john/keepass2john.py",
                 ]
             )
 

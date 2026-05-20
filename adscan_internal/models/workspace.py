@@ -39,7 +39,6 @@ class Workspace:
         domains: List of domain names in this workspace
         active_scan_id: Currently active scan ID
         settings: Workspace-specific settings
-        neo4j_config: Neo4j/BloodHound configuration
         created_at: When workspace was created
         updated_at: Last update timestamp
         metadata: Additional metadata
@@ -57,14 +56,6 @@ class Workspace:
 
     # Settings
     settings: Dict[str, Any] = field(default_factory=dict)
-    neo4j_config: Dict[str, str] = field(
-        default_factory=lambda: {
-            "host": "localhost",
-            "port": "7687",
-            "db_user": "neo4j",
-            "db_password": "neo4j",
-        }
-    )
 
     # Timestamps
     created_at: datetime = field(default_factory=utc_now)
@@ -88,7 +79,6 @@ class Workspace:
             "domains": self.domains,
             "active_scan_id": self.active_scan_id,
             "settings": self.settings,
-            "neo4j_config": self.neo4j_config,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "metadata": self.metadata,
@@ -115,15 +105,6 @@ class Workspace:
             domains=data.get("domains", []),
             active_scan_id=data.get("active_scan_id"),
             settings=data.get("settings", {}),
-            neo4j_config=data.get(
-                "neo4j_config",
-                {
-                    "host": "localhost",
-                    "port": "7687",
-                    "db_user": "neo4j",
-                    "db_password": "neo4j",
-                },
-            ),
             created_at=parse_iso_datetime_or_now(data.get("created_at")),
             updated_at=parse_iso_datetime_or_now(data.get("updated_at")),
             metadata=data.get("metadata", {}),

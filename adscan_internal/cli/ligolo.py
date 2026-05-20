@@ -16,6 +16,7 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_instruction,
     print_operation_header,
+    print_panel,
     print_success,
 )
 from adscan_internal.services.ligolo_service import (
@@ -46,19 +47,41 @@ def _require_workspace(shell: LigoloShell) -> str | None:
     workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
     if workspace_dir:
         return workspace_dir
-    print_error("No active workspace is loaded.")
-    print_instruction("Load or create a workspace before managing ligolo pivots.")
+    print_error("[-] No active workspace is loaded.")
+    print_instruction("Next: load or create a workspace before managing ligolo pivots.")
     return None
+
+
+def _alive_glyph(alive: bool) -> str:
+    """Return a color + glyph pairing safe for NO_COLOR terminals."""
+
+    if alive:
+        return "[green][+] yes[/green]"
+    return "[yellow][~] no[/yellow]"
+
+
+def _status_style(status: str) -> str:
+    """Map a status string to a color + glyph pairing."""
+
+    normalized = str(status or "").strip().lower()
+    if normalized in {"running", "active", "established", "up"}:
+        return f"[green][+] {status}[/green]"
+    if normalized in {"stopped", "exited", "dead"}:
+        return f"[yellow][~] {status}[/yellow]"
+    if normalized in {"failed", "error"}:
+        return f"[red][!] {status}[/red]"
+    return str(status or "unknown")
 
 
 def _print_proxy_status(state: dict[str, Any]) -> None:
     """Render one compact Ligolo proxy status block."""
 
+    alive = bool(state.get("alive"))
     details = {
         "Workspace": state.get("workspace_dir", "unknown"),
         "Domain": state.get("current_domain") or "none",
-        "Status": state.get("status", "unknown"),
-        "Alive": "yes" if state.get("alive") else "no",
+        "Status": _status_style(str(state.get("status", "unknown"))),
+        "Alive": _alive_glyph(alive),
         "PID": str(state.get("pid", "none")),
         "Listen": state.get("listen_addr", "unknown"),
         "API": state.get("api_laddr", "unknown"),
@@ -68,16 +91,16 @@ def _print_proxy_status(state: dict[str, Any]) -> None:
     stdout_log = state.get("stdout_log")
     stderr_log = state.get("stderr_log")
     if stdout_log:
-        print_info(f"Stdout Log: {mark_sensitive(str(stdout_log), 'path')}")
+        print_info(f"    Stdout Log: {mark_sensitive(str(stdout_log), 'path')}")
     if stderr_log:
-        print_info(f"Stderr Log: {mark_sensitive(str(stderr_log), 'path')}")
+        print_info(f"    Stderr Log: {mark_sensitive(str(stderr_log), 'path')}")
 
 
 def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> None:
     """Render one compact tunnel table."""
 
     if not records:
-        print_info("No Ligolo tunnels are persisted for this workspace.")
+        print_info("[~] No Ligolo tunnels are persisted for this workspace.")
         return
     ordered_records = []
     for record in records:
@@ -117,6 +140,8 @@ def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> No
     table.add_column("Target Preview")
     table.add_column("Relaunch")
     table.add_column("Why")
+    relaunch_color = {"Yes": "green", "Blocked": "yellow", "No": "red"}
+    relaunch_glyph = {"Yes": "[+]", "Blocked": "[~]", "No": "[-]"}
     for record, relaunch in ordered_records[:20]:
         targets = record.get("confirmed_targets") or []
         preview_hosts = []
@@ -126,17 +151,52 @@ def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> No
                     hostname_text = str(hostname or "").strip()
                     if hostname_text and hostname_text not in preview_hosts:
                         preview_hosts.append(hostname_text)
+        relaunch_label = relaunch.status_label
+        color = relaunch_color.get(relaunch_label, "white")
+        glyph = relaunch_glyph.get(relaunch_label, "")
+        relaunch_cell = f"[{color}]{glyph} {relaunch_label}[/{color}]" if glyph else relaunch_label
         table.add_row(
             mark_sensitive(str(record.get("tunnel_id") or "unknown"), "text"),
-            mark_sensitive(str(record.get("status") or "unknown"), "text"),
+            _status_style(str(record.get("status") or "unknown")),
             mark_sensitive(str(record.get("pivot_host") or "unknown"), "hostname"),
             mark_sensitive(str(record.get("interface_name") or "unknown"), "text"),
             ", ".join(mark_sensitive(str(route), "text") for route in (record.get("routes") or [])[:3]) or "-",
             ", ".join(mark_sensitive(host, "hostname") for host in preview_hosts) or "-",
-            mark_sensitive(relaunch.status_label, "text"),
+            relaunch_cell,
             mark_sensitive(relaunch.reason, "detail"),
         )
     console.print(table)
+
+
+def _render_proxy_start_jackpot(state: dict[str, Any], *, workspace_dir: str) -> None:
+    """Render the verdict-first panel when a Ligolo proxy listener is up."""
+
+    listen = str(state.get("listen_addr") or "unknown")
+    api = str(state.get("api_laddr") or "unknown")
+    pid = str(state.get("pid") or "unknown")
+
+    marked_listen = mark_sensitive(listen, "host")
+    marked_api = mark_sensitive(api, "host")
+
+    lines = [
+        "[bold]Verdict[/bold]   [green][+][/green] Ligolo-ng proxy listener is UP",
+        f"[bold]Listen[/bold]    {marked_listen} (awaiting agent callback)",
+        f"[bold]API[/bold]       {marked_api}",
+        f"[bold]PID[/bold]       {pid}",
+        f"[bold]Workspace[/bold] {mark_sensitive(workspace_dir, 'path')}",
+        "",
+        "[bold]Next:[/bold]",
+        "  [cyan]>[/cyan] Drop the Ligolo agent on a foothold and point it at this listener",
+        "  [cyan]>[/cyan] Once the agent connects, run [bold]session[/bold] in the proxy console and add routes for the internal range",
+        "  [cyan]>[/cyan] Verify the route with [bold]ip route show table all[/bold] before scanning",
+        "  [cyan]>[/cyan] Enumerate the internal range from inside ADscan with [bold]adscan start[/bold] once the tunnel is established",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="[bold]Ligolo Proxy[/bold] [green]listening[/green]",
+        title_align="left",
+        border_style="green",
+    )
 
 
 def run_ligolo_command(shell: LigoloShell, args: str) -> None:
@@ -183,7 +243,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                 None,
             )
             if record is None:
-                print_error(f"No Ligolo tunnel with ID '{tunnel_id}' exists in this workspace.")
+                print_error(f"[-] No Ligolo tunnel with ID '{tunnel_id}' exists in this workspace.")
                 return
             print_operation_header(
                 "Ligolo Tunnel Status",
@@ -191,7 +251,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                     "Workspace": workspace_dir,
                     "Domain": getattr(shell, "current_domain", None) or "none",
                     "Tunnel ID": tunnel_id,
-                    "Status": record.get("status", "unknown"),
+                    "Status": _status_style(str(record.get("status", "unknown"))),
                     "Pivot Host": record.get("pivot_host", "unknown"),
                     "Interface": record.get("interface_name", "unknown"),
                     "Relaunch": assess_persisted_tunnel_relaunchability(shell, record=record).status_label,
@@ -201,7 +261,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             _print_tunnel_table(shell, [record])
             relaunch = assess_persisted_tunnel_relaunchability(shell, record=record)
             print_info(
-                "Relaunch viability: "
+                "    Relaunch viability: "
                 f"{mark_sensitive(relaunch.status_label, 'text')} "
                 f"({mark_sensitive(relaunch.reason, 'detail')})"
             )
@@ -216,12 +276,16 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                 record = service.stop_tunnel(tunnel_id=tunnel_id)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
-                print_error("Failed to stop the Ligolo tunnel.")
+                print_error("[-] Failed to stop the Ligolo tunnel.")
                 print_exception(show_locals=False, exception=exc)
                 return
             print_success(
-                "Ligolo tunnel stopped. "
+                "[+] Ligolo tunnel stopped. "
                 f"Tunnel ID={mark_sensitive(str(record.get('tunnel_id') or tunnel_id), 'text')}"
+            )
+            print_instruction(
+                "Next: routes added through this tunnel were removed when the agent dropped. "
+                "Confirm with [bold]ip route show table all[/bold] before scanning over the previous range."
             )
             current_domain = str(record.get("domain") or getattr(shell, "current_domain", "")).strip()
             if current_domain:
@@ -248,7 +312,10 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                     item for item in candidates if item.tunnel_id == str(tunnel_id).strip()
                 ]
             if not candidates:
-                print_info("No relaunchable Ligolo pivots are available for this workspace.")
+                print_info("[~] No relaunchable Ligolo pivots are available for this workspace.")
+                print_instruction(
+                    "Next: start a fresh proxy with [bold]ligolo proxy start[/bold] and connect a new agent."
+                )
                 return
             candidate = candidates[0]
             if len(candidates) > 1 and not tunnel_id and hasattr(shell, "_questionary_select"):
@@ -262,18 +329,18 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                     labels,
                 )
                 if selected_idx is None:
-                    print_info("Skipping pivot relaunch by user choice.")
+                    print_info("[~] Skipping pivot relaunch by user choice.")
                     return
                 candidate = candidates[int(selected_idx)]
             if not relaunch_persisted_pivot(shell, candidate=candidate):
-                print_error("Failed to relaunch the selected previous pivot.")
+                print_error("[-] Failed to relaunch the selected previous pivot.")
             return
-        print_error(f"Unknown ligolo tunnel action '{action}'.")
+        print_error(f"[-] Unknown ligolo tunnel action '{action}'.")
         print_instruction("Use: ligolo tunnel <list|status|stop|relaunch>")
         return
 
     if command != "proxy":
-        print_error(f"Unknown ligolo command '{command}'.")
+        print_error(f"[-] Unknown ligolo command '{command}'.")
         print_instruction("Use: ligolo <proxy|tunnel> ...")
         return
 
@@ -283,7 +350,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             listen_addr = argv[2] if len(argv) > 2 else service.resolve_default_listen_addr()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_error("Failed to determine a default ligolo-ng listen address.")
+            print_error("[-] Failed to determine a default ligolo-ng listen address.")
             print_exception(show_locals=False, exception=exc)
             print_instruction("Inspect listeners with: ss -ltnp '( sport = :443 or sport = :80 )'")
             print_instruction(
@@ -299,7 +366,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                     break
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
-                    print_error("Failed to determine a default ligolo-ng API address.")
+                    print_error("[-] Failed to determine a default ligolo-ng API address.")
                     print_exception(show_locals=False, exception=exc)
                     action_choice = str(
                         Prompt.ask(
@@ -310,7 +377,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                         or "retry"
                     ).strip().lower()
                     if action_choice == "skip":
-                        print_info("Skipping Ligolo proxy start for now.")
+                        print_info("[~] Skipping Ligolo proxy start for now.")
                         return
                     if action_choice == "retry":
                         continue
@@ -331,6 +398,7 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                 "API": api_laddr,
                 "Mode": "Daemon",
                 "Egress Policy": "Prefer 443, fallback 80",
+                "Kernel Routes": "None added by proxy start (routes are pushed per-agent via the proxy console)",
             },
             icon="🧭",
         )
@@ -338,14 +406,15 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             state = service.start_proxy(listen_addr=listen_addr, api_laddr=api_laddr)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_error("Failed to start the ligolo-ng proxy.")
+            print_error("[-] Failed to start the ligolo-ng proxy.")
             print_exception(show_locals=False, exception=exc)
             return
         print_success(
-            "Ligolo-ng proxy started. "
+            "[+] Ligolo-ng proxy started. "
             f"Listen={mark_sensitive(str(state.get('listen_addr', 'unknown')), 'host')} "
             f"API={mark_sensitive(str(state.get('api_laddr', 'unknown')), 'host')}"
         )
+        _render_proxy_start_jackpot(state, workspace_dir=workspace_dir)
         return
 
     if action == "stop":
@@ -361,12 +430,16 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             state = service.stop_proxy()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_error("Failed to stop the ligolo-ng proxy.")
+            print_error("[-] Failed to stop the ligolo-ng proxy.")
             print_exception(show_locals=False, exception=exc)
             return
         print_success(
-            "Ligolo-ng proxy stopped. "
+            "[+] Ligolo-ng proxy stopped. "
             f"Previous PID={mark_sensitive(str(state.get('pid', 'unknown')), 'pid')}"
+        )
+        print_instruction(
+            "Next: any active tunnels were torn down with the proxy. "
+            "Verify your routing table with [bold]ip route show table all[/bold] before reusing the previous internal range."
         )
         try:
             reconcile_workspace_pivot_runtime_state(
@@ -398,22 +471,22 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             try:
                 max_lines = max(1, int(argv[2]))
             except ValueError:
-                print_error("Log lines must be an integer.")
+                print_error("[-] Log lines must be an integer.")
                 return
         state = service.get_status()
         _print_proxy_status(state)
         logs = service.read_recent_logs(max_lines=max_lines)
         stdout_lines = logs.get("stdout") or []
         stderr_lines = logs.get("stderr") or []
-        print_info(f"Recent Stdout Lines: {len(stdout_lines)}")
+        print_info(f"    Recent Stdout Lines: {len(stdout_lines)}")
         for line in stdout_lines:
             print_info(line, spacing="none")
-        print_info(f"Recent Stderr Lines: {len(stderr_lines)}")
+        print_info(f"    Recent Stderr Lines: {len(stderr_lines)}")
         for line in stderr_lines:
             print_info(line, spacing="none")
         return
 
-    print_error(f"Unknown ligolo proxy action '{action}'.")
+    print_error(f"[-] Unknown ligolo proxy action '{action}'.")
     print_instruction("Use: ligolo proxy <start|stop|status|logs>")
 
 

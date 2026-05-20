@@ -118,10 +118,10 @@ def resolve_bloodhound_pwdlastset_years(
     domain: str,
     users: list[str],
 ) -> dict[str, int]:
-    """Resolve pwdLastSet years for many users from BloodHound.
+    """Resolve pwdLastSet years for many users from the graph service.
 
     Args:
-        shell: Active shell exposing ``_get_bloodhound_service``.
+        shell: Active shell exposing graph service access.
         domain: Target domain.
         users: Eligible users to resolve.
 
@@ -134,7 +134,14 @@ def resolve_bloodhound_pwdlastset_years(
         return {}
 
     try:
-        service = shell._get_bloodhound_service()
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if not callable(service_getter):
+            return {}
+        service = service_getter()
         records: list[dict[str, Any]] = []
         wanted_user_list = sorted(wanted_users)
         for start in range(

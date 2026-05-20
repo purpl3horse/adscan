@@ -24,13 +24,25 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from adscan_internal.services.kerberos_ticket_service import KerberosTGTResult
 
 import rich.box
+from rich.console import Group
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
+
+from adscan_core.theme import (
+    COLOR_AMBER,
+    COLOR_CRIMSON,
+    COLOR_MUTED,
+    COLOR_SAGE,
+    COLOR_STEEL,
+)
 
 from adscan_internal import (
     print_error,
@@ -48,10 +60,8 @@ from adscan_internal.rich_output import (
     print_warning_verbose,
 )
 from adscan_internal.cli.common import build_lab_event_fields
-from adscan_internal.services import CredentialService, EnumerationService
+from adscan_internal.services import EnumerationService
 from adscan_internal.integrations.impacket import (
-    ImpacketContext,
-    ImpacketRunner,
     extract_kerberoast_candidate_users,
     parse_asreproast_output,
     parse_kerberoast_output,
@@ -70,8 +80,10 @@ def _resolve_dcsync_target_user(shell: Any, *, domain: str) -> str | None:
     known privileged accounts when available.
     """
     admins = shell.get_domain_admins(domain)
-    default_user = "All" if shell.domains_data[domain]["auth"] in ["pwned"] else (
-        admins[0] if admins else "Administrator"
+    default_user = (
+        "All"
+        if shell.domains_data[domain]["auth"] in ["pwned"]
+        else (admins[0] if admins else "Administrator")
     )
     selector = getattr(shell, "_questionary_select", None)
     if callable(selector):
@@ -86,7 +98,9 @@ def _resolve_dcsync_target_user(shell: Any, *, domain: str) -> str | None:
             selected_idx = selector(
                 f"Select the user to extract NTLM hashes from in {mark_sensitive(domain, 'domain')}:",
                 options,
-                default_idx=0 if default_user == "All" else max(options.index(default_user), 0)
+                default_idx=0
+                if default_user == "All"
+                else max(options.index(default_user), 0)
                 if default_user in options
                 else 0,
             )
@@ -356,6 +370,41 @@ def auto_generate_kerberos_ticket(
         return None
 
 
+def auto_generate_kerberos_ticket_result(
+    shell: KerberosShell,
+    username: str,
+    credential: str,
+    domain: str,
+    dc_ip: str | None = None,
+) -> "KerberosTGTResult | None":
+    """Return the full KerberosTGTResult including error_kind for structured error handling.
+
+    Args:
+        shell: Shell instance with workspace configuration.
+        username: Username for authentication.
+        credential: Password or NTLM hash.
+        domain: Domain name.
+        dc_ip: Optional Domain Controller IP address.
+
+    Returns:
+        KerberosTGTResult with success status and error_kind, or None on unexpected error.
+    """
+    from adscan_internal.services.kerberos_ticket_service import KerberosTicketService
+
+    try:
+        service = KerberosTicketService()
+        return service.auto_generate_tgt(
+            username=username,
+            credential=credential,
+            domain=domain,
+            workspace_dir=shell.current_workspace_dir or shell._get_workspace_cwd(),
+            dc_ip=dc_ip,
+        )
+    except Exception as e:
+        telemetry.capture_exception(e)
+        return None
+
+
 def ensure_kerberos_environment_for_command(
     shell: KerberosShell,
     domain: str,
@@ -436,23 +485,82 @@ def _print_roast_choice_help(
     *,
     priority_available: bool,
 ) -> None:
-    """Render a short helper panel for cracking choices."""
-    option_text = {
-        "recommended": "Admins + users with attack paths (fastest impact).",
-        "all": "All roastable users (slowest).",
-        "specific": "Choose a comma-separated list of usernames.",
-        "none": "Skip cracking for now.",
+    """Render an enhanced helper panel for cracking scope choices.
+
+    Each option is rendered with its estimated time-to-crack impact and a
+    visual cue (bold for the recommended option, dim for the rest) so the
+    operator can pick the right scope at a glance.
+
+    Hierarchy is encoded by weight (bold vs dim) and a leading marker
+    (``>`` for the active default, ``+`` for the recommended option, blank
+    for the rest), not by color alone, so the panel stays legible under
+    ``NO_COLOR`` and on monochrome terminals.
+    """
+    # (label, time_hint, use_case)
+    _OPTION_META: dict[str, tuple[str, str, str]] = {
+        "recommended": (
+            "Recommended",
+            "fastest impact",
+            "High-value accounts plus users with attack paths only",
+        ),
+        "all": (
+            "All users",
+            "slowest",
+            "Every roastable account in the domain",
+        ),
+        "specific": (
+            "Specific",
+            "your choice",
+            "Comma-separated list of usernames",
+        ),
+        "none": (
+            "Skip",
+            "no cracking",
+            "Save hashes for later, no cracking now",
+        ),
     }
-    lines = ["[bold]Choose which users to crack[/bold]"]
+
+    lines: list[str] = [
+        f"[bold {COLOR_SAGE}]Select cracking scope[/bold {COLOR_SAGE}]",
+        "",
+    ]
     for option in selection_options:
-        description = option_text.get(option, "")
-        lines.append(f"[cyan]{option}[/cyan] — {description}")
+        label, time_hint, use_case = _OPTION_META.get(option, (option, "", ""))
+        is_default = option == default_choice
+        is_recommended = option == "recommended"
+
+        if is_recommended and priority_available:
+            marker = "+"
+            line = (
+                f"  [bold {COLOR_SAGE}]{marker} {label}[/bold {COLOR_SAGE}]"
+                f"  [dim {COLOR_SAGE}]RECOMMENDED[/dim {COLOR_SAGE}]"
+                f"  [dim]({time_hint})[/dim]"
+                f"\n      [{COLOR_MUTED}]{use_case}[/{COLOR_MUTED}]"
+            )
+        elif is_default:
+            marker = ">"
+            line = (
+                f"  [bold {COLOR_STEEL}]{marker} {label}[/bold {COLOR_STEEL}]"
+                f"  [dim]({time_hint})[/dim]"
+                f"\n      [{COLOR_MUTED}]{use_case}[/{COLOR_MUTED}]"
+            )
+        else:
+            line = (
+                f"    [dim]{label}[/dim]"
+                f"  [dim]({time_hint})[/dim]"
+                f"\n      [{COLOR_MUTED}]{use_case}[/{COLOR_MUTED}]"
+            )
+        lines.append(line)
+        lines.append("")
+
     if not priority_available and "recommended" in selection_options:
         lines.append(
-            "[yellow]No recommended users detected; default set to all.[/yellow]"
+            f"[{COLOR_AMBER}]No priority users detected, defaulting to all accounts.[/{COLOR_AMBER}]"
         )
-    lines.append(f"[dim]Default: {default_choice}[/dim]")
-    print_panel("\n".join(lines), title="Cracking Options", expand=False)
+        lines.append("")
+
+    lines.append(f"[dim]Default selection: [bold]{default_choice}[/bold][/dim]")
+    print_panel("\n".join(lines), title="Cracking options", expand=False)
 
 
 def _should_crack_single_roast_user(
@@ -470,8 +578,8 @@ def _should_crack_single_roast_user(
 
     if hasattr(shell, "_questionary_select"):
         options = [
-            f"crack — Crack {username} now",
-            "none — Skip cracking for now",
+            f"crack: Crack {username} now",
+            "none: Skip cracking for now",
         ]
         selected_idx = shell._questionary_select(
             "Crack discovered user?",
@@ -553,9 +661,337 @@ def _extract_roast_candidate_users_from_stdout(
         return extract_kerberoast_candidate_users(output)
 
     if roast_type == "asreproast":
-        return [item.username for item in parse_asreproast_output(output) if item.username]
+        return [
+            item.username for item in parse_asreproast_output(output) if item.username
+        ]
 
     return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _classify_roast_account(username: str) -> str:
+    """Return a privilege label string for a roastable account.
+
+    Classification is purely name-heuristic. The caller is responsible for
+    passing accounts that have already been confirmed as high-value via
+    ``check_high_value`` into the ``admin_users`` bucket rather than here.
+    """
+    low = username.lower()
+    if low == "krbtgt":
+        return "krbtgt"
+    if any(low.startswith(p) for p in ("svc_", "svc-", "_svc", "service")):
+        return "service"
+    if any(
+        kw in low
+        for kw in ("admin", "mgmt", "backup", "sql", "iis", "mssql", "web", "exchange", "exch")
+    ):
+        return "sensitive-svc"
+    return "normal"
+
+
+def _roast_console_no_color(shell: KerberosShell) -> bool:
+    """Return True when the active console suppresses color (NO_COLOR / pipe / dumb terminal).
+
+    The privilege column and hash-type badges must remain readable when color
+    is unavailable, so the renderers prepend a glyph that carries the meaning
+    even when every span collapses to plain text. We consult the shared
+    Rich console rather than re-implementing the detection.
+    """
+    console = getattr(shell, "console", None)
+    if console is None:
+        return False
+    if getattr(console, "no_color", False):
+        return True
+    if not getattr(console, "is_terminal", True):
+        return True
+    return False
+
+
+def _roast_privilege_cell(username: str, is_admin: bool, *, no_color: bool = False) -> str:
+    """Return a Rich markup string for the privilege column.
+
+    The glyph prefix (``!!``, ``!``, ``*``, ``.``) encodes the same severity
+    ranking as the color, so a color-blind operator, a monochrome terminal,
+    or ``NO_COLOR=1`` still reads the hierarchy. Colors map to the project
+    semantic tokens in ``adscan_core.theme`` instead of ad-hoc hex values,
+    so light themes and user palette overrides apply cleanly.
+    """
+    if is_admin:
+        if no_color:
+            return "!! DA"
+        return f"[bold {COLOR_CRIMSON}]!! DA[/bold {COLOR_CRIMSON}]"
+    cls = _classify_roast_account(username)
+    if cls == "krbtgt":
+        if no_color:
+            return "!! krbtgt"
+        return f"[bold {COLOR_CRIMSON}]!! krbtgt[/bold {COLOR_CRIMSON}]"
+    if cls == "sensitive-svc":
+        if no_color:
+            return "! Sensitive SVC"
+        return f"[bold {COLOR_AMBER}]! Sensitive SVC[/bold {COLOR_AMBER}]"
+    if cls == "service":
+        if no_color:
+            return "* Service"
+        return f"[{COLOR_AMBER}]* Service[/{COLOR_AMBER}]"
+    if no_color:
+        return ". Normal"
+    return f"[{COLOR_MUTED}]. Normal[/{COLOR_MUTED}]"
+
+
+def _hash_type_badge(roast_type: str, *, no_color: bool = False) -> str:
+    """Return the bracket badge for a roast hash type.
+
+    The bracketed token itself (``[TGS]`` / ``[AS-REP]``) carries the meaning
+    so color is purely an enhancement. Tokens map to semantic theme slots.
+    """
+    if roast_type == "kerberoast":
+        if no_color:
+            return "[TGS]"
+        return f"[dim {COLOR_STEEL}][TGS][/dim {COLOR_STEEL}]"
+    if roast_type == "asreproast":
+        if no_color:
+            return "[AS-REP]"
+        return f"[dim {COLOR_AMBER}][AS-REP][/dim {COLOR_AMBER}]"
+    return "[dim][HASH][/dim]"
+
+
+def _print_roast_zero_results(
+    shell: KerberosShell,
+    *,
+    roast_type: str,
+    domain: str,
+) -> None:
+    """Render a muted informational panel when zero roastable accounts are found.
+
+    A zero result is a positive security signal: all accounts require
+    pre-authentication (for AS-REP roasting) or have no SPNs registered
+    (for Kerberoasting). The panel explains this instead of alarming the
+    operator with a red error, and ends with a state-specific footer
+    telling them what to try next (skill: contextual intelligence).
+    """
+    attack_label = "Kerberoast" if roast_type == "kerberoast" else "AS-REP Roast"
+    if roast_type == "kerberoast":
+        detail = (
+            "No Service Principal Names (SPNs) were found on user accounts. "
+            "All accounts appear to be standard user objects without registered services, "
+            "a good security posture indicator."
+        )
+        next_step = (
+            "Try AS-REP Roasting next, or pivot to ACL enumeration "
+            "to surface attack paths that do not depend on SPNs."
+        )
+    else:
+        detail = (
+            "All accounts require Kerberos pre-authentication. "
+            "No AS-REP hashes can be obtained without valid credentials, "
+            "a good security posture indicator."
+        )
+        next_step = (
+            "If you already hold credentials, run Kerberoasting next. "
+            "Otherwise pivot to unauthenticated SMB or LDAP enumeration."
+        )
+    body = (
+        f"[{COLOR_MUTED}]0 {attack_label}able accounts[/{COLOR_MUTED}]\n\n"
+        f"[dim]{detail}[/dim]\n\n"
+        f"[dim]Next:[/dim] [dim]{next_step}[/dim]"
+    )
+    shell.console.print(
+        Panel(
+            body,
+            title=f"[dim]{attack_label}: No targets found[/dim]",
+            title_align="left",
+            border_style="dim",
+            box=rich.box.MINIMAL,
+            expand=False,
+            padding=(0, 1),
+        )
+    )
+
+
+def _print_roast_results_table(
+    shell: KerberosShell,
+    *,
+    roast_type: str,
+    domain: str,
+    admin_users: list[str],
+    privileged_users: list[str],
+    non_admin_users: list[str],
+    has_attack_paths_fn: object,
+    auth_mode: str,
+) -> None:
+    """Render the roastable-accounts results in a single panel.
+
+    Round 2 collapses the previous two stacked panels (table + summary) into a
+    single panel whose footer holds the summary line plus the context-aware
+    next-action hint. This removes the nested-card anti-pattern and the
+    double chrome that the tui-design skill flags under Anti-Pattern #10
+    (over-decorated chrome) and impeccable flags as "nested cards are always
+    wrong".
+
+    Hierarchy is carried by typography + glyphs (bold for DA, ``!!`` prefix in
+    the privilege column, section rule between groups) so the panel remains
+    legible without color. Border color is a semantic accent only: it does
+    not encode required information.
+    """
+    no_color = _roast_console_no_color(shell)
+    badge = _hash_type_badge(roast_type, no_color=no_color)
+    attack_label = "Kerberoast" if roast_type == "kerberoast" else "AS-REP Roast"
+    hashcat_mode = "13100" if roast_type == "kerberoast" else "18200"
+
+    total_admin = len(admin_users)
+    total_normal = len(non_admin_users) + len(privileged_users)
+    total_all = total_admin + total_normal
+
+    if auth_mode == "auth":
+        # Authenticated table: privilege columns + DA visual grouping.
+        # Border accent escalates to crimson when a DA account is present.
+        border_color = COLOR_CRIMSON if total_admin > 0 else COLOR_STEEL
+        table = Table(
+            show_header=True,
+            header_style=f"bold {COLOR_STEEL}",
+            box=rich.box.SIMPLE_HEAVY,
+            border_style=border_color,
+            expand=True,
+            show_lines=False,
+            pad_edge=False,
+        )
+        table.add_column("Account", style="cyan", no_wrap=True)
+        table.add_column("Privilege", justify="left", no_wrap=True)
+        table.add_column("Hash", justify="center", no_wrap=True)
+        table.add_column("Path", justify="center", no_wrap=True)
+
+        def _path_cell(has_path: bool, is_da: bool) -> str:
+            if not has_path:
+                return "[dim].[/dim]" if no_color else "[dim]none[/dim]"
+            if no_color:
+                return "+ yes"
+            color = COLOR_CRIMSON if is_da else COLOR_AMBER
+            return f"[bold {color}]+ yes[/bold {color}]"
+
+        # DA accounts first: these are the jackpot.
+        for user in admin_users:
+            has_path = bool(
+                callable(has_attack_paths_fn) and has_attack_paths_fn(shell, domain, user)
+            )
+            table.add_row(
+                f"[bold]{user}[/bold]",
+                _roast_privilege_cell(user, is_admin=True, no_color=no_color),
+                badge,
+                _path_cell(has_path, is_da=True),
+            )
+
+        # Visual rule between DA and standard accounts when both groups exist.
+        if admin_users and (privileged_users or non_admin_users):
+            table.add_section()
+
+        for user in privileged_users:
+            has_path = bool(
+                callable(has_attack_paths_fn) and has_attack_paths_fn(shell, domain, user)
+            )
+            table.add_row(
+                user,
+                _roast_privilege_cell(user, is_admin=False, no_color=no_color),
+                badge,
+                _path_cell(has_path, is_da=False),
+            )
+
+        for user in non_admin_users:
+            has_path = bool(
+                callable(has_attack_paths_fn) and has_attack_paths_fn(shell, domain, user)
+            )
+            table.add_row(
+                user,
+                _roast_privilege_cell(user, is_admin=False, no_color=no_color),
+                badge,
+                _path_cell(has_path, is_da=False),
+            )
+
+        # Summary debrief line (color is an enhancement; the counts carry meaning).
+        parts: list[str] = [f"[bold {COLOR_SAGE}]{total_all} {attack_label}able[/bold {COLOR_SAGE}]"]
+        if total_admin > 0:
+            parts.append(
+                f"[bold {COLOR_CRIMSON}]{total_admin} DA account"
+                f"{'s' if total_admin != 1 else ''}[/bold {COLOR_CRIMSON}]"
+            )
+        if total_normal > 0:
+            parts.append(f"[{COLOR_MUTED}]{total_normal} standard[/{COLOR_MUTED}]")
+        summary_line = "  ·  ".join(parts)
+
+        # Context-aware footer: the most actionable command depends on whether
+        # any DA account is present. When it is, the operator's first move is
+        # almost always to crack DA accounts first, so we surface that explicitly.
+        if total_admin > 0:
+            next_action = (
+                f"[dim]Next:[/dim]  "
+                f"[bold {COLOR_STEEL}]hashcat -m {hashcat_mode} "
+                f"hashes.{roast_type}.recommended wordlist.txt[/bold {COLOR_STEEL}]"
+                f"   [dim](DA-first subset)[/dim]"
+            )
+        else:
+            next_action = (
+                f"[dim]Next:[/dim]  "
+                f"[bold {COLOR_STEEL}]hashcat -m {hashcat_mode} "
+                f"hashes.{roast_type} wordlist.txt[/bold {COLOR_STEEL}]"
+            )
+
+        # Render table + footer inside a single panel (no nested cards).
+        body = Group(
+            table,
+            Text(""),  # one-line spacer
+            Text.from_markup(f"{summary_line}\n{next_action}", justify="left"),
+        )
+        shell.console.print(
+            Panel(
+                body,
+                title=f"[bold]{attack_label}able accounts: {domain}[/bold]",
+                title_align="left",
+                border_style=border_color,
+                box=rich.box.ROUNDED,
+                expand=True,
+                padding=(0, 1),
+            )
+        )
+    else:
+        # Guest / unauthenticated table: simplified, no privilege data.
+        table = Table(
+            show_header=True,
+            header_style=f"bold {COLOR_STEEL}",
+            box=rich.box.SIMPLE_HEAVY,
+            border_style=COLOR_STEEL,
+            expand=True,
+            pad_edge=False,
+        )
+        table.add_column("Account", style="cyan")
+        table.add_column("Hash", justify="center", no_wrap=True)
+        for user in non_admin_users:
+            table.add_row(user, badge)
+
+        next_action = (
+            f"[dim]Next:[/dim]  "
+            f"[bold {COLOR_STEEL}]hashcat -m {hashcat_mode} "
+            f"hashes.{roast_type} wordlist.txt[/bold {COLOR_STEEL}]"
+        )
+        summary_line = (
+            f"[bold {COLOR_SAGE}]{total_all} {attack_label}able "
+            f"account{'s' if total_all != 1 else ''}[/bold {COLOR_SAGE}]"
+            f"  [dim](unauthenticated scan)[/dim]"
+        )
+
+        body = Group(
+            table,
+            Text(""),
+            Text.from_markup(f"{summary_line}\n{next_action}", justify="left"),
+        )
+        shell.console.print(
+            Panel(
+                body,
+                title=f"[bold]{attack_label}able accounts: {domain}[/bold]",
+                title_align="left",
+                border_style=COLOR_STEEL,
+                box=rich.box.ROUNDED,
+                expand=True,
+                padding=(0, 1),
+            )
+        )
 
 
 def finalize_roast_results(
@@ -651,8 +1087,7 @@ def finalize_roast_results(
             )
 
     if not normalized_users:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(f"No {roast_type}able users found in domain {marked_domain}")
+        _print_roast_zero_results(shell=shell, roast_type=roast_type, domain=domain)
 
         try:
             properties = {
@@ -709,48 +1144,18 @@ def finalize_roast_results(
                 status="discovered",
             )
 
-        table = Table(
-            title=f"[bold blue]{roast_type.capitalize()}able Users in {domain} (Authenticated)[/bold blue]",
-            show_header=True,
-            header_style="bold magenta",
-            box=rich.box.ROUNDED,
-            expand=True,
+        _print_roast_results_table(
+            shell=shell,
+            roast_type=roast_type,
+            domain=domain,
+            admin_users=admin_users,
+            privileged_users=privileged_users,
+            non_admin_users=non_admin_users,
+            has_attack_paths_fn=has_attack_paths_for_user,
+            auth_mode="auth",
         )
-        table.add_column("User", style="cyan")
-        table.add_column("Privileges", style="green")
-        table.add_column("Attack Path", style="yellow")
-        for user in admin_users:
-            has_path = "Yes" if has_attack_paths_for_user(shell, domain, user) else "No"
-            table.add_row(user, "[bold red]Administrator[/bold red]", has_path)
-        for user in privileged_users:
-            has_path = "Yes" if has_attack_paths_for_user(shell, domain, user) else "No"
-            table.add_row(user, "[yellow]Privileged[/yellow]", has_path)
-        for user in non_admin_users:
-            has_path = "Yes" if has_attack_paths_for_user(shell, domain, user) else "No"
-            table.add_row(user, "[cyan]General[/cyan]", has_path)
-        if not (admin_users or privileged_users or non_admin_users):
-            shell.console.print(
-                Panel(
-                    Text(
-                        f"No {roast_type}able users found in domain {domain}.",
-                        style="yellow",
-                    ),
-                    border_style="yellow",
-                )
-            )
-        else:
-            shell.console.print(Panel(table, border_style="bright_blue", expand=True))
     else:
-        table = Table(
-            title=f"[bold blue]{roast_type.capitalize()}able Users in {domain} (Guest)[/bold blue]",
-            show_header=False,
-            header_style="bold magenta",
-            box=rich.box.ROUNDED,
-            expand=True,
-        )
-        table.add_column("User", style="cyan")
         for user in normalized_users:
-            table.add_row(user)
             all_users.append(user)
             upsert_roast_entry_edge(
                 shell,
@@ -759,7 +1164,16 @@ def finalize_roast_results(
                 username=user,
                 status="discovered",
             )
-        shell.console.print(Panel(table, border_style="bright_blue", expand=True))
+        _print_roast_results_table(
+            shell=shell,
+            roast_type=roast_type,
+            domain=domain,
+            admin_users=[],
+            privileged_users=[],
+            non_admin_users=normalized_users,
+            has_attack_paths_fn=has_attack_paths_for_user,
+            auth_mode="guest",
+        )
 
     report_field = roast_type.lower()
     if report_field:
@@ -816,7 +1230,9 @@ def finalize_roast_results(
                 "hash_count": total_users,
                 "scan_mode": getattr(shell, "scan_mode", None),
             }
-            ttfh_properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            ttfh_properties.update(
+                build_lab_event_fields(shell=shell, include_slug=True)
+            )
             telemetry.capture("metric_ttfh", ttfh_properties)
 
         # Track hash count for case study metrics
@@ -891,7 +1307,7 @@ def finalize_roast_results(
                         "none": "Skip cracking for now",
                     }
                     options = [
-                        f"{option} — {option_descriptions.get(option, '')}".strip()
+                        f"{option}: {option_descriptions.get(option, '')}".strip()
                         for option in selection_options
                     ]
                     default_idx = selection_options.index(default_choice)
@@ -1009,21 +1425,6 @@ def run_kerberoast(
         )
         return None
 
-    if not shell.impacket_scripts_dir:
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-        )
-        return None
-
-    getuserspns_py_path = os.path.join(shell.impacket_scripts_dir, "GetUserSPNs.py")
-    if not os.path.isfile(getuserspns_py_path) or not os.access(
-        getuserspns_py_path, os.X_OK
-    ):
-        print_error(
-            f"GetUserSPNs.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-        )
-        return None
-
     workspace_cwd = shell._get_workspace_cwd()
     cracking_path = domain_subpath(
         workspace_cwd, shell.domains_dir, target_domain, shell.cracking_dir
@@ -1037,6 +1438,14 @@ def run_kerberoast(
     password = domain_credentials.get("password") or shell.domains_data.get(
         shell.domain or "", {}
     ).get("password")
+
+    # Determine the auth domain: if target_domain has its own credentials use it;
+    # otherwise we are using cross-domain trust credentials from shell.domain.
+    auth_domain: str = (
+        target_domain
+        if domain_credentials.get("username") and domain_credentials.get("password")
+        else (shell.domain or target_domain)
+    )
 
     if not username or not password:
         print_error(
@@ -1065,16 +1474,6 @@ def run_kerberoast(
         icon="🎫",
     )
 
-    ctx = ImpacketContext(
-        impacket_scripts_dir=shell.impacket_scripts_dir,
-        validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
-        get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
-        sync_clock_with_pdc=lambda d: bool(shell.do_sync_clock_with_pdc(d, verbose=True)),
-        workspace_dir=shell.current_workspace_dir or shell._get_workspace_cwd(),
-        domains_data=shell.domains_data,
-    )
-    impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
-
     enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
     hashes = enum_service.kerberos.kerberoast(
         domain=target_domain,
@@ -1082,9 +1481,11 @@ def run_kerberoast(
         username=username,
         password=password,
         hashes=None,
-        impacket_runner=impacket_runner,
-        impacket_context=ctx,
+        auth_domain=auth_domain,
         output_file=Path(output_file_abs),
+        workspace_dir=workspace_cwd,
+        domains_data=shell.domains_data,
+        sync_clock=getattr(shell, "sync_clock_with_pdc", None),
         scan_id=None,
     )
     # Ensure usernames are in stable order for downstream UI.
@@ -1175,88 +1576,36 @@ def run_asreproast(
         icon="🎟️",
     )
 
-    service = CredentialService()
-    executor = shell._get_service_executor()
-
     auth_mode = shell.domains_data[target_domain].get("auth")
-    # Keep legacy behavior for authenticated mode: use NetExec LDAP --asreproast.
+    enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
+
     if auth_mode == "auth" or auth_mode == "pwned":
-        if not shell.netexec_path:
-            print_error(
-                "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-            )
-            return None
-        auth = shell.build_auth_nxc(
-            shell.domains_data[shell.domain]["username"],
-            shell.domains_data[shell.domain]["password"],
-            shell.domain,
-            kerberos=False,
-        )
-        log_file_abs = domain_subpath(
-            workspace_cwd,
-            shell.domains_dir,
-            target_domain,
-            shell.cracking_dir,
-            "asreproast.log",
-        )
-        result = service.asreproast(
+        hashes = enum_service.kerberos.asreproast(
             domain=target_domain,
-            users_file=users_file_abs,
-            getnpusers_path="",  # unused in authenticated mode
-            output_file=output_file_abs,
             pdc=shell.domains_data[target_domain]["pdc"],
-            auth_string=auth,
-            netexec_path=shell.netexec_path,
-            log_file=log_file_abs,
-            executor=executor,
+            username=shell.domains_data[shell.domain]["username"],
+            password=shell.domains_data[shell.domain]["password"],
+            auth_domain=shell.domain,
+            usersfile=Path(users_file_abs),
+            output_file=Path(output_file_abs),
+            workspace_dir=workspace_cwd,
+            domains_data=shell.domains_data,
+            sync_clock=getattr(shell, "sync_clock_with_pdc", None),
             scan_id=None,
         )
+        result_users = [h.username for h in hashes]
     else:
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return None
-        getnpusers_py_path = os.path.join(shell.impacket_scripts_dir, "GetNPUsers.py")
-        if not os.path.isfile(getnpusers_py_path) or not os.access(
-            getnpusers_py_path, os.X_OK
-        ):
-            print_error(
-                f"GetNPUsers.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return None
-
-        ctx = ImpacketContext(
-            impacket_scripts_dir=shell.impacket_scripts_dir,
-            validate_script_exists=lambda p: os.path.isfile(p)
-            and os.access(p, os.X_OK),
-            get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
-            sync_clock_with_pdc=lambda d: bool(
-                shell.do_sync_clock_with_pdc(d, verbose=True)
-            ),
-            workspace_dir=shell.current_workspace_dir or shell._get_workspace_cwd(),
-            domains_data=shell.domains_data,
-        )
-        impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
-        enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
         hashes = enum_service.kerberos.asreproast(
             domain=target_domain,
             pdc=shell.domains_data[target_domain]["pdc"],
             usersfile=Path(users_file_abs),
-            impacket_runner=impacket_runner,
-            impacket_context=ctx,
             output_file=Path(output_file_abs),
+            workspace_dir=workspace_cwd,
+            domains_data=shell.domains_data,
+            sync_clock=getattr(shell, "sync_clock_with_pdc", None),
             scan_id=None,
         )
-        # Use parsed hashes as the user list for UI.
         result_users = [h.username for h in hashes]
-        return finalize_roast_results(
-            shell,
-            domain=target_domain,
-            roast_type="asreproast",
-            users=result_users,
-            auto_crack=auto_crack,
-        )
 
     try:
         properties = {
@@ -1270,17 +1619,11 @@ def run_asreproast(
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
 
-    if not result.success:
-        print_error(
-            f"Error attempting to perform asreproast: {result.error_message or 'Unknown error'}"
-        )
-        return None
-
     return finalize_roast_results(
         shell,
         domain=target_domain,
         roast_type="asreproast",
-        users=result.roastable_users,
+        users=result_users,
         auto_crack=auto_crack,
     )
 
@@ -1521,6 +1864,92 @@ def sync_clock_with_pdc(
                         "Could not disable NTP via timedatectl on the host; clock sync may be unreliable."
                     )
                 setattr(shell, "_host_ntp_disabled_once", True)
+
+            # --- Primary path: dc_time service (SMB Negotiate → NTP → net time) ---
+            # See ``adscan_internal/services/dc_time.py`` for channel ordering rationale.
+            # The legacy ntpdate / container ntpdate / RPC chain below is kept as a final
+            # fallback in case every read channel fails (e.g. SMB filtered AND ntpdate
+            # absent AND net-time absent) so existing customer environments don't regress.
+            try:
+                import asyncio as _asyncio
+                from adscan_internal.services.dc_time import (
+                    DCTimeUnavailable,
+                    get_dc_time,
+                    is_plausible_reading,
+                )
+
+                async def _read_dc_time():
+                    return await get_dc_time(pdc_ip, sock_path=sock_path)
+
+                try:
+                    reading = _asyncio.run(_read_dc_time())
+                except DCTimeUnavailable as exc:
+                    print_info_debug(
+                        "[clock-sync] all DC-time read channels failed, "
+                        f"falling back to legacy ntpdate/net-time path: {exc}"
+                    )
+                    reading = None
+                except RuntimeError as exc:
+                    # ``asyncio.run`` refuses to nest inside a running loop.
+                    telemetry.capture_exception(exc)
+                    print_info_debug(
+                        "[clock-sync] DC-time read could not start a new event loop, "
+                        f"falling back to legacy path: {exc}"
+                    )
+                    reading = None
+
+                if reading is not None:
+                    # Sanity-check the reading before handing it to the
+                    # privileged host clock setter. A parser bug or a
+                    # corrupted DC response can produce a year-1601 or
+                    # year-2099 datetime, or a multi-second stale read —
+                    # applying either silently corrupts the host clock
+                    # (TLS, cron, Kerberos retries) for the whole session.
+                    plausible, reason = is_plausible_reading(reading)
+                    if not plausible:
+                        print_warning(reason or "DC time reading failed sanity check.")
+                        telemetry.capture_exception(
+                            RuntimeError(
+                                f"dc_time reading rejected by sanity gate: {reason}"
+                            )
+                        )
+                        return False
+
+                    set_resp = host_helper_client_request(
+                        sock_path,
+                        op="set_system_time",
+                        payload={"datetime_iso": reading.when_utc.isoformat()},
+                    )
+                    _log_host_helper_clock_sync_response(
+                        operation="set_system_time",
+                        host=pdc_ip,
+                        response=set_resp,
+                    )
+                    if set_resp.ok:
+                        marked_pdc_ip = mark_sensitive(pdc_ip, "ip")
+                        print_success_verbose(
+                            f"Clock synchronized with PDC {marked_pdc_ip} "
+                            f"via {reading.channel.value} (rtt={reading.rtt_ms}ms)"
+                        )
+                        return True
+                    print_info_debug(
+                        "[clock-sync] DC time read succeeded but host-helper "
+                        f"set_system_time failed; falling back to legacy path: "
+                        f"rc={set_resp.returncode} msg={set_resp.message!r}"
+                    )
+            except (HostHelperError, OSError) as _dctime_exc:
+                telemetry.capture_exception(_dctime_exc)
+                print_info_debug(
+                    "[clock-sync] dc_time path raised host-helper error, "
+                    f"falling back to legacy path: {_dctime_exc}"
+                )
+            except Exception as _dctime_exc:  # noqa: BLE001 — defensive
+                telemetry.capture_exception(_dctime_exc)
+                print_info_debug(
+                    "[clock-sync] dc_time path raised unexpected error, "
+                    f"falling back to legacy path: {_dctime_exc}"
+                )
+
 
             ntp_resp = host_helper_client_request(
                 sock_path, op="ntpdate", payload={"host": pdc_ip}
@@ -1876,28 +2305,50 @@ def _sync_clock_via_net_time(
     return False
 
 
-def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) -> None:
+def run_dcsync(
+    shell: KerberosShell,
+    domain: str,
+    username: str,
+    password: str,
+    target_domain: str | None = None,
+) -> dict | None:
     """Perform DCSync to extract NTLM hashes of domain users.
 
     Args:
         shell: Shell instance with workspace and domain configuration.
-        domain: Target domain name.
+        domain: Auth domain — where the credential lives.
         username: Username for authentication.
         password: Password or hash for authentication.
+        target_domain: Domain to extract secrets from. Defaults to
+            ``domain`` for single-realm DCSync. When provided and different,
+            the DCSync targets ``target_domain``'s DC using the credential
+            from ``domain`` (cross-realm DCSync via trust).
     """
     from adscan_internal.rich_output import print_operation_header
-    from adscan_internal.workspaces import domain_subpath
     from adscan import _resolve_domain_key, _normalize_interactive_text
-    import shlex
 
-    resolved_domain = _resolve_domain_key(shell.domains_data, domain)
-    if not resolved_domain:
+    resolved_auth = _resolve_domain_key(shell.domains_data, domain)
+    if not resolved_auth:
         print_error(
             f"Unknown domain: {mark_sensitive(domain, 'domain')}. "
             "Run `domains` to list available domains."
         )
         return
-    domain = resolved_domain
+    auth_domain_explicit = resolved_auth
+
+    # Resolve the target domain (DC to dump). Defaults to auth domain.
+    if target_domain and target_domain.strip():
+        resolved_target = _resolve_domain_key(shell.domains_data, target_domain)
+        if not resolved_target:
+            print_error(
+                f"Unknown target domain for DCSync: "
+                f"{mark_sensitive(target_domain, 'domain')}. "
+                "Run `domains` to list available domains."
+            )
+            return
+        domain = resolved_target
+    else:
+        domain = resolved_auth
 
     target_user_raw = _resolve_dcsync_target_user(shell, domain=domain)
     target_user = _normalize_interactive_text(target_user_raw)
@@ -1905,78 +2356,9 @@ def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) 
         print_warning("No target user specified. Aborting DCSync.")
         return
 
-    disabled = "y"
-    auth = shell.build_auth_impacket(username, password, domain, kerberos=False)
-    command = ""
-    if not shell.impacket_scripts_dir:
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-        )
-        return
-    secretsdump_path = os.path.join(shell.impacket_scripts_dir, "secretsdump.py")
-    if not os.path.isfile(secretsdump_path) or not os.access(secretsdump_path, os.X_OK):
-        print_error(
-            f"secretsdump.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-        )
-        return
-
-    if password.lower().endswith(".ccache"):
-        command = f"KRB5CCNAME={shlex.quote(password)} "
-        auth = shell.build_auth_impacket(username, password, domain, kerberos=True)
-
-    # Build a log-safe version of the auth string
-    marked_domain = mark_sensitive(domain, "domain")
-    marked_username = mark_sensitive(username, "user")
-    marked_password = mark_sensitive(password, "password")
-    marked_pdc = mark_sensitive(shell.domains_data[domain]["pdc"], "ip")
-    marked_pdc_hostname = mark_sensitive(
-        shell.domains_data[domain]["pdc_hostname"], "host"
-    )
-    if password.lower().endswith(".ccache"):
-        auth_for_log = (
-            f"-k -no-pass {marked_domain}/'{marked_username}'@{marked_pdc_hostname} -k"
-        )
-    else:
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-        auth_for_log = f"{marked_domain}/'{marked_username}'"
-        auth_for_log += (
-            f"@{marked_pdc} -hashes :{marked_password}"
-            if is_hash
-            else f":'{marked_password}'@{marked_pdc}"
-        )
-
-    # Build command
-    if target_user.casefold() == "all" and disabled.lower() == "y":
-        command += f"{secretsdump_path} {auth} -just-dc-ntlm -o domains/{domain}/all"
-        command_for_log = (
-            f"{secretsdump_path} {auth_for_log} -just-dc-ntlm -o domains/{domain}/all"
-        )
-    else:
-        workspace_cwd = shell.current_workspace_dir or os.getcwd()
-        dcsync_path = domain_subpath(
-            workspace_cwd, shell.domains_dir, domain, shell.dcsync_dir
-        )
-        if not os.path.exists(dcsync_path):
-            os.makedirs(dcsync_path)
-        safe_target_user = _normalize_interactive_text(target_user)
-        marked_netbios = mark_sensitive(shell.domains_data[domain]["netbios"], "domain")
-        marked_target_user = mark_sensitive(target_user, "user")
-        command += (
-            f"{secretsdump_path} {auth} -just-dc-user "
-            f"{shell.domains_data[domain]['netbios']}/{safe_target_user} -just-dc-ntlm"
-        )
-        command_for_log = (
-            f"{secretsdump_path} {auth_for_log} -just-dc-user "
-            f"{marked_netbios}/{marked_target_user} -just-dc-ntlm"
-        )
-
-    # Professional operation header
     auth_method = (
         "Kerberos (ccache)" if password.lower().endswith(".ccache") else "Password"
     )
-
     print_operation_header(
         "DCSync Attack",
         details={
@@ -1988,7 +2370,6 @@ def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) 
         icon="🔄",
     )
 
-    print_info_debug(f"Command: {command_for_log}")
     marked_target = mark_sensitive(target_user, "user")
     if target_user.casefold() == "all":
         print_info_debug("[dcsync] Target scope: All users")
@@ -2004,11 +2385,29 @@ def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) 
         "retry_attempted": False,
     }
     try:
-        from adscan_internal.cli.secretsdump import execute_secretsdump
+        from adscan_internal.cli.secretsdump import execute_dcsync_native
 
-        execute_secretsdump(shell, command, domain)
+        # Cross-realm: keep the explicit auth domain so the AS-REQ goes to
+        # the credential's KDC, not the target domain's KDC.
+        auth_domain_for_native = (
+            auth_domain_explicit
+            if auth_domain_explicit != domain
+            else str(
+                (shell.domains_data.get(domain, {}) or {}).get("auth_domain") or domain
+            )
+        )
+        target_users_for_native: list[str] | None = (
+            None if target_user.casefold() == "all" else [target_user]
+        )
+        result = execute_dcsync_native(
+            shell,
+            domain=domain,
+            auth_domain=auth_domain_for_native,
+            target_users=target_users_for_native,
+        )
     finally:
         shell._current_dcsync_context = previous_context
+    return result
 
 
 def ask_for_dcsync(
@@ -2080,53 +2479,54 @@ def run_kerberoast_preauth(shell: KerberosShell, domain: str, user: str) -> None
     if not os.path.exists(cracking_path):
         os.makedirs(cracking_path)
 
-    users_file_rel = domain_relpath(shell.domains_dir, domain, "users.txt")
-    output_file_rel = domain_relpath(
-        shell.domains_dir, domain, shell.cracking_dir, "hashes.kerberoast"
+    users_file_abs = domain_subpath(
+        workspace_cwd, shell.domains_dir, domain, "users.txt"
     )
     pdc = shell.domains_data[domain]["pdc"]
-    pre_command = (
-        f"GetUserSPNs.py -no-preauth {user} -request -usersfile {users_file_rel} "
-        f"-dc-ip {pdc} {domain}/ -outputfile {output_file_rel}"
-    )
     marked_user = mark_sensitive(user, "user")
     marked_domain = mark_sensitive(domain, "domain")
-    command = (
-        f"GetUserSPNs.py -no-preauth {marked_user} -request -usersfile {users_file_rel} "
-        f"-dc-ip {pdc} {marked_domain}/ | grep -vE 'Name|v0.|---|CCache' | "
-        f"grep -oP '\\$krb5tgs\\$23\\$\\*\\K[^\\$]*(?=\\$)'"
-    )
 
     print_info(
         f"Generating kerberoastable user list with pre-auth for user {marked_user} "
         f"in domain {marked_domain}"
     )
-    print_info_debug(f"Command: {pre_command}")
     try:
-        completed_process = shell.run_command(pre_command, timeout=300)
-
-        if completed_process and completed_process.returncode == 0:
-            print_success_verbose("Pre-command completed successfully.")
-            # Now execute the second command sequentially
-            execute_roast(shell, command, domain, "kerberoast", auto_crack=True)
-            print_info_verbose(
-                f"Grepping kerberoastable users with pre-auth for user {marked_user} "
-                f"in domain {marked_domain}"
-            )
-        else:
-            error_message = ""
-            if completed_process:
-                error_message = (
-                    (completed_process.stderr or "").strip()
-                    if completed_process.stderr
-                    else (completed_process.stdout or "").strip()
+        enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
+        hashes = enum_service.kerberos.kerberoast_no_preauth(
+            domain=domain,
+            pdc=pdc,
+            no_preauth_username=user,
+            usersfile=Path(users_file_abs),
+            output_file=Path(
+                domain_subpath(
+                    workspace_cwd,
+                    shell.domains_dir,
+                    domain,
+                    shell.cracking_dir,
+                    "hashes.kerberoast",
                 )
-            print_error(
-                f"Error in pre-command: {error_message if error_message else 'Details not available'}"
-            )
+            ),
+            scan_id=None,
+        )
+        if not hashes:
+            print_error("No no-preauth Kerberoast hashes were produced.")
+            return
+
+        print_success_verbose("No-preauth Kerberoast completed successfully.")
+        finalize_roast_results(
+            shell,
+            domain=domain,
+            roast_type="kerberoast",
+            users=[item.username for item in hashes],
+            auto_crack=True,
+        )
+        print_info_verbose(
+            f"Generated Kerberoast hashes with no-preauth user {marked_user} "
+            f"in domain {marked_domain}"
+        )
     except Exception as e:
         telemetry.capture_exception(e)
-        print_error("Error executing pre-command.")
+        print_error("Error executing no-preauth Kerberoast.")
         from adscan_internal.rich_output import print_exception
 
         print_exception(show_locals=False, exception=e)

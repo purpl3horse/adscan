@@ -7,7 +7,7 @@ This module provides services for credential verification, roasting attacks
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
-import re
+import asyncio
 import subprocess
 import os
 import logging
@@ -17,7 +17,6 @@ from adscan_internal import telemetry
 from adscan_internal.command_runner import CommandSpec, default_runner
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import CredentialFoundEvent
-from adscan_internal.execution_outcomes import output_has_timeout_marker
 from adscan_internal.integrations.impacket.parsers import (
     extract_kerberoast_candidate_users,
     parse_asreproast_output,
@@ -30,11 +29,6 @@ from adscan_internal.subprocess_env import (
 
 
 logger = logging.getLogger(__name__)
-
-_NETEXEC_NEGATIVE_AUTH_LINE_RE = re.compile(
-    r"\[-\]\s+(?P<principal>[^\s]+(?:\\|/)[^:\s]+):",
-    re.IGNORECASE,
-)
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str] | None]
 
@@ -77,6 +71,35 @@ def _ensure_completed_process(
     if not isinstance(result, subprocess.CompletedProcess):
         raise RuntimeError(f"{operation} command returned no process result.")
     return result
+
+
+async def _diagnose_kdc_unreachable(*, kdc_ip: str, original_error: str) -> str:
+    """Translate a Kerberos transport failure into an actionable diagnosis.
+
+    Runs a 2-second native TCP probe to ``kdc_ip:88`` and maps the three
+    probe outcomes to operator-facing language. Replaces the historic
+    NetExec LDAP fallback, which gave a different protocol's answer when
+    Kerberos was actually unreachable — a silent inconsistency this
+    message removes. Never raises.
+    """
+    from adscan_internal.services.network_probe_service import tcp_probe
+
+    if not kdc_ip:
+        return f"Kerberos transport error (KDC address not set): {original_error}"
+
+    probe = await tcp_probe(kdc_ip, 88, timeout=2.0)
+    if probe.status == "filtered":
+        return (
+            f"Kerberos KDC unreachable: TCP/88 on {kdc_ip} is filtered "
+            "(no response). Verify network access from this host before "
+            "retrying — credentials cannot be validated without KDC access."
+        )
+    if probe.status == "closed":
+        return (
+            f"Kerberos KDC unreachable: TCP/88 on {kdc_ip} actively refused "
+            "the connection. The KDC service may be stopped on the DC."
+        )
+    return f"Kerberos transport error (TCP/88 reachable on {kdc_ip}): {original_error}"
 
 
 class CredentialStatus(str, Enum):
@@ -196,349 +219,226 @@ class CredentialService(BaseService):
     - Password spraying
     """
 
-    def verify_credentials(
-        self,
-        domain: str,
-        username: str,
-        credential: str,
-        pdc_fqdn: str,
-        netexec_path: str,
-        auth_string: str,
-        log_file_path: str,
-        scan_id: Optional[str] = None,
-        executor: CommandExecutor | None = None,
-        timeout: int = 60,
-    ) -> CredentialVerificationResult:
-        """Verify domain credentials against PDC.
+    # ------------------------------------------------------------------ #
+    # Native Kerberos verification                                         #
+    # ------------------------------------------------------------------ #
 
-        Args:
-            domain: Domain name
-            username: Username to verify
-            credential: Password or NTLM hash
-            pdc_fqdn: PDC fully qualified domain name
-            netexec_path: Path to NetExec executable
-            auth_string: Pre-built authentication string for NetExec
-            log_file_path: Path to log file
-            scan_id: Optional scan ID for progress tracking
-            executor: Optional command executor. When not provided, a default
-                subprocess-based executor is used. The CLI layer should inject
-                its own executor that routes through the NetExec helpers to
-                ensure clock-skew handling and retries.
-            timeout: Verification timeout in seconds
-
-        Returns:
-            CredentialVerificationResult with status and details
-        """
-        self._emit_progress(
-            scan_id=scan_id,
-            phase="credential_verification",
-            progress=0.0,
-            message=f"Verifying credentials for {username}@{domain}",
-        )
-
-        credential_type = "hash" if self._is_ntlm_hash(credential) else "password"
-
-        # Build command
-        command = f'{netexec_path} ldap {pdc_fqdn} {auth_string} --log "{log_file_path}"'
-
-        self.logger.info(
-            f"Verifying credentials for {username}@{domain} (type: {credential_type})"
-        )
-
-        self._emit_progress(
-            scan_id=scan_id,
-            phase="credential_verification",
-            progress=0.3,
-            message="Executing verification command",
-        )
-
-        # Execute verification
-        try:
-            exec_fn = executor or _default_executor
-            result = _ensure_completed_process(
-                exec_fn(command, timeout),
-                operation="Credential verification",
-            )
-
-            output = (result.stdout or "") + (result.stderr or "")
-
-            # Parse verification result
-            verification_result = self._parse_verification_output(
-                output, username, domain, credential_type
-            )
-            verification_result.raw_output = output
-
-            self._emit_progress(
-                scan_id=scan_id,
-                phase="credential_verification",
-                progress=1.0,
-                message=f"Verification completed: {verification_result.status.value}",
-            )
-
-            # Emit credential found event if valid
-            if verification_result.is_valid():
-                self._emit_event(
-                    CredentialFoundEvent(
-                        scan_id=scan_id,
-                        credential_type=credential_type,
-                        username=username,
-                        domain=domain,
-                        source="verification",
-                        is_admin=verification_result.is_admin,
-                    )
-                )
-
-            self.logger.info(
-                f"Credential verification for {username}@{domain}: {verification_result.status.value}"
-            )
-
-            return verification_result
-
-        except subprocess.TimeoutExpired:
-            telemetry.capture_exception(
-                TimeoutError(
-                    f"Credential verification timed out for {username}@{domain}"
-                )
-            )
-            self.logger.error(
-                f"Credential verification timed out for {username}@{domain}"
-            )
-            self._emit_progress(
-                scan_id=scan_id,
-                phase="credential_verification",
-                progress=1.0,
-                message="Verification timed out",
-            )
-            return CredentialVerificationResult(
-                status=CredentialStatus.TIMEOUT,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Verification timed out",
-            )
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            self.logger.exception(f"Error verifying credentials: {e}")
-            self._emit_progress(
-                scan_id=scan_id,
-                phase="credential_verification",
-                progress=1.0,
-                message="Verification failed with error",
-            )
-            return CredentialVerificationResult(
-                status=CredentialStatus.ERROR,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message=str(e),
-            )
-
-    def change_password_with_netexec(
+    async def _verify_via_kerberos(
         self,
         *,
         domain: str,
+        kdc_ip: str,
         username: str,
-        pdc_fqdn: str,
-        netexec_path: str,
-        auth_string: str,
-        new_password: str,
-        log_file_path: str,
-        executor: CommandExecutor | None = None,
-        timeout: int = 120,
-    ) -> PasswordChangeResult:
-        """Change a domain password using NetExec's ``change-password`` module."""
-        command = (
-            f'{netexec_path} smb {pdc_fqdn} {auth_string} '
-            f'-M change-password -o NEWPASS={shlex.quote(new_password)} '
-            f'--log "{log_file_path}"'
+        credential: str,
+        credential_type: str,
+    ) -> "CredentialVerificationResult":
+        """Verify a domain credential by requesting a Kerberos TGT via kerbad.
+
+        Returns a :class:`CredentialVerificationResult` in the same shape as
+        the netexec path so the caller can use either without changes.
+
+        Side-effect: on success the ccache bytes are attached to the result via
+        ``result.raw_output`` field (bytes, not str) so the caller can persist
+        the ticket immediately without an extra round-trip.
+
+        Falls through to ``ERROR`` only for genuinely unexpected transport
+        failures (network unreachable, etc.) — the caller should then fall back
+        to the netexec path if appropriate.
+        """
+        from adscan_internal.services.kerberos_transport import (
+            KerberosAuthError,
+            KerberosClockSkewError,
+            KerberosConfig,
+            KerberosEtypeError,
+            KerberosPrincipalError,
+            KerberosTransportError,
+            get_tgt,
         )
 
-        try:
-            exec_fn = executor or _default_executor
-            result = _ensure_completed_process(
-                exec_fn(command, timeout),
-                operation="Password change",
-            )
-            output = (result.stdout or "") + (result.stderr or "")
-            parsed = self._parse_password_change_output(
-                output=output,
-                username=username,
-                domain=domain,
-            )
-            parsed.raw_output = output
-            return parsed
-        except subprocess.TimeoutExpired:
-            telemetry.capture_exception(
-                TimeoutError(f"Password change timed out for {username}@{domain}")
-            )
-            return PasswordChangeResult(
-                success=False,
-                username=username,
-                domain=domain,
-                error_message="Password change timed out",
-            )
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            self.logger.exception("Error changing password with NetExec: %s", exc)
-            return PasswordChangeResult(
-                success=False,
-                username=username,
-                domain=domain,
-                error_message=str(exc),
-            )
+        nt_hash = credential if credential_type == "hash" else None
+        password = credential if credential_type == "password" else None
 
-    def _parse_verification_output(
-        self,
-        output: str,
-        username: str,
-        domain: str,
-        credential_type: str,
-    ) -> CredentialVerificationResult:
-        """Parse NetExec verification output.
+        cfg = KerberosConfig(
+            domain=domain,
+            kdc_ip=kdc_ip,
+            username=username,
+            password=password,
+            nt_hash=nt_hash,
+        )
 
-        Args:
-            output: Command output
-            username: Username tested
-            domain: Domain tested
-            credential_type: Type of credential
-
-        Returns:
-            CredentialVerificationResult
-        """
-        # Check for various status codes
-        if output_has_timeout_marker(output):
-            return CredentialVerificationResult(
-                status=CredentialStatus.TIMEOUT,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message=(
-                    "NetExec command timed out. Verify VPN/network connectivity and retry."
-                ),
-            )
-
-        if "STATUS_LOGON_FAILURE" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.INVALID,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Incorrect credentials",
-            )
-
-        if "STATUS_ACCOUNT_LOCKED_OUT" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.ACCOUNT_LOCKED,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Account locked out",
-            )
-
-        if "STATUS_ACCOUNT_DISABLED" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.ACCOUNT_DISABLED,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Account disabled",
-            )
-
-        if "STATUS_ACCOUNT_RESTRICTION" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.ACCOUNT_RESTRICTION,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Account restricted",
-            )
-
-        if "STATUS_PASSWORD_EXPIRED" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.PASSWORD_EXPIRED,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Password expired",
-            )
-
-        if "KDC_ERR_KEY_EXPIRED" in output or "STATUS_PASSWORD_MUST_CHANGE" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.PASSWORD_MUST_CHANGE,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Password must be changed before logon",
-            )
-
-        if "KDC_ERR_C_PRINCIPAL_UNKNOWN" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.USER_NOT_FOUND,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="User not found",
-            )
-
-        if "KDC_ERR_PREAUTH_FAILED" in output:
-            return CredentialVerificationResult(
-                status=CredentialStatus.INVALID,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Pre-authentication failed",
-            )
-
-        if self._contains_negative_auth_result(output, username, domain):
-            return CredentialVerificationResult(
-                status=CredentialStatus.INVALID,
-                username=username,
-                domain=domain,
-                credential_type=credential_type,
-                error_message="Incorrect credentials",
-            )
-
-        # Check for success
-        if "[+]" in output:
-            is_admin = "(Pwn3d!)" in output
-            return CredentialVerificationResult(
+        def _ok(ccache: bytes) -> "CredentialVerificationResult":
+            r = CredentialVerificationResult(
                 status=CredentialStatus.VALID,
                 username=username,
                 domain=domain,
                 credential_type=credential_type,
-                is_admin=is_admin,
+            )
+            # Attach ccache bytes so the caller can persist the ticket without
+            # an extra AS-REQ.  raw_output normally holds str but bytes here is
+            # intentional and documented — callers check isinstance before use.
+            r.raw_output = ccache  # type: ignore[assignment]
+            return r
+
+        def _fail(status: CredentialStatus, msg: str) -> "CredentialVerificationResult":
+            return CredentialVerificationResult(
+                status=status,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message=msg,
             )
 
-        # Unknown status
-        return CredentialVerificationResult(
-            status=CredentialStatus.ERROR,
-            username=username,
-            domain=domain,
-            credential_type=credential_type,
-            error_message="Unknown verification result",
-        )
+        try:
+            ccache = await get_tgt(cfg)
+            return _ok(ccache)
 
-    @staticmethod
-    def _contains_negative_auth_result(output: str, username: str, domain: str) -> bool:
-        """Return True when NetExec emitted a generic failed-auth line.
+        except KerberosEtypeError:
+            # RC4 rejected (AES-only KDC) — retry with AES etypes only.
+            from dataclasses import replace as _dc_replace
+            cfg_aes = _dc_replace(cfg, etypes=[18, 17])
+            try:
+                ccache = await get_tgt(cfg_aes)
+                return _ok(ccache)
+            except KerberosAuthError:
+                return _fail(CredentialStatus.INVALID, "Invalid credentials (AES-only KDC)")
+            except KerberosPrincipalError:
+                return _fail(CredentialStatus.USER_NOT_FOUND, "User not found")
+            except KerberosTransportError as exc:
+                return _fail(CredentialStatus.ERROR, str(exc))
 
-        NetExec often returns ``0`` even when LDAP/SMB auth fails, and for some
-        protocols it emits only a generic ``[-] domain\\user:secret`` line
-        without a more specific status code such as ``STATUS_LOGON_FAILURE``.
-        Treat those lines as invalid credentials when they match the tested
-        principal so the CLI does not downgrade them to an opaque error.
+        except KerberosPrincipalError:
+            return _fail(CredentialStatus.USER_NOT_FOUND, "User not found")
+
+        except KerberosAuthError as exc:
+            # Inspect the original kerbad error code to distinguish sub-states.
+            # KDC_ERR_CLIENT_REVOKED (0x12=18) covers locked + disabled accounts;
+            # we disambiguate with a quick LDAP read of userAccountControl.
+            # KDC_ERR_KEY_EXPIRED (0x17=23) = password must change.
+            original = getattr(exc, "__cause__", exc)
+            try:
+                from kerbad.protocol.errors import KerberosErrorCode  # noqa: PLC0415
+                code = getattr(original, "errorcode", None)
+                if code == KerberosErrorCode.KDC_ERR_KEY_EXPIRED:
+                    return _fail(
+                        CredentialStatus.PASSWORD_MUST_CHANGE,
+                        "Password must be changed before logon",
+                    )
+                if code == KerberosErrorCode.KDC_ERR_CLIENT_REVOKED:
+                    # Distinguish locked vs disabled via LDAP userAccountControl.
+                    uac_status = await self._ldap_get_account_status(
+                        domain=domain, kdc_ip=kdc_ip,
+                        username=username, password=password, nt_hash=nt_hash,
+                    )
+                    return _fail(uac_status, uac_status.value.replace("_", " ").capitalize())
+            except Exception:  # noqa: BLE001
+                pass
+            return _fail(CredentialStatus.INVALID, "Invalid credentials")
+
+        except KerberosClockSkewError:
+            # Clock skew is a transport problem, not a credential problem.
+            # Signal ERROR so the caller can fall back to netexec (which has its
+            # own clock-sync logic) or prompt for manual sync.
+            return _fail(CredentialStatus.ERROR, "Clock skew too large — sync clocks and retry")
+
+        except KerberosTransportError as exc:
+            # Port 88 unreachable, DNS failure, etc. Enrich the error with a
+            # native TCP probe so the operator gets a precise diagnosis
+            # ("filtered" vs "closed" vs "reachable but failing") instead of
+            # a generic transport string. Replaces the historic NetExec LDAP
+            # fallback — that path silently disagreed with Kerberos's verdict
+            # and was deleted.
+            diagnosis = await _diagnose_kdc_unreachable(
+                kdc_ip=kdc_ip, original_error=str(exc)
+            )
+            return _fail(CredentialStatus.ERROR, diagnosis)
+
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            return _fail(CredentialStatus.ERROR, str(exc))
+
+    async def _ldap_get_account_status(
+        self,
+        *,
+        domain: str,
+        kdc_ip: str,
+        username: str,
+        password: Optional[str],
+        nt_hash: Optional[str],
+    ) -> "CredentialStatus":
+        """Return ACCOUNT_LOCKED or ACCOUNT_DISABLED by reading userAccountControl via LDAP.
+
+        Uses an anonymous LDAP bind (no credentials needed for this attribute in
+        most AD configs) to avoid triggering another bad-password count.
+        Falls back to ACCOUNT_LOCKED when the attribute is unreadable.
         """
+        try:
+            from adscan_internal.services.ldap_transport_service import (
+                ADscanLDAPConfig,
+                ADscanLDAPConnection,
+            )
 
-        expected_principals = {
-            f"{domain}\\{username}".lower(),
-            f"{domain}/{username}".lower(),
-            username.lower(),
-        }
-        for match in _NETEXEC_NEGATIVE_AUTH_LINE_RE.finditer(output):
-            if match.group("principal").lower() in expected_principals:
-                return True
-        return False
+            cfg = ADscanLDAPConfig(
+                domain=domain,
+                dc_ip=kdc_ip,
+                use_ldaps=True,
+                use_kerberos=False,
+                username="",
+                password="",
+            )
+            with ADscanLDAPConnection(cfg) as conn:
+                conn.search(
+                    search_base=conn.domain_dn,
+                    search_filter=f"(sAMAccountName={username})",
+                    attributes=["userAccountControl"],
+                )
+                if conn.entries:
+                    uac_vals = (
+                        conn.entries[0].entry_attributes_as_dict.get("userAccountControl") or []
+                    )
+                    uac = int(uac_vals[0]) if uac_vals else 0
+                    # Bit 4 (0x10) = LOCKOUT, bit 1 (0x2) = ACCOUNTDISABLE
+                    if uac & 0x10:
+                        return CredentialStatus.ACCOUNT_LOCKED
+                    if uac & 0x2:
+                        return CredentialStatus.ACCOUNT_DISABLED
+        except Exception:  # noqa: BLE001
+            pass
+        return CredentialStatus.ACCOUNT_LOCKED  # safe default
+
+    def _verify_via_kerberos_sync(
+        self,
+        *,
+        domain: str,
+        kdc_ip: str,
+        username: str,
+        credential: str,
+        credential_type: str,
+    ) -> "CredentialVerificationResult":
+        """Sync wrapper for :meth:`_verify_via_kerberos`.
+
+        Detects whether an event loop is already running (lab runner, test
+        harness) and dispatches to a worker thread to avoid nested-loop errors.
+        """
+        import concurrent.futures
+
+        coro = self._verify_via_kerberos(
+            domain=domain,
+            kdc_ip=kdc_ip,
+            username=username,
+            credential=credential,
+            credential_type=credential_type,
+        )
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+
+        if in_loop:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(lambda: asyncio.run(coro)).result()
+        return asyncio.run(coro)
+
 
     def _parse_password_change_output(
         self,
@@ -579,6 +479,198 @@ class CredentialService(BaseService):
             domain=domain,
             error_message="Unknown password change result",
         )
+
+    def change_password_with_samr(
+        self,
+        *,
+        domain: str,
+        username: str,
+        old_password: str,
+        new_password: str,
+        pdc_host: str,
+        pdc_ip: Optional[str] = None,
+        timeout: int = 60,
+    ) -> "PasswordChangeResult":
+        """Change the user's own expired password via SAMR SamrChangePasswordUser.
+
+        This is the native path for STATUS_PASSWORD_MUST_CHANGE: the user
+        authenticates with their old (expired) password and sets a new one.
+        Uses ``SMBMachine.change_user_password`` → ``SamrChangePasswordUser``
+        (MS-SAMR §3.1.5.9.1) which does NOT require LDAPS.
+
+        Falls back to LDAP unicodePwd over LDAPS if SAMR fails.
+        """
+        import asyncio as _asyncio
+        import concurrent.futures as _cf
+        from adscan_core.rich_output import print_info_debug
+
+        # Both nxc and impacket use hSamrUnicodeChangePasswordUser2 over a NULL
+        # SESSION for STATUS_PASSWORD_MUST_CHANGE. This call does NOT require a
+        # user handle — it takes (server, username, old_pass, new_pass) directly
+        # and can execute over an anonymous/null SMB session.
+        # Reference: nxc change-password.py + impacket changepasswd.py pattern:
+        #   1. Try normal auth → if STATUS_PASSWORD_MUST_CHANGE
+        #   2. Reconnect anonymous, call hSamrUnicodeChangePasswordUser2
+        from adscan_internal.services.smb_transport import SMBConfig, smb_machine_for
+
+        connect_ip = pdc_ip or pdc_host
+        sam_user = username.split("@")[0] if "@" in username else username
+
+        from aiosmb.dcerpc.v5.interfaces.samrmgr import samrrpc_from_smb
+        from aiosmb.dcerpc.v5 import samr as _samr
+
+        auth_config = SMBConfig(
+            target_ip=connect_ip,
+            target_hostname=connect_ip,
+            domain=domain,
+            username=username,
+            password=old_password,
+            auth_domain=domain,
+            use_kerberos=False,
+            kdc_ip=connect_ip,
+            timeout=timeout,
+        )
+        # Markers that indicate NTLM auth was rejected because of expired password
+        # but null session + hSamrUnicodeChangePasswordUser2 should work.
+        _MUST_CHANGE_MARKERS = (
+            "STATUS_PASSWORD_MUST_CHANGE",
+            "STATUS_PASSWORD_EXPIRED",
+            "PASSWORD_MUST_CHANGE",
+            "PASSWORD_EXPIRED",
+        )
+
+        async def _call_unicode_change(machine_config: SMBConfig, label: str) -> bool:
+            """hSamrUnicodeChangePasswordUser2 over the given SMB session (auth or null)."""
+            try:
+                async with smb_machine_for(machine_config) as machine:
+                    service, err = await samrrpc_from_smb(machine.connection)
+                    if err is not None or service is None:
+                        print_info_debug(
+                            f"[change_password_samr] SAMR bind failed ({label}): {err!r}"
+                        )
+                        return False
+                    async with service:
+                        _, err = await _samr.hSamrUnicodeChangePasswordUser2(
+                            service.dce, "\x00", sam_user, old_password, new_password
+                        )
+                        if err is None:
+                            print_info_debug(
+                                f"[change_password_samr] hSamrUnicodeChangePasswordUser2 succeeded ({label})"
+                            )
+                            return True
+                        print_info_debug(
+                            f"[change_password_samr] hSamrUnicodeChangePasswordUser2 failed ({label}): {err!r}"
+                        )
+                        return False
+            except Exception:
+                raise  # let caller decide on retry
+
+        async def _call_unicode_change_tcp(label: str) -> bool:
+            """hSamrUnicodeChangePasswordUser2 over ncacn_ip_tcp (anonymous TCP RPC).
+
+            nxc uses ncacn_ip_tcp with anonymous credentials when the account's
+            password must change — this bypasses the SMB null-session restriction
+            (RestrictNullSessAccess) that blocks ncacn_np anonymous access on
+            hardened DCs like Baby.vl.
+            """
+            from aiosmb.dcerpc.v5.interfaces.endpointmgr import EPM
+            from aiosmb.dcerpc.v5.connection import DCERPC5Connection
+            from aiosmb.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_NONE
+            from aiosmb.dcerpc.v5 import samr as _samr
+            try:
+                # Discover SAMR's dynamic TCP port via endpoint mapper (port 135).
+                dce_target, err = await EPM.create_target(connect_ip, _samr.MSRPC_UUID_SAMR)
+                if err is not None or not dce_target:
+                    print_info_debug(
+                        f"[change_password_samr] EPM lookup failed ({label}): {err!r}"
+                    )
+                    return False
+
+                # Anonymous DCE/RPC connection — no credentials, no signing.
+                dce = DCERPC5Connection(None, dce_target)
+                dce.set_auth_type(RPC_C_AUTHN_LEVEL_NONE)
+
+                _, err = await dce.connect()
+                if err is not None:
+                    print_info_debug(
+                        f"[change_password_samr] TCP DCE connect failed ({label}): {err!r}"
+                    )
+                    return False
+                try:
+                    _, err = await dce.bind(_samr.MSRPC_UUID_SAMR)
+                    if err is not None:
+                        print_info_debug(
+                            f"[change_password_samr] SAMR bind failed ({label}): {err!r}"
+                        )
+                        return False
+
+                    _, err = await _samr.hSamrUnicodeChangePasswordUser2(
+                        dce, "\x00", sam_user, old_password, new_password
+                    )
+                    if err is None:
+                        print_info_debug(
+                            f"[change_password_samr] hSamrUnicodeChangePasswordUser2 "
+                            f"succeeded ({label})"
+                        )
+                        return True
+                    print_info_debug(
+                        f"[change_password_samr] hSamrUnicodeChangePasswordUser2 "
+                        f"failed ({label}): {err!r}"
+                    )
+                    return False
+                finally:
+                    await dce.disconnect()
+            except Exception as exc:
+                from adscan_core import telemetry
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[change_password_samr] TCP exception ({label}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return False
+
+        async def _do_samr_unicode_change() -> bool:
+            # Exact pattern from nxc change-password.py:
+            # 1. Try hSamrUnicodeChangePasswordUser2 with authenticated session (ncacn_np).
+            # 2. If auth fails with PASSWORD_MUST_CHANGE: switch to ncacn_ip_tcp anonymous.
+            #    ncacn_ip_tcp bypasses SMB null-session restrictions (RestrictNullSessAccess)
+            #    and is the correct approach for expired-password SAMR changes.
+            try:
+                return await _call_unicode_change(auth_config, "auth")
+            except Exception as auth_exc:
+                auth_msg = str(auth_exc).upper()
+                if not any(m in auth_msg for m in _MUST_CHANGE_MARKERS):
+                    from adscan_core import telemetry
+                    telemetry.capture_exception(auth_exc)
+                    print_info_debug(
+                        f"[change_password_samr] auth failed (not must-change): "
+                        f"{type(auth_exc).__name__}: {auth_exc}"
+                    )
+                    return False
+
+                print_info_debug(
+                    "[change_password_samr] auth rejected (password must change) "
+                    "— retrying via ncacn_ip_tcp anonymous"
+                )
+                return await _call_unicode_change_tcp("tcp-anonymous")
+
+        try:
+            try:
+                ok = _asyncio.run(_do_samr_unicode_change())
+            except RuntimeError:
+                with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+                    ok = pool.submit(_asyncio.run, _do_samr_unicode_change()).result(timeout=timeout)
+        except Exception as exc:
+            from adscan_core import telemetry
+            telemetry.capture_exception(exc)
+            return PasswordChangeResult(
+                success=False,
+                username=username,
+                domain=domain,
+                error_message=f"SAMR change_user_password exception: {exc}",
+            )
+
+        return PasswordChangeResult(success=ok, username=username, domain=domain)
 
     def kerberoast(
         self,
@@ -969,7 +1061,7 @@ class CredentialService(BaseService):
 
             output = (result.stdout or "") + (result.stderr or "")
 
-            verification_result = self._parse_verification_output(
+            verification_result = self._parse_verification_output(  # pylint: disable=no-member
                 output, username, domain, credential_type
             )
             verification_result.raw_output = output

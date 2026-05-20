@@ -18,7 +18,45 @@ from typing import Any
 
 from adscan_core.path_utils import get_adscan_home, get_effective_user_home
 
-VERSION = "8.0.0"
+def _bootstrap_version() -> str:
+    """Resolve ``VERSION`` at module-import time from a single source of truth.
+
+    Resolution order:
+
+    1. ``pyproject.toml`` walked up from this file (development / source tree
+       layout — covers ``uv run``, editable installs, and direct repo execution).
+    2. ``importlib.metadata.version("adscan")`` (installed via pip/pipx).
+    3. Hard sentinel ``"0.0.0"`` — only reached when the package is neither
+       installed nor in a source tree, which should never happen in practice.
+
+    Defined inline (not via the later ``_resolve_source_tree_version`` helper)
+    so the constant is available before any other code in this module loads.
+
+    Single-source-of-truth rule: bump ``pyproject.toml`` only; this constant
+    and every downstream consumer follow automatically.
+    """
+    here = Path(__file__).resolve().parent
+    _re = re.compile(r'(?ms)^\[project\].*?^\s*version\s*=\s*"([^"]+)"\s*$')
+    for candidate in [here, *here.parents]:
+        pyproject = candidate / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            match = _re.search(pyproject.read_text(encoding="utf-8"))
+            if match:
+                _v = str(match.group(1)).strip()
+                if _v:
+                    return _v
+        except OSError:
+            continue
+    try:
+        return str(version("adscan"))
+    except PackageNotFoundError:
+        pass
+    return "0.0.0"
+
+
+VERSION = _bootstrap_version()
 RUNTIME_CONTRACT_VERSION = "1"
 _LAUNCHER_VERSION_ENV = "ADSCAN_LAUNCHER_VERSION"
 _LAUNCHER_RUNTIME_CONTRACT_VERSION_ENV = "ADSCAN_LAUNCHER_RUNTIME_CONTRACT_VERSION"

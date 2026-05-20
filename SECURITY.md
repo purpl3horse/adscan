@@ -1,5 +1,13 @@
 # Security Policy
 
+## Supported Versions
+
+| Version | Supported          |
+|---------|--------------------|
+| 8.x     | ✅ Active support  |
+| 7.x     | ⚠️ Critical fixes only |
+| < 7.0   | ❌ End of life     |
+
 ## Reporting a Vulnerability
 
 Do not open public issues for vulnerabilities, exposed secrets, bypasses, or unsafe exploitation behavior.
@@ -12,7 +20,9 @@ Email hello@adscanpro.com with:
 - Logs or screenshots with secrets removed
 - Whether the issue affects LITE, PRO, docs, Docker images, or the PyPI launcher
 
-We will acknowledge valid reports as quickly as possible and coordinate fixes privately when disclosure could put users or customers at risk.
+## Response Timeline
+
+We acknowledge valid reports within **72 hours** and aim to ship fixes within **14 days** for critical vulnerabilities. We coordinate fixes privately when disclosure could put users or customers at risk.
 
 ## Safe Disclosure
 

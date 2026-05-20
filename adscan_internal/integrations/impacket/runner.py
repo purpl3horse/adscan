@@ -249,6 +249,7 @@ class ImpacketKerberosRetryContext:
     """Credential context required to prepare a deterministic Kerberos run."""
 
     domain: str
+    auth_domain: str | None
     username: str
     credential: str
     dc_ip: str | None = None
@@ -371,9 +372,7 @@ class ImpacketRunner:
             protocol = auth_policy_protocol or self._resolve_auth_posture_protocol(
                 script_name
             )
-            command_already_uses_kerberos = self._command_uses_kerberos(
-                current_command
-            )
+            command_already_uses_kerberos = self._command_uses_kerberos(current_command)
             decision = resolve_auth_policy_decision(
                 domains_data=ctx.domains_data,
                 domain=kerberos_retry_context.domain,
@@ -442,10 +441,36 @@ class ImpacketRunner:
                 and output_indicates_kerberos_auth_failure(combined_output)
                 and not output_indicates_kerberos_invalid_credentials(combined_output)
             ):
-                print_warning(
-                    "Impacket Kerberos authentication failed for a raw command. "
-                    "No NTLM fallback was attempted because the stored posture prefers Kerberos."
-                )
+                ntlm_allowed = decision is not None and str(
+                    decision.ntlm_status or ""
+                ).lower() not in {"disabled", "likely_disabled"}
+                if ntlm_allowed:
+                    print_warning(
+                        f"[{script_name}] Kerberos authentication failed — "
+                        "NTLM is not disabled, retrying with NTLM."
+                    )
+                    print_info_debug(f"[impacket] NTLM fallback command: {command}")
+                    ntlm_env = self._build_command_env(command=command, env=None)
+                    ntlm_execute_kwargs = dict(kwargs)
+                    ntlm_execute_kwargs["env"] = ntlm_env
+                    result, _ = self._execute_with_clock_skew_retry(
+                        script_name=script_name,
+                        command=command,
+                        ctx=ctx,
+                        domain=(
+                            kerberos_retry_context.domain
+                            if kerberos_retry_context is not None
+                            else None
+                        ),
+                        timeout=timeout,
+                        capture_output=capture_output,
+                        **ntlm_execute_kwargs,
+                    )
+                else:
+                    print_warning(
+                        f"[{script_name}] Kerberos authentication failed. "
+                        "NTLM is disabled — no fallback attempted."
+                    )
         self._log_result(script_name, result)
         return result
 
@@ -462,6 +487,7 @@ class ImpacketRunner:
         usersfile: Optional[str | Path] = None,
         outputfile: Optional[str | Path] = None,
         timeout: int = 300,
+        auth_domain: Optional[str] = None,
     ) -> ExecutionResult | None:
         """Run GetUserSPNs.py for Kerberoasting.
 
@@ -480,6 +506,19 @@ class ImpacketRunner:
         Returns:
             Completed process or None if failed
         """
+        import warnings as _warnings  # noqa: PLC0415
+
+        _warnings.warn(
+            "ImpacketRunner.run_getuserspns is deprecated; use kerbad-native "
+            "kerberoast_users/asreproast_users via the EnumerationService.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from adscan_core.rich_output import print_info_debug as _pid  # noqa: PLC0415
+
+        _pid(
+            "[impacket] DEPRECATED path engaged: run_getuserspns; expected to be removed."
+        )
         pdc = ctx.get_domain_pdc(domain)
         if not pdc:
             print_error(
@@ -489,6 +528,12 @@ class ImpacketRunner:
 
         args = []
         clean_domain = strip_sensitive_markers(str(domain))
+        # In cross-domain trust scenarios the authenticating user belongs to a different
+        # domain than the target; use auth_domain as the credential prefix so impacket
+        # authenticates to the correct KDC (e.g. ping.htb/user vs pong.htb/user).
+        clean_auth_domain = (
+            strip_sensitive_markers(str(auth_domain)) if auth_domain else clean_domain
+        )
 
         # Request TGS (comes first, like old_adscan.py: -request {auth})
         if request:
@@ -498,7 +543,7 @@ class ImpacketRunner:
         if username and password:
             clean_username = strip_sensitive_markers(str(username))
             clean_password = strip_sensitive_markers(str(password))
-            args.append(f"{clean_domain}/{clean_username}:{clean_password}")
+            args.append(f"{clean_auth_domain}/{clean_username}:{clean_password}")
         elif username and hashes:
             clean_username = strip_sensitive_markers(str(username))
             clean_hashes = strip_sensitive_markers(str(hashes))
@@ -506,10 +551,10 @@ class ImpacketRunner:
                 c in "0123456789abcdef" for c in clean_hashes.lower()
             )
             if is_hash:
-                args.append(f"{clean_domain}/{clean_username}")
+                args.append(f"{clean_auth_domain}/{clean_username}")
                 args.extend(["-hashes", f":{clean_hashes}"])
             else:
-                args.append(f"{clean_domain}/{clean_username}:{clean_hashes}")
+                args.append(f"{clean_auth_domain}/{clean_username}:{clean_hashes}")
         elif no_preauth:
             if not usersfile:
                 print_error("no-preauth mode requires usersfile")
@@ -551,6 +596,7 @@ class ImpacketRunner:
 
         kerberos_retry_context = self._build_retry_context(
             domain=domain,
+            auth_domain=auth_domain,
             username=username,
             password=password,
             hashes=hashes,
@@ -597,6 +643,19 @@ class ImpacketRunner:
         Returns:
             Completed process or None if failed
         """
+        import warnings as _warnings  # noqa: PLC0415
+
+        _warnings.warn(
+            "ImpacketRunner.run_getnpusers is deprecated; use kerbad-native "
+            "kerberoast_users/asreproast_users via the EnumerationService.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from adscan_core.rich_output import print_info_debug as _pid  # noqa: PLC0415
+
+        _pid(
+            "[impacket] DEPRECATED path engaged: run_getnpusers; expected to be removed."
+        )
         if not dc_ip:
             dc_ip = ctx.get_domain_pdc(domain)
             if not dc_ip:
@@ -1307,6 +1366,7 @@ class ImpacketRunner:
     def _build_retry_context(
         *,
         domain: str | None,
+        auth_domain: str | None = None,
         username: str | None,
         password: str | None,
         hashes: str | None,
@@ -1324,6 +1384,7 @@ class ImpacketRunner:
 
         return ImpacketKerberosRetryContext(
             domain=realm,
+            auth_domain=str(auth_domain or realm).strip() or realm,
             username=user,
             credential=secret.lstrip(":") if hashes and not password else secret,
             dc_ip=str(dc_ip or "").strip() or None,
@@ -1360,7 +1421,7 @@ class ImpacketRunner:
         result = service.auto_generate_tgt(
             username=retry_context.username,
             credential=retry_context.credential,
-            domain=retry_context.domain,
+            domain=str(retry_context.auth_domain or retry_context.domain),
             workspace_dir=workspace_dir,
             dc_ip=retry_context.dc_ip,
         )
@@ -1379,7 +1440,7 @@ class ImpacketRunner:
             service.setup_environment_for_domain(
                 workspace_dir=workspace_dir,
                 domain=retry_context.domain,
-                user_domain=retry_context.domain,
+                user_domain=str(retry_context.auth_domain or retry_context.domain),
                 username=retry_context.username,
                 domains_data=ctx.domains_data,
             )

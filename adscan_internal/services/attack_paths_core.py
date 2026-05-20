@@ -13,7 +13,6 @@ import re
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
-import json
 
 from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
@@ -102,9 +101,10 @@ class SampledDebugLogger:
         """Emit a compact suppression summary when lines were skipped."""
         if not self.enabled or self._suppressed <= 0:
             return
+        total = self._emitted + self._suppressed
         print_info_debug(
-            f"{self.prefix} suppressed {self._suppressed} additional per-path "
-            f"debug line(s) for {self.summary_label}"
+            f"{self.prefix} {self.summary_label}: "
+            f"{total} total ({self._emitted} shown, {self._suppressed} suppressed)"
         )
 
 
@@ -115,7 +115,7 @@ _PW_SNAPSHOT: dict[str, Any] | None = None
 _PW_MAX_DEPTH: int = 7
 _PW_MAX_PATHS: int | None = None
 _PW_TARGET: str = "highvalue"
-_PW_TARGET_MODE: str = "tier0"
+_PW_TARGET_MODE: str = "domain"
 _PW_FILTER_SHORTEST: bool = True
 _GROUP_MEMBERSHIP_INDEX_CACHE: dict[
     tuple[int, str, int], tuple[dict[str, int], dict[str, list[str]]]
@@ -148,6 +148,26 @@ def _log_phase_timing(
 def _debug_logging_enabled() -> bool:
     """Return whether attack-path debug logs are currently enabled."""
     return logging.getLogger("adscan").isEnabledFor(logging.DEBUG)
+
+
+def _debug_paths_checkpoint(label: str, records: list[dict[str, Any]]) -> None:
+    """Emit one compact debug line summarising a pipeline stage result.
+
+    Shows total path count plus a sample of unique sources so the log stays
+    readable even when hundreds of paths share the same starting node.
+    """
+    if not records:
+        print_info_debug(f"[attack_paths_core] {label}: 0 paths")
+        return
+    sources = [str(r.get("source") or "") for r in records if r.get("source")]
+    unique = sorted(set(sources))
+    top = unique[:3]
+    sample = ", ".join(repr(s) for s in top)
+    extra = f" +{len(unique) - 3} more" if len(unique) > 3 else ""
+    print_info_debug(
+        f"[attack_paths_core] {label}: {len(records)} paths, "
+        f"{len(unique)} unique source(s) [{sample}{extra}]"
+    )
 
 
 def _string_tuple(values: list[Any]) -> tuple[str, ...]:
@@ -314,6 +334,19 @@ def _extract_sid(value: str) -> str | None:
     return match.group(1).upper()
 
 
+def _domain_sid_from_sid(sid: str) -> str | None:
+    """Return the AD domain SID for a domain object SID or principal SID."""
+    sid = str(sid or "").strip().upper()
+    if not sid.startswith("S-1-5-21-"):
+        return None
+    parts = sid.split("-")
+    if len(parts) == 7:
+        return sid
+    if len(parts) > 7:
+        return "-".join(parts[:-1])
+    return None
+
+
 def _empty_group_whitelist(domain: str) -> set[str]:
     normalized: set[str] = set()
     domain_value = str(domain or "").strip()
@@ -359,6 +392,89 @@ def prepare_membership_snapshot(
     ):
         normalized = dict(data)
         normalized.setdefault("tier0_users", [])
+        # When the file also has raw BH edges (membership-1.0 schema written by
+        # persist_bloodhound_membership_snapshot), merge those MemberOf edges into
+        # the existing dicts. This prevents runtime additions (ESC13, AddMember)
+        # from shadowing real AD memberships when user_to_groups was only partially
+        # populated before the BH edges were present.
+        nodes_map = normalized.get("nodes")
+        edges = normalized.get("edges")
+        if isinstance(nodes_map, dict) and isinstance(edges, list) and edges:
+            u2g: dict[str, list[str]] = normalized.get("user_to_groups") or {}
+            if not isinstance(u2g, dict):
+                u2g = {}
+            c2g: dict[str, list[str]] = normalized.get("computer_to_groups") or {}
+            if not isinstance(c2g, dict):
+                c2g = {}
+            g2p: dict[str, list[str]] = normalized.get("group_to_parents") or {}
+            if not isinstance(g2p, dict):
+                g2p = {}
+            u2g_sets: dict[str, set[str]] = {
+                k: set(v) for k, v in u2g.items() if isinstance(v, list)
+            }
+            c2g_sets: dict[str, set[str]] = {
+                k: set(v) for k, v in c2g.items() if isinstance(v, list)
+            }
+            g2p_sets: dict[str, set[str]] = {
+                k: set(v) for k, v in g2p.items() if isinstance(v, list)
+            }
+            changed = False
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                relation = (
+                    edge.get("relation") or edge.get("label") or edge.get("kind") or ""
+                )
+                if str(relation) != "MemberOf":
+                    continue
+                from_id = edge.get("from") or edge.get("source")
+                to_id = edge.get("to") or edge.get("target")
+                if not from_id or not to_id:
+                    continue
+                from_node = nodes_map.get(str(from_id))
+                to_node = nodes_map.get(str(to_id))
+                if not isinstance(from_node, dict) or not isinstance(to_node, dict):
+                    continue
+                if _node_kind(to_node) != "Group":
+                    continue
+                from_label = _canonical_membership_label(
+                    domain, _canonical_principal_label_for_membership(from_node)
+                )
+                to_label = _canonical_membership_label(
+                    domain, _canonical_node_label(to_node)
+                )
+                if not from_label or not to_label:
+                    continue
+                from_kind = _node_kind(from_node)
+                if from_kind == "User":
+                    before = len(u2g_sets.get(from_label, set()))
+                    u2g_sets.setdefault(from_label, set()).add(to_label)
+                    changed = changed or len(u2g_sets[from_label]) != before
+                elif from_kind == "Computer":
+                    before = len(c2g_sets.get(from_label, set()))
+                    c2g_sets.setdefault(from_label, set()).add(to_label)
+                    changed = changed or len(c2g_sets[from_label]) != before
+                elif from_kind == "Group":
+                    before = len(g2p_sets.get(from_label, set()))
+                    g2p_sets.setdefault(from_label, set()).add(to_label)
+                    changed = changed or len(g2p_sets[from_label]) != before
+            primary_changed = _merge_primary_group_memberships_from_nodes(
+                domain=domain,
+                nodes_map=nodes_map,
+                user_to_groups=u2g_sets,
+                computer_to_groups=c2g_sets,
+            )
+            changed = changed or primary_changed
+            if changed:
+                normalized["user_to_groups"] = {
+                    k: sorted(v, key=str.lower) for k, v in sorted(u2g_sets.items())
+                }
+                normalized["computer_to_groups"] = {
+                    k: sorted(v, key=str.lower) for k, v in sorted(c2g_sets.items())
+                }
+                normalized["group_to_parents"] = {
+                    k: sorted(v, key=str.lower) for k, v in sorted(g2p_sets.items())
+                }
         return normalized
 
     nodes_map = data.get("nodes")
@@ -380,7 +496,9 @@ def prepare_membership_snapshot(
     for node in nodes_map.values():
         if not isinstance(node, dict):
             continue
-        label = _canonical_membership_label(domain, _canonical_node_label(node))
+        label = _canonical_membership_label(
+            domain, _canonical_principal_label_for_membership(node)
+        )
         if not label:
             continue
         if _node_kind(node) == "Group":
@@ -396,15 +514,14 @@ def prepare_membership_snapshot(
             label_to_sid[label] = sid
             sid_to_label.setdefault(sid, label)
             if sid.startswith("S-1-5-21-"):
-                parts = sid.split("-")
-                if len(parts) >= 5:
-                    candidate_sid = "-".join(parts[:-1])
+                candidate_sid = _domain_sid_from_sid(sid)
+                if candidate_sid:
                     if not first_domain_sid:
                         first_domain_sid = candidate_sid
                     if not preferred_domain_sid:
                         label_domain = str(domain or "").strip().upper()
                         label_match = label.endswith(f"@{label_domain}")
-                        rid = parts[-1]
+                        rid = sid.split("-")[-1]
                         preferred_rids = {
                             "512",
                             "513",
@@ -436,7 +553,7 @@ def prepare_membership_snapshot(
             continue
 
         from_label = _canonical_membership_label(
-            domain, _canonical_node_label(from_node)
+            domain, _canonical_principal_label_for_membership(from_node)
         )
         to_label = _canonical_membership_label(domain, _canonical_node_label(to_node))
         if not from_label or not to_label:
@@ -449,6 +566,13 @@ def prepare_membership_snapshot(
             computer_to_groups.setdefault(from_label, set()).add(to_label)
         elif from_kind == "Group":
             group_to_parents.setdefault(from_label, set()).add(to_label)
+
+    _merge_primary_group_memberships_from_nodes(
+        domain=domain,
+        nodes_map=nodes_map,
+        user_to_groups=user_to_groups,
+        computer_to_groups=computer_to_groups,
+    )
 
     domain_sid = preferred_domain_sid or first_domain_sid
     return {
@@ -470,6 +594,95 @@ def prepare_membership_snapshot(
         "sid_to_label": sid_to_label,
         "domain_sid": domain_sid,
     }
+
+
+def _merge_primary_group_memberships_from_nodes(
+    *,
+    domain: str,
+    nodes_map: dict[str, Any],
+    user_to_groups: dict[str, set[str]],
+    computer_to_groups: dict[str, set[str]],
+) -> bool:
+    """Add effective primary-group memberships omitted from LDAP ``memberOf``.
+
+    Active Directory does not include a principal's primary group in the
+    ``memberOf`` attribute. Native graph snapshots therefore need to derive that
+    edge from ``primaryGroupID`` and the principal/domain SID so owned-scope
+    path search can inherit rights granted to groups such as Domain Users.
+    """
+    sid_to_group_label = _build_group_label_by_sid(domain, nodes_map)
+    changed = False
+    for node in nodes_map.values():
+        if not isinstance(node, dict):
+            continue
+        kind = _node_kind(node)
+        if kind not in {"User", "Computer"}:
+            continue
+        principal_label = _canonical_membership_label(
+            domain, _canonical_principal_label_for_membership(node)
+        )
+        primary_group_sid = _primary_group_sid_for_node(node)
+        if not principal_label or not primary_group_sid:
+            continue
+        group_label = sid_to_group_label.get(primary_group_sid)
+        if not group_label or group_label == principal_label:
+            continue
+        target = user_to_groups if kind == "User" else computer_to_groups
+        groups = target.setdefault(principal_label, set())
+        before = len(groups)
+        groups.add(group_label)
+        changed = changed or len(groups) != before
+    return changed
+
+
+def _build_group_label_by_sid(domain: str, nodes_map: dict[str, Any]) -> dict[str, str]:
+    """Return SID -> canonical group label for group nodes in a graph snapshot."""
+    result: dict[str, str] = {}
+    for node in nodes_map.values():
+        if not isinstance(node, dict) or _node_kind(node) != "Group":
+            continue
+        sid = _extract_node_sid(node)
+        label = _canonical_membership_label(domain, _canonical_node_label(node))
+        if sid and label:
+            result[sid] = label
+    return result
+
+
+def _primary_group_sid_for_node(node: dict[str, Any]) -> str:
+    """Return the primary group SID for a user/computer node, if derivable."""
+    principal_sid = _extract_node_sid(node)
+    if not principal_sid or not principal_sid.startswith("S-1-5-21-"):
+        return ""
+    primary_group_id = _node_primary_group_id(node)
+    if primary_group_id is None:
+        return ""
+    domain_sid, _, _rid = principal_sid.rpartition("-")
+    if not domain_sid:
+        return ""
+    return f"{domain_sid}-{primary_group_id}"
+
+
+def _node_primary_group_id(node: dict[str, Any]) -> int | None:
+    """Return a normalized ``primaryGroupID`` value from node metadata."""
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    for key in ("primarygroupid", "primaryGroupID", "primary_group_id"):
+        value = node.get(key)
+        if value is None:
+            value = props.get(key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_node_sid(node: dict[str, Any]) -> str:
+    """Extract a normalized SID from a graph node."""
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    object_id = str(
+        node.get("objectId") or props.get("objectid") or props.get("objectId") or ""
+    ).strip()
+    return _extract_sid(object_id)
 
 
 def _canonical_membership_label(domain: str, value: str) -> str:
@@ -508,6 +721,32 @@ def _canonical_node_label(node: dict[str, Any]) -> str:
     if isinstance(name, str) and name.strip():
         return name.strip()
     return str(label or "").strip()
+
+
+def _canonical_principal_label_for_membership(node: dict[str, Any]) -> str:
+    """Return the canonical principal label used for membership snapshot keys.
+
+    Membership lookups (``_snapshot_get_direct_groups``) canonicalize the
+    incoming principal as ``<sAMAccountName>@<DOMAIN>``.  For consistency,
+    the snapshot writer must store keys in the same form.  BloodHound's
+    ``label`` field equals the sAMAccountName for User nodes but the
+    FQDN for Computer nodes (``RODC01.GARFIELD.HTB``), which would key
+    Computer entries under a form lookups never use.
+
+    Prefers ``properties.samaccountname`` (BloodHound CE / native collector
+    populate this on User and Computer nodes), then falls back to the
+    existing ``_canonical_node_label`` behaviour for non-principal node
+    kinds (Group, Domain, OU, GPO, etc.) where the label IS the canonical
+    identifier.
+    """
+    kind = _node_kind(node)
+    if kind in {"User", "Computer"}:
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        for key in ("samaccountname", "sAMAccountName", "sam_account_name"):
+            value = props.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return _canonical_node_label(node)
 
 
 def _node_kind(node: dict[str, Any]) -> str:
@@ -581,13 +820,21 @@ def _find_node_id_by_label(graph: dict[str, Any], label: str) -> str | None:
     normalized = _normalize_account(label)
 
     def _quality_score(node: dict[str, Any]) -> int:
+        """Mirror of attack_graph_service._find_node_id_by_label scoring.
+
+        Security principals (Group/User/Computer/Domain) outrank structural
+        AD objects (OU/Container/CertTemplate) so an OU named "Domain
+        Controllers" never wins over the Domain Controllers security group.
+        """
         score = 0
         kind = _node_kind(node)
         props = (
             node.get("properties") if isinstance(node.get("properties"), dict) else {}
         )
 
-        if kind != "Unknown":
+        if kind in {"Group", "User", "Computer", "Domain"}:
+            score += 100  # security principals always outrank structural objects
+        elif kind != "Unknown":
             score += 50
         else:
             score -= 50
@@ -1568,7 +1815,20 @@ def _minimize_display_record_by_redundant_memberof(
         # outgoing MemberOf, so the start node never falsely marks its own direct
         # membership hop as redundant.  All other MemberOf edges at rel_idx > 0
         # are evaluated against groups already accumulated by prior nodes.
-        if str(rel or "").strip().lower() == "memberof" and rel_idx + 1 < len(nodes):
+        #
+        # The redundancy check ONLY applies when the source of the MemberOf is
+        # a membership principal (User/Computer). The original anti-pattern is
+        # ``USER1 → GenericAll → USER2 → MemberOf → GROUP`` where USER1 is
+        # already in GROUP, so showing USER2's hop adds no value. Group→Group
+        # MemberOf chains (e.g. ``DA → MemberOf → Administrators``) are pure
+        # nested membership topology and are load-bearing in domain-mode kill
+        # chains — never flag those as redundant or the rule deletes paths
+        # routed deliberately by the priority-membership-suppression filter.
+        if (
+            is_principal
+            and str(rel or "").strip().lower() == "memberof"
+            and rel_idx + 1 < len(nodes)
+        ):
             group_label = canonical_label(str(nodes[rel_idx + 1]))
             if group_label and group_label in satisfied_groups:
                 redundant_memberof_indices.append(rel_idx)
@@ -1584,11 +1844,68 @@ def _minimize_display_record_by_redundant_memberof(
     if not redundant_memberof_indices:
         return record
 
-    # The path contains a redundant MemberOf pivot — the source principal already
-    # belongs to the target group via a shorter direct membership, so this longer
-    # route adds no new information and would produce a duplicate display entry.
-    # Return None so the caller drops the record entirely.
-    return None
+    # The path contains a redundant MemberOf tail. Instead of eliminating the
+    # entire record, TRUNCATE it at the first redundant hop. This preserves
+    # the non-redundant prefix — e.g. "USER1 → ForceChangePassword → USER2 →
+    # MemberOf → Group[redundant]" becomes "USER1 → ForceChangePassword → USER2",
+    # which is a valuable attack step that would otherwise be silently dropped.
+    #
+    # Original rationale for full elimination: "truncating to GROUP1 creates a
+    # duplicate of the shorter path that already starts at GROUP1 directly." But
+    # that argument only applies when the terminal is a GROUP continuation, not
+    # when the truncation terminal is a USER being targeted by a control edge.
+    # The dedup stage (step 4 of the post-processing pipeline) handles any
+    # duplicates produced by truncation.
+    first_redundant = redundant_memberof_indices[0]
+    if first_redundant == 0:
+        # Entire path starts with a redundant hop — no valuable prefix to keep.
+        return None
+
+    # Truncate nodes to the principal BEFORE the redundant MemberOf, and rels
+    # to exclude everything from the redundant index onwards.
+    truncated_nodes = list(nodes)[: first_redundant + 1]
+    truncated_rels = list(rels)[:first_redundant]
+
+    if not truncated_rels:
+        # Nothing actionable in the truncated path.
+        return None
+
+    truncated = dict(record)
+    truncated["nodes"] = truncated_nodes
+    truncated["relations"] = truncated_rels
+    if "length" in truncated:
+        truncated["length"] = len(truncated_rels)
+    # Preserve source/target: source stays the same, target is now the node
+    # just before the first redundant hop.
+    if "target" in truncated and len(truncated_nodes) > 1:
+        truncated["target"] = truncated_nodes[-1]
+    # Slice steps to match the truncated relations so the execution router
+    # has the correct step list.  If there are no original steps, build
+    # minimal ones from nodes+relations so the router can proceed.
+    orig_steps = record.get("steps")
+    if isinstance(orig_steps, list) and orig_steps:
+        truncated_steps = list(orig_steps)[:first_redundant]
+        # Re-number steps sequentially after slicing.
+        for i, s in enumerate(truncated_steps, start=1):
+            if isinstance(s, dict):
+                s = dict(s)
+                s["step"] = i
+                truncated_steps[i - 1] = s
+        truncated["steps"] = truncated_steps
+    else:
+        # Build minimal step dicts from the truncated nodes/relations.
+        truncated["steps"] = [
+            {
+                "step": i + 1,
+                "action": str(truncated_rels[i]),
+                "from": str(truncated_nodes[i]),
+                "to": str(truncated_nodes[i + 1]),
+                "status": record.get("status", "theoretical"),
+            }
+            for i in range(len(truncated_rels))
+            if i + 1 < len(truncated_nodes)
+        ]
+    return truncated
 
 
 def _minimize_display_record_by_repeated_labels(
@@ -1769,8 +2086,13 @@ def _inject_memberof_edges_from_snapshot(
             continue
 
         group_labels: set[str] = set()
-        if recursive and recursive_groups_by_principal:
-            group_labels.update(recursive_groups_by_principal.get(label, ()))
+        cached_recursive_groups = (
+            recursive_groups_by_principal.get(label, ())
+            if recursive and recursive_groups_by_principal
+            else ()
+        )
+        if cached_recursive_groups:
+            group_labels.update(cached_recursive_groups)
         else:
             for group in direct_groups:
                 group_label = _canonical_membership_label(domain, group)
@@ -1899,7 +2221,7 @@ def compute_display_paths_for_domain(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     expand_terminal_memberships: bool = True,
     start_node_ids: set[str] | None = None,
     materialized_artifacts: dict[str, Any] | None = None,
@@ -1949,9 +2271,7 @@ def compute_display_paths_for_domain(
             ),
         )
 
-    mode = (target_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = attack_graph_core.normalize_target_mode(target_mode)
     unfiltered_started_at = time.monotonic()
     unfiltered = attack_graph_core.compute_display_paths_for_domain_unfiltered(
         runtime_graph,
@@ -2037,7 +2357,7 @@ def compute_display_paths_for_start_node(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     expand_start_memberships: bool = True,
     expand_terminal_memberships: bool = True,
     filter_shortest_paths: bool = True,
@@ -2140,9 +2460,7 @@ def compute_display_paths_for_start_node(
             ),
         )
 
-    mode = (target_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = attack_graph_core.normalize_target_mode(target_mode)
     raw_started_at = time.monotonic()
     records = attack_graph_core.compute_display_paths_for_start_node(
         runtime_graph,
@@ -2159,10 +2477,7 @@ def compute_display_paths_for_start_node(
         records=records,
     )
 
-    print_info_debug(
-        f"[attack_paths_core] Raw paths for start_node_id={start_node_id}: "
-        f"{json.dumps([r.get('source') for r in records])}"
-    )
+    _debug_paths_checkpoint(f"raw paths start_node_id={start_node_id}", records)
     minimized_started_at = time.monotonic()
     minimized_records = minimize_display_paths(
         records, domain=domain, snapshot=snapshot
@@ -2173,10 +2488,7 @@ def compute_display_paths_for_start_node(
         started_at=minimized_started_at,
         records=minimized_records,
     )
-    print_info_debug(
-        f"[attack_paths_core] After minimize_display_paths: "
-        f"{json.dumps([r.get('source') for r in minimized_records])}"
-    )
+    _debug_paths_checkpoint("after minimize_display_paths", minimized_records)
     annotated_started_at = time.monotonic()
     annotated = apply_affected_user_metadata(
         minimized_records,
@@ -2191,10 +2503,7 @@ def compute_display_paths_for_start_node(
         started_at=annotated_started_at,
         records=annotated,
     )
-    print_info_debug(
-        f"[attack_paths_core] After apply_affected_user_metadata: "
-        f"{json.dumps([r.get('source') for r in annotated])}"
-    )
+    _debug_paths_checkpoint("after apply_affected_user_metadata", annotated)
     if filter_shortest_paths:
         filtered_started_at = time.monotonic()
         filtered = filter_shortest_paths_for_principals(annotated)
@@ -2210,9 +2519,7 @@ def compute_display_paths_for_start_node(
             started_at=pipeline_started_at,
             records=filtered,
         )
-        print_info_debug(
-            f"[attack_paths_core] After filter_shortest_paths_for_principals: {len(filtered)}"
-        )
+        _debug_paths_checkpoint("after filter_shortest_paths_for_principals", filtered)
         return filtered
     _log_phase_timing(
         scope="start_node",
@@ -2232,7 +2539,7 @@ def compute_display_paths_for_user(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     filter_shortest_paths: bool = True,
     materialized_artifacts: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -2263,7 +2570,7 @@ def compute_display_paths_for_principals(
     max_paths: int | None = None,
     target: str = "highvalue",
     membership_sample_max: int = 3,
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     filter_shortest_paths: bool = True,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()

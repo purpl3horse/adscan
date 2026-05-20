@@ -13,7 +13,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from adscan_internal.services.auth_posture_service import get_ntlm_status
+from adscan_internal.services.auth_posture_service import get_ntlm_status, get_rc4_status
 
 
 _NTLM_DISABLED_MARKERS = (
@@ -41,6 +41,10 @@ _KERBEROS_FAILURE_MARKERS = (
 _KERBEROS_INVALID_CREDENTIAL_MARKERS = (
     "KDC_ERR_PREAUTH_FAILED",
     "PREAUTHENTICATION FAILED",
+)
+
+_KERBEROS_RC4_DISABLED_MARKERS = (
+    "KDC_ERR_ETYPE_NOSUPP",
 )
 
 _NETEXEC_UNAUTH_USERNAMES = {"", "guest", "anonymous", "null"}
@@ -79,6 +83,12 @@ def output_indicates_kerberos_invalid_credentials(output: str) -> bool:
     return any(marker in upper for marker in _KERBEROS_INVALID_CREDENTIAL_MARKERS)
 
 
+def output_indicates_rc4_disabled(output: str) -> bool:
+    """Return True when tool output indicates the KDC rejected RC4 (AES-only domain)."""
+    upper = str(output or "").upper()
+    return any(marker in upper for marker in _KERBEROS_RC4_DISABLED_MARKERS)
+
+
 def should_prefer_kerberos_first(
     *,
     domains_data: Mapping[str, Any] | None,
@@ -99,6 +109,20 @@ def should_prefer_kerberos_first(
     if status == "likely_enabled":
         return False
     return default_preference
+
+
+def kerberos_nt_hash_viable(
+    *,
+    domains_data: Mapping[str, Any] | None,
+    domain: str | None,
+) -> bool:
+    """Return False when RC4 is known disabled, making NT-hash Kerberos impossible.
+
+    RC4-HMAC is the only Kerberos etype derivable from an NT hash. When the KDC
+    has RC4 disabled (KDC_ERR_ETYPE_NOSUPP), any Kerberos attempt with just an
+    NT hash will fail before reaching auth — skip it entirely.
+    """
+    return get_rc4_status(domains_data, domain=domain) != "likely_disabled"
 
 
 def resolve_auth_policy_decision(
@@ -180,6 +204,17 @@ def resolve_netexec_auth_policy_decision(
             reason="protocol_kerberos_unsupported",
         )
 
+    # RC4 is known disabled and command uses NT hash — Kerberos is cryptographically impossible.
+    if (
+        get_rc4_status(domains_data, domain=domain) == "likely_disabled"
+        and _netexec_command_uses_hash_auth(command)
+    ):
+        return AuthPolicyDecision(
+            prefer_kerberos=False,
+            ntlm_status=base_decision.ntlm_status,
+            reason="rc4_disabled_nt_hash",
+        )
+
     if base_decision.ntlm_status in {"likely_disabled", "likely_enabled"}:
         return base_decision
 
@@ -248,10 +283,12 @@ def netexec_can_use_kerberos(command: str) -> bool:
         return False
     if "-d" not in argv and "--domain" not in argv:
         return False
-    if "-p" not in argv and "-H" not in argv:
+    if "-p" not in argv and "-H" not in argv and "--aesKey" not in argv:
         return False
     return _flag_has_value(argv, "-u") and (
-        _flag_has_value(argv, "-p") or _flag_has_value(argv, "-H")
+        _flag_has_value(argv, "-p")
+        or _flag_has_value(argv, "-H")
+        or _flag_has_value(argv, "--aesKey")
     )
 
 
@@ -537,6 +574,15 @@ def _looks_like_domain_hostname(target: str, domain: str | None) -> bool:
     return value.endswith(f".{domain_name}") or "." not in value
 
 
+def _netexec_command_uses_hash_auth(command: str) -> bool:
+    """Return True when the NetExec command authenticates with -H (NT hash)."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    return "-H" in argv and _flag_has_value(argv, "-H")
+
+
 def _get_domain_entry(
     domains_data: Mapping[str, Any] | None,
     domain: str | None,
@@ -555,3 +601,63 @@ def _get_domain_entry(
         if str(key).strip().casefold() == normalized and isinstance(value, Mapping):
             return value
     return None
+
+def build_netexec_aeskey_command(command: str, aes_key: str) -> str | None:
+    """Replace NT-hash auth with NetExec AES Kerberos auth.
+
+    Converts:
+        nxc ldap dc -u user -H <nt> -d domain -k
+
+    Into:
+        nxc ldap dc -u user -d domain --aesKey <aes> -k
+
+    The command remains Kerberos-based and removes the RC4/NT hash material.
+    """
+    normalized_aes = str(aes_key or "").strip().lower()
+    if len(normalized_aes) not in {32, 64}:
+        return None
+
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+
+    if "--aesKey" in argv:
+        return None
+
+    if "-H" not in argv:
+        return None
+
+    hash_index = _find_flag_index(argv, "-H")
+    if hash_index is None or hash_index + 1 >= len(argv):
+        return None
+
+    # Remove "-H <hash>"
+    new_argv = list(argv)
+    del new_argv[hash_index:hash_index + 2]
+
+    # Ensure Kerberos mode is explicit.
+    if "-k" not in new_argv:
+        insert_at = len(new_argv)
+        domain_idx = _find_flag_index(new_argv, "-d")
+        if domain_idx is None:
+            domain_idx = _find_flag_index(new_argv, "--domain")
+        if domain_idx is not None and domain_idx + 1 < len(new_argv):
+            insert_at = domain_idx + 2
+        new_argv.insert(insert_at, "-k")
+
+    # Insert AES near auth flags.
+    insert_at = len(new_argv)
+    last_auth_idx = -1
+    for flag in ("-u", "-p", "-d", "--domain", "-k"):
+        idx = _find_flag_index(new_argv, flag)
+        if idx is not None:
+            if flag in {"-u", "-p", "-d", "--domain"} and idx + 1 < len(new_argv):
+                last_auth_idx = max(last_auth_idx, idx + 1)
+            else:
+                last_auth_idx = max(last_auth_idx, idx)
+    if last_auth_idx >= 0:
+        insert_at = last_auth_idx + 1
+
+    new_argv[insert_at:insert_at] = ["--aesKey", normalized_aes]
+    return shlex.join(new_argv)

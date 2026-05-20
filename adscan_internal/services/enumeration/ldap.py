@@ -7,6 +7,7 @@ user enumeration, group enumeration, and computer enumeration.
 from collections.abc import Callable
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
+import asyncio
 import subprocess
 import logging
 
@@ -49,6 +50,125 @@ def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess
             env=cmd_env,
         )
     )
+
+
+def _native_anonymous_user_inventory(
+    *,
+    pdc: str,
+    ldap_filter: str,
+    timeout: int,
+) -> list[dict[str, object]]:
+    """Native anonymous LDAP user-object dump via badldap simple-bind.
+
+    Mirrors the connection pattern used by
+    :func:`adscan_internal.services.unauth_enrichment_service._enrich_ldap_active_users_native`
+    so the unauth flow and any external callers go through the same
+    ``ldap+simple://`` simple-bind code path. Returns a list of
+    ``{"distinguished_name": str, "attributes": dict[str, list]}`` items.
+    Empty list when the directory denies the search after a successful
+    anonymous bind.
+    """
+    from adscan_internal import telemetry as _telemetry
+    from badldap.commons.factory import LDAPConnectionFactory
+
+    async def _run() -> list[dict[str, object]]:
+        conn = None
+        last_exc: Exception | None = None
+        for transport, port in (("ldaps", 636), ("ldap", 389)):
+            url = f"{transport}+simple://@{pdc}:{port}"
+            try:
+                factory = LDAPConnectionFactory.from_url(url)
+                client = factory.get_client()
+                if hasattr(client, "_disable_signing"):
+                    client._disable_signing = True
+                if hasattr(client, "_disable_channel_binding"):
+                    client._disable_channel_binding = True
+                ok, err = await asyncio.wait_for(client.connect(), timeout=timeout)
+                if not ok:
+                    raise err or RuntimeError(
+                        f"{transport.upper()} connect returned ok=False"
+                    )
+                conn = client
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+        if conn is None:
+            if last_exc is not None:
+                _telemetry.capture_exception(last_exc)
+                raise last_exc
+            return []
+
+        try:
+            server_info = None
+            if hasattr(conn, "get_server_info"):
+                server_info = conn.get_server_info()
+            if not server_info:
+                server_info = getattr(conn, "_serverinfo", None)
+            base_dn = ""
+            if isinstance(server_info, dict):
+                raw = server_info.get("defaultNamingContext")
+                if isinstance(raw, list):
+                    base_dn = str(raw[0]) if raw else ""
+                elif raw:
+                    base_dn = str(raw)
+                if not base_dn:
+                    ncs = server_info.get("namingContexts")
+                    if isinstance(ncs, list) and ncs:
+                        base_dn = str(ncs[0])
+            if not base_dn:
+                return []
+
+            collected: list[dict[str, object]] = []
+            try:
+                async for item, err in conn.pagedsearch(
+                    ldap_filter,
+                    ["*"],
+                    controls=None,
+                    tree=base_dn,
+                    search_scope=2,
+                ):
+                    if err is not None:
+                        raise err
+                    attrs = dict(item.get("attributes", {}) or {})
+                    dn = item.get("objectName") or attrs.get("distinguishedName") or ""
+                    if isinstance(dn, list):
+                        dn = dn[0] if dn else ""
+                    collected.append(
+                        {
+                            "distinguished_name": str(dn or ""),
+                            "attributes": attrs,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # Hardened directory: bind OK but search refused. Return
+                # what we have (empty) instead of raising "Connected, but
+                # not bound." up the stack.
+                _telemetry.capture_exception(exc)
+                logger.debug(
+                    f"Anonymous LDAP search denied on {pdc}: {exc}"
+                )
+                return []
+            return collected
+        finally:
+            try:
+                disconnect = getattr(conn, "disconnect", None)
+                if disconnect is not None:
+                    maybe = disconnect()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" in str(exc) or "running event loop" in str(exc):
+            # Caller is already inside a loop — run on a fresh loop in a thread.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, _run()).result()
+        raise
 
 
 @dataclass
@@ -542,157 +662,6 @@ class LDAPEnumerationMixin:
 
         return groups
 
-    @requires_auth(AuthMode.AUTHENTICATED)
-    def enumerate_active_users(
-        self,
-        domain: str,
-        pdc: str,
-        auth_mode: AuthMode,
-        username: str,
-        password: str,
-        netexec_path: str,
-        *,
-        log_file: Optional[str] = None,
-        executor: CommandExecutor | None = None,
-        scan_id: Optional[str] = None,
-        timeout: int = 120,
-    ) -> List[str]:
-        """Enumerate active (enabled) users via NetExec LDAP.
-
-        This mirrors the legacy CLI behavior that used ``--active-users`` to
-        generate ``enabled_users.txt``.
-
-        Args:
-            domain: Domain name
-            pdc: PDC hostname/IP
-            auth_mode: Authentication mode (must be AUTHENTICATED)
-            username: Username
-            password: Password or hash
-            netexec_path: Path to NetExec
-            log_file: Optional NetExec log file path
-            executor: Optional injected executor (CLI should pass run_command wrapper)
-            scan_id: Optional scan ID
-            timeout: Timeout in seconds
-
-        Returns:
-            List of active usernames (sAMAccountName), lowercased and unique.
-        """
-        self.parent._emit_progress(
-            scan_id=scan_id,
-            phase="ldap_active_user_enumeration",
-            progress=0.0,
-            message=f"Enumerating active users via LDAP on {domain}",
-        )
-
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-        if is_hash:
-            auth_string = f"-u '{username}' -H '{password}' -d '{domain}'"
-        else:
-            auth_string = f"-u '{username}' -p '{password}' -d '{domain}'"
-
-        log_part = f' --log "{log_file}"' if log_file else ""
-        command = f"{netexec_path} ldap {pdc} {auth_string} --active-users{log_part}"
-
-        try:
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-            usernames: list[str] = []
-            if result.returncode == 0 and result.stdout:
-                usernames = self._parse_netexec_active_users_output(result.stdout)
-
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_active_user_enumeration",
-                progress=1.0,
-                message=f"Active user enumeration completed: {len(usernames)} user(s) found",
-            )
-            return usernames
-        except subprocess.TimeoutExpired:
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_active_user_enumeration",
-                progress=1.0,
-                message="Active user enumeration timed out",
-            )
-            return []
-        except Exception as e:
-            self.logger.exception(f"Error during LDAP active user enumeration: {e}")
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_active_user_enumeration",
-                progress=1.0,
-                message="Active user enumeration failed",
-            )
-            return []
-
-    def enumerate_active_users_anonymous(
-        self,
-        *,
-        pdc: str,
-        netexec_path: str,
-        log_file: Optional[str] = None,
-        executor: CommandExecutor | None = None,
-        scan_id: Optional[str] = None,
-        timeout: int = 120,
-    ) -> List[str]:
-        """Enumerate active users via anonymous LDAP when the server allows it.
-
-        Args:
-            pdc: Domain controller hostname/IP.
-            netexec_path: Path to NetExec.
-            log_file: Optional NetExec log file path.
-            executor: Optional injected executor.
-            scan_id: Optional scan ID.
-            timeout: Timeout in seconds.
-
-        Returns:
-            Lower-cased, de-duplicated username list.
-        """
-        self.parent._emit_progress(
-            scan_id=scan_id,
-            phase="ldap_active_user_enumeration_anonymous",
-            progress=0.0,
-            message=f"Enumerating active users via anonymous LDAP on {pdc}",
-        )
-
-        log_part = f' --log "{log_file}"' if log_file else ""
-        command = f'{netexec_path} ldap {pdc} -u "" -p "" --active-users{log_part}'
-
-        try:
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-            usernames: list[str] = []
-            if result.returncode == 0 and result.stdout:
-                usernames = self._parse_netexec_active_users_output(result.stdout)
-
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_active_user_enumeration_anonymous",
-                progress=1.0,
-                message=f"Anonymous active user enumeration completed: {len(usernames)} user(s) found",
-            )
-            return usernames
-        except subprocess.TimeoutExpired:
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_active_user_enumeration_anonymous",
-                progress=1.0,
-                message="Anonymous active user enumeration timed out",
-            )
-            return []
-        except Exception as e:
-            self.logger.exception(
-                f"Error during anonymous LDAP active user enumeration: {e}"
-            )
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_active_user_enumeration_anonymous",
-                progress=1.0,
-                message="Anonymous active user enumeration failed",
-            )
-            return []
 
     def query_anonymous_user_inventory(
         self,
@@ -705,21 +674,25 @@ class LDAPEnumerationMixin:
         scan_id: Optional[str] = None,
         timeout: int = 120,
     ) -> List[LDAPAnonymousUserRecord]:
-        """Query LDAP anonymously for enabled user objects.
+        """Query LDAP anonymously for user objects.
 
-        Args:
-            pdc: Domain controller hostname/IP.
-            netexec_path: Path to NetExec.
-            log_file: Optional NetExec log file path.
-            ldap_filter: Optional LDAP filter. When omitted, a default
-                enabled-user filter is used.
-            executor: Optional injected executor.
-            scan_id: Optional scan ID.
-            timeout: Timeout in seconds.
+        Native badldap implementation using an explicit ``ldap+simple://`` /
+        ``ldaps+simple://`` SIMPLE bind with empty credentials (RFC 4513
+        §5.1.1 anonymous), so paged searches actually work. The previous
+        sync ``ADscanLDAPConnection`` path used the NONE-protocol URL form
+        which leaves the connection in CONNECTED (not BOUND) state and
+        crashed pagedsearch with ``Connected, but not bound.`` on every
+        hardened DC.
 
-        Returns:
-            List of best-effort user records extracted from LDAP query output.
+        On hardened directories that allow the anonymous bind but reject
+        searches (``operationsError`` / ``ERROR_NOT_AUTHENTICATED``), this
+        returns ``[]`` cleanly — no exception escapes.
+
+        ``netexec_path``, ``log_file`` and ``executor`` are accepted for
+        backward compatibility with legacy callsites and ignored.
         """
+        _ = (netexec_path, log_file, executor)
+
         effective_filter = (
             ldap_filter
             or "(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
@@ -731,73 +704,12 @@ class LDAPEnumerationMixin:
             message=f"Querying anonymous LDAP user inventory on {pdc}",
         )
 
-        _ = (netexec_path, log_file, executor)
-
         try:
-            from ldap3 import ALL_ATTRIBUTES, BASE, SUBTREE, Connection, Server
-
-            server = Server(pdc, use_ssl=False, connect_timeout=min(timeout, 10))
-            connection = Connection(
-                server,
-                user="",
-                password="",
-                auto_bind=False,
-                receive_timeout=timeout,
+            objects = _native_anonymous_user_inventory(
+                pdc=pdc,
+                ldap_filter=effective_filter,
+                timeout=timeout,
             )
-            if not connection.bind():
-                self.parent._emit_progress(
-                    scan_id=scan_id,
-                    phase="ldap_anonymous_user_inventory",
-                    progress=1.0,
-                    message="Anonymous LDAP user inventory query failed",
-                )
-                return []
-
-            connection.search(
-                search_base="",
-                search_filter="(objectClass=*)",
-                attributes=["defaultNamingContext", "namingContexts"],
-                search_scope=BASE,
-            )
-            root_entries = list(getattr(connection, "entries", []) or [])
-            base_dn = ""
-            if root_entries:
-                attrs = getattr(root_entries[0], "entry_attributes_as_dict", {}) or {}
-                contexts = attrs.get("defaultNamingContext") or attrs.get("namingContexts") or []
-                if not isinstance(contexts, list):
-                    contexts = [contexts]
-                base_dn = str(contexts[0] if contexts else "").strip()
-            if not base_dn:
-                connection.unbind()
-                return []
-
-            connection.search(
-                search_base=base_dn,
-                search_filter=effective_filter,
-                attributes=ALL_ATTRIBUTES,
-                search_scope=SUBTREE,
-                paged_size=1000,
-            )
-            records = self._parse_ldap_entries_anonymous_user_inventory(
-                list(getattr(connection, "entries", []) or [])
-            )
-            connection.unbind()
-
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_anonymous_user_inventory",
-                progress=1.0,
-                message=f"Anonymous LDAP user inventory completed: {len(records)} user object(s) found",
-            )
-            return records
-        except subprocess.TimeoutExpired:
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_anonymous_user_inventory",
-                progress=1.0,
-                message="Anonymous LDAP user inventory timed out",
-            )
-            return []
         except Exception as e:
             self.logger.exception(f"Error during anonymous LDAP user inventory: {e}")
             self.parent._emit_progress(
@@ -808,14 +720,24 @@ class LDAPEnumerationMixin:
             )
             return []
 
+        records = self._parse_netexec_anonymous_user_inventory(objects)
+
+        self.parent._emit_progress(
+            scan_id=scan_id,
+            phase="ldap_anonymous_user_inventory",
+            progress=1.0,
+            message=f"Anonymous LDAP user inventory completed: {len(records)} user object(s) found",
+        )
+        return records
+
     def _parse_ldap_entries_anonymous_user_inventory(
         self, entries: list[object]
     ) -> List[LDAPAnonymousUserRecord]:
-        """Normalize ldap3 entries into anonymous user records."""
+        """Normalize LDAP entries into anonymous user records."""
         objects: list[dict[str, object]] = []
         for entry in entries:
-            dn = str(getattr(entry, "entry_dn", "") or "").strip()
-            attrs = getattr(entry, "entry_attributes_as_dict", {}) or {}
+            dn = str(getattr(entry, "dn", None) or getattr(entry, "entry_dn", "") or "").strip()
+            attrs = entry.entry_attributes_as_dict
             if not isinstance(attrs, dict):
                 attrs = {}
             objects.append({"distinguished_name": dn, "attributes": attrs})
@@ -935,16 +857,23 @@ class LDAPEnumerationMixin:
         anonymous access is allowed.
 
         Args:
-            pdc: PDC hostname/IP
-            netexec_path: Path to NetExec
-            scan_id: Optional scan ID
-            timeout: Timeout in seconds
+            pdc: PDC hostname/IP.
+            netexec_path: Unused — kept for backward compatibility with the
+                legacy NetExec-based signature; the bind is now native.
+            log_file: Unused — kept for compatibility.
+            executor: Unused — kept for compatibility.
+            scan_id: Optional scan ID.
+            timeout: Timeout in seconds for the underlying async probe.
 
         Returns:
             Dictionary with test results:
                 - accessible: bool - Whether anonymous access succeeded
                 - error: Optional[str] - Error message if failed
         """
+        # Backward-compat shim: parameters retained so existing callers continue
+        # to work, but we no longer shell out to NetExec.
+        _ = (netexec_path, log_file, executor)
+
         self.parent._emit_progress(
             scan_id=scan_id,
             phase="ldap_anonymous_test",
@@ -954,70 +883,49 @@ class LDAPEnumerationMixin:
 
         self.logger.info(f"Testing anonymous LDAP access on {pdc}")
 
-        log_part = f' --log "{log_file}"' if log_file else ""
-        command = f'{netexec_path} ldap {pdc} -u "" -p ""{log_part}'
-
         try:
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-
-            output = (result.stdout or "") + (result.stderr or "")
-            output_lower = output.lower()
-            error_markers = (
-                "error in searchrequest",
-                "operationserror",
-                "successful bind must be completed",
-                "status_access_denied",
-                "invalid credentials",
-            )
-            success_markers = (
-                "[+]",
-                "status_success",
-                "bind successful",
-                "authenticated",
+            from adscan_internal.services.unauth_probe_service import (
+                _probe_ldap_anonymous,
             )
 
-            error_detected = any(marker in output_lower for marker in error_markers)
-            success_detected = any(marker in output_lower for marker in success_markers)
+            probe_result = asyncio.run(_probe_ldap_anonymous(pdc, timeout))
 
-            # Treat explicit LDAP errors as a failed anonymous bind even if a [+] line exists.
-            accessible = bool(success_detected and not error_detected)
+            accessible = probe_result.status == "open"
 
             self.parent._emit_progress(
                 scan_id=scan_id,
                 phase="ldap_anonymous_test",
                 progress=1.0,
-                message=f"Anonymous LDAP test completed: {'Accessible' if accessible else 'Not accessible'}",
+                message=(
+                    f"Anonymous LDAP test completed: "
+                    f"{'Accessible' if accessible else 'Not accessible'}"
+                ),
             )
 
-            error_message = None
+            error_message: Optional[str] = None
             if not accessible:
-                if error_detected:
-                    error_message = "Anonymous access denied (LDAP error reported)."
-                else:
-                    error_message = "Anonymous access denied."
-
-            result_data = {
-                "accessible": accessible,
-                "error": error_message,
-            }
+                error_message = probe_result.error or "Anonymous access denied."
 
             self.logger.info(
-                f"Anonymous LDAP access test: {'SUCCESS' if accessible else 'DENIED'}",
+                f"Anonymous LDAP access test: "
+                f"{'SUCCESS' if accessible else 'DENIED'}",
                 extra={"pdc": pdc, "accessible": accessible},
             )
 
-            return result_data
+            return {"accessible": accessible, "error": error_message}
 
-        except subprocess.TimeoutExpired:
-            self.logger.error("Anonymous LDAP access test timed out")
+        except RuntimeError as e:
+            # Asyncio loop conflict — caller is already inside an event loop.
+            self.logger.exception(
+                f"Anonymous LDAP test cannot run synchronously: {e}"
+            )
             self.parent._emit_progress(
                 scan_id=scan_id,
                 phase="ldap_anonymous_test",
                 progress=1.0,
-                message="Test timed out",
+                message="Test could not run (loop conflict)",
             )
-            return {"accessible": False, "error": "Timeout"}
+            return {"accessible": False, "error": str(e)}
 
         except Exception as e:
             self.logger.exception(f"Error during anonymous LDAP test: {e}")
@@ -1157,43 +1065,3 @@ class LDAPEnumerationMixin:
 
         return computers
 
-    def _parse_netexec_active_users_output(self, output: str) -> List[str]:
-        """Parse NetExec ``--active-users`` output to a username list."""
-        if not output:
-            return []
-
-        usernames: list[str] = []
-        seen: set[str] = set()
-        for line in output.splitlines():
-            line = line.strip()
-            if not line or "LDAP" not in line:
-                continue
-            if "-Username-" in line:
-                continue
-            if "\\" in line:
-                candidate = line.split("\\")[-1].strip()
-            else:
-                parts = line.split(None, 5)
-                if len(parts) < 5:
-                    continue
-                candidate = parts[4].strip()
-
-            candidate = candidate.strip("[]")
-            if not candidate:
-                continue
-            if candidate in {"*", "+", "-"}:
-                continue
-            if candidate.startswith("[") or candidate.startswith("-"):
-                continue
-            if candidate.casefold() in {
-                "ldap",
-                "total",
-            }:
-                continue
-
-            key = candidate.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            usernames.append(key)
-        return usernames

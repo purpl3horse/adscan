@@ -18,7 +18,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional, Protocol
+from typing import Callable, Protocol
 
 from adscan_internal import (
     print_error,
@@ -42,6 +42,7 @@ from adscan_internal.rich_output import (
 from adscan_internal.subprocess_env import command_string_needs_clean_env
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces import domain_relpath, domain_subpath
+from adscan_core.theme import ADSCAN_PRIMARY
 from adscan_internal.workspaces.computers import (
     count_enabled_computer_accounts,
     has_enabled_computer_list,
@@ -81,6 +82,29 @@ def _extract_typed_source_steps(source_steps: list[object] | None) -> list[objec
     except Exception:  # noqa: BLE001
         return []
     return [step for step in source_steps if isinstance(step, CredentialSourceStep)]
+
+
+def _build_lockout_context_from_eligibility(
+    eligibility: "SprayEligibilityResult | None",
+) -> dict[str, object] | None:
+    """Return a lockout-context dict the hits panel can render inline.
+
+    The hits panel surfaces this as a status-bar-style reminder so the
+    operator does not have to mentally hold the threshold across a
+    multi-minute spray (tui-design § Principle 6, Contextual Intelligence).
+    """
+    if eligibility is None:
+        return None
+    notes = getattr(eligibility, "notes", []) or []
+    no_lockout = any("no lockout" in str(note).lower() for note in notes)
+    return {
+        "threshold": getattr(eligibility, "lockout_threshold", None),
+        "minimum_remaining": getattr(
+            eligibility, "minimum_remaining_attempts", None
+        ),
+        "safe_reserve": getattr(eligibility, "safe_remaining_threshold", None),
+        "no_lockout": no_lockout,
+    }
 
 
 def _domain_hit_is_hash(shell: object, credential: str) -> bool:
@@ -139,8 +163,6 @@ def handle_validated_domain_hits_followup(
     store credentials, classify Tier-0/high-value users, offer attack paths, and
     optionally enumerate selected users when no path is available.
     """
-    import sys
-
     from adscan_internal.cli.attack_path_execution import (
         offer_attack_paths_for_execution_for_principals,
     )
@@ -149,7 +171,7 @@ def handle_validated_domain_hits_followup(
         UserRiskFlags,
         classify_users_tier0_high_value,
     )
-    from adscan_internal.rich_output import BRAND_COLORS, print_panel
+    from adscan_internal.rich_output import print_panel
     from rich.prompt import Confirm
     from rich.table import Table
     from rich.text import Text
@@ -158,9 +180,8 @@ def handle_validated_domain_hits_followup(
     if not normalized_hits:
         return False
 
-    is_interactive = bool(
-        sys.stdin.isatty() and not (os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
-    )
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    is_interactive = not _is_non_interactive(shell)
     store = CredentialStoreService()
 
     for hit in normalized_hits:
@@ -175,6 +196,16 @@ def handle_validated_domain_hits_followup(
             credential=credential,
             is_hash=bool(hit.get("is_hash")),
         )
+
+    # Persist credentials to disk immediately so downstream attack-path execution
+    # can always resolve the password even when the function returns early (e.g.
+    # after offer_attack_paths_for_execution_for_principals succeeds).
+    save_fn = getattr(shell, "save_workspace_data", None)
+    if callable(save_fn):
+        try:
+            save_fn()
+        except Exception:  # noqa: BLE001
+            pass
 
     risk_flags_by_user: dict[str, UserRiskFlags] = {}
     try:
@@ -205,41 +236,88 @@ def handle_validated_domain_hits_followup(
     ]
 
     if privileged_hits:
+        from adscan_core.theme import COLOR_AMBER, COLOR_CRIMSON
+
+        tier0_hits = [
+            h for h in privileged_hits
+            if risk_flags_by_user.get(
+                str(h.get("username") or "").strip().lower(), UserRiskFlags()
+            ).is_tier0
+        ]
+        highvalue_hits = [
+            h for h in privileged_hits
+            if not risk_flags_by_user.get(
+                str(h.get("username") or "").strip().lower(), UserRiskFlags()
+            ).is_tier0
+        ]
+
         privileged_table = Table(
-            title=Text(
-                "Privileged Credentials Detected",
-                style=f"bold {BRAND_COLORS['warning']}",
-            ),
             show_header=True,
-            header_style=f"bold {BRAND_COLORS['warning']}",
+            header_style=f"bold {COLOR_CRIMSON}",
             show_lines=True,
+            box=None,
         )
         privileged_table.add_column("#", style="dim", width=4, justify="right")
+        privileged_table.add_column("Privilege", width=18)
         privileged_table.add_column("Username", style="bold")
-        privileged_table.add_column("Risk", style="bold")
+        # Per-row command hint — concrete, copyable, not a restatement of the
+        # alert summary above (impeccable § Copy: no restated headings).
+        privileged_table.add_column("Run next", style="dim")
 
         for idx, hit in enumerate(privileged_hits, start=1):
             user = str(hit.get("username") or "")
             flags = risk_flags_by_user.get(user.strip().lower(), UserRiskFlags())
-            risk_label = "Tier-0" if flags.is_tier0 else "High-Value"
-            privileged_table.add_row(str(idx), mark_sensitive(user, "user"), risk_label)
+            if flags.is_tier0:
+                # ▲ glyph + text so the badge does not depend on red color.
+                priv_badge = Text("▲ TIER-0 / DA", style=f"bold {COLOR_CRIMSON}")
+                action_hint = f"attack_paths owned tier0  ·  enum {user}"
+            else:
+                priv_badge = Text("◆ HIGH VALUE", style=f"bold {COLOR_AMBER}")
+                action_hint = f"attack_paths owned highvalue  ·  enum {user}"
+            privileged_table.add_row(
+                str(idx),
+                priv_badge,
+                mark_sensitive(user, "user"),
+                action_hint,
+            )
 
-        message = Text()
-        message.append(
-            "One or more privileged domain credentials were validated.\n\n",
-            style="bold yellow",
+        alert_text = Text()
+        alert_text.append(
+            f"  {len(privileged_hits)} privileged credential"
+            f"{'s' if len(privileged_hits) != 1 else ''} validated\n\n",
+            style=f"bold {COLOR_CRIMSON}",
         )
-        message.append(
-            "Pivoting with a Tier-0/high-value account is typically the fastest route to domain compromise.\n",
-            style="yellow",
-        )
+        if tier0_hits:
+            alert_text.append(
+                f"  {len(tier0_hits)} Tier-0 (Domain Admin equivalent) "
+                f"account{'s' if len(tier0_hits) != 1 else ''} captured.\n",
+                style=f"bold {COLOR_CRIMSON}",
+            )
+            alert_text.append(
+                "  Immediate pivot opportunity — ADscan will offer attack paths next.\n",
+                style=COLOR_CRIMSON,
+            )
+        elif highvalue_hits:
+            alert_text.append(
+                f"  {len(highvalue_hits)} high-value "
+                f"account{'s' if len(highvalue_hits) != 1 else ''} captured.\n",
+                style=f"bold {COLOR_AMBER}",
+            )
+            alert_text.append(
+                "  Run attack_paths to identify escalation routes.\n",
+                style=COLOR_AMBER,
+            )
 
         print_panel(
-            [message, privileged_table],
-            title=Text("Privileged Credentials Found", style="bold yellow"),
-            border_style="yellow",
+            [alert_text, privileged_table],
+            title=Text(
+                " PRIVILEGED CREDENTIALS CAPTURED ",
+                style=f"bold {COLOR_CRIMSON}",
+            ),
+            border_style=COLOR_CRIMSON,
             expand=False,
         )
+
 
         pivot_now = (
             Confirm.ask(
@@ -271,6 +349,7 @@ def handle_validated_domain_hits_followup(
                 str(selected.get("username") or ""),
                 str(selected.get("credential") or ""),
                 source_steps=source_steps,
+                credential_origin="spray",
             )
             return True
 
@@ -307,6 +386,7 @@ def handle_validated_domain_hits_followup(
                 str(first_hit.get("credential") or ""),
                 source_steps=source_steps,
                 prompt_for_user_privs_after=False,
+                credential_origin="spray",
             )
             return True
         return False
@@ -408,6 +488,7 @@ def handle_validated_domain_hits_followup(
                 str(hit.get("credential") or ""),
                 source_steps=source_steps,
                 prompt_for_user_privs_after=True,
+                credential_origin="spray",
             )
         return True
 
@@ -420,6 +501,7 @@ def handle_validated_domain_hits_followup(
             str(first_hit.get("credential") or ""),
             source_steps=source_steps,
             prompt_for_user_privs_after=False,
+            credential_origin="spray",
         )
         return True
     return False
@@ -514,6 +596,8 @@ _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS = 3
 _DEFAULT_MULTI_SPRAY_RESERVE = 2
 _MAX_MULTI_SPRAY_PREVIEW = 10
 _ADAPTIVE_YEAR_SUMMARY_PREVIEW_PER_YEAR = 5
+
+LOCKOUT_FREE_VARIATION_SPRAY_ENABLED: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1050,51 +1134,247 @@ def _render_valid_spray_hits_panel(
     hits: list[dict[str, str]],
     *,
     spray_type: str | None,
+    risk_flags: dict[str, object] | None = None,
+    lockout_context: dict[str, object] | None = None,
 ) -> None:
-    """Render a concise panel listing the discovered spray hits."""
-    from adscan_internal.rich_output import BRAND_COLORS, print_panel
+    """Render a concise, action-oriented panel listing the discovered spray hits.
+
+    Args:
+        hits: List of hit dicts with at minimum ``username`` and ``password`` keys.
+        spray_type: Human-readable spray method label (e.g. ``"Custom Password"``).
+        risk_flags: Optional pre-computed risk flags keyed by lower-cased username.
+            Each value must expose ``.is_tier0`` and ``.is_high_value`` attributes.
+            When provided, each row gains a privilege badge (Tier-0 / High-Value /
+            Standard).  Pass ``None`` (default) when classification data is not
+            available at the call site — the column is omitted in that case.
+        lockout_context: Optional dict with lockout posture state to surface
+            inline as a status-bar-style reminder under the hits table. Keys:
+            ``threshold`` (int|None), ``minimum_remaining`` (int|None),
+            ``safe_reserve`` (int|None), ``no_lockout`` (bool).
+    """
+    from adscan_core.theme import COLOR_AMBER, COLOR_CRIMSON, COLOR_SAGE
+    from adscan_internal.rich_output import print_panel
     from rich.table import Table
     from rich.text import Text
 
+    # ── Zero-hits path — dim informational panel ──────────────────────────────
+    if not hits:
+        print_panel(
+            "[dim]No valid credentials found for this spray attempt.[/dim]\n"
+            "[dim]Adjust the password list, wait for the observation window to "
+            "reset, or try a different spray type.[/dim]",
+            title="[dim]Spraying Results — No Hits[/dim]",
+            border_style="dim",
+            expand=False,
+        )
+        return
+
+    # ── Sorting: Tier-0 first, High-Value second, Standard last ──────────────
+    _rf = risk_flags or {}
+
+    def _sort_key(item: dict[str, str]) -> tuple[int, str]:
+        ukey = str(item.get("username") or "").strip().lower()
+        flags = _rf.get(ukey)
+        if flags is not None:
+            if getattr(flags, "is_tier0", False):
+                return (0, ukey)
+            if getattr(flags, "is_high_value", False):
+                return (1, ukey)
+        return (2, ukey)
+
+    hits_sorted = sorted(hits, key=_sort_key)
+    total = len(hits_sorted)
+    _DISPLAY_LIMIT = 5
+    display_hits = hits_sorted[:_DISPLAY_LIMIT]
+
+    # ── Build table ───────────────────────────────────────────────────────────
+    # Hierarchy beyond color (tui-design § Visual Hierarchy):
+    # privilege class is encoded by glyph + text + color + row weight so the
+    # signal survives monochrome terminals and red/green color-blindness.
+    show_privilege_col = bool(_rf)
     table = Table(
-        title=Text("Valid Credentials Found", style=f"bold {BRAND_COLORS['info']}"),
         show_header=True,
-        header_style=f"bold {BRAND_COLORS['info']}",
+        header_style=f"bold {COLOR_SAGE}",
         show_lines=True,
+        box=None,
     )
     table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Username", style="bold")
+    if show_privilege_col:
+        table.add_column("Privilege", width=16)
+    table.add_column("Username")
     table.add_column("Method", style="dim")
-    table.add_column("Accepted Secret", style="yellow")
+    table.add_column("Credential")
 
-    hits_sorted = sorted(hits, key=lambda item: str(item.get("username", "")).lower())
-    for idx, hit in enumerate(hits_sorted[:10], start=1):
+    # Track the highest-priority class found across ALL hits (not just the
+    # truncated display window) so the contextual footer in § Next surfaces
+    # the right next-action even when Tier-0 sits beyond the display cap.
+    top_class = "standard"
+    for hit in hits_sorted:
+        ukey = str(hit.get("username") or "").strip().lower()
+        flags = _rf.get(ukey)
+        if flags is not None and getattr(flags, "is_tier0", False):
+            top_class = "tier0"
+            break
+        if flags is not None and getattr(flags, "is_high_value", False):
+            top_class = "high_value"
+
+    for idx, hit in enumerate(display_hits, start=1):
         user = str(hit.get("username") or "")
         password = str(hit.get("password") or "")
-        accepted_secret = (
+        cred_label = (
             "Blank password"
             if spray_type == "Blank Password" or password == ""
             else "Password accepted"
         )
-        table.add_row(
-            str(idx),
-            mark_sensitive(user, "user"),
-            spray_type or "Password spray",
-            accepted_secret,
+
+        row_class = "standard"
+        if show_privilege_col:
+            ukey = user.strip().lower()
+            flags = _rf.get(ukey)
+            if flags is not None and getattr(flags, "is_tier0", False):
+                # Glyph ▲ + text + crimson so the badge reads identically
+                # in monochrome and to red/green color-blind operators.
+                priv_badge = Text("▲ TIER-0", style=f"bold {COLOR_CRIMSON}")
+                row_class = "tier0"
+            elif flags is not None and getattr(flags, "is_high_value", False):
+                priv_badge = Text("◆ HIGH VALUE", style=f"bold {COLOR_AMBER}")
+                row_class = "high_value"
+            else:
+                priv_badge = Text("· Standard", style="dim")
+
+        # Visual weight per row — bold for Tier-0, normal for high-value,
+        # dim for standard. This restores hierarchy when color is stripped.
+        if row_class == "tier0":
+            user_text = Text(mark_sensitive(user, "user"), style=f"bold {COLOR_CRIMSON}")
+            cred_text = Text(cred_label, style="bold yellow")
+            num_text = Text(str(idx), style=f"bold {COLOR_CRIMSON}")
+        elif row_class == "high_value":
+            user_text = Text(mark_sensitive(user, "user"), style="bold")
+            cred_text = Text(cred_label, style="yellow")
+            num_text = Text(str(idx), style="bold")
+        else:
+            user_text = Text(mark_sensitive(user, "user"))
+            cred_text = Text(cred_label, style="yellow")
+            num_text = Text(str(idx), style="dim")
+
+        if show_privilege_col:
+            table.add_row(
+                num_text,
+                priv_badge,
+                user_text,
+                spray_type or "Password spray",
+                cred_text,
+            )
+        else:
+            table.add_row(
+                num_text,
+                user_text,
+                spray_type or "Password spray",
+                cred_text,
+            )
+
+    # ── Panel title — hit count prominent, color-coded ────────────────────────
+    panel_title = Text()
+    # ✓ glyph so the success signal survives mono / no-color rendering.
+    panel_title.append(
+        f" ✓ {total} valid credential{'' if total == 1 else 's'} found ",
+        style=f"bold {COLOR_SAGE}",
+    )
+
+    footer_lines: list[str] = []
+    if total > _DISPLAY_LIMIT:
+        footer_lines.append(
+            f"[dim]Showing {_DISPLAY_LIMIT} of {total}. "
+            f"Run [bold]creds show[/bold] to view all stored credentials.[/dim]"
+        )
+    if spray_type == "Blank Password":
+        footer_lines.append(
+            "[dim]These accounts authenticated with a blank password — "
+            "credentials stored as empty-password entries.[/dim]"
         )
 
-    if len(hits_sorted) > 10:
-        print_warning(
-            f"Showing 10/{len(hits_sorted)} valid credentials. Use `creds show` to see stored credentials."
+    # ── Status-bar-style lockout reminder (tui-design Principle 6) ────────────
+    # The eligibility panel is shown once upfront; after a multi-minute spray
+    # the operator no longer recalls the threshold. Surface it inline.
+    if lockout_context:
+        try:
+            no_lockout_flag = bool(lockout_context.get("no_lockout"))
+            threshold_val = lockout_context.get("threshold")
+            min_remaining = lockout_context.get("minimum_remaining")
+            safe_reserve = lockout_context.get("safe_reserve")
+            if no_lockout_flag:
+                footer_lines.append(
+                    "[dim]Lockout: [/dim]"
+                    f"[{COLOR_SAGE}]✓ none enforced[/{COLOR_SAGE}] [dim]· spray may continue freely[/dim]"
+                )
+            elif isinstance(threshold_val, int) and threshold_val > 0:
+                if isinstance(min_remaining, int):
+                    if min_remaining <= 1:
+                        rem_style = COLOR_CRIMSON
+                        rem_glyph = "!"
+                    elif min_remaining <= 3:
+                        rem_style = COLOR_AMBER
+                        rem_glyph = "⚠"
+                    else:
+                        rem_style = COLOR_SAGE
+                        rem_glyph = "✓"
+                    reserve_str = (
+                        f" · reserve {safe_reserve}"
+                        if isinstance(safe_reserve, int) and safe_reserve > 0
+                        else ""
+                    )
+                    footer_lines.append(
+                        "[dim]Lockout: [/dim]"
+                        f"[{rem_style}]{rem_glyph} {min_remaining} attempts left per account[/{rem_style}]"
+                        f" [dim]· threshold {threshold_val}{reserve_str}[/dim]"
+                    )
+                else:
+                    footer_lines.append(
+                        f"[dim]Lockout: threshold {threshold_val} · per-account remaining unknown[/dim]"
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Context-aware Next action (tui-design Principle 6) ────────────────────
+    # The operator's next move depends on what was captured. A static
+    # "attack_paths or enum" line treats all outcomes equally and wastes
+    # the highest-leverage moment of the run.
+    if top_class == "tier0":
+        footer_lines.append(
+            f"[bold {COLOR_CRIMSON}]▶ Next:[/bold {COLOR_CRIMSON}] "
+            "[dim]Tier-0 credential captured — pivot immediately with "
+            "[bold]attack_paths owned tier0[/bold] or run "
+            "[bold]enum[/bold] on the Tier-0 user to confirm DA rights.[/dim]"
         )
+    elif top_class == "high_value":
+        footer_lines.append(
+            f"[bold {COLOR_AMBER}]▶ Next:[/bold {COLOR_AMBER}] "
+            "[dim]High-value account captured — review "
+            "[bold]attack_paths owned highvalue[/bold] for escalation routes.[/dim]"
+        )
+    elif show_privilege_col:
+        footer_lines.append(
+            f"[{COLOR_SAGE}]▶ Next:[/{COLOR_SAGE}] "
+            "[dim]Standard accounts captured — run "
+            "[bold]attack_paths owned[/bold] to look for derived control, "
+            "or [bold]enum[/bold] to expand reach.[/dim]"
+        )
+    else:
+        # No classification available — keep the previous neutral guidance.
+        footer_lines.append(
+            f"[{COLOR_SAGE}]▶ Next:[/{COLOR_SAGE}] "
+            "[dim]Review attack paths with [bold]attack_paths[/bold] "
+            "or pivot with [bold]enum[/bold] on a high-value account.[/dim]"
+        )
+
+    content_parts: list[object] = [table]
+    if footer_lines:
+        content_parts.append(Text.from_markup("\n" + "\n".join(footer_lines)))
 
     print_panel(
-        [table],
-        title=Text(
-            f"Spraying Results ({len(hits_sorted)} success{'es' if len(hits_sorted) != 1 else ''})",
-            style=f"bold {BRAND_COLORS['info']}",
-        ),
-        border_style=BRAND_COLORS["info"],
+        content_parts,
+        title=panel_title,
+        border_style=COLOR_SAGE,
         expand=False,
     )
     if spray_type == "Blank Password":
@@ -1256,6 +1536,71 @@ def _persist_and_record_spray_hits(
                     "[spray] Failed to record artifact/share credential provenance edge (continuing)."
                 )
 
+    # Mint a Kerberos TGT for every validated hit as soon as the
+    # credential is confirmed. Without this, downstream operations that
+    # later need to authenticate as the new principal call the LDAP
+    # transport with ``username + password + ccache=None``; the
+    # transport then silently falls back to ``KRB5CCNAME`` (carrying the
+    # ccache of an earlier principal) and binds as the WRONG user.
+    # Observed on HTB Puppy 2026-05-21: post-spray ``enable_user`` ran
+    # as LEVI.JAMES instead of the just-sprayed ant.edwards, and the
+    # modify was rejected with ``insufficientAccessRights`` because
+    # LEVI.JAMES had no GenericAll over the target. Minting the TGT
+    # here writes the ccache to the canonical per-user location
+    # (``<workspace>/domains/<domain>/kerberos/tickets/<user>.ccache``),
+    # which ``ensure_user_ccache`` and ``KerberosTicketService.get_ticket_for_user``
+    # both consult first — closing the hijack without any change to the
+    # downstream call sites.
+    #
+    # Best-effort: minting is wrapped in try/except so a Kerberos AS-REQ
+    # failure (e.g. KDC unreachable, clock skew not yet synced) does
+    # NOT block the spray success — the credential is still recorded
+    # and the downstream caller falls back to fresh AS-REQ via the
+    # LDAP transport's password slot.
+    try:
+        from adscan_internal.services.kerberos_ticket_service import (
+            ensure_user_ccache,
+        )
+
+        for hit in hits_sorted:
+            username = str(hit.get("username") or "").strip()
+            password = str(hit.get("password") or "")
+            if not username or not password:
+                continue
+            try:
+                ticket_path = ensure_user_ccache(
+                    shell,
+                    user=username,
+                    domain=domain,
+                    credential=password,
+                    force_refresh=True,
+                )
+                if ticket_path:
+                    print_info_debug(
+                        "[spray] minted TGT for sprayed credential: "
+                        f"user={mark_sensitive(username, 'user')} "
+                        f"domain={mark_sensitive(domain, 'domain')}"
+                    )
+                else:
+                    print_info_debug(
+                        "[spray] TGT mint returned no ticket path; "
+                        "downstream auth will fall back to AS-REQ via the "
+                        f"LDAP password slot. user={mark_sensitive(username, 'user')}"
+                    )
+            except Exception as mint_exc:  # noqa: BLE001 — best-effort
+                telemetry.capture_exception(mint_exc)
+                print_info_debug(
+                    f"[spray] TGT mint raised for {mark_sensitive(username, 'user')}: "
+                    f"{type(mint_exc).__name__}: {mint_exc}. Downstream auth will "
+                    "fall back to fresh AS-REQ via the LDAP password slot."
+                )
+    except ImportError:
+        # ensure_user_ccache lives in the runtime image; the public
+        # repo strip may exclude it. Falling back silently is correct —
+        # the LDAP transport's password slot handles the AS-REQ on
+        # demand, just without the per-user ccache reuse benefit.
+        pass
+
     if persist_via_add_credential:
         for hit in hits_sorted:
             username = str(hit.get("username") or "").strip()
@@ -1269,6 +1614,7 @@ def _persist_and_record_spray_hits(
                 source_steps=source_steps,
                 prompt_for_user_privs_after=True,
                 allow_empty_credential=allow_empty_credential,
+                credential_origin="spray",
             )
         return
 
@@ -1729,19 +2075,26 @@ def get_spraying_user_list_path(
 def get_password_spraying_history(shell: SprayShell) -> dict:
     """Return the password spraying history dict, initializing it if needed.
 
-    Structure:
+    Schema (v2 — granular per (domain, user, password)):
         {
             "<domain>": {
-                "<category>": {
-                    "count": int,
-                    "last_run": str,  # ISO 8601 UTC
-                    # For category == "password":
-                    # "passwords": {
-                    #     "<password>": {"count": int, "last_run": str}
-                    # }
+                "<user_lower>": {
+                    "<password>": {
+                        "first_run": str,   # ISO 8601 UTC
+                        "last_run":  str,   # ISO 8601 UTC
+                        "count":     int,
+                        "modes":     ["password" | "variation" | "adaptive_year"
+                                       | "useraspass" | "useraspass_lower"
+                                       | "useraspass_upper" | "batch", ...]
+                    }
                 }
             }
         }
+
+    Persisted via ``adscan_internal/workspaces/state.py`` so repeats are
+    detected across sessions, not just within one. ``user_lower`` is the
+    sAMAccountName casefolded for case-insensitive matching; the password
+    is stored verbatim.
     """
     history = getattr(shell, "password_spraying_history", None)
     if not isinstance(history, dict):
@@ -1750,131 +2103,276 @@ def get_password_spraying_history(shell: SprayShell) -> dict:
     return history
 
 
-def _spraying_category_tracks_password(category: str) -> bool:
-    """Return whether repeat detection should track a category per password."""
-    return category in {"password", "adaptive_year_password"}
-
-
-def register_spraying_attempt(
-    shell: SprayShell, domain: str, category: str, password: Optional[str] = None
+def register_user_spray_attempts(
+    shell: SprayShell,
+    *,
+    domain: str,
+    combos: list[tuple[str, str]],
+    mode: str,
 ) -> None:
-    """Record a password spraying attempt in the in-memory history."""
+    """Record N (user, password) attempts in the workspace-persisted history.
+
+    Idempotent: re-registering the same combo bumps count + last_run and
+    appends the mode to the entry's mode list (deduplicated). Empty
+    usernames or passwords are silently skipped — the caller should not
+    pass them but defensive filtering keeps the helper safe.
+    """
     try:
         history = get_password_spraying_history(shell)
-        domain_history = history.setdefault(domain, {})
-        category_entry = domain_history.setdefault(category, {})
         now_iso = datetime.now(timezone.utc).isoformat()
-
-        if _spraying_category_tracks_password(category):
-            passwords_entry = category_entry.setdefault("passwords", {})
-            if password is None:
-                return
-            pwd_entry = passwords_entry.setdefault(
-                password, {"count": 0, "last_run": None}
-            )
-            pwd_entry["count"] = int(pwd_entry.get("count", 0)) + 1
-            pwd_entry["last_run"] = now_iso
-        else:
-            category_entry["count"] = int(category_entry.get("count", 0)) + 1
-            category_entry["last_run"] = now_iso
+        for username, password in combos:
+            if not username or not password:
+                continue
+            domain_history = history.setdefault(domain, {})
+            user_lower = str(username).casefold()
+            user_entry = domain_history.setdefault(user_lower, {})
+            pwd_entry = user_entry.setdefault(password, None)
+            if pwd_entry is None or not isinstance(pwd_entry, dict):
+                user_entry[password] = {
+                    "first_run": now_iso,
+                    "last_run": now_iso,
+                    "count": 1,
+                    "modes": [mode],
+                }
+            else:
+                pwd_entry["count"] = int(pwd_entry.get("count", 0)) + 1
+                pwd_entry["last_run"] = now_iso
+                existing_modes = pwd_entry.get("modes")
+                if not isinstance(existing_modes, list):
+                    pwd_entry["modes"] = [mode]
+                elif mode not in existing_modes:
+                    existing_modes.append(mode)
     except Exception as exc:
         telemetry.capture_exception(exc)
 
 
-def should_proceed_with_repeated_spraying(
-    shell: SprayShell, domain: str, category: str, password: Optional[str] = None
-) -> bool:
-    """Check if this spraying is a repeat and, if so, warn and ask for confirmation.
+def find_already_attempted_combos(
+    shell: SprayShell,
+    *,
+    domain: str,
+    combos: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict]:
+    """Return {combo: history_entry} for combos that have an entry in history.
 
-    Returns:
-        bool: True if spraying should continue, False if it should be cancelled.
+    Lookup is case-insensitive on user, case-sensitive on password.
     """
     try:
         history = get_password_spraying_history(shell)
         domain_history = history.get(domain, {})
-        category_entry = domain_history.get(category, {})
+        result: dict[tuple[str, str], dict] = {}
+        for username, password in combos:
+            if not username or not password:
+                continue
+            user_lower = str(username).casefold()
+            user_entry = domain_history.get(user_lower)
+            if not isinstance(user_entry, dict):
+                continue
+            pwd_entry = user_entry.get(password)
+            if isinstance(pwd_entry, dict):
+                result[(username, password)] = pwd_entry
+        return result
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        return {}
 
-        is_repeat = False
-        last_run = None
 
-        if _spraying_category_tracks_password(category):
-            passwords_entry = category_entry.get("passwords", {})
-            if password is not None and password in passwords_entry:
-                is_repeat = True
-                last_run = passwords_entry[password].get("last_run")
-        else:
-            if category_entry:
-                is_repeat = True
-                last_run = category_entry.get("last_run")
+def confirm_with_history_check(
+    shell: SprayShell,
+    *,
+    domain: str,
+    proposed_combos: list[tuple[str, str]],
+    mode_label: str,
+    multi_combo: bool = False,
+) -> list[tuple[str, str]] | None:
+    """Check history; if any proposed combos are repeats, prompt the operator.
 
-        if not is_repeat:
-            # First time: just register and continue silently
-            register_spraying_attempt(shell, domain, category, password)
-            return True
+    Returns the combos that should actually be sprayed, or None if the
+    operator cancelled.
+
+    UX:
+      - No repeats:  return proposed_combos as-is (no panel shown).
+      - Repeats and multi_combo == False:  yellow panel listing N
+        already-attempted users + last_run summary, then a binary
+        Confirm.ask (default=False). Returns proposed_combos if accepted,
+        None if not.
+      - Repeats and multi_combo == True:  yellow panel showing repeat
+        count + a 3-way questionary.select:
+            (1) Spray everything (force re-test) [default]
+            (2) Skip already-tested combos
+            (3) Cancel
+        Returns proposed_combos for (1), filtered list for (2),
+        None for (3).
+    """
+    try:
+        already_tried = find_already_attempted_combos(
+            shell, domain=domain, combos=proposed_combos
+        )
+        if not already_tried:
+            return proposed_combos
 
         marked_domain = mark_sensitive(domain, "domain")
-        category_labels = {
-            "useraspass": "Username as password",
-            "useraspass_lower": "Username as password in lowercase",
-            "useraspass_upper": "Username as password in uppercase",
-            "blank_password": "Blank password",
-            "password": "Specific password",
-            "adaptive_year_password": "Adaptive year password",
-            "computer_pre2k": "Computer accounts (pre2k)",
-        }
-        category_label = category_labels.get(category, category)
+        repeat_count = len(already_tried)
+        lines: list[str] = [
+            f"Domain: {marked_domain}",
+            f"Spray type: {mode_label}",
+            f"Proposed combos: {len(proposed_combos)}",
+            f"Already attempted: {repeat_count}",
+        ]
 
-        lines: list[str] = []
+        # Show last_run for up to 5 repeat entries
+        sample = list(already_tried.items())[:5]
+        if sample:
+            lines.append("")
+            lines.append("Sample of repeated combos (user / last seen):")
+            for (username, _password), entry in sample:
+                last_run = entry.get("last_run", "unknown")
+                lines.append(f"  {mark_sensitive(username, 'user')} — {last_run}")
+            if repeat_count > 5:
+                lines.append(f"  ... and {repeat_count - 5} more")
+
+        lines.append("")
         lines.append(
-            f"You have already performed a password spraying in domain {marked_domain}"
-        )
-        if _spraying_category_tracks_password(category) and password is not None:
-            marked_password = mark_sensitive(password, "password")
-            if category == "adaptive_year_password":
-                lines.append(
-                    f"using adaptive year variants derived from {marked_password}."
-                )
-            else:
-                lines.append(
-                    f"using the password {marked_password} (same password spraying type)."
-                )
-        else:
-            lines.append(f"with type: {category_label}.")
-
-        if last_run:
-            lines.append(f"Last execution time (UTC): {last_run}")
-
-        lines.append(
-            "\nRepeating the same spraying may increase the risk of account lockouts "
+            "Repeating the same spraying may increase the risk of account lockouts "
             "or violate password policy guidance."
         )
         lines.append(
             "Only continue if you are sure this is allowed and expected for your engagement."
         )
 
-        panel_content = "\n".join(lines)
-
         print_panel(
-            panel_content,
+            "\n".join(lines),
             title="[bold yellow]Repeated Password Spraying Detected[/bold yellow]",
             border_style="yellow",
             expand=False,
         )
 
-        proceed = Confirm.ask(
-            "Taking this into account, do you still want to continue with this password spraying?",
-            default=False,
-        )
-        if not proceed:
-            return False
+        if not multi_combo:
+            proceed = Confirm.ask(
+                "Do you still want to continue with this spray?",
+                default=False,
+            )
+            return proposed_combos if proceed else None
 
-        # User explicitly accepted the risk, register attempt
-        register_spraying_attempt(shell, domain, category, password)
-        return True
+        # 3-way choice for multi-combo modes
+        _CHOICE_SPRAY_ALL = "Spray everything (force re-test)"
+        _CHOICE_SKIP = "Skip already-tested combos"
+        _CHOICE_CANCEL = "Cancel"
+
+        select_fn = getattr(shell, "_questionary_select", None)
+        if callable(select_fn):
+            choice_idx = select_fn(
+                "How do you want to proceed?",
+                [_CHOICE_SPRAY_ALL, _CHOICE_SKIP, _CHOICE_CANCEL],
+                default_idx=0,
+            )
+            if choice_idx is None:
+                return None
+            choice = [_CHOICE_SPRAY_ALL, _CHOICE_SKIP, _CHOICE_CANCEL][choice_idx]
+        else:
+            # Non-interactive fallback: default to spray all
+            choice = _CHOICE_SPRAY_ALL
+
+        if choice == _CHOICE_CANCEL:
+            return None
+        if choice == _CHOICE_SKIP:
+            filtered = [c for c in proposed_combos if c not in already_tried]
+            return filtered if filtered else None
+        return proposed_combos
     except Exception as exc:
         telemetry.capture_exception(exc)
-        # If anything goes wrong, do not block spraying flow
-        return True
+        # If history check fails, do not block spraying
+        return proposed_combos
+
+
+def _compute_spray_eligibility_pso_aware(
+    *,
+    file_users: list[str],
+    badpwd_by_user: dict[str, int],
+    default_threshold: int | None,
+    pso_threshold_by_user: dict[str, int | None],
+    safe_remaining_threshold: int,
+    no_lockout_enforced: bool,
+) -> SprayEligibilityResult:
+    """Compute spray eligibility using per-user PSO-effective lockout thresholds.
+
+    For users with a PSO assigned, the PSO's lockoutThreshold overrides the
+    domain default.  Users without a PSO fall back to the domain default.
+    """
+    from adscan_internal.spraying import ExcludedUser  # noqa: PLC0415
+
+    notes: list[str] = []
+    eligible: list[str] = []
+    excluded: list[ExcludedUser] = []
+
+    if no_lockout_enforced:
+        notes.append("No lockout enforced (threshold=0 or None). All users eligible.")
+        return SprayEligibilityResult(
+            input_users=list(file_users),
+            eligible_users=list(file_users),
+            excluded_users=[],
+            lockout_threshold=default_threshold,
+            safe_remaining_threshold=safe_remaining_threshold,
+            minimum_remaining_attempts=None,
+            used_policy_data=False,
+            notes=notes,
+            no_lockout_enforced=True,
+        )
+
+    pso_users = sum(1 for u in pso_threshold_by_user if u in badpwd_by_user)
+    if pso_users:
+        notes.append(
+            f"PSO-aware eligibility: {pso_users} user(s) have a fine-grained "
+            "password policy that overrides the domain default."
+        )
+
+    minimum_remaining: int | None = None
+
+    for user in file_users:
+        norm = user.strip().lower()
+        effective_threshold = pso_threshold_by_user.get(norm, default_threshold)
+        if effective_threshold is None:
+            # No threshold data — include conservatively
+            eligible.append(user)
+            continue
+
+        badpwd = badpwd_by_user.get(norm)
+        if badpwd is None:
+            excluded.append(
+                ExcludedUser(
+                    username=user, reason="No BadPwdCount data (safer to skip)"
+                )
+            )
+            continue
+
+        remaining = effective_threshold - badpwd
+        if remaining > safe_remaining_threshold:
+            eligible.append(user)
+            minimum_remaining = (
+                remaining
+                if minimum_remaining is None
+                else min(minimum_remaining, remaining)
+            )
+        else:
+            excluded.append(
+                ExcludedUser(
+                    username=user,
+                    reason=f"Too close to lockout (remaining={remaining}, "
+                    f"threshold={'PSO' if norm in pso_threshold_by_user else 'domain'}={effective_threshold})",
+                    badpwd_count=badpwd,
+                    remaining_attempts=remaining,
+                )
+            )
+
+    return SprayEligibilityResult(
+        input_users=list(file_users),
+        eligible_users=eligible,
+        excluded_users=excluded,
+        lockout_threshold=default_threshold,
+        safe_remaining_threshold=safe_remaining_threshold,
+        minimum_remaining_attempts=minimum_remaining,
+        used_policy_data=True,
+        notes=notes,
+    )
 
 
 def compute_spraying_eligibility(
@@ -1917,7 +2415,7 @@ def compute_spraying_eligibility(
         f"(safe remaining threshold={safe_threshold}, users in list={len(file_users)})."
     )
 
-    if is_auth and shell.netexec_path:
+    if is_auth:
         auth_domain: str | None = None
         preferred_domain_data = shell.domains_data.get(domain, {})
         preferred_username = preferred_domain_data.get("username")
@@ -1941,7 +2439,116 @@ def compute_spraying_eligibility(
                 safe_remaining_threshold=safe_threshold,
                 strict_missing_badpwd=True,
             )
-        if auth_domain and auth_username and auth_password:
+
+        # --- Native LDAP path (badldap, PSO-aware) ---
+        native_policy_ok = False
+        try:
+            from adscan_internal.services.spray_policy_service import (  # noqa: PLC0415
+                fetch_spray_policy_sync,
+            )
+            from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
+                resolve_ldap_target_endpoints,
+            )
+
+            print_info_verbose("Fetching password policy via native LDAP...")
+            ldap_endpoints = resolve_ldap_target_endpoints(
+                target_domain=domain,
+                domain_data=shell.domains_data.get(domain, {}),
+                kerberos_ready=True,
+            )
+            spray_policy = fetch_spray_policy_sync(
+                domain=domain,
+                dc_ip=pdc_ip,
+                username=auth_username,
+                password=auth_password,
+                use_kerberos=True,
+                kerberos_target_hostname=ldap_endpoints.kerberos_target_hostname,
+                auth_domain=auth_domain,
+            )
+
+            if not spray_policy.fetch_errors:
+                dp = spray_policy.default_policy
+                lockout_threshold = dp.lockout_threshold
+                no_lockout_enforced = dp.no_lockout_enforced or lockout_threshold == 0
+                native_policy_ok = True
+
+                pso_count = len(spray_policy.pso_by_dn)
+                pso_assigned = len(spray_policy.pso_dn_by_user)
+                if no_lockout_enforced:
+                    print_info_verbose(
+                        "Password policy: no lockout enforced (threshold=0 or None). "
+                        "Spraying cannot lock accounts."
+                    )
+                elif lockout_threshold is not None:
+                    pso_info = (
+                        f", {pso_count} PSO(s) found ({pso_assigned} user(s) assigned)"
+                        if pso_count
+                        else ""
+                    )
+                    print_info_verbose(
+                        f"Password policy: lockout threshold={lockout_threshold}"
+                        f"{pso_info}."
+                    )
+                else:
+                    print_warning_verbose(
+                        "Password policy: lockout threshold unavailable from native LDAP."
+                    )
+                    native_policy_ok = False
+
+                if native_policy_ok and not (
+                    no_lockout_enforced or lockout_threshold == 0
+                ):
+                    if spray_policy.badpwd_by_user:
+                        # Build effective per-user badPwdCount using PSO-aware thresholds
+                        badpwd_by_user = {}
+                        for u, count in spray_policy.badpwd_by_user.items():
+                            badpwd_by_user[u] = count
+                        print_info_verbose(
+                            f"Fetched badPwdCount for {len(badpwd_by_user)} user(s)"
+                            + (
+                                f" (PSO-aware: {pso_assigned} users have fine-grained policy)"
+                                if pso_assigned
+                                else ""
+                            )
+                            + "."
+                        )
+
+                        # Store PSO data on eligibility result via custom compute path
+                        if pso_assigned and pso_count:
+                            # Build per-user effective lockout threshold for PSO users
+                            pso_effective: dict[str, int | None] = {}
+                            for u in spray_policy.pso_dn_by_user:
+                                pso_effective[u] = (
+                                    spray_policy.effective_lockout_threshold(u)
+                                )
+
+                            return _compute_spray_eligibility_pso_aware(
+                                file_users=file_users,
+                                badpwd_by_user=badpwd_by_user,
+                                default_threshold=lockout_threshold,
+                                pso_threshold_by_user=pso_effective,
+                                safe_remaining_threshold=safe_threshold,
+                                no_lockout_enforced=no_lockout_enforced,
+                            )
+                    else:
+                        print_warning_verbose(
+                            "Native LDAP returned policy but no badPwdCount data."
+                        )
+                        native_policy_ok = False
+            else:
+                print_warning_verbose(
+                    f"Native policy fetch had errors: {'; '.join(spray_policy.fetch_errors)}. "
+                    "Falling back to NetExec."
+                )
+        except Exception as _native_exc:  # noqa: BLE001
+            telemetry.capture_exception(_native_exc)
+            print_warning_verbose(
+                f"Native policy fetch raised an exception: {_native_exc}. "
+                "Falling back to NetExec."
+            )
+
+        # --- NetExec fallback ---
+        if not native_policy_ok and shell.netexec_path:
             pass_pol_cmd = build_netexec_pass_pol_command(
                 nxc_path=shell.netexec_path,
                 dc_ip=pdc_ip,
@@ -2028,16 +2635,15 @@ def compute_spraying_eligibility(
                         "User query command produced no output; BadPwdCount data "
                         "unavailable."
                     )
+        elif not native_policy_ok and not shell.netexec_path:
+            print_warning_verbose(
+                "Policy lookup failed and no fallback tool is available."
+            )
     else:
         if not is_auth:
             print_warning_verbose(
                 f"Skipping password policy lookup for {marked_domain} because the "
                 "current domain context is not authenticated."
-            )
-        elif not shell.netexec_path:
-            print_warning_verbose(
-                "Skipping password policy lookup because the policy query tool is "
-                "not configured."
             )
 
     return compute_spray_eligibility(
@@ -2253,37 +2859,149 @@ def print_spraying_eligibility(
         bool: True when the calling flow should continue, False when the user
             cancels after reviewing excluded accounts.
     """
+    from adscan_core.theme import COLOR_AMBER, COLOR_CRIMSON, COLOR_MUTED, COLOR_SAGE
+    from rich.text import Text
+
     marked_domain = mark_sensitive(domain, "domain")
-    summary_lines: list[str] = [
-        f"Domain: {marked_domain}",
-        f"Users in list: {len(eligibility.input_users)}",
-        f"Eligible users: {len(eligibility.eligible_users)}",
-        f"Excluded users: {len(eligibility.excluded_users)}",
-    ]
-    if eligibility.lockout_threshold is not None:
-        summary_lines.append(
-            f"Account lockout threshold: {eligibility.lockout_threshold}"
+    threshold = eligibility.lockout_threshold
+
+    # ── Lockout badge — the most safety-critical piece of information ─────────
+    # Glyph-paired text (✓ / ⚠ / ! / ?) so the badge survives both monochrome
+    # rendering and red/green color blindness (tui-design § Accessibility).
+    no_lockout = any("no lockout" in note.lower() for note in eligibility.notes)
+    if no_lockout or threshold == 0:
+        lockout_badge = Text(
+            " ✓ NO LOCKOUT ENFORCED — spray freely ",
+            style=f"bold {COLOR_SAGE}",
         )
-        summary_lines.append(
-            f"Safe remaining attempts threshold: {eligibility.safe_remaining_threshold}"
+        lockout_border = COLOR_SAGE
+    elif threshold is not None and threshold <= 3:
+        lockout_badge = Text(
+            f" ! LOCKOUT THRESHOLD: {threshold} — spray conservatively ",
+            style=f"bold {COLOR_CRIMSON}",
         )
+        lockout_border = COLOR_CRIMSON
+    elif threshold is not None and threshold <= 10:
+        lockout_badge = Text(
+            f" ⚠ LOCKOUT THRESHOLD: {threshold} — moderate risk ",
+            style=f"bold {COLOR_AMBER}",
+        )
+        lockout_border = COLOR_AMBER
+    elif threshold is not None:
+        lockout_badge = Text(
+            f" ⚠ LOCKOUT THRESHOLD: {threshold} ",
+            style=f"bold {COLOR_AMBER}",
+        )
+        lockout_border = COLOR_AMBER
+    else:
+        lockout_badge = Text(
+            " ? LOCKOUT THRESHOLD: unknown — proceed with one password ",
+            style=f"bold {COLOR_AMBER}",
+        )
+        lockout_border = COLOR_AMBER
+
+    # ── Eligible / excluded counts ────────────────────────────────────────────
+    n_eligible = len(eligibility.eligible_users)
+    n_excluded = len(eligibility.excluded_users)
+    n_total = len(eligibility.input_users)
+
+    eligible_text = Text()
+    eligible_text.append("  Domain: ", style="dim")
+    eligible_text.append(f"{marked_domain}\n", style="bold")
+    eligible_text.append("  Target users: ", style="dim")
+    eligible_text.append(
+        f"{n_eligible} eligible",
+        style=f"bold {COLOR_SAGE}" if n_eligible > 0 else f"bold {COLOR_CRIMSON}",
+    )
+    eligible_text.append(f" / {n_total} total", style="dim")
+    if n_excluded > 0:
+        eligible_text.append(
+            f"  ({n_excluded} excluded — see table below)",
+            style=f" {COLOR_AMBER}",
+        )
+    eligible_text.append("\n")
+
+    if eligibility.safe_remaining_threshold:
+        eligible_text.append("  Safe-attempt reserve: ", style="dim")
+        eligible_text.append(
+            f"{eligibility.safe_remaining_threshold} attempt(s) held back per account\n",
+            style="dim",
+        )
+    if eligibility.minimum_remaining_attempts is not None:
+        eligible_text.append(
+            "  Minimum remaining attempts (worst eligible account): ", style="dim"
+        )
+        remaining = eligibility.minimum_remaining_attempts
+        remaining_style = (
+            f"bold {COLOR_CRIMSON}"
+            if remaining <= 1
+            else (f"bold {COLOR_AMBER}" if remaining <= 3 else f"bold {COLOR_SAGE}")
+        )
+        eligible_text.append(f"{remaining}\n", style=remaining_style)
+
     if eligibility.notes:
-        summary_lines.append("")
-        summary_lines.extend(eligibility.notes)
+        eligible_text.append("\n")
+        for note in eligibility.notes:
+            eligible_text.append(f"  {note}\n", style=f"dim {COLOR_MUTED}")
+
+    panel_content: list[object] = [lockout_badge, Text(""), eligible_text]
 
     print_panel(
-        "\n".join(summary_lines),
-        title="[bold cyan]Spray Eligibility Summary[/bold cyan]",
-        border_style="cyan",
+        panel_content,
+        title="[bold]Spray Eligibility[/bold]",
+        border_style=lockout_border,
         expand=False,
     )
 
+    # ── Severe-action confirmation when remaining ≤ 1 ────────────────────────
+    # Pattern from tui-design § Dialogs & Confirmation: severe actions
+    # require resource-name input, not a y/n with default-true. One more
+    # failure on the worst eligible account triggers lockout here.
+    min_remaining = eligibility.minimum_remaining_attempts
+    if (
+        eligibility.used_policy_data
+        and isinstance(min_remaining, int)
+        and min_remaining <= 1
+        and not getattr(shell, "auto", False)
+        and threshold is not None
+        and threshold > 0
+    ):
+        print_warning(
+            f"Worst eligible account has only {min_remaining} attempt(s) before "
+            f"lockout. One failed spray will lock at least one account."
+        )
+        try:
+            confirmation = Prompt.ask(
+                f"Type the domain name [bold]{domain}[/bold] to proceed, "
+                f"or press Enter to abort",
+                default="",
+                show_default=False,
+            )
+        except (EOFError, KeyboardInterrupt):
+            print_warning("Spray aborted (no confirmation received).")
+            return False
+        if (confirmation or "").strip().lower() != domain.strip().lower():
+            print_warning(
+                "Domain name not entered — aborting spray to protect eligible accounts."
+            )
+            return False
+
     if eligibility.excluded_users:
-        table = Table(title="Excluded users (preview)", show_lines=False)
-        table.add_column("User")
-        table.add_column("Reason")
-        table.add_column("BadPwdCount", justify="right")
-        table.add_column("Remaining", justify="right")
+        from rich.box import MINIMAL as _BOX_MINIMAL
+
+        excl_table = Table(
+            title=Text(
+                f"Excluded accounts ({n_excluded}) — these will NOT be sprayed",
+                style=f"dim {COLOR_AMBER}",
+            ),
+            show_lines=False,
+            box=_BOX_MINIMAL,
+            header_style="dim",
+        )
+        excl_table.add_column("User", style="dim")
+        excl_table.add_column("Reason", style="dim")
+        excl_table.add_column("BadPwdCount", justify="right", style="dim")
+        excl_table.add_column("Remaining", justify="right", style="dim")
 
         preview = eligibility.excluded_users[:20]
         for excluded in preview:
@@ -2296,8 +3014,8 @@ def print_spraying_eligibility(
                 if excluded.remaining_attempts is not None
                 else "-"
             )
-            table.add_row(marked_user, excluded.reason, badpwd_str, remaining_str)
-        print_table(table)
+            excl_table.add_row(marked_user, excluded.reason, badpwd_str, remaining_str)
+        print_table(excl_table)
         if len(eligibility.excluded_users) > len(preview):
             print_info_verbose(
                 f"Excluded users total: {len(eligibility.excluded_users)} "
@@ -2317,6 +3035,7 @@ def print_spraying_eligibility(
             )
         )
     return True
+
 
 
 def _resolve_multi_credential_spray_budget(
@@ -3305,12 +4024,6 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         do_computer_pre2k_spraying(shell, domain)
         return
 
-    if not should_proceed_with_repeated_spraying(
-        shell, domain, spray_category, spray_password
-    ):
-        print_info("Password spraying cancelled by user.")
-        return
-
     eligibility = compute_spraying_eligibility(
         shell,
         domain=domain,
@@ -3340,12 +4053,46 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         )
         return
 
+    # History check uses (user, password) combos — computed now that we have eligible_users.
+    # blank_password is excluded from history tracking.
+    if spray_category != "blank_password":
+        if spray_category == "password" and spray_password is not None:
+            _proposed_combos = [(u, spray_password) for u in eligibility.eligible_users]
+            _mode_label = "Specific password"
+        elif spray_category == "useraspass":
+            _proposed_combos = [(u, u) for u in eligibility.eligible_users]
+            _mode_label = "Username as password"
+        elif spray_category == "useraspass_lower":
+            _proposed_combos = [(u, u.lower()) for u in eligibility.eligible_users]
+            _mode_label = "Username as password (lowercase)"
+        elif spray_category == "useraspass_upper":
+            _proposed_combos = [(u, u.capitalize()) for u in eligibility.eligible_users]
+            _mode_label = "Username as password (uppercase)"
+        else:
+            _proposed_combos = None
+            _mode_label = None
+        if _proposed_combos is not None and _mode_label is not None:
+            _accepted = confirm_with_history_check(
+                shell,
+                domain=domain,
+                proposed_combos=_proposed_combos,
+                mode_label=_mode_label,
+                multi_combo=False,
+            )
+            if _accepted is None:
+                print_info("Password spraying cancelled by user.")
+                return
+
     if spray_category == "password" and spray_password is not None:
+        _spray_combos = [(u, spray_password) for u in eligibility.eligible_users]
         _execute_single_password_spraying(
             shell,
             domain=domain,
             password=spray_password,
             eligibility=eligibility,
+        )
+        register_user_spray_attempts(
+            shell, domain=domain, combos=_spray_combos, mode="password"
         )
         return
 
@@ -3458,6 +4205,28 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
                 user_as_pass=user_as_pass,
             )
             spraying_command(shell, kerbrute_cmd, domain, spray_type=spray_type)
+            # Register per-(user, password) history for useraspass modes.
+            if spray_category == "useraspass":
+                register_user_spray_attempts(
+                    shell,
+                    domain=domain,
+                    combos=[(u, u) for u in eligibility.eligible_users],
+                    mode="useraspass",
+                )
+            elif spray_category == "useraspass_lower":
+                register_user_spray_attempts(
+                    shell,
+                    domain=domain,
+                    combos=[(u, u.lower()) for u in eligibility.eligible_users],
+                    mode="useraspass_lower",
+                )
+            elif spray_category == "useraspass_upper":
+                register_user_spray_attempts(
+                    shell,
+                    domain=domain,
+                    combos=[(u, u.capitalize()) for u in eligibility.eligible_users],
+                    mode="useraspass_upper",
+                )
     finally:
         try:
             os.remove(temp_users_path)
@@ -3510,6 +4279,17 @@ def spraying_with_password(
             f"[spray] Aborting spraying_with_password for {marked_domain}: no eligible execution context"
         )
         return
+    _swp_combos = [(u, password) for u in eligibility.eligible_users]
+    _swp_accepted = confirm_with_history_check(
+        shell,
+        domain=domain,
+        proposed_combos=_swp_combos,
+        mode_label="Specific password",
+        multi_combo=False,
+    )
+    if _swp_accepted is None:
+        print_info("Password spraying cancelled by user.")
+        return
     _execute_single_password_spraying(
         shell,
         domain=domain,
@@ -3519,6 +4299,9 @@ def spraying_with_password(
         source_context=source_context,
         source_steps=source_steps,
         show_intro=True,
+    )
+    register_user_spray_attempts(
+        shell, domain=domain, combos=_swp_combos, mode="password"
     )
 
 
@@ -3533,6 +4316,7 @@ def _execute_single_password_spraying(
     source_steps: list[object] | None = None,
     show_intro: bool = False,
     offer_adaptive_year: bool = True,
+    offer_variation_spray: bool = True,
 ) -> bool:
     """Execute one custom-password spray using a prevalidated eligibility set."""
     from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
@@ -3578,6 +4362,7 @@ def _execute_single_password_spraying(
         has_year_candidate = (
             offer_adaptive_year and len(extract_password_year_candidates(password)) == 1
         )
+        _spray_lockout_ctx = _build_lockout_context_from_eligibility(eligibility)
         base_hits = execute_spraying_command(
             shell,
             kerbrute_cmd,
@@ -3589,8 +4374,18 @@ def _execute_single_password_spraying(
             persist_hits=not has_year_candidate,
             run_validated_hits_followup=not has_year_candidate,
             render_hits_panel=not has_year_candidate,
+            lockout_context=_spray_lockout_ctx,
         )
         if not has_year_candidate:
+            if offer_variation_spray and eligibility.no_lockout_enforced:
+                _maybe_execute_lockout_free_variation_spraying(
+                    shell,
+                    domain=domain,
+                    password=password,
+                    eligibility=eligibility,
+                    source_context=source_context,
+                    source_steps=source_steps,
+                )
             return True
 
         print_panel(
@@ -3607,6 +4402,38 @@ def _execute_single_password_spraying(
             expand=False,
         )
 
+        # Offer variation spray first when applicable (audit + lockout=0).
+        # Variation is more comprehensive than adaptive-year (it sweeps years
+        # globally rather than per-user pwdLastSet), so when the operator
+        # accepts it, adaptive-year is redundant and we skip it. When the
+        # operator rejects variation OR the gate filters it out (CTF
+        # workspace, lockout enforced, missing eligibility), the existing
+        # adaptive-year flow runs as a fallback for year-tokenised bases.
+        if offer_variation_spray and _maybe_execute_lockout_free_variation_spraying(
+            shell,
+            domain=domain,
+            password=password,
+            eligibility=eligibility,
+            source_context=source_context,
+            source_steps=source_steps,
+        ):
+            if base_hits:
+                _render_valid_spray_hits_panel(
+                    base_hits,
+                    spray_type="Custom Password",
+                    lockout_context=_spray_lockout_ctx,
+                )
+                _persist_and_record_spray_hits(
+                    shell,
+                    domain=domain,
+                    hits=base_hits,
+                    spray_type="Custom Password",
+                    entry_label=entry_label,
+                    source_context=source_context,
+                    source_steps=source_steps,
+                )
+            return True
+
         hit_users = {
             str(hit.get("username") or "").strip().casefold()
             for hit in base_hits
@@ -3622,6 +4449,7 @@ def _execute_single_password_spraying(
                 _render_valid_spray_hits_panel(
                     base_hits,
                     spray_type="Custom Password",
+                    lockout_context=_spray_lockout_ctx,
                 )
                 _persist_and_record_spray_hits(
                     shell,
@@ -3678,6 +4506,7 @@ def _execute_single_password_spraying(
                 _render_valid_spray_hits_panel(
                     base_hits,
                     spray_type="Custom Password",
+                    lockout_context=_spray_lockout_ctx,
                 )
                 _persist_and_record_spray_hits(
                     shell,
@@ -3716,6 +4545,7 @@ def _execute_single_password_spraying(
             _render_valid_spray_hits_panel(
                 combined_hits,
                 spray_type="Combined Password Spray",
+                lockout_context=_spray_lockout_ctx,
             )
             print_panel(
                 "\n".join(
@@ -3846,7 +4676,7 @@ def _maybe_execute_adaptive_year_password_spraying(
         )
 
         if len(extract_password_year_candidates(password)) != 1:
-            return False
+            return [] if return_hits else False
         if pwdlastset_years_by_user is None:
             pwdlastset_years_by_user = resolve_bloodhound_pwdlastset_years(
                 shell,
@@ -3864,10 +4694,10 @@ def _maybe_execute_adaptive_year_password_spraying(
         print_info_debug(
             f"[adaptive-year-spray] plan resolution failed for {marked_password}: {exc}"
         )
-        return False
+        return [] if return_hits else False
 
     if adaptive_plan is None:
-        return False
+        return [] if return_hits else False
 
     combos = list(getattr(adaptive_plan, "combos", ()))
     original_year = getattr(adaptive_plan, "original_year", None)
@@ -3910,14 +4740,21 @@ def _maybe_execute_adaptive_year_password_spraying(
     if not use_adaptive:
         return [] if return_hits else False
 
-    if not should_proceed_with_repeated_spraying(
+    _adaptive_combos_for_history = [
+        (str(getattr(c, "username", "")), str(getattr(c, "password", "")))
+        for c in combos
+        if getattr(c, "username", None) and getattr(c, "password", None)
+    ]
+    _accepted_adaptive = confirm_with_history_check(
         shell,
-        domain,
-        "adaptive_year_password",
-        password,
-    ):
+        domain=domain,
+        proposed_combos=_adaptive_combos_for_history,
+        mode_label="Adaptive year password",
+        multi_combo=False,
+    )
+    if _accepted_adaptive is None:
         print_info(
-            f"Skipping adaptive year spray for {marked_password} because repeated spraying was not approved."
+            f"Skipping adaptive year spray for {marked_password} — repeated spraying not approved."
         )
         return [] if return_hits else True
 
@@ -3945,6 +4782,12 @@ def _maybe_execute_adaptive_year_password_spraying(
         persist_hits=not return_hits,
         run_validated_hits_followup=not return_hits,
         render_hits_panel=not return_hits,
+    )
+    register_user_spray_attempts(
+        shell,
+        domain=domain,
+        combos=_adaptive_combos_for_history,
+        mode="adaptive_year",
     )
     if return_hits:
         return result if isinstance(result, list) else []
@@ -4046,6 +4889,417 @@ def _persist_adaptive_year_spray_manifest(
         print_warning("Failed to persist adaptive year spray diagnostic manifest.")
         print_info_debug(f"[adaptive-year-spray] Manifest persistence failed: {exc}")
         return None
+
+
+def _render_variation_spray_panel(
+    plan: "VariationSprayPlan",  # noqa: F821
+    base_password: str,
+) -> None:
+    """Render the variation spray info panel using print_panel."""
+
+    marked = mark_sensitive(base_password, "password")
+    total_combos = len(plan.combos)
+    lines = [
+        f"Base password:        {marked}",
+        "Domain lockout:       DISABLED (lockoutThreshold = 0)",
+        f"Eligible users:       {plan.cohort_compliant_count + plan.cohort_legacy_count}",
+        f"  \u251c\u2500 Compliant:          {plan.cohort_compliant_count}   (filtered: current policy minLen + complexity)",
+        f"  \u2514\u2500 Legacy:             {plan.cohort_legacy_count}   (relaxed filter \u2014 never-expires or predates current policy)",
+    ]
+    if plan.applied_policies:
+        lines.append(f"Applied policies:     {', '.join(plan.applied_policies)}")
+    lines += [
+        "",
+        f"Variation tier:       Tier {plan.max_tier}",
+        f"Year sweep range:     {plan.year_sweep_min}–{plan.year_sweep_min + plan.year_sweep_back} "
+        f"({plan.year_sweep_back} years, derived from oldest pwdLastSet in the legacy cohort)",
+        f"Budget cap:           {plan.budget:,} authentications",
+        f"Estimated auths:      {total_combos:,}",
+    ]
+    if plan.truncated:
+        lines.append(
+            f"  Budget cap hit at Tier {plan.truncated_at_tier} "
+            "\u2014 some users received partial coverage"
+        )
+    else:
+        headroom = plan.budget - total_combos
+        lines.append(
+            f"  Budget headroom:    {headroom:,} (could promote tier within budget)"
+        )
+
+    lines += [
+        "",
+        "OPSEC notice:",
+        f"  This will generate \u2248{total_combos:,} pre-authentication failures on the KDC",
+        "  (Event 4771 Kerberos / 4625 NTLM). Microsoft Defender for Identity",
+        "  raises a 'Password spray attack' alert above ~100 failures/min.",
+        "  Ensure the customer has been notified before proceeding.",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="[bold cyan]Lockout-Free Variation Spray Available[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+
+
+def _prompt_variation_spray(
+    preview_plan: "VariationSprayPlan",  # noqa: F821
+    base_password: str,
+    prefs: "SprayVariationPreferences",  # noqa: F821
+    ddp_min_length: int,
+    ddp_complexity: bool,
+    *,
+    inventory_dir: str,
+    eligible_users: list[str],
+    compliance_report: object,
+) -> tuple[bool, "VariationSprayPlan | None", "SprayVariationPreferences | None"]:  # noqa: F821
+    """Run the interactive prompt sequence for variation spray.
+
+    Returns (accepted, final_plan, updated_prefs_or_None).
+    ``updated_prefs`` is non-None when the operator changed values and
+    agreed to save them.
+    """
+    from rich.prompt import Confirm, IntPrompt  # noqa: PLC0415
+
+    from adscan_internal.services.password_variation_plan_service import (  # noqa: PLC0415
+        build_variation_spray_plan,
+    )
+    from adscan_internal.services.spray_preferences_service import (  # noqa: PLC0415
+        SprayVariationPreferences,
+    )
+    import datetime as _dt  # noqa: PLC0415
+
+    accepted = Confirm.ask(
+        "Run lockout-free variation spray? (replaces single-password spray)",
+        default=True,
+    )
+    if not accepted:
+        return False, None, None
+
+    max_tier = IntPrompt.ask(
+        "Maximum tier to include [1=~15 / 2=~40 / 3=~80 variations/user]",
+        default=prefs.max_tier_default,
+    )
+    max_tier = max(1, min(3, int(max_tier)))
+
+    budget = IntPrompt.ask(
+        "Budget (max authentications)",
+        default=prefs.budget,
+    )
+    budget = max(1, int(budget))
+
+    current_year = _dt.date.today().year
+    final_plan = build_variation_spray_plan(
+        base_password=base_password,
+        eligible_users=eligible_users,
+        compliance_report=compliance_report,
+        ddp_min_length=ddp_min_length,
+        ddp_complexity=ddp_complexity,
+        pso_policies={},
+        max_tier=max_tier,
+        budget=budget,
+        current_year=current_year,
+    )
+
+    changed = max_tier != prefs.max_tier_default or budget != prefs.budget
+    updated_prefs: SprayVariationPreferences | None = None
+    if changed:
+        save_default = Confirm.ask(
+            "Save as your default for future runs?", default=False
+        )
+        if save_default:
+            never_ask = Confirm.ask(
+                "Skip this prompt entirely on future runs and just use saved values?",
+                default=False,
+            )
+            updated_prefs = SprayVariationPreferences(
+                budget=budget,
+                auto_accept=never_ask,
+                max_tier_default=max_tier,
+            )
+
+    if max_tier != preview_plan.max_tier or budget != preview_plan.budget:
+        _render_variation_spray_panel(final_plan, base_password)
+        proceed = Confirm.ask("Proceed with these settings?", default=True)
+        if not proceed:
+            return False, None, None
+
+    return True, final_plan, updated_prefs
+
+
+def _execute_variation_spray(
+    shell: SprayShell,
+    *,
+    domain: str,
+    plan: "VariationSprayPlan",  # noqa: F821
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> bool:
+    """Convert a VariationSprayPlan to a _BatchPasswordSprayPlan and execute."""
+    if not plan.combos:
+        print_warning("No variation combos were generated after policy filtering.")
+        return False
+
+    # Convert to _BatchPasswordCombo format expected by the existing engine
+    batch_combos = tuple(
+        _BatchPasswordCombo(
+            username=c.username,
+            password=c.password,
+            base_password=c.base_password,
+            mode="variation",
+        )
+        for c in plan.combos
+    )
+    batch_plan = _BatchPasswordSprayPlan(
+        combos=batch_combos,
+        base_passwords=(plan.base_password,),
+        adaptive_base_passwords=(),
+        flat_base_passwords=(plan.base_password,),
+    )
+
+    # Persist manifest before execution so it's available even on error
+    _persist_variation_spray_manifest(shell, domain=domain, plan=plan)
+
+    _execute_batch_password_spraying(
+        shell,
+        domain=domain,
+        plan=batch_plan,
+        source_context={
+            **(source_context or {}),
+            "origin": str(
+                (source_context or {}).get("origin") or "lockout_free_variation"
+            ),
+            "lockout_free_variation": True,
+            "max_tier": plan.max_tier,
+            "budget": plan.budget,
+            "cohort_compliant": plan.cohort_compliant_count,
+            "cohort_legacy": plan.cohort_legacy_count,
+        },
+        source_steps=source_steps,
+    )
+    return True
+
+
+def _persist_variation_spray_manifest(
+    shell: SprayShell,
+    *,
+    domain: str,
+    plan: "VariationSprayPlan",  # noqa: F821
+) -> None:
+    """Write variation spray manifest JSON to the workspace."""
+    import datetime as _dt  # noqa: PLC0415
+
+    try:
+        workspace_cwd = shell._get_workspace_cwd()  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        workspace_cwd = getattr(shell, "current_workspace_dir", "") or os.getcwd()
+
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    spray_dir = domain_subpath(
+        workspace_cwd, shell.domains_dir, domain, "spraying", "variations"
+    )
+    os.makedirs(spray_dir, exist_ok=True)
+    manifest_path = os.path.join(spray_dir, f"{ts}.json")
+
+    by_tier: dict[str, int] = {}
+    by_cohort: dict[str, int] = {}
+    for c in plan.combos:
+        by_tier[str(c.tier)] = by_tier.get(str(c.tier), 0) + 1
+        key = c.cohort.value if hasattr(c.cohort, "value") else str(c.cohort)
+        by_cohort[key] = by_cohort.get(key, 0) + 1
+
+    payload = {
+        "schema_version": 2,
+        "timestamp_utc": ts,
+        "domain": domain,
+        # Raw base password — this is a workspace artifact (not console output),
+        # so mark_sensitive is not applied here. Keep consistent with the
+        # adaptive-year manifest which stores the raw value.
+        "base_password": plan.base_password,
+        "max_tier": plan.max_tier,
+        "budget": plan.budget,
+        "policy_never_modified": plan.policy_never_modified,
+        "applied_policies": list(plan.applied_policies),
+        "cohort_compliant_count": plan.cohort_compliant_count,
+        "cohort_legacy_count": plan.cohort_legacy_count,
+        "truncated": plan.truncated,
+        "truncated_at_tier": plan.truncated_at_tier,
+        "combos_total": len(plan.combos),
+        "combos_by_tier": by_tier,
+        "combos_by_cohort": by_cohort,
+        # Per-user combo list — forensic evidence of what was attempted.
+        # Different users may receive different variation sets depending on
+        # their cohort (compliant vs legacy) and applied policy (DDP vs PSO).
+        # Mirrors the adaptive-year manifest schema for consistency.
+        "combos": [
+            {
+                "username": c.username,
+                "password": c.password,
+                "tier": c.tier,
+                "rule": c.rule,
+                "cohort": c.cohort.value
+                if hasattr(c.cohort, "value")
+                else str(c.cohort),
+            }
+            for c in plan.combos
+        ],
+        # Hits are appended here by the report/web layer when available;
+        # the initial write is empty because the Kerbrute run is still pending.
+        "hits": [],
+    }
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        print_info(
+            f"Variation spray manifest saved to {mark_sensitive(manifest_path, 'path')}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("Failed to persist variation spray manifest.")
+
+
+def _maybe_execute_lockout_free_variation_spraying(
+    shell: SprayShell,
+    *,
+    domain: str,
+    password: str,
+    eligibility: SprayEligibilityResult,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> bool:
+    """Offer and execute lockout-free variation spray for one base password.
+
+    Returns True when the spray was accepted and launched (regardless of
+    whether it produced hits), False when skipped or ineligible.
+    """
+    if not LOCKOUT_FREE_VARIATION_SPRAY_ENABLED:
+        return False
+
+    # Gate by workspace type: variation spray is an audit-engagement feature,
+    # not a CTF technique. CTF challenges have authored solve paths
+    # (Kerberoasting, ESC1, ACL abuse, share creds) — brute-forcing variations
+    # would be noise. Operators who genuinely need it on a CTF can flip the
+    # workspace type or call the orchestrator directly.
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if workspace_type != "audit":
+        return False
+
+    if not eligibility.no_lockout_enforced:
+        return False
+
+    if not eligibility.eligible_users:
+        return False
+
+    from adscan_internal.services.password_variation_plan_service import (  # noqa: PLC0415
+        build_variation_spray_plan,
+        load_compliance_report_from_workspace,
+        load_ddp_policy_from_workspace,
+    )
+    from adscan_internal.services.spray_preferences_service import (  # noqa: PLC0415
+        load_spray_variation_preferences,
+        save_spray_variation_preferences,
+    )
+
+    # Resolve workspace inventory dir
+    try:
+        workspace_cwd = shell._get_workspace_cwd()  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        workspace_cwd = getattr(shell, "current_workspace_dir", "") or os.getcwd()
+
+    inventory_dir = domain_subpath(
+        workspace_cwd, shell.domains_dir, domain, "inventory"
+    )
+
+    compliance_report = load_compliance_report_from_workspace(inventory_dir)
+    ddp_min_length, ddp_complexity = load_ddp_policy_from_workspace(inventory_dir)
+    prefs = load_spray_variation_preferences()
+
+    # Build preview plan with saved defaults so panel shows real numbers
+    import datetime as _dt  # noqa: PLC0415
+
+    current_year = _dt.date.today().year
+    preview_plan = build_variation_spray_plan(
+        base_password=password,
+        eligible_users=list(eligibility.eligible_users),
+        compliance_report=compliance_report,
+        ddp_min_length=ddp_min_length,
+        ddp_complexity=ddp_complexity,
+        pso_policies={},
+        max_tier=prefs.max_tier_default,
+        budget=prefs.budget,
+        current_year=current_year,
+    )
+
+    _render_variation_spray_panel(preview_plan, password)
+
+    if prefs.auto_accept:
+        final_plan = preview_plan
+    else:
+        accepted, final_plan, updated_prefs = _prompt_variation_spray(
+            preview_plan,
+            password,
+            prefs,
+            ddp_min_length,
+            ddp_complexity,
+            inventory_dir=inventory_dir,
+            eligible_users=list(eligibility.eligible_users),
+            compliance_report=compliance_report,
+        )
+        if not accepted:
+            return False
+        if updated_prefs is not None:
+            save_spray_variation_preferences(updated_prefs)
+
+    _variation_combos_for_history = [
+        (str(c.username), str(c.password))
+        for c in final_plan.combos
+        if c.username and c.password
+    ]
+    _accepted_variation = confirm_with_history_check(
+        shell,
+        domain=domain,
+        proposed_combos=_variation_combos_for_history,
+        mode_label="Lockout-free variation spray",
+        multi_combo=True,
+    )
+    if _accepted_variation is None:
+        print_info(
+            f"Skipping variation spray for {mark_sensitive(password, 'password')} "
+            "— repeated spraying not approved."
+        )
+        return True
+    if _accepted_variation is not _variation_combos_for_history:
+        # Operator chose "Skip already-tested combos" — rebuild the plan with
+        # only the accepted combos.
+        _accepted_set = set(_accepted_variation)
+        _filtered_combos = tuple(
+            c for c in final_plan.combos if (c.username, c.password) in _accepted_set
+        )
+        if not _filtered_combos:
+            print_info(
+                "No new variation combos to spray after filtering already-tested ones."
+            )
+            return True
+        import dataclasses as _dc  # noqa: PLC0415
+
+        final_plan = _dc.replace(final_plan, combos=_filtered_combos)
+        _variation_combos_for_history = list(_accepted_variation)
+
+    _executed = _execute_variation_spray(
+        shell,
+        domain=domain,
+        plan=final_plan,
+        source_context=source_context,
+        source_steps=source_steps,
+    )
+    register_user_spray_attempts(
+        shell,
+        domain=domain,
+        combos=_variation_combos_for_history,
+        mode="variation",
+    )
+    return _executed
 
 
 def _build_batch_password_spray_plan(
@@ -4231,15 +5485,6 @@ def _prepare_password_spraying_eligibility(
     if not _ensure_spraying_clock_sync(shell, domain, source=clock_sync_source):
         return None
 
-    if not should_proceed_with_repeated_spraying(
-        shell,
-        domain,
-        spray_category,
-        spray_password,
-    ):
-        print_info("Password spraying cancelled by user.")
-        return None
-
     eligibility = compute_spraying_eligibility(
         shell,
         domain=domain,
@@ -4319,6 +5564,30 @@ def spraying_with_username_as_password(
         )
         return
 
+    # History check for useraspass modes.
+    if spray_category == "useraspass":
+        _uap_mode = "useraspass"
+        _uap_combos = [(u, u) for u in eligibility.eligible_users]
+        _uap_label = "Username as password"
+    elif spray_category == "useraspass_lower":
+        _uap_mode = "useraspass_lower"
+        _uap_combos = [(u, u.lower()) for u in eligibility.eligible_users]
+        _uap_label = "Username as password (lowercase)"
+    else:
+        _uap_mode = "useraspass_upper"
+        _uap_combos = [(u, u.capitalize()) for u in eligibility.eligible_users]
+        _uap_label = "Username as password (uppercase)"
+    _uap_accepted = confirm_with_history_check(
+        shell,
+        domain=domain,
+        proposed_combos=_uap_combos,
+        mode_label=_uap_label,
+        multi_combo=False,
+    )
+    if _uap_accepted is None:
+        print_info("Password spraying cancelled by user.")
+        return
+
     kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
     eligible_for_kerbrute = list(eligibility.eligible_users)
     if spray_category == "useraspass_lower":
@@ -4367,6 +5636,9 @@ def spraying_with_username_as_password(
             entry_label=entry_label,
             source_context=source_context,
             source_steps=source_steps,
+        )
+        register_user_spray_attempts(
+            shell, domain=domain, combos=_uap_combos, mode=_uap_mode
         )
     finally:
         try:
@@ -4778,28 +6050,38 @@ def spraying_with_passwords(
                 default=no_lockout_enforced,
             )
             if use_batch:
-                approved_passwords: list[str] = []
-                approved_password_set: set[str] = set()
-                adaptive_password_set = set(batch_plan.adaptive_base_passwords)
-                for password in batch_plan.base_passwords:
-                    category = (
-                        "adaptive_year_password"
-                        if password in adaptive_password_set
-                        else "password"
-                    )
-                    if should_proceed_with_repeated_spraying(
-                        shell,
-                        domain,
-                        category,
-                        password,
-                    ):
-                        approved_passwords.append(password)
-                        approved_password_set.add(password)
-                    else:
-                        print_info(
-                            "Skipping repeated batch password "
-                            f"{mark_sensitive(password, 'password')}."
-                        )
+                # History check: propose the full batch combo list, offer skip/continue/cancel.
+                _batch_history_combos = [
+                    (str(combo.username), str(combo.password))
+                    for combo in batch_plan.combos
+                    if combo.username and combo.password
+                ]
+                _batch_accepted = confirm_with_history_check(
+                    shell,
+                    domain=domain,
+                    proposed_combos=_batch_history_combos,
+                    mode_label="Batch password spray",
+                    multi_combo=True,
+                )
+                if _batch_accepted is None:
+                    print_info("Batch spray cancelled by user.")
+                    return executed_passwords
+                # Determine which base-passwords survive after history filtering.
+                if _batch_accepted is not _batch_history_combos:
+                    _accepted_batch_set = set(_batch_accepted)
+                    approved_password_set: set[str] = {
+                        combo.base_password
+                        for combo in batch_plan.combos
+                        if (combo.username, combo.password) in _accepted_batch_set
+                    }
+                    approved_passwords: list[str] = [
+                        p
+                        for p in batch_plan.base_passwords
+                        if p in approved_password_set
+                    ]
+                else:
+                    approved_password_set = set(batch_plan.base_passwords)
+                    approved_passwords = list(batch_plan.base_passwords)
                 if approved_passwords:
                     filtered_plan = _BatchPasswordSprayPlan(
                         combos=tuple(
@@ -4819,6 +6101,11 @@ def spraying_with_passwords(
                             if password in approved_password_set
                         ),
                     )
+                    _batch_to_register = [
+                        (str(combo.username), str(combo.password))
+                        for combo in filtered_plan.combos
+                        if combo.username and combo.password
+                    ]
                     if _execute_batch_password_spraying(
                         shell,
                         domain=domain,
@@ -4827,6 +6114,12 @@ def spraying_with_passwords(
                         source_steps=source_steps,
                     ):
                         executed_passwords.extend(approved_passwords)
+                        register_user_spray_attempts(
+                            shell,
+                            domain=domain,
+                            combos=_batch_to_register,
+                            mode="batch",
+                        )
 
                 result_lines = [
                     f"Sprayed now: {len(executed_passwords)}",
@@ -4851,11 +6144,17 @@ def spraying_with_passwords(
             f"Spraying password {index}/{len(selected_passwords)} on domain "
             f"{mark_sensitive(domain, 'domain')}: {marked_password}"
         )
-        if not should_proceed_with_repeated_spraying(
-            shell, domain, "password", password
-        ):
+        _seq_combos = [(u, password) for u in eligibility.eligible_users]
+        _seq_accepted = confirm_with_history_check(
+            shell,
+            domain=domain,
+            proposed_combos=_seq_combos,
+            mode_label="Specific password",
+            multi_combo=False,
+        )
+        if _seq_accepted is None:
             print_info(
-                f"Skipping password {marked_password} because repeated spraying was not approved."
+                f"Skipping password {marked_password} — repeated spraying not approved."
             )
             continue
         if _maybe_execute_adaptive_year_password_spraying(
@@ -4867,6 +6166,7 @@ def spraying_with_passwords(
             source_steps=source_steps,
             pwdlastset_years_by_user=adaptive_pwdlastset_years_by_user,
         ):
+            # adaptive_year registers its own history entries
             executed_passwords.append(password)
             continue
 
@@ -4881,6 +6181,9 @@ def spraying_with_passwords(
             offer_adaptive_year=False,
         ):
             executed_passwords.append(password)
+            register_user_spray_attempts(
+                shell, domain=domain, combos=_seq_combos, mode="password"
+            )
 
     result_lines = [
         f"Sprayed now: {len(executed_passwords)}",
@@ -5159,14 +6462,19 @@ def execute_spraying_command(
     persist_hits: bool = True,
     run_validated_hits_followup: bool = True,
     render_hits_panel: bool = True,
+    lockout_context: dict[str, object] | None = None,
 ) -> list[dict[str, str]]:
     """Execute the spraying command and process results."""
     from adscan_internal.cli.common import SECRET_MODE
 
     marked_domain = mark_sensitive(domain, "domain")
-    print_warning(
-        f"Performing the spraying on {marked_domain}. Please be patient (this can take a while)"
-    )
+    # Best-effort eligible-user count for the spinner heartbeat (the kerbrute
+    # command already wraps a temp file; we only need a label, not the path).
+    _spinner_label_parts: list[str] = []
+    if spray_type:
+        _spinner_label_parts.append(spray_type)
+    _spinner_label_parts.append(f"on {marked_domain}")
+    _spinner_label = " ".join(_spinner_label_parts)
 
     try:
         # Use run_command instead of spawn_command to avoid output interleaving
@@ -5178,14 +6486,25 @@ def execute_spraying_command(
             f"use_clean_env={use_clean_env} on domain {marked_domain}"
         )
 
-        completed_process = shell.run_command(
-            command,
-            timeout=None,  # No timeout for spraying (can take a long time)
-            shell=True,
-            capture_output=True,
-            text=True,
-            use_clean_env=use_clean_env,
+        # Heartbeat spinner so the operator sees progress, not a frozen TTY
+        # (tui-design Anti-Pattern #8: Blocking UI during operations). The
+        # spinner is a no-op on non-TTY (CI, piped output) per rich.Console.
+        from adscan_core.output._state import _get_console
+        _console = _get_console()
+        _status_cm = _console.status(
+            f"[bold {ADSCAN_PRIMARY}]Spraying {_spinner_label} …[/bold {ADSCAN_PRIMARY}] "
+            "[dim](kerbrute streaming, results render when complete)[/dim]",
+            spinner="dots",
         )
+        with _status_cm:
+            completed_process = shell.run_command(
+                command,
+                timeout=None,  # No timeout for spraying (can take a long time)
+                shell=True,
+                capture_output=True,
+                text=True,
+                use_clean_env=use_clean_env,
+            )
 
         if completed_process is None:
             print_error("Failed to execute password spraying command")
@@ -5231,6 +6550,7 @@ def execute_spraying_command(
                 _render_valid_spray_hits_panel(
                     hits,
                     spray_type=spray_type,
+                    lockout_context=lockout_context,
                 )
             if persist_hits:
                 _persist_and_record_spray_hits(
@@ -5300,27 +6620,37 @@ def execute_netexec_spraying_command(
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
+    lockout_context: dict[str, object] | None = None,
 ) -> None:
     """Execute a NetExec-based spray and process its hits."""
     from adscan_internal.cli.common import SECRET_MODE
 
     marked_domain = mark_sensitive(domain, "domain")
-    print_warning(
-        f"Performing the spraying on {marked_domain}. Please be patient (this can take a while)"
-    )
+    _spinner_label_parts: list[str] = []
+    if spray_type:
+        _spinner_label_parts.append(spray_type)
+    _spinner_label_parts.append(f"on {marked_domain}")
+    _spinner_label = " ".join(_spinner_label_parts)
 
     try:
         print_info_debug(
             f"[spray] Executing NetExec spraying command on domain {marked_domain}"
         )
-        completed_process = shell._run_netexec(
-            command,
-            domain=domain,
-            timeout=None,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        from adscan_core.output._state import _get_console
+        _console = _get_console()
+        with _console.status(
+            f"[bold {ADSCAN_PRIMARY}]Spraying {_spinner_label} via NetExec …[/bold {ADSCAN_PRIMARY}] "
+            "[dim](SMB auth attempts streaming, results render when complete)[/dim]",
+            spinner="dots",
+        ):
+            completed_process = shell._run_netexec(
+                command,
+                domain=domain,
+                timeout=None,
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
 
         if completed_process is None:
             print_error("Failed to execute password spraying command")
@@ -5337,7 +6667,9 @@ def execute_netexec_spraying_command(
         hits = [{"username": username, "password": ""} for username in hit_usernames]
 
         if hits:
-            _render_valid_spray_hits_panel(hits, spray_type=spray_type)
+            _render_valid_spray_hits_panel(
+                hits, spray_type=spray_type, lockout_context=lockout_context
+            )
             _persist_and_record_spray_hits(
                 shell,
                 domain=domain,
@@ -5427,9 +6759,8 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
         f"{len(computer_sams)} enabled computer account(s)."
     )
 
-    if not should_proceed_with_repeated_spraying(shell, domain, "computer_pre2k", None):
-        print_info("Computer pre2k check cancelled by user.")
-        return
+    # pre2k spray is excluded from the unified per-(user, password) history
+    # (single trivial credential per machine — not worth dedup tracking).
 
     summary_lines = [
         f"Domain: {marked_domain}",
@@ -5487,3 +6818,18 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
             os.remove(combos_path)
         except OSError:
             pass
+
+
+
+def register_spraying_attempt(
+    shell: "SprayShell", domain: str, category: str, password: "str | None" = None
+) -> None:
+    """Public wrapper for recording a spraying attempt — delegates to internal helper."""
+    _mark_recommended_spraying_attempt(shell, domain, category)
+
+
+def should_proceed_with_repeated_spraying(
+    shell: "SprayShell", domain: str, category: str, password: "str | None" = None
+) -> bool:
+    """Public wrapper for checking if repeated spraying should proceed."""
+    return not _has_recommended_spraying_attempt(shell, domain)

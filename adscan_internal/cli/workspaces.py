@@ -418,7 +418,6 @@ def workspace_show(shell: WorkspaceShell) -> None:
             "domains": shell.variables.get("domains"),
             "interface": shell.variables.get("interface"),
             "myip": shell.variables.get("myip"),
-            "neo4j_host": shell.variables.get("neo4j_host"),
             "auto_mode": shell.variables.get("auto"),
         }
         for key, value in display_vars.items():

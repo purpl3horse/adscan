@@ -6,18 +6,127 @@ while leaving acquisition and backend execution inside the CLI module.
 
 from __future__ import annotations
 
+
 from typing import Any, Callable
 
 from rich.prompt import Confirm
 
-from adscan_internal import print_info_debug, print_warning_debug, telemetry
+from adscan_internal import print_info, print_info_debug, print_warning_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.smb_sensitive_file_policy import (
+    SMB_SENSITIVE_SCAN_PHASES,
     SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS,
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
     SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
     SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+    get_production_sensitive_scan_phase_sequence,
 )
+
+# Phases pre-selected when no posture signal suggests otherwise.
+# Heavy artifacts opt-in only — too slow and resource-intensive for a default.
+_DEFAULT_SELECTED_PHASES: frozenset[str] = frozenset({
+    SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+    SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS,
+    SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+})
+_ALL_PHASES: frozenset[str] = frozenset({
+    SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+    SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS,
+    SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+    SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
+})
+
+
+def select_sensitive_scan_phases(
+    shell: Any,
+    *,
+    domain: str,
+    transport_label: str = "SMB",
+) -> frozenset[str]:
+    """Show an upfront phase-selection checkbox and return the chosen phase IDs.
+
+    CTF workspaces auto-select all phases without a prompt (the pentester wants
+    maximum coverage against a fresh target). Audit workspaces show a checkbox
+    with the three lighter phases pre-ticked so the operator can opt in/out of
+    any combination — including heavy artifacts — before any fetching begins.
+
+    Returns an empty frozenset when the domain is already pwned (CTF) or when
+    the user cancels the prompt.
+    """
+    if should_skip_sensitive_scan_prompt_for_ctf_pwned(shell=shell, domain=domain):
+        print_info_debug(
+            f"Skipping {transport_label} phase selection because the CTF domain is "
+            f"already pwned: domain={mark_sensitive(domain, 'domain')}"
+        )
+        return frozenset()
+
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+
+    # Non-interactive (CI / pipe / auto mode): skip the checkbox entirely.
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    if _is_non_interactive(shell):
+        print_info_debug(
+            f"{transport_label} phase selection: auto-selecting all phases"
+        )
+        return _ALL_PHASES
+
+    all_phases = get_production_sensitive_scan_phase_sequence()
+    phase_labels = [
+        str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get("label", p) or p)
+        for p in all_phases
+    ]
+    phase_descriptions = [
+        str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get("description", "") or "")
+        for p in all_phases
+    ]
+    options = [
+        f"{label}  — {desc}" if desc else label
+        for label, desc in zip(phase_labels, phase_descriptions)
+    ]
+
+    # CTF: pre-select all phases (environment is stable, operator may still
+    # want to deselect specific ones).
+    # Audit: pre-select the three lighter phases, heavy artifacts opt-in.
+    default_phases = _ALL_PHASES if workspace_type == "ctf" else _DEFAULT_SELECTED_PHASES
+    default_labels = [
+        f"{str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get('label', p) or p)}  — "
+        f"{str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get('description', '') or '')}"
+        if str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get("description", "") or "")
+        else str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get("label", p) or p)
+        for p in all_phases
+        if p in default_phases
+    ]
+
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if callable(checkbox):
+        selected_options = checkbox(
+            f"Select {transport_label} credential-hunt phases to run:",
+            options,
+            default_values=default_labels,
+        )
+    else:
+        from adscan_internal.questionary_prompts import prompt_questionary_checkbox
+        selected_options = prompt_questionary_checkbox(
+            title=f"Select {transport_label} credential-hunt phases to run:",
+            options=options,
+            default_values=default_labels,
+        )
+
+    if selected_options is None:
+        print_info_debug(f"{transport_label} phase selection cancelled — no phases will run.")
+        return frozenset()
+
+    selected_set = set(selected_options)
+    selected_phases: set[str] = set()
+    for phase, label, desc in zip(all_phases, phase_labels, phase_descriptions):
+        option_str = f"{label}  — {desc}" if desc else label
+        if option_str in selected_set:
+            selected_phases.add(phase)
+
+    print_info_debug(
+        f"{transport_label} phase selection: selected={sorted(selected_phases)}"
+    )
+    return frozenset(selected_phases)
 
 
 def should_skip_sensitive_scan_prompt_for_ctf_pwned(*, shell: Any, domain: str) -> bool:
@@ -126,15 +235,17 @@ def should_continue_with_heavy_artifact_analysis(
             f"domain is already pwned: domain={mark_sensitive(domain, 'domain')}"
         )
         return False
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    default = workspace_type == "ctf"
     prompt = (
         "Do you want to continue with heavy artifact analysis "
         "(ZIP/DMP/PCAP/VDI)? This is slower and more resource-intensive."
     )
     confirmer = getattr(shell, "_questionary_confirm", None)
     if callable(confirmer):
-        response = confirmer(prompt, default=True)
+        response = confirmer(prompt, default=default)
         return bool(response)
-    return Confirm.ask(prompt, default=True)
+    return Confirm.ask(prompt, default=default)
 
 
 def run_staged_smb_sensitive_scan(
@@ -156,6 +267,21 @@ def run_staged_smb_sensitive_scan(
     should_run_heavy_phase: Callable[..., bool] = should_continue_with_heavy_artifact_analysis,
 ) -> dict[str, Any]:
     """Run the staged SMB sensitive-data flow using injected backend callbacks."""
+    # ── Upfront phase selection ───────────────────────────────────────────────
+    selected_phases = select_sensitive_scan_phases(
+        shell, domain=domain, transport_label="SMB"
+    )
+    if not selected_phases:
+        print_info("No SMB credential-hunt phases selected — skipping analysis.")
+        return {
+            "completed": True,
+            "credential_findings": 0,
+            "artifact_hits": 0,
+            "phases_run": [],
+            "ai_attempted": False,
+            "ai_success": None,
+        }
+
     analysis_context: dict[str, Any] = {
         "ai_configured": bool(ai_configured),
     }
@@ -183,15 +309,11 @@ def run_staged_smb_sensitive_scan(
             }
 
     results: list[dict[str, Any]] = []
-    text_phase_result: dict[str, Any] | None = None
 
-    if should_run_phase(
-        shell=shell,
-        domain=domain,
-        phase=SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
-        prior_phase_result=None,
-    ):
-        text_phase_result = run_phase(
+    for phase in get_production_sensitive_scan_phase_sequence():
+        if phase not in selected_phases:
+            continue
+        phase_result = run_phase(
             shell=shell,
             domain=domain,
             shares=shares,
@@ -200,66 +322,14 @@ def run_staged_smb_sensitive_scan(
             username=username,
             password=password,
             backend=backend,
-            phase=SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+            phase=phase,
             cifs_mount_root=cifs_mount_root,
             backend_context=backend_context,
             analysis_context=analysis_context,
         )
-        results.append(text_phase_result)
-        if not bool(text_phase_result.get("completed")):
-            print_completion_summary(backend_context=backend_context)
-            return {
-                "completed": False,
-                "credential_findings": int(text_phase_result.get("credential_findings", 0) or 0),
-                "phases_run": results,
-                "ai_attempted": bool(analysis_context.get("ai_attempted")),
-                "ai_success": analysis_context.get("ai_success"),
-            }
-
-    if should_run_phase(
-        shell=shell,
-        domain=domain,
-        phase=SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
-        prior_phase_result=text_phase_result,
-    ):
-        for phase in (
-            SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
-            SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS,
-        ):
-            phase_result = run_phase(
-                shell=shell,
-                domain=domain,
-                shares=shares,
-                hosts=hosts,
-                share_map=share_map,
-                username=username,
-                password=password,
-                backend=backend,
-                phase=phase,
-                cifs_mount_root=cifs_mount_root,
-                backend_context=backend_context,
-                analysis_context=analysis_context,
-            )
-            results.append(phase_result)
-            if not bool(phase_result.get("completed")):
-                break
-
-    if should_run_heavy_phase(shell=shell, domain=domain):
-        heavy_result = run_phase(
-            shell=shell,
-            domain=domain,
-            shares=shares,
-            hosts=hosts,
-            share_map=share_map,
-            username=username,
-            password=password,
-            backend=backend,
-            phase=SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
-            cifs_mount_root=cifs_mount_root,
-            backend_context=backend_context,
-            analysis_context=analysis_context,
-        )
-        results.append(heavy_result)
+        results.append(phase_result)
+        if not bool(phase_result.get("completed")):
+            break
 
     print_completion_summary(backend_context=backend_context)
     return {
@@ -277,6 +347,7 @@ def run_staged_smb_sensitive_scan(
 
 __all__ = [
     "run_staged_smb_sensitive_scan",
+    "select_sensitive_scan_phases",
     "should_continue_with_deeper_sensitive_scan",
     "should_continue_with_heavy_artifact_analysis",
     "should_run_credential_phase",

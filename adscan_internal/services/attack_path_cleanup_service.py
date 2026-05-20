@@ -10,6 +10,9 @@ from adscan_internal import print_info, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_internal.services.attack_graph_service import update_edge_status_by_labels
 from adscan_internal.services.exploitation import ExploitationService
+from adscan_internal.services.membership_snapshot import (
+    remove_runtime_user_group_membership,
+)
 
 _CLEANUP_SCOPE_ATTR = "_attack_path_cleanup_scopes"
 
@@ -143,6 +146,28 @@ def register_cleanup_from_outcome(
     }
     scopes[-1].setdefault("actions", []).append(action)
 
+    # Register with ledger (stored on shell, optional)
+    ledger = getattr(shell, "environment_change_ledger", None)
+    if ledger is not None:
+        _change_id = ledger.register_change(
+            kind="group_membership_added",
+            domain=str(action["domain"]),
+            target=f"{action['added_user']} → {action['target_group']}",
+            detail={
+                "username": action["added_user"],
+                "group": action["target_group"],
+                "exec_username": action["exec_username"],
+                "from_label": action["from_label"],
+                "relation": action["relation"],
+                "to_label": action["to_label"],
+            },
+            method=(
+                f"BloodHound attack path — {action['relation']}"
+                f" ({action['from_label']} → {action['to_label']})"
+            ),
+        )
+        action["_ledger_change_id"] = _change_id
+
     update_edge_status_by_labels(
         shell,
         domain,
@@ -187,8 +212,12 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
         from_label = str(action.get("from_label") or "").strip()
         relation = str(action.get("relation") or "").strip()
         to_label = str(action.get("to_label") or "").strip()
-        bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
         pdc_host = _resolve_bloody_cleanup_host(shell, domain=target_domain)
+        # Ensure FQDN is target-domain-qualified, not executor-domain-qualified.
+        # _resolve_bloody_host in remove_group_member uses the auth domain to
+        # append a suffix, which produces the wrong DC when target != auth domain.
+        if pdc_host and "." not in pdc_host:
+            pdc_host = f"{pdc_host}.{target_domain}"
 
         cleanup_notes: dict[str, Any] = {
             "cleanup_pending": True,
@@ -199,12 +228,7 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
         }
 
         if not (
-            target_group
-            and added_user
-            and exec_username
-            and exec_password
-            and bloody_path
-            and pdc_host
+            target_group and added_user and exec_username and exec_password and pdc_host
         ):
             cleanup_notes.update(
                 {
@@ -227,18 +251,30 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                 error_summary="Missing cleanup credential or target metadata.",
             )
             all_ok = False
+            ledger = getattr(shell, "environment_change_ledger", None)
+            if ledger is not None:
+                _cid = action.get("_ledger_change_id")
+                if _cid:
+                    ledger.mark_operator_required(
+                        _cid,
+                        manual_cleanup_instructions=(
+                            f"Remove '{added_user}' from '{target_group}' manually:\n"
+                            f"  Remove-ADGroupMember -Identity '{target_group}'"
+                            f" -Members '{added_user}' -Confirm:$false"
+                        ),
+                    )
             continue
 
         try:
             result = ExploitationService().acl.remove_group_member(
                 pdc_host=pdc_host,
-                bloody_path=bloody_path,
                 domain=domain,
                 username=exec_username,
                 password=exec_password,
                 target_group=target_group,
                 target_username=added_user,
                 kerberos=True,
+                target_domain=target_domain,
                 timeout=300,
             )
             cleanup_ok = bool(result.success)
@@ -247,8 +283,12 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                     "cleanup_pending": not cleanup_ok,
                     "cleanup_status": "success" if cleanup_ok else "failed",
                     "cleanup_completed_at": _utc_now_iso(),
-                    "cleanup_error": "" if cleanup_ok else str(result.raw_output or "").strip(),
-                    "cleanup_already_absent": bool(getattr(result, "already_absent", False)),
+                    "cleanup_error": ""
+                    if cleanup_ok
+                    else str(result.raw_output or "").strip(),
+                    "cleanup_already_absent": bool(
+                        getattr(result, "already_absent", False)
+                    ),
                 }
             )
             update_edge_status_by_labels(
@@ -261,11 +301,27 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                 notes=cleanup_notes,
             )
             if cleanup_ok:
+                try:
+                    remove_runtime_user_group_membership(
+                        shell,
+                        target_domain,
+                        username=added_user,
+                        group_name=target_group,
+                        source="group_membership_attack_step",
+                        origin_relation="AddMember",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
                 print_info(
                     "Attack-path cleanup completed: "
                     f"removed {mark_sensitive(added_user, 'user')} from "
                     f"{mark_sensitive(target_group, 'group')}."
                 )
+                ledger = getattr(shell, "environment_change_ledger", None)
+                if ledger is not None:
+                    _cid = action.get("_ledger_change_id")
+                    if _cid:
+                        ledger.mark_reverted(_cid)
             else:
                 _mark_group_membership_cleanup_panel(
                     target_group=target_group,
@@ -274,6 +330,20 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                     or "Automatic group-membership cleanup failed.",
                 )
                 all_ok = False
+                ledger = getattr(shell, "environment_change_ledger", None)
+                if ledger is not None:
+                    _cid = action.get("_ledger_change_id")
+                    if _cid:
+                        ledger.mark_failed(
+                            _cid,
+                            error=str(result.raw_output or "").strip()
+                            or "Automatic group-membership cleanup failed.",
+                            manual_cleanup_instructions=(
+                                f"Remove '{added_user}' from '{target_group}' manually:\n"
+                                f"  Remove-ADGroupMember -Identity '{target_group}'"
+                                f" -Members '{added_user}' -Confirm:$false"
+                            ),
+                        )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             cleanup_notes.update(
@@ -297,5 +367,18 @@ def execute_cleanup_scope(shell: Any, *, scope_id: str) -> bool:
                 error_summary=str(exc),
             )
             all_ok = False
+            ledger = getattr(shell, "environment_change_ledger", None)
+            if ledger is not None:
+                _cid = action.get("_ledger_change_id")
+                if _cid:
+                    ledger.mark_failed(
+                        _cid,
+                        error=str(exc),
+                        manual_cleanup_instructions=(
+                            f"Remove '{added_user}' from '{target_group}' manually:\n"
+                            f"  Remove-ADGroupMember -Identity '{target_group}'"
+                            f" -Members '{added_user}' -Confirm:$false"
+                        ),
+                    )
 
     return all_ok

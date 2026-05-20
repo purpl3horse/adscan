@@ -15,11 +15,33 @@ from adscan_internal import (
     print_success,
     telemetry,
 )
-from adscan_internal.integrations.netexec.parsers import parse_adcs_detection_output
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_internal.services import CredentialStoreService
-from adscan_internal.workspaces import domain_relpath
+from adscan_internal.services.collector.adcs_collector import ADCSCollector
+from adscan_internal.services.collector.models import CollectionResult
+from adscan_internal.services.ldap_transport_service import (
+    ADscanLDAPConfig,
+    ADscanLDAPConnection,
+    prepare_kerberos_ldap_environment,
+    resolve_ldap_target_endpoints,
+)
+
+
+def _set_adcs_fqdn_if_hostname(domain_data: dict[str, Any], value: str | None) -> None:
+    """Persist the CA hostname as adcs_fqdn when value is a valid FQDN.
+
+    Leaves any existing adcs_fqdn unchanged when value is an IP or empty, so a
+    previously stored FQDN is not overwritten by a less-specific value observed
+    later in a different collection path.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address
+
+    if not isinstance(value, str):
+        return
+    candidate = value.strip()
+    if candidate and "." in candidate and not is_ip_address(candidate):
+        domain_data["adcs_fqdn"] = candidate
 
 
 def _set_adcs_detection_state(
@@ -32,7 +54,9 @@ def _set_adcs_detection_state(
     source_context: str | None = None,
 ) -> None:
     """Persist ADCS detection state with basic traceability fields."""
-    domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    domain_data = (
+        shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    )
     if not isinstance(domain_data, dict):
         domain_data = {}
     if detected is None:
@@ -45,6 +69,7 @@ def _set_adcs_detection_state(
     if source_context:
         domain_data["adcs_detected_source_context"] = source_context
     shell.domains_data[domain] = domain_data
+    _persist_adcs_domain_state(shell)
 
 
 def _is_inconclusive_adcs_reason(reason: str) -> bool:
@@ -55,6 +80,101 @@ def _is_inconclusive_adcs_reason(reason: str) -> bool:
     if normalized.startswith("auth_"):
         return True
     return False
+
+
+def _persist_adcs_domain_state(shell: Any) -> None:
+    """Persist updated ``domains_data`` when the active shell exposes a saver."""
+    save_domain_data = getattr(shell, "save_domain_data", None)
+    if not callable(save_domain_data):
+        return
+    try:
+        save_domain_data()
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[adcs] Failed to persist ADCS domain state: {exc}")
+
+
+def _ca_name_from_node_name(node_name: object) -> str | None:
+    """Extract the legacy CA display value from a collector node name."""
+    name = str(node_name or "").strip()
+    if not name:
+        return None
+    return name.split("@", 1)[0].strip() or None
+
+
+def _extract_adcs_metadata(result: CollectionResult) -> tuple[str | None, str | None]:
+    """Return ``(enrollment_server, ca_name)`` from native ADCS collector output."""
+    for node in result.nodes.values():
+        if node.kind != "EnterpriseCA":
+            continue
+        dns_hostname = str(node.properties.get("dns_hostname") or "").strip() or None
+        ca_name = _ca_name_from_node_name(node.name)
+        return dns_hostname, ca_name
+    return None, None
+
+
+def _collect_adcs_metadata_native(
+    *,
+    domain: str,
+    domain_data: dict[str, Any],
+    username: str,
+    password: str,
+    auth_domain: str,
+    use_kerberos: bool,
+    shell: Any,
+) -> tuple[str | None, str | None]:
+    """Collect ADCS metadata through the native badldap-backed collector."""
+    endpoints = resolve_ldap_target_endpoints(
+        target_domain=domain,
+        domain_data=domain_data,
+        kerberos_ready=use_kerberos,
+    )
+    dc_address = endpoints.dc_address
+    if not dc_address:
+        raise ValueError("Missing LDAP target DC address for ADCS detection.")
+
+    workspace_dir = (
+        shell._get_workspace_cwd()  # noqa: SLF001
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", "")
+    )
+    if use_kerberos:
+        prepare_kerberos_ldap_environment(
+            operation_name="ADCS detection",
+            target_domain=domain,
+            workspace_dir=str(workspace_dir or ""),
+            username=username,
+            user_domain=auth_domain,
+            credential=password,
+            dc_ip=endpoints.dc_ip,
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=lambda target: (
+                shell.do_sync_clock_with_pdc(target, verbose=False)
+                if hasattr(shell, "do_sync_clock_with_pdc")
+                else None
+            ),
+        )
+
+    auth_domain_data = getattr(shell, "domains_data", {}).get(auth_domain, {})
+    auth_kdc = (
+        str(auth_domain_data.get("pdc") or "").strip()
+        if isinstance(auth_domain_data, dict)
+        else ""
+    )
+    config = ADscanLDAPConfig(
+        domain=domain,
+        dc_ip=dc_address,
+        use_ldaps=True,
+        use_kerberos=use_kerberos,
+        username=username,
+        password=password,
+        kerberos_target_hostname=endpoints.kerberos_target_hostname,
+        auth_domain=auth_domain,
+        auth_kdc=auth_kdc or endpoints.dc_ip or dc_address,
+    )
+    with ADscanLDAPConnection(config) as connection:
+        result = ADCSCollector(connection=connection, domain=domain).collect()
+    return _extract_adcs_metadata(result)
 
 
 def _resolve_adcs_credentials(
@@ -170,20 +290,6 @@ def detect_adcs(
                 f"{marked_username}@{marked_domain}"
             )
 
-        auth = shell.build_auth_nxc(
-            username,
-            password,
-            auth_domain,
-            kerberos=use_kerberos,
-        )
-
-        marked_pdc_fqdn = mark_sensitive(pdc_fqdn, "hostname")
-        log_path = domain_relpath(shell.domains_dir, domain, shell.ldap_dir, "adcs.log")
-        command = (
-            f"{shell.netexec_path} ldap {marked_pdc_fqdn} {auth} "
-            f"--log {log_path} -M adcs"
-        )
-
         if not silent:
             print_operation_header(
                 "ADCS Detection",
@@ -197,54 +303,25 @@ def detect_adcs(
                 },
                 icon="🔐",
             )
-            print_info_debug(f"Command: {command}")
+            print_info_debug(
+                "[adcs] Running native badldap ADCS collection against "
+                f"{mark_sensitive(pdc_fqdn, 'hostname')}"
+            )
 
-        completed_process = shell._run_netexec(
-            command,
+        enrollment_server, ca_name = _collect_adcs_metadata_native(
             domain=domain,
-            timeout=900,
-            operation_kind="adcs_detection",
-            service="ldap",
+            domain_data=domain_data,
+            username=username,
+            password=password,
+            auth_domain=auth_domain,
+            use_kerberos=use_kerberos,
+            shell=shell,
         )
-        if completed_process is None:
-            if emit_telemetry:
-                _capture_adcs_not_discovered(shell, domain_data, error=True)
-            _set_adcs_detection_state(
-                shell,
-                domain=domain,
-                detected=False,
-                via="ldap",
-                reason="runner_returned_none",
-                source_context=source_context,
-            )
-            return False
-
-        output = completed_process.stdout or ""
-        errors = completed_process.stderr or ""
-
-        if completed_process.returncode != 0:
-            if not silent:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_error(f"Error searching for ADCS in domain {marked_domain}")
-                if errors:
-                    print_error(errors.strip())
-            if emit_telemetry:
-                _capture_adcs_not_discovered(shell, domain_data, error=True)
-            _set_adcs_detection_state(
-                shell,
-                domain=domain,
-                detected=False,
-                via="ldap",
-                reason=f"netexec_nonzero:{completed_process.returncode}",
-                source_context=source_context,
-            )
-            return False
-
-        enrollment_server, ca_name = parse_adcs_detection_output(output)
         adcs_found = bool(enrollment_server or ca_name)
 
         if enrollment_server:
             domain_data["adcs"] = enrollment_server
+            _set_adcs_fqdn_if_hostname(domain_data, enrollment_server)
             if not silent:
                 print_success(f"ADCS Enrollment Server found: {enrollment_server}")
         if ca_name:
@@ -270,16 +347,22 @@ def detect_adcs(
             domain=domain,
             detected=adcs_found,
             via="ldap",
-            reason="enrollment_server_or_ca_found" if adcs_found else "ldap_detection_empty",
+            reason="enrollment_server_or_ca_found"
+            if adcs_found
+            else "ldap_detection_empty",
             source_context=source_context,
         )
-        domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+        domain_data = (
+            shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+        )
         if isinstance(domain_data, dict):
             if enrollment_server:
                 domain_data["adcs"] = enrollment_server
+                _set_adcs_fqdn_if_hostname(domain_data, enrollment_server)
             if ca_name:
                 domain_data["ca"] = ca_name
             shell.domains_data[domain] = domain_data
+            _persist_adcs_domain_state(shell)
         return adcs_found
     except Exception as exc:
         if emit_telemetry:
@@ -307,21 +390,26 @@ def detect_adcs_from_bloodhound(
     domain: str,
     silent: bool = False,
 ) -> tuple[str | None, str | None]:
-    """Try to resolve ADCS metadata (host + CA) from BloodHound CE."""
+    """Try to resolve ADCS metadata (host + CA) from the graph service."""
     try:
-        if not hasattr(shell, "_get_bloodhound_service"):
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if not callable(service_getter):
             if not silent:
-                print_info_debug("[adcs-bh] BloodHound service unavailable.")
+                print_info_debug("[adcs-graph] Graph service unavailable.")
             return None, None
 
-        service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+        service = service_getter()
         client = getattr(service, "client", None)
         execute_rows = getattr(client, "execute_query_rows", None)
         execute_graph = getattr(client, "execute_query_with_relationships", None)
         if not callable(execute_rows) and not callable(execute_graph):
             if not silent:
                 print_info_debug(
-                    "[adcs-bh] BloodHound client has no rows/graph query methods."
+                    "[adcs-graph] Graph client has no rows/graph query methods."
                 )
             return None, None
 
@@ -332,7 +420,7 @@ def detect_adcs_from_bloodhound(
         RETURN p
         """
         if not silent:
-            print_info_debug(f"[adcs-bh] Using query: {query.strip()}")
+            print_info_debug(f"[adcs-graph] Using query: {query.strip()}")
         adcs_host: str | None = None
         ca_name: str | None = None
 
@@ -352,21 +440,21 @@ def detect_adcs_from_bloodhound(
                     return None, None
                 if not silent:
                     print_info_debug(
-                        "[adcs-bh] HostsCAService graph: "
+                        "[adcs-graph] HostsCAService graph: "
                         f"nodes={len(nodes_map)}, edges={len(edges)}"
                     )
                     if edges:
                         sample_edge = edges[0]
                         if isinstance(sample_edge, dict):
                             print_info_debug(
-                                "[adcs-bh] HostsCAService edge sample keys: "
+                                "[adcs-graph] HostsCAService edge sample keys: "
                                 f"{list(sample_edge.keys())}"
                             )
                     if nodes_map:
                         sample_node = next(iter(nodes_map.values()), None)
                         if isinstance(sample_node, dict):
                             print_info_debug(
-                                "[adcs-bh] HostsCAService node sample keys: "
+                                "[adcs-graph] HostsCAService node sample keys: "
                                 f"{list(sample_node.keys())}"
                             )
                 for edge in edges:
@@ -376,7 +464,7 @@ def detect_adcs_from_bloodhound(
                     edge_kind = str(edge.get("kind") or "").strip()
                     if not silent:
                         print_info_debug(
-                            "[adcs-bh] HostsCAService edge: "
+                            "[adcs-graph] HostsCAService edge: "
                             f"label={edge_label!r} kind={edge_kind!r} "
                             f"source={edge.get('source')!r} target={edge.get('target')!r} "
                             f"from={edge.get('from')!r} to={edge.get('to')!r}"
@@ -409,7 +497,7 @@ def detect_adcs_from_bloodhound(
                     target_node = _resolve_node(target_id)
                     if not silent:
                         print_info_debug(
-                            "[adcs-bh] HostsCAService nodes: "
+                            "[adcs-graph] HostsCAService nodes: "
                             f"source_id={source_id!r} target_id={target_id!r} "
                             f"source_kind={str(source_node.get('kind') or '') if isinstance(source_node, dict) else None!r} "
                             f"target_kind={str(target_node.get('kind') or '') if isinstance(target_node, dict) else None!r} "
@@ -421,10 +509,7 @@ def detect_adcs_from_bloodhound(
                     if isinstance(source_node, dict):
                         if str(source_node.get("kind") or "").lower() == "computer":
                             adcs = str(source_node.get("label") or "").strip() or None
-                        if (
-                            str(source_node.get("kind") or "").lower()
-                            == "enterpriseca"
-                        ):
+                        if str(source_node.get("kind") or "").lower() == "enterpriseca":
                             ca = _normalize_ca(
                                 str(
                                     source_node.get("caname")
@@ -434,10 +519,7 @@ def detect_adcs_from_bloodhound(
                                 ).strip()
                             )
                     if isinstance(target_node, dict):
-                        if (
-                            str(target_node.get("kind") or "").lower()
-                            == "enterpriseca"
-                        ):
+                        if str(target_node.get("kind") or "").lower() == "enterpriseca":
                             ca = _normalize_ca(
                                 str(
                                     target_node.get("caname")
@@ -454,7 +536,7 @@ def detect_adcs_from_bloodhound(
             except Exception as exc:  # noqa: BLE001
                 if not silent:
                     print_info_debug(
-                        f"[adcs-bh] HostsCAService graph parse error: {exc}"
+                        f"[adcs-graph] HostsCAService graph parse error: {exc}"
                     )
                     print_exception(exception=exc)
                 return None, None
@@ -465,12 +547,11 @@ def detect_adcs_from_bloodhound(
             if isinstance(graph, dict):
                 if not silent:
                     print_info_debug(
-                        "[adcs-bh] HostsCAService graph keys: "
-                        f"{list(graph.keys())}"
+                        f"[adcs-graph] HostsCAService graph keys: {list(graph.keys())}"
                     )
                 adcs_host, ca_name = _extract_from_graph(graph)
                 if not silent and not (adcs_host or ca_name):
-                    print_info_debug("[adcs-bh] HostsCAService graph empty.")
+                    print_info_debug("[adcs-graph] HostsCAService graph empty.")
 
         rows: list[Any] = []
 
@@ -481,14 +562,14 @@ def detect_adcs_from_bloodhound(
                 if not silent:
                     marked_domain = mark_sensitive(domain, "domain")
                     print_info_debug(
-                        f"[adcs-bh] No HostsCAService rows for {marked_domain}."
+                        f"[adcs-graph] No HostsCAService rows for {marked_domain}."
                     )
                 return None, None
 
             sample_row = rows[0]
             if not silent:
                 print_info_debug(
-                    "[adcs-bh] HostsCAService row sample: "
+                    "[adcs-graph] HostsCAService row sample: "
                     f"type={type(sample_row).__name__}, keys={list(sample_row.keys()) if isinstance(sample_row, dict) else 'N/A'}"
                 )
 
@@ -506,9 +587,7 @@ def detect_adcs_from_bloodhound(
                 if isinstance(nodes, list):
                     return [
                         props
-                        for props in (
-                            _extract_node_props(node) for node in nodes
-                        )
+                        for props in (_extract_node_props(node) for node in nodes)
                         if isinstance(props, dict)
                     ]
                 segments = path_obj.get("segments")
@@ -545,17 +624,22 @@ def detect_adcs_from_bloodhound(
                         if isinstance(labels, list)
                         else []
                     )
-                    if "enterpriseca" in label_list or node.get("caname") or node.get(
-                        "caName"
+                    if (
+                        "enterpriseca" in label_list
+                        or node.get("caname")
+                        or node.get("caName")
                     ):
-                        ca_name = _normalize_ca(
-                            str(
-                                node.get("caname")
-                                or node.get("caName")
-                                or node.get("name")
-                                or ""
-                            ).strip()
-                        ) or ca_name
+                        ca_name = (
+                            _normalize_ca(
+                                str(
+                                    node.get("caname")
+                                    or node.get("caName")
+                                    or node.get("name")
+                                    or ""
+                                ).strip()
+                            )
+                            or ca_name
+                        )
                     if "computer" in label_list or node.get("dnshostname"):
                         adcs_host = (
                             str(
@@ -573,7 +657,7 @@ def detect_adcs_from_bloodhound(
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
             print_info_debug(
-                f"[adcs-bh] Resolved for {marked_domain}: "
+                f"[adcs-graph] Resolved for {marked_domain}: "
                 f"adcs={adcs_host!r}, ca={ca_name!r}"
             )
 
@@ -596,7 +680,9 @@ def ensure_adcs_metadata(
     source_context: str | None = None,
 ) -> bool:
     """Ensure ADCS metadata (adcs + ca) is populated using BH → LDAP fallback."""
-    domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    domain_data = (
+        shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    )
     if not domain_data:
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
@@ -613,11 +699,21 @@ def ensure_adcs_metadata(
     if not force and domain_data.get("adcs_detected") is False:
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
-            cached_reason = str(domain_data.get("adcs_detected_reason") or "unknown").strip() or "unknown"
-            cached_checked_at = str(domain_data.get("adcs_detected_checked_at") or "").strip() or "unknown"
-            cached_via = str(domain_data.get("adcs_detected_via") or "unknown").strip() or "unknown"
+            cached_reason = (
+                str(domain_data.get("adcs_detected_reason") or "unknown").strip()
+                or "unknown"
+            )
+            cached_checked_at = (
+                str(domain_data.get("adcs_detected_checked_at") or "").strip()
+                or "unknown"
+            )
+            cached_via = (
+                str(domain_data.get("adcs_detected_via") or "unknown").strip()
+                or "unknown"
+            )
             cached_source_context = (
-                str(domain_data.get("adcs_detected_source_context") or "").strip() or "unknown"
+                str(domain_data.get("adcs_detected_source_context") or "").strip()
+                or "unknown"
             )
             print_info_debug(
                 f"[adcs] Cached negative ADCS detection for {marked_domain}; skipping lookup. "
@@ -631,6 +727,7 @@ def ensure_adcs_metadata(
     )
     if adcs_host:
         domain_data["adcs"] = adcs_host
+        _set_adcs_fqdn_if_hostname(domain_data, adcs_host)
     if ca_name:
         domain_data["ca"] = ca_name
 
@@ -643,7 +740,9 @@ def ensure_adcs_metadata(
             reason="bloodhound_metadata_resolved",
             source_context=source_context,
         )
-        domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+        domain_data = (
+            shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+        )
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
             print_success(
@@ -673,7 +772,11 @@ def ensure_adcs_metadata(
             source_context=source_context,
         )
         if found:
-            domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+            domain_data = (
+                shell.domains_data.get(domain, {})
+                if hasattr(shell, "domains_data")
+                else {}
+            )
             if isinstance(domain_data, dict):
                 domain_data["adcs_detected_via"] = "ldap"
                 if source_context:
@@ -681,9 +784,7 @@ def ensure_adcs_metadata(
                 shell.domains_data[domain] = domain_data
             if not silent:
                 marked_domain = mark_sensitive(domain, "domain")
-                print_success(
-                    f"ADCS metadata resolved via LDAP for {marked_domain}."
-                )
+                print_success(f"ADCS metadata resolved via LDAP for {marked_domain}.")
         return found
 
     _set_adcs_detection_state(
@@ -691,10 +792,13 @@ def ensure_adcs_metadata(
         domain=domain,
         detected=False,
         via="bloodhound",
-        reason="bloodhound_and_ldap_not_found" if allow_ldap_fallback else "bloodhound_not_found",
+        reason="bloodhound_and_ldap_not_found"
+        if allow_ldap_fallback
+        else "bloodhound_not_found",
         source_context=source_context,
     )
     return False
+
 
 def _capture_adcs_discovered(
     shell: Any,
@@ -775,7 +879,11 @@ def do_show_adcs_cache(shell: Any, domain: str) -> None:
         print_instruction("Usage: show_adcs_cache <domain>")
         return
 
-    domain_data = shell.domains_data.get(target_domain, {}) if hasattr(shell, "domains_data") else {}
+    domain_data = (
+        shell.domains_data.get(target_domain, {})
+        if hasattr(shell, "domains_data")
+        else {}
+    )
     if not isinstance(domain_data, dict) or not domain_data:
         marked_domain = mark_sensitive(target_domain, "domain")
         print_error(f"Domain {marked_domain} is not initialized.")

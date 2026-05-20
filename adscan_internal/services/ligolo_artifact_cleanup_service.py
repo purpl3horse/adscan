@@ -27,6 +27,7 @@ from adscan_internal.services.exploitation.remote_windows_execution import (
     RemoteWindowsAuth,
     RemoteWindowsExecutionService,
 )
+from adscan_internal.services.pivot_auth_context_service import resolve_pivot_auth_secret
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,20 +264,22 @@ def cleanup_remote_ligolo_artifact(
     )
 
 
-def _resolve_reusable_password(shell: Any, *, domain: str, username: str) -> str | None:
-    """Return one reusable cleartext password from workspace credential state."""
-
-    domains_data = getattr(shell, "domains_data", {})
-    domain_data = domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
-    credentials = domain_data.get("credentials", {}) if isinstance(domain_data, dict) else {}
-    if not isinstance(credentials, dict):
-        return None
-    secret = str(credentials.get(username) or "").strip()
-    if not secret:
-        return None
-    if getattr(shell, "is_hash", lambda _: False)(secret):
-        return None
-    return secret
+def _resolve_reusable_pivot_secret(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    source_service: str,
+    record: dict[str, Any],
+) -> str | None:
+    """Return the reusable auth material for one persisted Ligolo pivot."""
+    return resolve_pivot_auth_secret(
+        shell,
+        domain=domain,
+        username=username,
+        source_service=source_service,
+        record=record,
+    )
 
 
 def _persist_cleanup_result(
@@ -337,7 +340,19 @@ def cleanup_workspace_ligolo_artifacts(
         username = str(record.get("pivot_username") or "").strip()
         remote_agent_path = str(record.get("remote_agent_path") or "").strip()
         remote_agent_pid = record.get("remote_agent_pid")
-        password = _resolve_reusable_password(shell, domain=domain, username=username)
+        pivot_auth = record.get("pivot_auth") if isinstance(record.get("pivot_auth"), dict) else {}
+        kerberos_spn_host = (
+            str(record.get("pivot_kerberos_spn_host") or "").strip()
+            or str(pivot_auth.get("kerberos_spn_host") or "").strip()
+            or None
+        )
+        password = _resolve_reusable_pivot_secret(
+            shell,
+            domain=domain,
+            username=username,
+            source_service=source_service,
+            record=record,
+        )
 
         if tunnel_id:
             service.update_tunnel_record(
@@ -358,11 +373,19 @@ def cleanup_workspace_ligolo_artifacts(
         remote_executor = RemoteWindowsExecutionService(shell)
 
         def _execute_remote_script(**kwargs: Any) -> str:
+            secret = str(kwargs.get("password") or password or "")
+            winrm_secret = (
+                secret
+                if source_service == "winrm" and secret.strip().lower().endswith(".ccache")
+                else None
+            )
             auth = RemoteWindowsAuth(
                 domain=str(kwargs.get("domain") or domain),
                 host=str(kwargs.get("host") or pivot_host),
                 username=str(kwargs.get("username") or username),
-                secret=str(kwargs.get("password") or password or ""),
+                secret=secret,
+                winrm_secret=winrm_secret,
+                kerberos_spn_host=kerberos_spn_host,
             )
             result = remote_executor.execute_powershell(
                 auth,
@@ -377,6 +400,24 @@ def cleanup_workspace_ligolo_artifacts(
                 )
             return str(result.stdout or "")
 
+        # Register file artifact with ledger before attempting cleanup
+        ledger = getattr(shell, "environment_change_ledger", None)
+        _ledger_change_id: str | None = None
+        if ledger is not None and remote_agent_path:
+            _unc_agent_path = remote_agent_path.replace("/", "\\")
+            _ledger_change_id = ledger.register_change(
+                kind="file_uploaded",
+                domain=str(domain or ""),
+                target=f"\\\\{pivot_host}\\{_unc_agent_path}",
+                detail={
+                    "host": str(pivot_host or ""),
+                    "path": str(remote_agent_path or ""),
+                    "tunnel_id": str(tunnel_id or ""),
+                    "source_service": str(record.get("source_service") or ""),
+                },
+                method="Ligolo pivot tunnel agent",
+            )
+
         result = cleanup_remote_ligolo_artifact(
             domain=domain,
             pivot_host=pivot_host,
@@ -390,6 +431,28 @@ def cleanup_workspace_ligolo_artifacts(
         )
         _persist_cleanup_result(service=service, tunnel_id=tunnel_id, result=result)
         results.append(result)
+
+        # Update ledger based on cleanup outcome
+        if ledger is not None and _ledger_change_id:
+            if result.cleanup_succeeded:
+                ledger.mark_reverted(_ledger_change_id)
+            elif not result.credential_available:
+                ledger.mark_operator_required(
+                    _ledger_change_id,
+                    manual_cleanup_instructions=(
+                        f"Delete the staged agent manually on {pivot_host}:\n"
+                        f"  del \"{remote_agent_path}\""
+                    ),
+                )
+            else:
+                ledger.mark_failed(
+                    _ledger_change_id,
+                    error=result.message,
+                    manual_cleanup_instructions=(
+                        f"Delete the staged agent manually on {pivot_host}:\n"
+                        f"  del \"{remote_agent_path}\""
+                    ),
+                )
 
         if result.cleanup_succeeded:
             print_info(

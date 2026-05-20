@@ -233,6 +233,11 @@ class CredentialStoreService(BaseService):
         if "credentials" not in domain_data:
             domain_data["credentials"] = {}
 
+        # Normalize username to lowercase so lookups (which use lower-cased keys
+        # throughout the codebase) always find the credential.  Callers that pass
+        # upper-cased names (e.g. kerbrute returning "BANKING$") otherwise produce
+        # a key mismatch that silently prevents attack-path execution.
+        username = username.lower()
         current_cred = domain_data["credentials"].get(username)
         current_is_hash = self._looks_like_ntlm_hash(current_cred)
         credential_changed = False
@@ -328,8 +333,18 @@ class CredentialStoreService(BaseService):
         )
 
     # ------------------------------------------------------------------ #
-    # Kerberos tickets
+    # Kerberos tickets — TGTs only
     # ------------------------------------------------------------------ #
+    #
+    # Invariant: ``domains_data[domain]["kerberos_tickets"]`` maps a
+    # ``username`` to a ccache file that contains a TGT for that user
+    # (server == krbtgt/<REALM>@<REALM>, client == username@<REALM>).
+    #
+    # Service tickets produced by RBCD/S4U/silver-ticket flows MUST be
+    # persisted via :meth:`store_service_ticket` instead.  Mixing them in
+    # ``kerberos_tickets`` triggered the LDAP fast-path bug where the mere
+    # presence of *any* ccache made callers attempt Kerberos auth without a
+    # usable ticket for the active user.
 
     def store_kerberos_ticket(
         self,
@@ -338,16 +353,59 @@ class CredentialStoreService(BaseService):
         domain: str,
         username: str,
         ticket_path: str,
-    ) -> None:
-        """Register a Kerberos ticket path for a domain user.
+        realm: Optional[str] = None,
+        validate: bool = True,
+    ) -> bool:
+        """Register a Kerberos TGT for *username*.
 
-        This is the service-layer equivalent of the direct updates to the
-        ``\"kerberos_tickets\"`` dictionary that used to live in ``adscan.py``.
+        Args:
+            domains_data: Shared workspace domain mapping.
+            domain: Domain key in ``domains_data``.
+            username: Principal whose TGT this ccache holds (without realm).
+            ticket_path: Filesystem path to the ``.ccache``.
+            realm: Optional explicit Kerberos realm.  When omitted the domain
+                name (uppercased) is used.
+            validate: When ``True`` (default), inspect the ccache and refuse
+                to persist if it does not contain a TGT for ``username``.
+                Set to ``False`` only for tests or for cases where the caller
+                has already validated upstream.
+
+        Returns:
+            ``True`` if the entry was persisted, ``False`` when validation
+            rejected the ccache.  Callers should treat ``False`` as a real
+            failure — it means the produced ccache cannot be used as a TGT.
         """
+        from adscan_internal.rich_output import (  # noqa: PLC0415
+            mark_sensitive,
+            print_warning_debug,
+        )
+
+        normalized_user = str(username or "").strip()
+        normalized_path = str(ticket_path or "").strip()
+        if not normalized_user or not normalized_path:
+            return False
+
+        if validate:
+            from adscan_internal.services.kerberos_ccache_inspector import (  # noqa: PLC0415
+                validate_tgt_for_user,
+            )
+
+            effective_realm = (realm or domain or "").strip().upper() or None
+            result = validate_tgt_for_user(
+                normalized_path, username=normalized_user, realm=effective_realm
+            )
+            if not result.ok:
+                print_warning_debug(
+                    f"[kerberos_tickets] refusing to persist {mark_sensitive(normalized_path, 'path')} "
+                    f"as TGT for {mark_sensitive(normalized_user, 'user')}@"
+                    f"{mark_sensitive(effective_realm or '?', 'domain')}: {result.reason}"
+                )
+                return False
 
         domain_data = self.ensure_domain_entry(domains_data, domain)
         tickets = domain_data.setdefault("kerberos_tickets", {})
-        tickets[username] = ticket_path
+        tickets[normalized_user] = normalized_path
+        return True
 
     def get_kerberos_ticket(
         self,
@@ -382,6 +440,115 @@ class CredentialStoreService(BaseService):
             return False
         tickets.pop(username, None)
         return True
+
+    # ------------------------------------------------------------------ #
+    # Service tickets — RBCD / S4U / constrained delegation / silver tickets
+    # ------------------------------------------------------------------ #
+    #
+    # Stored as a list of ``ServiceTicket.to_dict()`` payloads under
+    # ``domains_data[domain]["service_tickets"]``.  Lookups are by SPN /
+    # impersonated user / target host.  The same SPN+impersonated_user pair
+    # may appear more than once across different attack flows; callers
+    # decide which entry to use based on freshness / kind.
+
+    def store_service_ticket(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        ticket: "ServiceTicket",  # noqa: F821 — forward ref, imported below
+    ) -> bool:
+        """Persist a derived service ticket under *domain*.
+
+        Existing entries with the same ``ccache_path`` are replaced rather
+        than duplicated, so reruns of the same attack step keep one row per
+        ccache file.
+        """
+        from adscan_internal.models.service_ticket import (  # noqa: PLC0415
+            ServiceTicket,
+        )
+
+        if not isinstance(ticket, ServiceTicket):
+            raise TypeError(
+                "store_service_ticket requires a ServiceTicket instance; "
+                f"got {type(ticket).__name__}"
+            )
+        if not ticket.ccache_path or not ticket.spn:
+            return False
+
+        domain_data = self.ensure_domain_entry(domains_data, domain)
+        bucket = domain_data.setdefault("service_tickets", [])
+        if not isinstance(bucket, list):
+            bucket = []
+            domain_data["service_tickets"] = bucket
+
+        payload = ticket.to_dict()
+        for idx, existing in enumerate(bucket):
+            if (
+                isinstance(existing, dict)
+                and str(existing.get("ccache_path") or "").strip()
+                == ticket.ccache_path
+            ):
+                bucket[idx] = payload
+                return True
+        bucket.append(payload)
+        return True
+
+    def iter_service_tickets(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        spn: Optional[str] = None,
+        impersonated_user: Optional[str] = None,
+        target_host: Optional[str] = None,
+    ) -> "list[ServiceTicket]":  # noqa: F821 — forward ref
+        """Return service tickets for *domain* matching the given filters."""
+        from adscan_internal.models.service_ticket import (  # noqa: PLC0415
+            ServiceTicket,
+        )
+
+        domain_data = domains_data.get(domain, {})
+        bucket = domain_data.get("service_tickets", []) if isinstance(domain_data, dict) else []
+        if not isinstance(bucket, list):
+            return []
+
+        out: list[ServiceTicket] = []
+        for raw in bucket:
+            if not isinstance(raw, dict):
+                continue
+            ticket = ServiceTicket.from_dict(raw)
+            if ticket.matches(
+                spn=spn,
+                impersonated_user=impersonated_user,
+                target_host=target_host,
+            ):
+                out.append(ticket)
+        return out
+
+    def delete_service_ticket(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        ccache_path: str,
+    ) -> bool:
+        """Remove the service ticket entry whose ccache path matches.
+
+        Returns ``True`` if an entry was removed.
+        """
+        normalized = str(ccache_path or "").strip()
+        if not normalized:
+            return False
+        domain_data = domains_data.get(domain, {})
+        bucket = domain_data.get("service_tickets", []) if isinstance(domain_data, dict) else []
+        if not isinstance(bucket, list):
+            return False
+        for idx, entry in enumerate(bucket):
+            if isinstance(entry, dict) and str(entry.get("ccache_path") or "").strip() == normalized:
+                bucket.pop(idx)
+                return True
+        return False
 
     # ------------------------------------------------------------------ #
     # Kerberos key material

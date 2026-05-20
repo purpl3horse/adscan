@@ -22,6 +22,18 @@ def activate_workspace(shell: Any, *, workspaces_dir: str, workspace_name: str) 
     paths = resolve_workspace_paths(workspaces_dir, workspace_name)
     shell.current_workspace = workspace_name
     shell.current_workspace_dir = paths.root
+
+    # Initialise the environment change ledger for the newly activated workspace.
+    # Wrapped in a broad except so a ledger failure never blocks workspace activation.
+    try:
+        from adscan_internal.services.environment_change_ledger import EnvironmentChangeLedger
+
+        shell.environment_change_ledger = EnvironmentChangeLedger(paths.root)
+    except Exception:  # noqa: BLE001 — best-effort, must not break activation
+        shell.environment_change_ledger = None
+
+    shell.acl_cleanup_actions: list[dict] = []
+
     return paths.root
 
 

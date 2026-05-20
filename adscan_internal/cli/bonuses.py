@@ -1,0 +1,874 @@
+"""Bonus PDF asset library — shared catalog and renderer.
+
+After the surface-unification kill, the standalone ``adscan playbook``,
+``adscan checklist`` and ``adscan coverage-matrix`` commands have been
+removed. Those four PDFs are now generated exclusively through
+``adscan deliver`` (with optional ``--only <slug>`` selection).
+
+The LITE-tier ``adscan cheatsheet`` command remains — it is an operator
+desk reference, not part of the Client Deliverable Kit, so it keeps its
+own dedicated entry point.
+
+This module retains:
+
+* :data:`BONUSES` — the catalog (filename, title, template, theme) used
+  by ``adscan deliver`` and ``adscan cheatsheet`` to render each item.
+* :data:`_CONTEXT_BUILDERS` — Jinja context builders, one per bonus.
+* :func:`render_bonus` — entry point used by ``deliver.py``.
+* :func:`run_cheatsheet` / :func:`add_cheatsheet_subparser` — LITE CLI
+  surface for the operator cheat sheet.
+
+Workspace-aware filtering
+-------------------------
+
+When ``render_bonus`` is invoked with a ``workspace_dir`` pointing at a
+real scan (``technical_report.json`` present), the playbook, checklist
+and coverage matrix re-rank their content to surface techniques actually
+observed in the engagement above the static reference catalog. The full
+catalog is preserved in a clearly-labelled "for reference" section at
+the end of each bonus, so procurement / compliance use-cases still get
+the comprehensive view.
+
+When no workspace data is available, a visible warning is printed and
+the bonuses fall back to the historical static behaviour.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from jinja2 import BaseLoader, Environment, select_autoescape
+
+from adscan_core import telemetry
+from adscan_core.paths import get_adscan_home_dir
+from adscan_core.rich_output import (
+    print_error,
+    print_info,
+    print_success,
+    print_warning,
+)
+
+
+# ---------------------------------------------------------------------------
+# Bonus catalog — central source of truth for filenames + stated values.
+# ---------------------------------------------------------------------------
+
+BONUSES: dict[str, dict[str, Any]] = {
+    "playbook": {
+        "filename": "AD_Hardening_Playbook.pdf",
+        "title":    "AD Hardening Playbook",
+        "value":    497,
+        "subtitle": "30-day playbook for the six tactics that cause 80% of AD breaches.",
+        "template": "playbook/playbook.html",
+        "theme":    "premium_dark",
+    },
+    "cheatsheet": {
+        "filename": "Quick_Start_Cheatsheet.pdf",
+        "title":    "Quick-Start Cheat Sheet",
+        "value":    197,
+        "subtitle": "Two-page desk reference: 15 commands, 14 key bindings, 5 fast fixes.",
+        "template": "cheatsheet/cheatsheet.html",
+        "theme":    "premium_dark",
+    },
+    "checklist": {
+        "filename": "MITRE_Remediation_Checklist.pdf",
+        "title":    "MITRE Remediation Checklist",
+        "value":    297,
+        "subtitle": "Auditor-grade remediation worksheet for every tracked ATT&CK technique.",
+        "template": "checklist/checklist.html",
+        "theme":    "premium_dark",
+    },
+    "coverage-matrix": {
+        "filename":   "Coverage_Matrix.pdf",
+        "title":      "ADscan Coverage Matrix",
+        "value":      0,  # Procurement utility — no value-stack tag.
+        "subtitle":   "Active Directory checks mapped to ATT&CK and compliance frameworks.",
+        "template":   "coverage_matrix/coverage_matrix.html",
+        "theme":      "corporate_light",
+        "is_bonus":   False,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_THEME_MARKER = "<!-- {{ THEME_CSS }} -->"
+
+
+def _bonus_output_dir() -> Path:
+    """Return the canonical output directory for bonus PDFs.
+
+    Falls back to ``~/.adscan/bonuses`` when ADscan is running outside the
+    container (e.g., during ``pytest``).
+    """
+    return get_adscan_home_dir() / "bonuses"
+
+
+def _load_template(template_relpath: str) -> str:
+    """Load a Jinja template source from the reporting templates package.
+
+    Honors ``ADSCAN_TEMPLATE_OVERRIDE_DIR`` when set — the override dir is
+    consulted FIRST and only falls through to the bundled package resource
+    when the override path does not exist. This lets the LITE cheatsheet
+    bake pipeline mount the live template directory from the host into the
+    PRO container, so editing ``cheatsheet.html`` on disk takes effect on
+    the next ``adscan cheatsheet`` invocation without requiring a full PRO
+    image rebuild. Layout under the override dir mirrors the package
+    layout exactly (e.g. ``cheatsheet/cheatsheet.html``).
+
+    The override is opt-in: when the env var is empty/unset, behavior is
+    byte-identical to the legacy "read from bundled resource" path.
+    """
+    override_dir = str(os.environ.get("ADSCAN_TEMPLATE_OVERRIDE_DIR") or "").strip()
+    if override_dir:
+        override_path = Path(override_dir) / template_relpath
+        try:
+            if override_path.is_file():
+                return override_path.read_text(encoding="utf-8")
+        except OSError:
+            # Treat any I/O hiccup on the override path as "not present"
+            # and fall through to the bundled resource so the bake never
+            # hard-fails on a misconfigured mount.
+            pass
+
+    from importlib.resources import files
+
+    root = files("adscan_internal.pro.reporting.templates")
+    candidate = root.joinpath(template_relpath)
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Bonus template missing: {template_relpath}")
+    return candidate.read_text(encoding="utf-8")
+
+
+def _load_theme(theme_name: str) -> str:
+    """Load theme CSS — empty string if the theme is missing.
+
+    Honors ``ADSCAN_THEME_OVERRIDE_DIR`` — same opt-in mechanism as
+    ``_load_template``. The override dir holds theme files named
+    ``<theme>.css`` (e.g. ``premium_dark.css``). When the override is
+    unset or the file is not found, falls back to the bundled
+    ``adscan_internal.pro.reporting.themes`` loader.
+    """
+    override_dir = str(os.environ.get("ADSCAN_THEME_OVERRIDE_DIR") or "").strip()
+    if override_dir:
+        override_path = Path(override_dir) / f"{theme_name}.css"
+        try:
+            if override_path.is_file():
+                return override_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    try:
+        from adscan_internal.pro.reporting.themes import load_theme_css
+
+        return load_theme_css(theme_name)
+    except Exception:
+        return ""
+
+
+def _render_html(template_source: str, context: dict[str, Any], theme_css: str) -> str:
+    """Render a bonus template with theme CSS injected into ``<head>``."""
+    env = Environment(loader=BaseLoader(), autoescape=select_autoescape(["html"]))
+    rendered = env.from_string(template_source).render(**context)
+    if theme_css:
+        inject = f"<style data-adscan-theme>\n{theme_css}\n</style>"
+        if _THEME_MARKER in rendered:
+            rendered = rendered.replace(_THEME_MARKER, inject, 1)
+        else:
+            rendered = rendered.replace("</head>", f"{inject}\n</head>", 1)
+    return rendered
+
+
+def _render_pdf(html_str: str) -> bytes:
+    """Render HTML to PDF bytes via the chromium engine."""
+    from adscan_internal.pro.reporting.engines import get_engine
+    from adscan_internal.pro.reporting.engines import (  # noqa: F401 - registration
+        chromium_engine as _chromium,
+    )
+
+    engine = get_engine("chromium")
+    ok, reason = engine.is_available()
+    if not ok:
+        raise RuntimeError(
+            f"Chromium engine unavailable ({reason}). "
+            "Install with: pip install playwright && playwright install chromium"
+        )
+    return engine.render_pdf(html_str, base_url=None, options={})
+
+
+def _maybe_prompt_open(pdf_path: Path) -> None:
+    """Prompt the operator to open the PDF; route through the host helper.
+
+    Delegates to :func:`adscan_internal.services.host_open.prompt_and_open`
+    so the PDF actually opens on the operator's desktop (via the host
+    helper socket) instead of a no-op ``xdg-open`` inside a display-less
+    container. The helper auto-skips in non-interactive contexts so
+    ``adscan ci`` and similar batch flows remain non-blocking.
+    """
+    from adscan_internal.services.host_open import prompt_and_open
+
+    prompt_and_open(pdf_path, prompt="Open it now?", default=True)
+
+
+def _resolve_output_path(bonus_key: str, override: str | None) -> Path:
+    """Resolve the final output path; create the parent dir lazily."""
+    if override:
+        path = Path(override).expanduser().resolve()
+    else:
+        path = (_bonus_output_dir() / BONUSES[bonus_key]["filename"]).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _print_completion_panel(bonus_key: str, pdf_path: Path) -> None:
+    """Print the completion panel."""
+    from adscan_internal.services.host_open import display_host_path
+
+    meta = BONUSES[bonus_key]
+    print_success(f"{meta['title']} ready: {display_host_path(pdf_path)}")
+    print_info("")
+    if meta.get("is_bonus", True):
+        print_info("  This bonus is included free with ADscan.")
+        print_info(f"  Stated value: ${meta['value']}.")
+    else:
+        print_info(f"  {meta.get('subtitle', '')}")
+    print_info("")
+
+
+# ---------------------------------------------------------------------------
+# Workspace-aware filtering helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_observed_techniques(workspace_dir: Path | None) -> set[str]:
+    """Best-effort lookup of techniques observed in the workspace scan.
+
+    Wraps :func:`bonus_workspace.get_observed_techniques` with the visible
+    warning required by the bonus contract: if no workspace signal is
+    available, the operator must know the bonus is being rendered from
+    the static reference catalog rather than the live engagement.
+    """
+    if workspace_dir is None:
+        return set()
+    try:
+        from adscan_internal.pro.reporting.bonus_workspace import (
+            get_observed_techniques,
+        )
+        return get_observed_techniques(workspace_dir)
+    except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
+        telemetry.capture_exception(exc)
+        return set()
+
+
+def _is_observed(technique_id: str, observed: set[str]) -> bool:
+    """Return ``True`` if the technique (or any ancestor) is in ``observed``.
+
+    Match rules:
+
+    * Exact ID hit (``T1558.003`` in observed set) → True
+    * Parent technique hit when the ID is a subtechnique (observed
+      contains ``T1558`` and ``technique_id`` is ``T1558.003``) → True
+    * Any subtechnique of ``technique_id`` is observed (observed
+      contains ``T1558.003`` and ``technique_id`` is ``T1558``) → True
+
+    The third rule keeps the top-level reference techniques in the
+    "observed" bucket whenever a more specific subtechnique fired.
+    """
+    if not observed:
+        return False
+    if technique_id in observed:
+        return True
+    if "." in technique_id:
+        parent = technique_id.split(".", 1)[0]
+        if parent in observed:
+            return True
+    else:
+        prefix = technique_id + "."
+        if any(tid.startswith(prefix) for tid in observed):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Context builders — one per bonus.
+# ---------------------------------------------------------------------------
+
+# Map a tactic name (as used in the playbook chapter dicts) to the tactic
+# label used in :mod:`mitre_data` so we can score chapters by how many
+# observed techniques fall under each.
+_PLAYBOOK_TACTIC_ALIASES: dict[str, str] = {
+    "Credential Access":      "Credential Access",
+    "Privilege Escalation":   "Privilege Escalation",
+    "Lateral Movement":       "Lateral Movement",
+    "Persistence":            "Persistence",
+    "Defense Evasion":        "Defense Evasion",
+    "Initial Access":         "Initial Access",
+}
+
+
+def _extract_technique_ids_from_action(action: str) -> list[str]:
+    """Pull every ``T####(.###)?`` token out of a playbook action string."""
+    import re
+
+    return re.findall(r"T\d{4}(?:\.\d{3})?", action)
+
+
+def _ctx_playbook(
+    *,
+    observed: set[str] | None = None,
+    has_workspace_signal: bool = False,
+) -> dict[str, Any]:
+    """Build the Jinja context for the AD Hardening Playbook.
+
+    When the caller has observed-technique signal from the workspace,
+    each chapter is annotated with an ``observed_count`` and the list of
+    chapters is re-ordered so tactics with the most observed techniques
+    surface first. Without signal, the static chapter order is preserved.
+    """
+    from adscan_internal.pro.reporting.playbook_content import PLAYBOOK
+
+    observed = observed or set()
+    tactics = [dict(chapter) for chapter in PLAYBOOK["tactics"]]
+
+    # Annotate every chapter with the count of attacker actions whose
+    # cited technique IDs appear in the observed set. The template uses
+    # this to render an "observed in your scan" badge per chapter.
+    for chapter in tactics:
+        ids: set[str] = set()
+        for action in chapter.get("attacker_actions", []):
+            for tid in _extract_technique_ids_from_action(action):
+                ids.add(tid)
+        chapter["technique_ids"] = sorted(ids)
+        chapter["observed_techniques"] = sorted(
+            t for t in ids if _is_observed(t, observed)
+        )
+        chapter["observed_count"] = len(chapter["observed_techniques"])
+        chapter["is_observed"] = chapter["observed_count"] > 0
+
+    if has_workspace_signal and observed:
+        # Stable resort: observed chapters first (descending observed_count),
+        # then unobserved chapters in the original chapter order.
+        tactics.sort(
+            key=lambda c: (
+                0 if c["is_observed"] else 1,
+                -c["observed_count"],
+                c["chapter"],
+            )
+        )
+
+    return {
+        "title":                PLAYBOOK["title"],
+        "subtitle":             PLAYBOOK["subtitle"],
+        "narrative_paragraphs": PLAYBOOK["narrative_paragraphs"],
+        "tactics":              tactics,
+        "calendar":             PLAYBOOK["calendar"],
+        "report_date":          time.strftime("%B %d, %Y"),
+        "has_workspace_signal": has_workspace_signal,
+        "observed_count_total": sum(c["observed_count"] for c in tactics),
+    }
+
+
+def _ctx_cheatsheet() -> dict[str, Any]:
+    """Build the Jinja context for the Quick-Start Cheat Sheet.
+
+    Delegates to :mod:`adscan_internal.pro.reporting.cheatsheet_content`
+    which (a) holds the curated commands / posture labels in one data
+    structure, (b) auto-pulls scan phases from the canonical
+    ``SCAN_PHASES`` tuple, and (c) runs a structural validator that
+    fails the bake if any curated entry references a verb / category /
+    phase that no longer exists. The import is lazy because this module
+    lives under ``adscan_internal/pro/`` and is stripped from LITE; in
+    LITE the cheatsheet command takes the pre-baked-PDF fast-path and
+    never calls this function.
+    """
+    from adscan_internal.pro.reporting.cheatsheet_content import (
+        build_cheatsheet_context,
+    )
+
+    return build_cheatsheet_context()
+
+
+# Severity heuristic for the checklist — picked once per technique using the
+# tactic + technique-id as a tiebreak. Keeps the catalog deterministic and
+# aligned with the rest of the report engine. Workspace-observed techniques
+# are surfaced separately at render time via the ``observed`` argument to
+# :func:`_ctx_checklist`.
+_CHECKLIST_SEVERITY: dict[str, str] = {
+    # Critical — direct breakage of the domain or NTLM/Kerberos pillars.
+    "T1003": "critical", "T1003.001": "critical", "T1003.006": "critical",
+    "T1558.003": "critical", "T1558.004": "critical", "T1558": "critical",
+    "T1550.002": "critical", "T1550.003": "critical",
+    "T1078": "critical", "T1078.002": "critical",
+    "T1486": "critical",
+    # High — prerequisite or amplifier paths.
+    "T1110.003": "high", "T1187": "high",
+    "T1552.006": "high", "T1557.001": "high", "T1649": "high",
+    "T1098": "high", "T1136": "high",
+    "T1556.007": "high", "T1133": "high", "T1190": "high",
+    "T1068": "high", "T1021.001": "high", "T1021.002": "high",
+    # Medium — discovery and lateral helpers.
+    "T1110.001": "medium", "T1552.001": "medium", "T1555": "medium",
+    "T1018": "medium", "T1069": "medium", "T1087": "medium", "T1087.002": "medium",
+    "T1482": "medium", "T1570": "medium", "T1027": "medium", "T1070": "medium",
+}
+
+
+def _ctx_checklist(
+    *,
+    observed: set[str] | None = None,
+    has_workspace_signal: bool = False,
+) -> dict[str, Any]:
+    """Build the Jinja context for the MITRE Remediation Checklist.
+
+    The template renders ``observed_groups`` (techniques actually surfaced
+    by the scan, grouped by tactic) and ``reference_groups`` (the rest of
+    the catalog, for procurement / audit completeness). When no workspace
+    signal is available, ``observed_groups`` is empty and the template
+    falls back to rendering ``reference_groups`` only.
+    """
+    from adscan_internal.pro.reporting.checklist_content import (
+        TECHNIQUE_MITIGATIONS,
+    )
+    from adscan_internal.pro.reporting.mitre_data import (
+        TACTICS_ORDER,
+        TECHNIQUES,
+    )
+
+    observed = observed or set()
+    sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+    def _row(tid: str, name: str) -> dict[str, Any]:
+        return {
+            "id":         tid,
+            "name":       name,
+            "severity":   _CHECKLIST_SEVERITY.get(tid, "low"),
+            "mitigation": TECHNIQUE_MITIGATIONS.get(
+                tid, "Document the mitigation in the next sprint."
+            ),
+            "observed":   _is_observed(tid, observed),
+        }
+
+    by_tactic_obs: dict[str, list[dict[str, Any]]] = {t: [] for t in TACTICS_ORDER}
+    by_tactic_ref: dict[str, list[dict[str, Any]]] = {t: [] for t in TACTICS_ORDER}
+    for tid, meta in TECHNIQUES.items():
+        tactic = meta["tactic"]
+        if tactic not in by_tactic_obs:
+            continue
+        row = _row(tid, meta["name"])
+        if row["observed"]:
+            by_tactic_obs[tactic].append(row)
+        else:
+            by_tactic_ref[tactic].append(row)
+
+    def _make_groups(by_tactic: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        groups: list[dict[str, Any]] = []
+        for tactic in TACTICS_ORDER:
+            items = by_tactic.get(tactic) or []
+            if not items:
+                continue
+            items.sort(key=lambda it: (-sev_rank.get(it["severity"], 0), it["id"]))
+            groups.append({"tactic": tactic, "techniques": items})
+        return groups
+
+    observed_groups = _make_groups(by_tactic_obs) if has_workspace_signal else []
+    reference_groups = _make_groups(by_tactic_ref)
+
+    # When there is no workspace signal we still expose ``tactic_groups``
+    # in the legacy shape so any external override of the template keeps
+    # working. With signal, ``tactic_groups`` mirrors ``observed_groups``
+    # for the same reason.
+    tactic_groups = observed_groups if has_workspace_signal else reference_groups
+
+    return {
+        "tactic_groups":        tactic_groups,
+        "observed_groups":      observed_groups,
+        "reference_groups":     reference_groups,
+        "has_workspace_signal": has_workspace_signal,
+        "observed_count_total": sum(
+            len(g["techniques"]) for g in observed_groups
+        ),
+        "report_date":          time.strftime("%B %d, %Y"),
+    }
+
+
+def _ctx_coverage_matrix(
+    *,
+    observed: set[str] | None = None,
+    has_workspace_signal: bool = False,
+) -> dict[str, Any]:
+    """Build the Jinja context for the ADscan Coverage Matrix.
+
+    Produces two parallel row lists rendered by the template:
+
+    * ``observed_rows`` — techniques actually surfaced by the scan
+      (grouped by tactic, observed-first sort).
+    * ``reference_rows`` — the rest of the catalog for procurement /
+      compliance completeness.
+
+    The legacy ``rows`` field is preserved for backward template
+    compatibility and mirrors ``reference_rows`` when no workspace
+    signal is available, or the concatenation otherwise.
+    """
+    from adscan_internal.pro.reporting.compliance_mapping import (
+        FRAMEWORK_ORDER,
+        FRAMEWORKS,
+        controls_for,
+    )
+    from adscan_internal.pro.reporting.mitre_data import (
+        TACTICS_ORDER,
+        TECHNIQUES,
+    )
+
+    observed = observed or set()
+
+    by_tactic_obs: dict[str, list[tuple[str, str]]] = {t: [] for t in TACTICS_ORDER}
+    by_tactic_ref: dict[str, list[tuple[str, str]]] = {t: [] for t in TACTICS_ORDER}
+    for tid, meta in TECHNIQUES.items():
+        tactic = meta["tactic"]
+        if tactic not in by_tactic_obs:
+            continue
+        if _is_observed(tid, observed):
+            by_tactic_obs[tactic].append((tid, meta["name"]))
+        else:
+            by_tactic_ref[tactic].append((tid, meta["name"]))
+    for items in by_tactic_obs.values():
+        items.sort(key=lambda it: it[0])
+    for items in by_tactic_ref.values():
+        items.sort(key=lambda it: it[0])
+
+    def _build_rows(
+        by_tactic: dict[str, list[tuple[str, str]]],
+        is_observed_block: bool,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for tactic in TACTICS_ORDER:
+            items = by_tactic.get(tactic) or []
+            for index, (tid, name) in enumerate(items):
+                cells: list[str] = []
+                for fw_key in FRAMEWORK_ORDER:
+                    ids = controls_for(tid, fw_key)
+                    cells.append(", ".join(ids))
+                out.append({
+                    "tactic":          tactic,
+                    "first_in_tactic": index == 0,
+                    "id":              tid,
+                    "name":            name,
+                    "cells":           cells,
+                    "observed":        is_observed_block,
+                })
+        return out
+
+    observed_rows = _build_rows(by_tactic_obs, True) if has_workspace_signal else []
+    reference_rows = _build_rows(by_tactic_ref, False)
+
+    # Legacy single-list ``rows`` for any template that has not been
+    # updated yet. With workspace signal we concatenate observed first.
+    rows = observed_rows + reference_rows if has_workspace_signal else reference_rows
+
+    frameworks = [
+        {
+            "key":       k,
+            "label":     FRAMEWORKS[k]["label"],
+            "long_name": FRAMEWORKS[k]["long_name"],
+            "reference": FRAMEWORKS[k]["reference"],
+        }
+        for k in FRAMEWORK_ORDER
+    ]
+
+    # Coverage summary: per-framework count of techniques that have at
+    # least one mapped control. Used by the matrix header strip to give
+    # procurement / RFP readers an at-a-glance compliance signal before
+    # they read a single row.
+    total_techniques = sum(
+        1
+        for tid, meta in TECHNIQUES.items()
+        if meta["tactic"] in TACTICS_ORDER
+    )
+    per_framework_summary: list[dict[str, Any]] = []
+    for fw_key in FRAMEWORK_ORDER:
+        covered = sum(
+            1
+            for tid, meta in TECHNIQUES.items()
+            if meta["tactic"] in TACTICS_ORDER and controls_for(tid, fw_key)
+        )
+        pct = round((covered / total_techniques) * 100) if total_techniques else 0
+        per_framework_summary.append({
+            "key":     fw_key,
+            "label":   FRAMEWORKS[fw_key]["label"],
+            "covered": covered,
+            "total":   total_techniques,
+            "pct":     pct,
+        })
+    coverage_summary = {
+        "total_techniques": total_techniques,
+        "per_framework":    per_framework_summary,
+    }
+
+    version = os.environ.get("ADSCAN_VERSION", "").strip() or "1.0"
+    return {
+        "rows":                 rows,
+        "observed_rows":        observed_rows,
+        "reference_rows":       reference_rows,
+        "frameworks":           frameworks,
+        "coverage_summary":     coverage_summary,
+        "version":              version,
+        "report_date":          time.strftime("%B %d, %Y"),
+        "has_workspace_signal": has_workspace_signal,
+        "observed_count_total": len(observed_rows),
+    }
+
+
+# Builders that consume workspace signal share a uniform signature
+# ``builder(observed: set[str], has_workspace_signal: bool) -> dict``.
+# Cheatsheet remains static — operator desk reference, not a deliverable.
+_CONTEXT_BUILDERS_STATIC: dict[str, Callable[[], dict[str, Any]]] = {
+    "cheatsheet": _ctx_cheatsheet,
+}
+
+_CONTEXT_BUILDERS_DYNAMIC: dict[
+    str, Callable[..., dict[str, Any]]
+] = {
+    "playbook":        _ctx_playbook,
+    "checklist":       _ctx_checklist,
+    "coverage-matrix": _ctx_coverage_matrix,
+}
+
+
+def _build_context(
+    bonus_key: str,
+    workspace_dir: Path | None,
+) -> dict[str, Any]:
+    """Build the Jinja context for ``bonus_key``, threading workspace data.
+
+    Static bonuses (currently only the cheatsheet) ignore ``workspace_dir``.
+    Dynamic bonuses receive the observed-technique set and a boolean
+    flag indicating whether the workspace produced any usable signal —
+    they use the flag to decide whether to render the "observed in this
+    scan" sections.
+    """
+    if bonus_key in _CONTEXT_BUILDERS_STATIC:
+        return _CONTEXT_BUILDERS_STATIC[bonus_key]()
+
+    builder = _CONTEXT_BUILDERS_DYNAMIC.get(bonus_key)
+    if builder is None:
+        raise KeyError(f"No context builder for bonus '{bonus_key}'")
+
+    observed = _resolve_observed_techniques(workspace_dir)
+    has_signal = bool(observed)
+    if workspace_dir is not None and not has_signal:
+        # Workspace was supplied but produced no signal — operator must
+        # know the bonus is being rendered from the static catalog so
+        # they can investigate before sending it to the customer.
+        print_warning(
+            f"Bonus '{bonus_key}': no observed techniques in {workspace_dir} — "
+            "rendering the static reference catalog as fallback."
+        )
+    return builder(observed=observed, has_workspace_signal=has_signal)
+
+
+# ---------------------------------------------------------------------------
+# Core renderer — used by ``adscan deliver`` to produce each kit PDF.
+# ---------------------------------------------------------------------------
+
+def render_bonus(
+    bonus_key: str,
+    output_path: Path,
+    *,
+    is_sample: bool = False,
+    truncate: bool = False,
+    workspace_dir: Path | None = None,
+    theme: str | None = None,
+) -> int:
+    """Render a single bonus PDF to ``output_path``. Returns bytes written.
+
+    Args:
+        bonus_key: One of ``BONUSES`` keys.
+        output_path: Destination PDF path (parent dirs must exist).
+        is_sample: When ``True`` (only set by ``scripts/regenerate_samples.py``),
+            inject the public-sample watermark band on every page. The
+            cheatsheet is product documentation and is NEVER watermarked
+            even when this flag is set.
+        truncate: Playbook-only — render cover + narrative + Week 1 + a
+            preview-CTA page (≈4 pages) instead of the full 30-day plan.
+            Ignored for non-playbook bonuses.
+        workspace_dir: Optional workspace path. When supplied, the
+            playbook / checklist / coverage matrix bonuses re-rank their
+            content so techniques observed in the workspace's
+            ``technical_report.json`` surface above the static reference
+            catalog. Passing ``None`` (or a workspace with no findings)
+            falls back to the historical static behaviour with a visible
+            warning.
+        theme: Override the per-bonus default theme.  When non-empty,
+            ``"premium_dark"`` / ``"dark"`` → dark operator aesthetic;
+            ``"corporate_light"`` / ``"light"`` → white corporate theme
+            suitable for printing or board presentations.  Empty string or
+            ``None`` → use the theme catalogued in ``BONUSES[bonus_key]``.
+
+    Real customer flows (``adscan deliver``, web Celery
+    ``generate_deliverable_kit``) MUST NOT pass ``is_sample=True``.
+    """
+    _THEME_ALIASES = {"dark": "premium_dark", "light": "corporate_light"}
+    if bonus_key not in BONUSES:
+        raise KeyError(f"Unknown bonus '{bonus_key}'")
+
+    meta = BONUSES[bonus_key]
+    resolved_theme = _THEME_ALIASES.get(theme or "", theme or "") or meta["theme"]
+    template_source = _load_template(meta["template"])
+    theme_css = _load_theme(resolved_theme)
+    context = _build_context(bonus_key, workspace_dir)
+    if bonus_key == "playbook":
+        context["truncate"] = bool(truncate)
+    html_str = _render_html(template_source, context, theme_css)
+
+    # Cheatsheet is product docs — never watermarked even on sample runs.
+    if is_sample and bonus_key != "cheatsheet":
+        from adscan_internal.pro.reporting.sample_watermark import (
+            inject_sample_watermark,
+        )
+        html_str = inject_sample_watermark(html_str, is_sample=True)
+
+    pdf_bytes = _render_pdf(html_str)
+    output_path.write_bytes(pdf_bytes)
+    return len(pdf_bytes)
+
+
+# ---------------------------------------------------------------------------
+# LITE CLI surface — only the operator cheat sheet keeps a standalone command.
+# ---------------------------------------------------------------------------
+
+# Pre-baked LITE cheatsheet PDF. The LITE runtime ships without the PRO
+# reporting templates/engines, so it cannot render the cheatsheet on demand.
+# Instead the LITE Dockerfile copies a single pre-baked PDF here (the
+# private build pipeline produces it via ``scripts/bake_cheatsheet.sh``
+# using the PRO renderer and seeds it into the build context).
+_LITE_STATIC_CHEATSHEET_PATH = Path("/opt/adscan/static/cheatsheet/Quick_Start_Cheatsheet.pdf")
+
+
+def _try_use_baked_static(bonus_key: str, output_path: Path) -> int | None:
+    """When PRO renderer is unavailable, fall back to the pre-baked PDF.
+
+    Returns the number of bytes copied when the fallback succeeds, ``None``
+    when the fallback is not applicable (renderer is available or no
+    baked artefact exists for ``bonus_key``).
+
+    Currently only the LITE cheatsheet has a baked artefact — every other
+    bonus belongs to the PRO Client Deliverable Kit and is gated by the
+    exit-42 protocol upstream.
+    """
+    if bonus_key != "cheatsheet":
+        return None
+    try:
+        # If this import succeeds we have the PRO renderer; defer to it.
+        import adscan_internal.pro  # noqa: F401
+        return None
+    except ModuleNotFoundError:
+        pass
+
+    if not _LITE_STATIC_CHEATSHEET_PATH.is_file():
+        # Image build pipeline failed to seed the asset. Surface the
+        # condition clearly so it's a build-pipeline bug, not a silent
+        # "your free thing is broken" moment for the operator.
+        print_error(
+            "LITE cheatsheet asset missing — the pre-baked PDF was not "
+            "found at the expected path. This is a build-pipeline issue: "
+            "rebuild the LITE image with `./scripts/build_docker_lite_image.sh --dev`."
+        )
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_bytes = _LITE_STATIC_CHEATSHEET_PATH.read_bytes()
+    output_path.write_bytes(pdf_bytes)
+    return len(pdf_bytes)
+
+
+def _run_one(args: argparse.Namespace, bonus_key: str) -> int:
+    """Generic single-bonus runner — currently used only by ``run_cheatsheet``."""
+    output_override = getattr(args, "output_path", None)
+    no_open = bool(getattr(args, "no_open", False))
+    no_render = bool(getattr(args, "no_render", False))
+
+    output_path = _resolve_output_path(bonus_key, output_override)
+
+    if no_render:
+        try:
+            meta = BONUSES[bonus_key]
+            tpl = _load_template(meta["template"])
+            ctx = _build_context(bonus_key, None)
+            _render_html(tpl, ctx, _load_theme(meta["theme"]))
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error(f"Bonus dry-run failed: {exc}")
+            return 1
+        print_success(f"{BONUSES[bonus_key]['title']} dry-run OK (no PDF written).")
+        return 0
+
+    # LITE fast-path: if PRO renderer is stripped, copy the pre-baked PDF.
+    baked_size = _try_use_baked_static(bonus_key, output_path)
+    if baked_size is not None:
+        size = baked_size
+    else:
+        try:
+            size = render_bonus(bonus_key, output_path)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error(f"Could not render {BONUSES[bonus_key]['title']}: {exc}")
+            return 1
+
+    # Show the HOST path so the operator can copy/paste it. Inside the
+    # container the artefact lives at /opt/adscan/bonuses/<file>, but the
+    # bind mount surfaces the same bytes at ~/.adscan/bonuses/<file> on
+    # the host — that's the path they'll actually need.
+    from adscan_internal.services.host_open import display_host_path
+
+    host_display = display_host_path(output_path)
+    print_info(f"Wrote {size:,} bytes to {host_display}.")
+    _print_completion_panel(bonus_key, output_path)
+    if not no_open:
+        _maybe_prompt_open(output_path)
+    return 0
+
+
+def run_cheatsheet(args: argparse.Namespace) -> int:
+    """``adscan cheatsheet`` entry point (LITE-tier operator desk reference)."""
+    return _run_one(args, "cheatsheet")
+
+
+def add_cheatsheet_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the LITE-tier ``cheatsheet`` subparser on the main argparse tree."""
+    parser = subparsers.add_parser(
+        "cheatsheet",
+        help="Render the Quick-Start Cheat Sheet PDF (operator companion).",
+    )
+    parser.add_argument(
+        "--output",
+        dest="output_path",
+        default=None,
+        help=(
+            "Override the output PDF path. Default: "
+            f"~/.adscan/bonuses/{BONUSES['cheatsheet']['filename']}"
+        ),
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not prompt to open the PDF after rendering.",
+    )
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="Smoke / dry-run only — verify template + content, skip PDF render.",
+    )
+
+
+__all__ = [
+    "BONUSES",
+    "add_cheatsheet_subparser",
+    "render_bonus",
+    "run_cheatsheet",
+]

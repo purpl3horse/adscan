@@ -84,7 +84,12 @@ class Domain:
     )  # {host: {service: {user: password}}}
     kerberos_tickets: Dict[str, str] = field(
         default_factory=dict
-    )  # {username: ticket_path}
+    )  # {username: ticket_path} — TGTs only (validated via kerberos_ccache_inspector)
+    service_tickets: List[Dict[str, Any]] = field(
+        default_factory=list
+    )  # Derived STs from RBCD / S4U / constrained delegation / silver tickets.
+    # Each entry is a ServiceTicket.to_dict() payload; see
+    # adscan_internal.models.service_ticket for the schema.
     kerberos_keys: Dict[str, Dict[str, str]] = field(default_factory=dict)
     rodc_followup_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     auth_posture: Dict[str, Any] = field(default_factory=dict)
@@ -123,6 +128,7 @@ class Domain:
             "credentials": self.credentials,
             "local_credentials": self.local_credentials,
             "kerberos_tickets": self.kerberos_tickets,
+            "service_tickets": self.service_tickets,
             "kerberos_keys": self.kerberos_keys,
             "rodc_followup_state": self.rodc_followup_state,
             "auth_posture": self.auth_posture,
@@ -167,6 +173,7 @@ class Domain:
             credentials=data.get("credentials", {}),
             local_credentials=data.get("local_credentials", {}),
             kerberos_tickets=data.get("kerberos_tickets", {}),
+            service_tickets=list(data.get("service_tickets", []) or []),
             kerberos_keys=data.get("kerberos_keys", {}),
             rodc_followup_state=data.get("rodc_followup_state", {}),
             auth_posture=data.get("auth_posture", {}),
@@ -233,3 +240,95 @@ class Domain:
         self.current_phase = phase
         self.phase_progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
         self.updated_at = utc_now()
+
+
+def resolve_dc_ip(domain_data: dict) -> str | None:
+    """Return the best-available DC/KDC IP from a domains_data entry.
+
+    Fallback chain: pdc → dc_ip → dcs[0] → None.
+    'pdc' is the authoritative IP set at scan start and is the most reliably
+    populated field. 'dc_ip' is the model field. 'dcs[0]' is the last resort
+    from the discovered DC list.
+
+    Use this everywhere a KDC or DC IP must be resolved from domains_data
+    instead of hand-rolling .get("dc_ip") / .get("pdc") chains at each call site.
+    """
+    pdc = str(domain_data.get("pdc") or "").strip()
+    if pdc:
+        return pdc
+    dc_ip = str(domain_data.get("dc_ip") or "").strip()
+    if dc_ip:
+        return dc_ip
+    dcs: list = domain_data.get("dcs") or []
+    if dcs:
+        first = str(dcs[0]).strip()
+        if first:
+            return first
+    return None
+
+
+def resolve_dc_fqdn(
+    domain_data: dict,
+    *,
+    target_domain: str,
+    ip_hostname_inventory: dict | None = None,
+) -> str | None:
+    """Return the best-available DC FQDN for Kerberos SPN targeting.
+
+    Symmetric to ``resolve_dc_ip``: walks the canonical fallback chain over a
+    ``domains_data`` entry and returns ``None`` when no FQDN is recoverable.
+    Centralises the lookup so transport-config builders never have to remember
+    every alias the collector might have populated.
+
+    Fallback chain:
+        1. ``pdc_hostname_fqdn`` (collector canonical FQDN)
+        2. ``pdc_fqdn``           (legacy alias)
+        3. ``dc_fqdn``             (model field)
+        4. ``pdc_hostname``        — kept as-is when already FQDN, promoted to
+           ``"<host>.<target_domain>"`` when short; rejected when it is an IP.
+        5. ``ip_hostname_inventory`` (massdns/reachability map IP → hostnames)
+        6. ``None``                (caller decides whether to fail loud)
+
+    Args:
+        domain_data: One ``domains_data[domain]`` entry.
+        target_domain: DNS domain name; used to promote short hostnames.
+        ip_hostname_inventory: Optional ``{ip: [hostname, …]}`` map loaded via
+            ``load_workspace_ip_hostname_inventory``. When provided and no
+            FQDN was found above, the resolver maps the resolved DC IP to a
+            hostname candidate that ends in ``.<target_domain>`` when possible.
+
+    Returns:
+        FQDN string with no trailing dot, or ``None``.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address  # noqa: PLC0415
+
+    target_domain_clean = str(target_domain or "").strip().rstrip(".")
+
+    for key in ("pdc_hostname_fqdn", "pdc_fqdn", "dc_fqdn"):
+        candidate = str(domain_data.get(key) or "").strip().rstrip(".")
+        if candidate and not is_ip_address(candidate):
+            return candidate
+
+    pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip().rstrip(".")
+    if pdc_hostname and not is_ip_address(pdc_hostname):
+        if "." in pdc_hostname:
+            return pdc_hostname
+        if target_domain_clean:
+            return f"{pdc_hostname}.{target_domain_clean}"
+
+    if ip_hostname_inventory:
+        from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+            choose_hostname_for_kerberos_spn,
+        )
+
+        dc_ip = resolve_dc_ip(domain_data)
+        if dc_ip:
+            chosen = choose_hostname_for_kerberos_spn(
+                ip=dc_ip,
+                domain=target_domain_clean or None,
+                inventory=ip_hostname_inventory,
+            )
+            if chosen and not is_ip_address(chosen):
+                return chosen
+
+    return None

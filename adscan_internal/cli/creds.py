@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from adscan_internal.services.credentials import CredentialMetadata
 
 from rich.panel import Panel
 from rich.prompt import Confirm
@@ -34,7 +36,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
-from adscan_internal.rich_output import BRAND_COLORS, mark_sensitive, print_panel
+from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
@@ -45,6 +47,27 @@ from adscan_internal.cli.cracking import (
 from adscan_internal.services.session_compromise_state_service import (
     mark_session_user_compromised,
 )
+from adscan_internal.models.domain import resolve_dc_ip
+from adscan_core.theme import (
+    ADSCAN_PRIMARY,
+    COLOR_AMBER,
+    COLOR_CRIMSON,
+    COLOR_MUTED,
+    COLOR_SAGE,
+    COLOR_STEEL,
+)
+
+# UX glyphs paired with semantic colors so the credential surfaces remain
+# readable in NO_COLOR / monochrome terminals. Every state badge in this
+# module leads with a glyph so meaning never depends on color alone.
+GLYPH_VERIFIED = "✓"   # ✓ stored / verified
+GLYPH_FAILED = "✗"     # ✗ rejected / failed
+GLYPH_WARNING = "⚠"    # ⚠ caution
+GLYPH_JACKPOT = "★"    # ★ Tier-0 / DA jackpot
+GLYPH_PENDING = "○"    # ○ awaiting
+GLYPH_ACTIVE = "●"     # ● active
+GLYPH_NEXT = "▸"       # ▸ suggested next action
+GLYPH_BULLET = "•"     # • neutral list bullet
 
 NON_SPRAYABLE_CREDSWEEPER_RULES = {"uuid"}
 UUID_VALUE_RE = re.compile(
@@ -175,18 +198,18 @@ def ensure_domain_ready_for_manual_credential_save(
     print_panel(
         "\n".join(
             [
-                "⚠️ Domain not initialized in this workspace.",
-                f"Domain: {marked_domain}",
-                f"Credential user: {marked_user}",
-                f"Requested operation: {operation_scope}",
+                f"{GLYPH_WARNING} Domain not initialized in this workspace.",
+                f"Domain:           {marked_domain}",
+                f"Credential user:  {marked_user}",
+                f"Requested:        {operation_scope}",
                 "",
                 "Recommended workflow:",
-                "1) Run `start_auth` first to initialize domain context, validate DNS/DC, and verify credentials.",
-                "2) After `start_auth`, use `creds save` only to add additional credentials discovered later.",
+                f"  {GLYPH_BULLET} Run `start_auth` first to initialize domain context, validate DNS/DC, and verify credentials.",
+                f"  {GLYPH_BULLET} After `start_auth`, use `creds save` only to add additional credentials discovered later.",
             ]
         ),
-        title="[bold yellow]Initialize Domain First[/bold yellow]",
-        border_style="yellow",
+        title=f"[bold {COLOR_AMBER}]{GLYPH_WARNING} Initialize Domain First[/bold {COLOR_AMBER}]",
+        border_style=COLOR_AMBER,
         expand=False,
     )
     print_instruction("Run `start_auth` now to initialize this domain properly.")
@@ -212,6 +235,80 @@ def ensure_domain_ready_for_manual_credential_save(
     return False
 
 
+def _resolve_credential_provenance_label(
+    shell: Any, *, domain: str, user: str
+) -> str:
+    """Return a compact provenance attribution for a stored credential.
+
+    Reads the recorded ``source_steps`` (when present) and derives a short
+    "via X" label (spray, kerberoast, DCSync, GPP, LAPS, backup_operators,
+    ADCS, manual save, ...). When nothing is recorded the label degrades to
+    a neutral marker so the column never goes blank.
+    """
+    try:
+        domain_data = (shell.domains_data or {}).get(domain, {}) or {}
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+    meta_root = domain_data.get("credentials_meta") or {}
+    user_meta = meta_root.get(user) if isinstance(meta_root, dict) else None
+    if isinstance(user_meta, dict):
+        origin = str(user_meta.get("credential_origin") or "").strip()
+        if origin:
+            normalized = origin.lower()
+            mapping = {
+                "readlapspassword": "LAPS read",
+                "synclapspassword": "LAPS sync",
+                "gpppassword": "GPP cpassword",
+                "gpp_cpassword": "GPP cpassword",
+                "gpp_autologon": "GPP autologon",
+                "userdescription": "user description",
+                "user_description": "user description",
+                "kerberoast": "kerberoast",
+                "asreproast": "AS-REP roast",
+                "timeroast": "timeroast",
+                "dcsync": "DCSync",
+                "backup_operators": "Backup Operators",
+                "adcs_esc1": "ADCS ESC1",
+                "adcs_esc4": "ADCS ESC4",
+                "adcs": "ADCS",
+                "spray": "password spray",
+                "manual": "manual save",
+                "force_change_password": "ForceChangePassword",
+                "shadow_credentials": "shadow credentials",
+                "lsass_dump": "LSASS dump",
+                "sam_dump": "SAM dump",
+                "lsa_secrets": "LSA secrets",
+                "dpapi": "DPAPI",
+                "gmsa": "gMSA",
+                "rodc_key_list": "RODC key list",
+                "writelogonscript": "WriteLogonScript",
+                "winrm_creds": "WinRM session",
+                "rdp_creds": "RDP session",
+            }
+            for key, label in mapping.items():
+                if key in normalized:
+                    return label
+            return origin
+
+    # Fall back to scanning the attack graph provenance edges when available.
+    try:
+        graph_provenance = domain_data.get("credential_provenance") or {}
+        user_steps = (
+            graph_provenance.get(user) if isinstance(graph_provenance, dict) else None
+        )
+        if isinstance(user_steps, list) and user_steps:
+            first = user_steps[0]
+            if isinstance(first, dict):
+                relation = str(first.get("relation") or first.get("kind") or "").strip()
+                if relation:
+                    return relation
+    except Exception:  # noqa: BLE001
+        pass
+
+    return "unknown"
+
+
 def show_creds(shell: Any) -> None:
     """Display all stored credentials using Rich Tables, Panels, and Trees.
 
@@ -219,8 +316,15 @@ def show_creds(shell: Any) -> None:
         shell: The PentestShell instance with domains_data and license_mode.
     """
     if not shell.domains_data:
-        shell.console.print(
-            Text("No credentials stored in the current workspace.", style="yellow")
+        empty_body = Text.from_markup(
+            f"[{COLOR_MUTED}]{GLYPH_PENDING} No credentials stored in the current workspace.[/{COLOR_MUTED}]\n"
+            f"[{COLOR_MUTED}]Next:[/{COLOR_MUTED}] [bold]{GLYPH_NEXT}[/bold] run `start_auth` to capture and validate your first credential."
+        )
+        print_panel(
+            empty_body,
+            title=f"[bold {COLOR_MUTED}]Credential Store[/bold {COLOR_MUTED}]",
+            border_style=COLOR_MUTED,
+            expand=False,
         )
         return
 
@@ -229,67 +333,139 @@ def show_creds(shell: Any) -> None:
         domain_renderables = []
         creds_found_for_this_domain = False
 
-        # Domain credentials
+        # Domain credentials.
         if "credentials" in data and data["credentials"]:
             creds_found_for_this_domain = True
             overall_creds_found = True
 
             domain_creds_table = Table(
-                title=Text("Domain Credentials", style=f"bold {BRAND_COLORS['info']}"),
+                title=Text(
+                    "Domain Credentials",
+                    style=f"bold {ADSCAN_PRIMARY}",
+                ),
                 show_header=True,
-                header_style=f"bold {BRAND_COLORS['info']}",
+                header_style=f"bold {ADSCAN_PRIMARY}",
                 box=rich.box.ROUNDED,
+                pad_edge=False,
+            )
+            domain_creds_table.add_column("", width=2, no_wrap=True)
+            domain_creds_table.add_column(
+                "User", style=COLOR_SAGE, width=28, overflow="fold"
             )
             domain_creds_table.add_column(
-                "User", style="green", width=30, overflow="fold"
+                "Kind", style=COLOR_STEEL, width=10, no_wrap=True
             )
             domain_creds_table.add_column(
-                "Credential", style="white", width=40, overflow="fold"
+                "Credential", style="white", width=38, overflow="fold"
+            )
+            domain_creds_table.add_column(
+                "Provenance", style=COLOR_MUTED, width=22, overflow="fold"
             )
             for user, cred_value in data["credentials"].items():
                 cred_display = str(cred_value)
                 marked_user = mark_sensitive(user, "user")
                 marked_cred_display = mark_sensitive(cred_display, "password")
-                domain_creds_table.add_row(marked_user, marked_cred_display)
+                try:
+                    is_hash_cred = is_hash(cred_display)
+                except Exception:  # noqa: BLE001
+                    is_hash_cred = False
+                kind_cell = (
+                    Text(f"{GLYPH_BULLET} hash", style=COLOR_AMBER)
+                    if is_hash_cred
+                    else Text(f"{GLYPH_BULLET} pass", style=COLOR_STEEL)
+                )
+                glyph_cell = Text(GLYPH_VERIFIED, style=COLOR_SAGE)
+                provenance = _resolve_credential_provenance_label(
+                    shell, domain=domain, user=user
+                )
+                provenance_cell = Text(
+                    f"via {provenance}",
+                    style=COLOR_MUTED if provenance == "unknown" else COLOR_STEEL,
+                )
+                domain_creds_table.add_row(
+                    glyph_cell,
+                    marked_user,
+                    kind_cell,
+                    marked_cred_display,
+                    provenance_cell,
+                )
             domain_renderables.append(domain_creds_table)
 
-        # Local credentials
+        # Local credentials.
         if "local_credentials" in data and data["local_credentials"]:
             creds_found_for_this_domain = True
             overall_creds_found = True
             domain_renderables.append(
-                Text("\nLocal Credentials", style=f"bold {BRAND_COLORS['info']}")
+                Text(
+                    f"\n{GLYPH_BULLET} Local Credentials",
+                    style=f"bold {ADSCAN_PRIMARY}",
+                )
             )
-            local_creds_tree_root = Tree("[bold]Hosts[/bold]")
+            local_creds_tree_root = Tree(
+                Text("Hosts", style=f"bold {COLOR_STEEL}")
+            )
 
             for host, services in data["local_credentials"].items():
                 host_branch = local_creds_tree_root.add(
-                    Text(host, style=BRAND_COLORS["info"])
+                    Text(f"{GLYPH_ACTIVE} {host}", style=COLOR_STEEL)
                 )
                 for service, users in services.items():
-                    service_branch = host_branch.add(Text(service, style="purple"))
+                    service_branch = host_branch.add(
+                        Text(service, style=ADSCAN_PRIMARY)
+                    )
                     for user, cred_value in users.items():
                         cred_display = str(cred_value)
+                        marked_user_local = mark_sensitive(user, "user")
+                        marked_cred_local = mark_sensitive(cred_display, "password")
                         service_branch.add(
-                            Text(
-                                f"User: {user}, Credential: {cred_display}",
-                                style="white",
+                            Text.from_markup(
+                                f"[{COLOR_SAGE}]{GLYPH_VERIFIED}[/{COLOR_SAGE}] "
+                                f"[bold]{marked_user_local}[/bold] "
+                                f"[{COLOR_MUTED}]=>[/{COLOR_MUTED}] {marked_cred_local}"
                             )
                         )
             domain_renderables.append(local_creds_tree_root)
 
         if creds_found_for_this_domain:
-            from adscan_internal import print_panel
-
             marked_domain = mark_sensitive(domain, "domain")
+            # Verdict-first title: state the domain and the high-level posture
+            # before the table renders, so operators scanning many domains in
+            # a long session can triage at-a-glance.
+            domain_data = shell.domains_data.get(domain, {}) or {}
+            auth_status = str(domain_data.get("auth", "unauth") or "unauth").lower()
+            if auth_status == "pwned":
+                verdict_glyph, verdict_color, verdict_text = (
+                    GLYPH_JACKPOT,
+                    COLOR_CRIMSON,
+                    "DOMAIN COMPROMISED",
+                )
+            elif auth_status == "auth":
+                verdict_glyph, verdict_color, verdict_text = (
+                    GLYPH_VERIFIED,
+                    COLOR_SAGE,
+                    "AUTHENTICATED",
+                )
+            else:
+                verdict_glyph, verdict_color, verdict_text = (
+                    GLYPH_PENDING,
+                    COLOR_MUTED,
+                    "UNAUTHENTICATED",
+                )
             print_panel(
                 domain_renderables,
-                title=f"[bold {BRAND_COLORS['info']}]Domain: {marked_domain}[/bold {BRAND_COLORS['info']}]",
-                border_style=BRAND_COLORS["info"],
+                title=(
+                    f"[bold {verdict_color}]{verdict_glyph} {verdict_text}"
+                    f"[/bold {verdict_color}] "
+                    f"[{COLOR_MUTED}]:[/{COLOR_MUTED}] "
+                    f"[bold {ADSCAN_PRIMARY}]{marked_domain}[/bold {ADSCAN_PRIMARY}]"
+                ),
+                border_style=verdict_color,
             )
 
     if not overall_creds_found:
-        print_warning("No credentials found in any domain.")
+        print_warning(
+            f"{GLYPH_PENDING} No credentials found in any domain."
+        )
 
 
 def clear_creds(shell: Any, domain: str) -> None:
@@ -383,26 +559,39 @@ def _prompt_for_domain_user_selection(
     """
     print_panel(
         Text.from_markup(
-            f"[bold {BRAND_COLORS['info']}]{domain}[/bold {BRAND_COLORS['info']}]",
+            f"[bold {ADSCAN_PRIMARY}]{GLYPH_ACTIVE} {domain}[/bold {ADSCAN_PRIMARY}]",
             justify="center",
         ),
-        title=f"[bold {BRAND_COLORS['info']}]Domain[/bold {BRAND_COLORS['info']}]",
-        border_style=BRAND_COLORS["info"],
+        title=f"[bold {ADSCAN_PRIMARY}]Domain[/bold {ADSCAN_PRIMARY}]",
+        border_style=ADSCAN_PRIMARY,
         expand=False,
         padding=(0, 1),
     )
     table = Table(
-        title=f"[bold {BRAND_COLORS['info']}]Available Users[/bold {BRAND_COLORS['info']}]",
+        title=f"[bold {ADSCAN_PRIMARY}]Available Users[/bold {ADSCAN_PRIMARY}]",
         box=rich.box.ROUNDED,
         show_lines=True,
-        title_style=f"bold {BRAND_COLORS['info']}",
+        title_style=f"bold {ADSCAN_PRIMARY}",
     )
-    table.add_column("ID", style="dim white", width=6, justify="center")
-    table.add_column("Username", style="bold magenta")
+    table.add_column("ID", style=COLOR_MUTED, width=6, justify="center")
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("Username", style=f"bold {COLOR_SAGE}")
+    table.add_column("Provenance", style=COLOR_MUTED, overflow="fold")
 
     for idx, user_name in enumerate(user_list):
         marked_user_name = mark_sensitive(user_name, "user")
-        table.add_row(str(idx + 1), marked_user_name)
+        provenance = _resolve_credential_provenance_label(
+            shell, domain=domain, user=user_name
+        )
+        table.add_row(
+            str(idx + 1),
+            Text(GLYPH_VERIFIED, style=COLOR_SAGE),
+            marked_user_name,
+            Text(
+                f"via {provenance}",
+                style=COLOR_MUTED if provenance == "unknown" else COLOR_STEEL,
+            ),
+        )
 
     print_table(table)
 
@@ -687,17 +876,18 @@ def _ensure_verified_domain_credential_ticket(
         dc_ip = None
         if "dc_ip" in shell.domains_data.get(domain, {}):
             dc_ip = shell.domains_data[domain]["dc_ip"]
-        ccache_file = shell._auto_generate_kerberos_ticket(
-            user, credential, domain, dc_ip
-        )
+
+        tgt_result = shell._auto_generate_kerberos_ticket_result(user, credential, domain, dc_ip)
+
         marked_user = mark_sensitive(user, "user")
         marked_domain = mark_sensitive(domain, "domain")
-        if ccache_file:
+
+        if tgt_result is not None and tgt_result.success and tgt_result.ticket_path:
             store_service.store_kerberos_ticket(
                 domains_data=shell.domains_data,
                 domain=domain,
                 username=user,
-                ticket_path=ccache_file,
+                ticket_path=tgt_result.ticket_path,
             )
             if not ui_silent:
                 print_info(
@@ -708,14 +898,33 @@ def _ensure_verified_domain_credential_ticket(
                     f"[ui_silent] Kerberos ticket generated for {marked_user}@{marked_domain}"
                 )
         else:
-            if not ui_silent:
-                print_warning(
-                    f"Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
+            error_kind = getattr(tgt_result, "error_kind", None) if tgt_result is not None else None
+            if error_kind == "rc4_disabled":
+                from adscan_internal.services.auth_posture_service import record_rc4_disabled_signal
+                record_rc4_disabled_signal(
+                    shell.domains_data,
+                    domain=domain,
+                    source="kerberos_ticket_service",
+                    signal="KDC_ERR_ETYPE_NOSUPP",
+                    message=getattr(tgt_result, "error_message", None),
                 )
+                if shell.current_workspace_dir:
+                    shell.save_workspace_data()
+                if not ui_silent:
+                    print_warning(
+                        f"Domain {marked_domain} requires AES for Kerberos (RC4 disabled). "
+                        f"No Kerberos ticket generated for {marked_user}. "
+                        "NTLM will be used if available, or supply a password for AES Kerberos."
+                    )
             else:
-                print_info_verbose(
-                    f"[ui_silent] Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
-                )
+                if not ui_silent:
+                    print_warning(
+                        f"Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
+                    )
+                else:
+                    print_info_verbose(
+                        f"[ui_silent] Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
+                    )
     except Exception as e:  # noqa: BLE001
         telemetry.capture_exception(e)
         marked_user = mark_sensitive(user, "user")
@@ -775,7 +984,8 @@ def handle_auth_and_optional_privs(
             return "full_scan"
         if not prompt_when_already_authenticated:
             return "full_scan" if force_authenticated_enumeration else "skip"
-        if getattr(shell, "auto", False) or not sys.stdin.isatty():
+        from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+        if _is_non_interactive(shell):
             print_info_debug(
                 "[creds] start_auth re-run on already-auth domain in non-interactive mode; "
                 "defaulting to full authenticated scan."
@@ -810,19 +1020,19 @@ def handle_auth_and_optional_privs(
         print_panel(
             "\n".join(
                 [
-                    "This domain is already marked as authenticated in the current workspace.",
-                    f"Workspace type: {str(workspace_type or 'unknown').upper()}",
-                    f"Domain: {marked_domain}",
+                    f"{GLYPH_ACTIVE} This domain is already marked as authenticated in the current workspace.",
+                    f"Workspace type:  {str(workspace_type or 'unknown').upper()}",
+                    f"Domain:          {marked_domain}",
                     "",
                     scan_focus,
                     "",
                     "Choose how to proceed:",
-                    "1) Rerun the full authenticated scan pipeline now",
-                    "2) Skip the full scan and stay on the current user context",
+                    "  1. Rerun the full authenticated scan pipeline now",
+                    "  2. Skip the full scan and stay on the current user context",
                 ]
             ),
-            title="[bold cyan]Authenticated Domain Already Initialized[/bold cyan]",
-            border_style="cyan",
+            title=f"[bold {COLOR_STEEL}]{GLYPH_ACTIVE} Authenticated Domain Already Initialized[/bold {COLOR_STEEL}]",
+            border_style=COLOR_STEEL,
             expand=False,
         )
 
@@ -956,7 +1166,22 @@ def handle_auth_and_optional_privs(
         return "other", "other"
 
     def _get_terminal_attack_path_search_mode() -> str | None:
-        """Return the canonical terminal search mode when the active step is last."""
+        """Return the canonical terminal search mode when the active step is last.
+
+        ``search_mode_label`` is set by the attack-path execution engine when it
+        opens an active step.  Most call sites pass canonical labels
+        (``direct_compromise``, ``pivot``, ``followup_terminal``, ``low_priv``)
+        or their visible aliases.  Bespoke follow-ups (e.g. RODC PRP control
+        path) sometimes pass descriptive strings that don't normalize to any
+        canonical mode — in that case the field arrives as a free-form string
+        the alias table cannot map.
+
+        To stay robust as new follow-ups are added, when the label cannot be
+        normalized we **derive** the search mode from ``compromise_semantics``
+        instead.  ``compromise_semantics`` is the catalog-level source of truth
+        for what kind of compromise a relation produces, so the derivation is
+        always correct as long as the relation is in the step catalog.
+        """
         context = get_attack_path_step_context(shell)
         raw_search_mode = str(context.get("search_mode_label") or "").strip()
         search_mode = normalize_search_mode_label(raw_search_mode)
@@ -972,23 +1197,72 @@ def handle_auth_and_optional_privs(
                 f"context={mark_sensitive(str(context), 'detail')}"
             )
             return None
-        terminal_mode = (
-            search_mode
-            if search_mode
-            in {"pivot", "direct_compromise", "followup_terminal"}
-            and step_index > 0
-            and step_index == last_executable_idx
-            else None
-        )
+
+        canonical_modes = {"pivot", "direct_compromise", "followup_terminal", "low_priv"}
+        is_terminal_step = step_index > 0 and step_index == last_executable_idx
+
+        derivation_source = "search_mode_label"
+        terminal_mode: str | None
+        if search_mode in canonical_modes and is_terminal_step:
+            terminal_mode = search_mode
+        elif is_terminal_step:
+            # Fallback: derive from compromise_semantics (catalog-level truth).
+            # Maps every catalog semantic that has a sensible terminal-mode
+            # interpretation; everything else stays ``None`` (no terminal
+            # classification).
+            semantics_to_mode = {
+                "direct_target_compromise": "direct_compromise",
+                "access_capability_only": "followup_terminal",
+                "credential_access_only": "followup_terminal",
+            }
+            derived = semantics_to_mode.get(compromise_semantics)
+            if derived:
+                terminal_mode = derived
+                derivation_source = "compromise_semantics"
+            else:
+                terminal_mode = None
+        else:
+            terminal_mode = None
+
         print_info_debug(
             "[creds] terminal attack-path check: "
-            f"search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
+            f"raw_search_mode_label={mark_sensitive(raw_search_mode or 'none', 'detail')} "
+            f"normalized_search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
             f"compromise_semantics={mark_sensitive(compromise_semantics, 'detail')} "
             f"compromise_effort={mark_sensitive(compromise_effort, 'detail')} "
             f"step_index={step_index} last_executable_idx={last_executable_idx} "
-            f"result={mark_sensitive(terminal_mode or 'none', 'detail')}"
+            f"result={mark_sensitive(terminal_mode or 'none', 'detail')} "
+            f"derived_via={derivation_source}"
         )
+        if (
+            is_terminal_step
+            and search_mode not in canonical_modes
+            and raw_search_mode
+        ):
+            # Surface the bespoke label so the team knows which producer is
+            # using a non-canonical string.  The fallback derivation kept the
+            # behaviour correct, so this is a hint, not a failure.
+            print_info_debug(
+                "[creds] terminal attack-path: search_mode_label is non-canonical "
+                f"(raw={mark_sensitive(raw_search_mode, 'detail')!r}); "
+                "falling back to compromise_semantics. Consider passing one of "
+                f"{sorted(canonical_modes)} from the producing call site."
+            )
         return terminal_mode
+
+    def _is_active_attack_path_step_terminal() -> bool:
+        """Return True when the active attack-path step is the last executable step."""
+        context = get_attack_path_step_context(shell)
+        try:
+            step_index = int(context.get("step_index") or 0)
+            last_executable_idx = int(context.get("last_executable_idx") or 0)
+        except (TypeError, ValueError):
+            print_info_debug(
+                "[creds] terminal step check: invalid attack-path step context "
+                f"context={mark_sensitive(str(context), 'detail')}"
+            )
+            return False
+        return step_index > 0 and step_index == last_executable_idx
 
     def _is_terminal_pivot_attack_step() -> bool:
         """Return True when the active step is the final pivot-search step."""
@@ -1272,6 +1546,12 @@ def handle_auth_and_optional_privs(
         )
         if compromise_semantics != "direct_target_compromise":
             return False
+        if not _is_active_attack_path_step_terminal():
+            print_info_debug(
+                "[creds] attack-context direct-compromise flow: disabled "
+                "(active step is not terminal)"
+            )
+            return False
 
         normalized_user = normalize_samaccountname(user)
         if not normalized_user or not target_principal:
@@ -1323,12 +1603,90 @@ def handle_auth_and_optional_privs(
             f"(auth={updated_auth_status!r})"
         )
 
+    # Defensive cleanup: an earlier (buggy) version stored the dedup set inside
+    # domains_data[domain]["_privs_assessed_users"] which broke JSON
+    # serialization.  Scrub it once on entry so workspaces resumed from that
+    # buggy state can still serialize cleanly.
+    try:
+        _stale_entry = shell.domains_data.get(domain) if isinstance(shell.domains_data, dict) else None
+        if isinstance(_stale_entry, dict) and "_privs_assessed_users" in _stale_entry:
+            _stale_entry.pop("_privs_assessed_users", None)
+    except Exception:  # noqa: BLE001
+        pass
+
     for user, cred in users_with_creds:
         if not user or (cred is None) or (cred == "" and not allow_empty_credentials):
             continue
         try:
             if skip_user_privs_enumeration:
                 continue
+
+            # Dedup guard: skip privilege enumeration for users that were already
+            # assessed this session.  This prevents the DCSync → fallback LSA dump
+            # → re-add machine account → re-ask DCSync loop.
+            # The set lives as a shell attribute (not domains_data) so it never
+            # gets serialized to workspace JSON — resets on adscan restart only.
+            #
+            # Exception: when re-adding a Domain Admin credential while the domain
+            # is NOT yet pwned, fall through and re-run the privilege check.  The
+            # operator likely wants progress (a manual `dump lsa`, a different
+            # attack path, changed network conditions, etc.).  Safe because the
+            # "DA-already-captured" short-circuit in
+            # _offer_machine_account_dump_fallback prevents the DCSync→fallback
+            # automated loop independently.
+            _by_domain: dict[str, set[str]] = getattr(shell, "_privs_assessed_users_by_domain", None) or {}
+            if not isinstance(_by_domain, dict):
+                _by_domain = {}
+            _assessed: set[str] = _by_domain.setdefault(domain, set())
+            setattr(shell, "_privs_assessed_users_by_domain", _by_domain)
+            _user_key = normalize_samaccountname(user).lower()
+            if _user_key in _assessed:
+                # Use the canonical DA-or-high-value resolver: layered fallback
+                # of (1) is_user_tier0_or_high_value (graph + snapshot + cached
+                # lists) and (2) is_well_known_da_name (localized Administrator
+                # variants + krbtgt + persisted builtin_administrator_name).
+                # Covers custom DA names (svc_eng_admin), localized DAs
+                # (Administrador, Administrateur), and the early-pentest window
+                # before any LDAP collection has run.
+                from adscan_internal.services.high_value import (
+                    is_user_da_or_high_value,
+                )
+                _is_high_value_user = False
+                try:
+                    _is_high_value_user = is_user_da_or_high_value(
+                        shell, domain=domain, samaccountname=user
+                    )
+                except Exception:  # noqa: BLE001
+                    _is_high_value_user = False
+                _domain_pwned = updated_auth_status == "pwned"
+                if _is_high_value_user and not _domain_pwned:
+                    print_info_debug(
+                        f"[creds] re-running ask_for_user_privs for high-value "
+                        f"user {_user_key!r}: domain not yet pwned"
+                    )
+                    # Fall through to standard flow — do not skip.
+                else:
+                    # Compact muted notice — no prompt, no sound, no friction.
+                    # Following tui-design §3: "Reversible → Just do it, show brief
+                    # confirmation in status bar."  The operator can re-trigger with
+                    # `privs <user>@<domain>` if needed.
+                    from rich.text import Text as _Text
+                    from adscan_core.rich_output import _get_console  # noqa: PLC0415
+                    _line = _Text()
+                    _line.append("  ↩ ", style="dim #6E7681")
+                    _line.append(mark_sensitive(user, "user"), style="#6E7681")
+                    _line.append("  ·  ", style="dim #6E7681")
+                    _line.append("privileges already assessed this session", style="dim #6E7681")
+                    try:
+                        _get_console().print(_line)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    print_info_debug(
+                        f"[creds] skipping ask_for_user_privs for {_user_key!r}: "
+                        "already assessed this session"
+                    )
+                    continue
+
             if updated_auth_status == "pwned":
                 print_info_debug(
                     "[creds] skipping attack-path privilege UX because domain is pwned"
@@ -1361,6 +1719,7 @@ def handle_auth_and_optional_privs(
                     f"[creds] enabling ask_for_user_privs for terminal {mode_label} path "
                     f"user={mark_sensitive(normalized_user, 'user')}"
                 )
+                _assessed.add(_user_key)
                 shell.ask_for_user_privs(domain, user, cred)
                 continue
 
@@ -1375,6 +1734,7 @@ def handle_auth_and_optional_privs(
                     f"user={mark_sensitive(normalized_user, 'user')} "
                     f"target_principal={mark_sensitive(target_principal or 'N/A', 'user')}"
                 )
+                _assessed.add(_user_key)
                 shell.ask_for_user_privs(domain, user, cred)
                 continue
 
@@ -1490,6 +1850,13 @@ def handle_auth_and_optional_privs(
             print_info_debug(
                 f"[creds] ask_for_user_privs: user={mark_sensitive(user, 'user')}"
             )
+            # Mark as assessed BEFORE the call so that any re-entry triggered
+            # inside ask_for_user_privs (e.g. DCSync → fallback → LSA re-dump →
+            # add_credential again) sees the flag and skips immediately.
+            try:
+                _assessed.add(_user_key)
+            except Exception:  # noqa: BLE001
+                pass
             shell.ask_for_user_privs(domain, user, cred)
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
@@ -1500,11 +1867,11 @@ def _mark_user_owned_in_bloodhound(shell: Any, domain: str, user: str) -> None:
     """Mark a verified domain credential holder as owned in BloodHound (best-effort).
 
     Args:
-        shell: PentestShell instance with ``_get_bloodhound_service`` access.
+        shell: PentestShell instance with ``_get_graph_service`` access.
         domain: Domain name (e.g. ``"corp.local"``).
         user: Username (samAccountName or UPN).
     """
-    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    service_getter = getattr(shell, "_get_graph_service", None)
     if not service_getter:
         return
     try:
@@ -1535,6 +1902,134 @@ def _mark_user_owned_in_bloodhound(shell: Any, domain: str, user: str) -> None:
         )
 
 
+def _classify_credential_jackpot(
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+) -> tuple[str, str, str, str]:
+    """Classify the just-stored credential into a verdict tier.
+
+    Returns ``(verdict_text, verdict_glyph, verdict_color, next_action)``.
+    Tier-0 / Domain-Admin accounts get a crimson + jackpot framing. Regular
+    accounts get a sage "stored" framing. The verdict drives both the panel
+    border and the suggested next action, so the prompt visually "jumps" the
+    moment a Tier-0 account lands and stays subdued otherwise.
+    """
+    raw_user = (user or "").strip().lower()
+
+    da_markers = {
+        "administrator",
+        "krbtgt",
+        "domain admins",
+    }
+    is_da_account = any(marker in raw_user for marker in da_markers)
+
+    is_tier0 = False
+    try:
+        domain_data = (shell.domains_data or {}).get(domain, {}) or {}
+        tier0_users = domain_data.get("tier0_users") or domain_data.get("high_value_users") or []
+        if isinstance(tier0_users, (list, set, tuple)):
+            tier0_lower = {str(value or "").strip().lower() for value in tier0_users}
+            if raw_user in tier0_lower:
+                is_tier0 = True
+    except Exception:  # noqa: BLE001
+        is_tier0 = False
+
+    if is_da_account or is_tier0:
+        return (
+            "DOMAIN ADMIN CAPTURED" if is_da_account else "TIER-0 PRINCIPAL CAPTURED",
+            GLYPH_JACKPOT,
+            COLOR_CRIMSON,
+            "run `dump dcsync` to extract the full NTDS.dit",
+        )
+
+    return (
+        "CREDENTIAL STORED",
+        GLYPH_VERIFIED,
+        COLOR_SAGE,
+        "run `attack_paths owned` to spray and pivot from this principal",
+    )
+
+
+def _render_credential_stored_panel(
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    credential: str,
+    is_hash: bool,
+    source_steps: list[object] | None,
+    credential_origin: str | None,
+) -> None:
+    """Verdict-first panel rendered right after a domain credential verifies.
+
+    UX intent: the operator stores credentials dozens of times in a single
+    engagement. The single piece of information they want is a one-line
+    answer to "what did I just unlock and what should I do next?". This
+    panel leads with the verdict, places provenance + kind on a single
+    info line, and surfaces a single highest-value next action.
+    """
+    marked_user = mark_sensitive(user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+
+    verdict_text, verdict_glyph, verdict_color, next_action = (
+        _classify_credential_jackpot(shell, domain=domain, user=user)
+    )
+
+    # Provenance attribution. Prefer the explicit origin tag when the caller
+    # supplied one, otherwise derive from recorded steps, otherwise fall back
+    # to the credentials_meta-derived label.
+    provenance_label = ""
+    if credential_origin:
+        provenance_label = str(credential_origin).strip()
+    elif source_steps:
+        try:
+            first_step = source_steps[0]
+            provenance_label = (
+                getattr(first_step, "relation", None)
+                or getattr(first_step, "kind", None)
+                or ""
+            )
+            provenance_label = str(provenance_label or "").strip()
+        except Exception:  # noqa: BLE001
+            provenance_label = ""
+    if not provenance_label:
+        provenance_label = _resolve_credential_provenance_label(
+            shell, domain=domain, user=user
+        )
+
+    kind_label = "NTLM hash" if is_hash else "password"
+
+    provenance_part = (
+        f"    [{COLOR_MUTED}]Provenance:[/{COLOR_MUTED}] via {provenance_label}"
+        if provenance_label and provenance_label.lower() != "unknown"
+        else ""
+    )
+    info_lines = [
+        f"[bold]{marked_user}[/bold] [{COLOR_MUTED}]@[/{COLOR_MUTED}] [bold]{marked_domain}[/bold]",
+        f"[{COLOR_MUTED}]Kind:[/{COLOR_MUTED}] {kind_label}{provenance_part}",
+        "",
+        (
+            f"[bold {verdict_color}]{GLYPH_NEXT} Next:[/bold {verdict_color}] "
+            f"{next_action}"
+        ),
+    ]
+
+    body = Text.from_markup("\n".join(info_lines))
+
+    print_panel(
+        body,
+        title=(
+            f"[bold {verdict_color}]{verdict_glyph} {verdict_text}"
+            f"[/bold {verdict_color}]"
+        ),
+        border_style=verdict_color,
+        expand=False,
+        padding=(0, 1),
+    )
+
+
 def add_credential(
     shell: Any,
     domain: str,
@@ -1559,6 +2054,7 @@ def add_credential(
     mark_user_compromised: bool = True,
     credential_origin: str | None = None,
     local_account_rid: str | None = None,
+    metadata: "CredentialMetadata | None" = None,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -1761,6 +2257,14 @@ def add_credential(
                 is_hash=is_hash,
             )
             credential_persisted = True
+            _apply_credential_metadata(
+                shell, domain=domain, user=user, metadata=metadata
+            )
+
+            # Phase 3: AdminTo edge emission lives inside
+            # ``_check_local_creds_native_smb`` (the native SMB Pwn3d!
+            # verifier). Non-SMB services never emit an AdminTo edge here.
+
             marked_user = mark_sensitive(user, "user")
             marked_host = mark_sensitive(host, "hostname")
 
@@ -1924,6 +2428,9 @@ def add_credential(
                 is_hash=is_hash,
             )
             credential_persisted = True
+            _apply_credential_metadata(
+                shell, domain=domain, user=user, metadata=metadata
+            )
             # Respect store precedence rules (e.g. keep existing plaintext over new hash).
             is_hash = update_result.is_hash
             if is_hash:
@@ -2127,6 +2634,20 @@ def add_credential(
                     f"{mark_sensitive(user, 'user')}@{mark_sensitive(domain, 'domain')}: {_bh_exc}"
                 )
 
+            if not ui_silent:
+                try:
+                    _render_credential_stored_panel(
+                        shell,
+                        domain=domain,
+                        user=user,
+                        credential=cred,
+                        is_hash=is_hash,
+                        source_steps=source_steps,
+                        credential_origin=credential_origin,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+
             _ensure_verified_domain_credential_ticket(
                 shell,
                 domain=domain,
@@ -2254,6 +2775,7 @@ def add_credentials_batch(
     verify_credential: bool = True,
     ui_silent: bool = False,
     ensure_fresh_kerberos_ticket: bool = True,
+    metadata_by_user: "dict[str, CredentialMetadata] | None" = None,
 ) -> list[tuple[str, str]]:
     """Persist multiple domain credentials with optional batch hash cracking.
 
@@ -2284,6 +2806,11 @@ def add_credentials_batch(
         return []
 
     for username, resolved_credential in resolved_credentials:
+        per_user_metadata = None
+        if metadata_by_user:
+            per_user_metadata = metadata_by_user.get(username) or metadata_by_user.get(
+                username.lower()
+            )
         add_credential(
             shell=shell,
             domain=domain,
@@ -2297,6 +2824,7 @@ def add_credentials_batch(
             verify_credential=verify_credential,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+            metadata=per_user_metadata,
         )
 
     return resolved_credentials
@@ -2513,6 +3041,157 @@ def _resolve_verified_domain_credential(
     return fallback_credential
 
 
+def _check_local_creds_native_smb(
+    shell: Any,
+    *,
+    domain_name: str,
+    username: str,
+    cred_value: str,
+    host: str,
+) -> bool:
+    """Verify a *local* credential has SMB admin on *host* via native aiosmb.
+
+    Replaces the NetExec ``(Pwn3d!)`` subprocess for the SMB branch of
+    :func:`check_local_creds`. The credential being verified is a
+    **local account on the target host** — this is the
+    ``add_credential(host=X, service="smb")`` path which stores under
+    ``domains_data[domain]["local_credentials"]``, not the domain user
+    branch. ``domain_name`` is workspace context, not an AD identity
+    for the user.
+
+    Graph mutation is intentionally NOT performed here. AdminTo edges
+    are owned by:
+      * the LDAP / native graph collector for domain users
+      * ``LocalAdminPassReuse`` star-topology edges for local credential
+        reuse (see ``dumps.py:_run_native_local_admin_reuse_check``)
+    Emitting an ``AdminTo`` edge from a local-credential verification
+    would risk a sAMAccountName collision falsely linking the AD
+    built-in Administrator to the host.
+
+    Returns:
+        True when local admin is confirmed (Pwn3d!), False otherwise.
+        Never raises to the caller.
+    """
+    from adscan_internal import (
+        print_error,
+        print_info_debug,
+        print_info_verbose,
+        print_operation_header,
+        print_success,
+        print_warning,
+    )
+    from adscan_internal.rich_output import mark_sensitive
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.smb_privilege import (
+        SMBPrivilegeStatus,
+        verify_domain_user_local_admin,
+    )
+
+    is_hash = bool(shell.is_hash(cred_value))
+    cred_type = "Hash" if is_hash else "Password"
+    print_operation_header(
+        "Local Credential Verification",
+        details={
+            "Domain Context": domain_name,
+            "Target Host": host,
+            "Service": "SMB",
+            "Username": username,
+            cred_type: cred_value,
+        },
+        icon="🔑",
+    )
+
+    marked_username = mark_sensitive(username, "user")
+    marked_host = mark_sensitive(host, "hostname")
+
+    print_info_verbose("Executing host credential verification (native aiosmb)")
+    print_info_debug(
+        f"[creds] native SMB Pwn3d! probe host={marked_host} "
+        f"user={marked_username} cred_kind={'nt_hash' if is_hash else 'password'}"
+    )
+
+    # Pull a KDC hint from domains_data when available — keeps Kerberos
+    # fallback working in NTLM-disabled environments.
+    kdc_ip: str | None = None
+    try:
+        kdc_ip = resolve_dc_ip((shell.domains_data.get(domain_name, {}) or {}))
+    except Exception:  # noqa: BLE001
+        kdc_ip = None
+
+    try:
+        result = run_async_sync(
+            verify_domain_user_local_admin(
+                domain=domain_name,
+                username=username,
+                credential=cred_value,
+                host=host,
+                kdc_ip=kdc_ip,
+            )
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        telemetry.capture_exception(exc)
+        print_error(
+            f"An unexpected error occurred during host credential verification: {exc}"
+        )
+        return False
+
+    status = result.status
+
+    if status == SMBPrivilegeStatus.ADMIN:
+        print_success(
+            f"User '[bold]{marked_username}[/bold]' has "
+            f"[bold red]ADMIN[/bold red] access to [bold]{marked_host}[/bold] "
+            f"via [bold]smb[/bold]!"
+        )
+        # NOTE: This path is `add_credential(host=X, service="smb")` — a
+        # LOCAL credential. The verified user is a local account on the
+        # target host (no AD identity), so emitting an `AdminTo` edge
+        # would be wrong: aside from the user node not existing in the
+        # AD attack_graph.json, a sAMAccountName collision (e.g. local
+        # "Administrator" matching the domain built-in Administrator)
+        # would write a falsified AdminTo edge from the domain user to
+        # the host. Local-credential reuse is captured separately by
+        # `LocalAdminPassReuse` star-topology edges from
+        # `dumps.py:_run_native_local_admin_reuse_check_async`. Domain
+        # user → host AdminTo materialization is owned by the LDAP /
+        # native graph collector, which is the canonical source of
+        # truth for AD relationships. The `add_runtime_admin_to_edge`
+        # helper from Phase 3 stays available for a future native
+        # "domain-user pwn3d sweep" flow if one is added.
+        return True
+
+    if status == SMBPrivilegeStatus.NOT_ADMIN:
+        print_info_verbose(
+            f"Successfully verified credentials for user "
+            f"'[bold]{marked_username}[/bold]' on host "
+            f"'[bold]{marked_host}[/bold]' via [bold]smb[/bold] "
+            "(non-admin access)."
+        )
+        return True
+
+    if status == SMBPrivilegeStatus.AUTH_FAILED:
+        print_error(
+            f"Logon failure for local user '[bold]{marked_username}[/bold]' on "
+            f"host '[bold]{marked_host}[/bold]' via [bold]smb[/bold]. "
+            "Incorrect credentials."
+        )
+        return False
+
+    if status == SMBPrivilegeStatus.UNREACHABLE:
+        print_warning(
+            f"Host '[bold]{marked_host}[/bold]' unreachable for SMB privilege "
+            f"check ({result.error or 'network error'})."
+        )
+        return False
+
+    print_error(
+        f"Host credential verification failed for user '[bold]{marked_username}[/bold]' "
+        f"on '[bold]{marked_host}[/bold]' via [bold]smb[/bold] "
+        f"({result.error or 'unknown error'})."
+    )
+    return False
+
+
 def check_local_creds(
     shell: Any,
     domain_name: str,
@@ -2521,7 +3200,13 @@ def check_local_creds(
     host: str,
     service: str,
 ) -> bool:
-    """Verify host-specific credentials for a service using NetExec via CredentialService."""
+    """Verify host-specific credentials for a service.
+
+    SMB goes through the native aiosmb path
+    (:func:`_check_local_creds_native_smb`). Non-SMB services
+    (winrm, mssql, ...) keep going through the legacy NetExec
+    subprocess until they are individually migrated.
+    """
     import os
 
     from rich.panel import Panel
@@ -2538,6 +3223,15 @@ def check_local_creds(
     )
     from adscan_internal.rich_output import mark_sensitive
     from adscan_internal.services.credential_service import CredentialStatus
+
+    if str(service or "").strip().lower() == "smb":
+        return _check_local_creds_native_smb(
+            shell,
+            domain_name=domain_name,
+            username=username,
+            cred_value=cred_value,
+            host=host,
+        )
 
     cred_type = "Hash" if shell.is_hash(cred_value) else "Password"
     print_operation_header(
@@ -2696,8 +3390,11 @@ def check_local_creds(
         shell.console.print(
             Panel(
                 result.raw_output.strip(),
-                title=f"NXC Output for {username}@{host} ({service})",
-                border_style="dim red",
+                title=(
+                    f"[bold {COLOR_CRIMSON}]{GLYPH_FAILED} NXC Output[/bold {COLOR_CRIMSON}] "
+                    f"[{COLOR_MUTED}]:[/{COLOR_MUTED}] {username}@{host} ({service})"
+                ),
+                border_style=COLOR_CRIMSON,
                 expand=False,
             )
         )
@@ -3312,15 +4009,70 @@ def deduplicate_credential_entries_for_spraying(
 
 def filter_sprayable_credential_entries(
     credential_entries: list[tuple[str, tuple]],
+    *,
+    include_implausible: bool = False,
 ) -> tuple[list[tuple], int]:
-    """Filter one deduplicated finding set down to spraying-eligible credentials."""
+    """Filter one deduplicated finding set down to spraying-eligible credentials.
+
+    Two gates apply in sequence, both load-bearing:
+
+    1. **Sprayability gate** (legacy): the rule itself must produce
+       password-shaped output. Rules that emit hashes, tokens, or
+       structured secrets are excluded here so we never spray a
+       SHA-256 against the DC by accident.
+    2. **Plausibility gate** (new, 2026-05-21): even password-shaped
+       output must pass :func:`is_plausible_password` to reach the
+       spraying pool. This kills JSON-fragment FPs, GUIDs, hashes,
+       and Base64 blobs that the regex layer accidentally captured.
+       Operator can override via ``include_implausible=True`` when
+       they have manual reason to spray a flagged candidate.
+
+    Both gates merge into a single ``skipped`` counter for the caller's
+    summary line; downstream debug logs surface the per-candidate
+    reason so operators can audit exactly what the gate rejected.
+
+    Args:
+        credential_entries: ``(rule_name, cred_tuple)`` pairs produced
+            by the dedup step. ``cred_tuple[0]`` is the password value.
+        include_implausible: When ``True``, skip the plausibility gate
+            and let implausible candidates through. The legacy
+            sprayability gate still applies. Used by the
+            ``spray --include-implausible`` override flag.
+
+    Returns:
+        ``(sprayable_tuples, skipped_count)``. ``sprayable_tuples`` is
+        the curated list ready to be handed to kerbrute; ``skipped_count``
+        is the COMBINED count of rule-incompatible AND implausible
+        candidates dropped.
+    """
+    from adscan_internal.services.password_plausibility import (
+        is_plausible_password,
+    )
+
     sprayable: list[tuple] = []
     skipped = 0
     for rule_name, cred_tuple in credential_entries:
-        if is_sprayable_credsweeper_candidate(rule_name, cred_tuple):
-            sprayable.append(cred_tuple)
-        else:
+        if not is_sprayable_credsweeper_candidate(rule_name, cred_tuple):
             skipped += 1
+            continue
+
+        if not include_implausible:
+            value = str(cred_tuple[0] or "")
+            verdict = is_plausible_password(value)
+            if not verdict.plausible:
+                skipped += 1
+                # Mark sensitive at debug time so the per-candidate audit
+                # trail surfaces the reason without leaking the raw value
+                # into shared telemetry.
+                print_info_debug(
+                    "[spray-gate] dropped implausible candidate: "
+                    f"rule={rule_name!r} category={verdict.category!r} "
+                    f"reason={verdict.reason!r}"
+                )
+                continue
+
+        sprayable.append(cred_tuple)
+
     return sprayable, skipped
 
 
@@ -3332,7 +4084,11 @@ def display_credentials_with_rich(
 ) -> None:
     """Display all found credentials in a structured, aesthetic format using Rich.
 
-    Organized by credential type with ML confidence scores.
+    Organized by credential type with ML confidence scores and a plausibility
+    badge that surfaces structural anti-patterns (JSON fragments, GUIDs,
+    hashes, Base64 blobs) without filtering them from the operator's view.
+    See :mod:`adscan_internal.services.password_plausibility` for the
+    verdict layers.
 
     Args:
         shell: The PentestShell instance with console
@@ -3341,6 +4097,11 @@ def display_credentials_with_rich(
     if not credentials:
         return
 
+    from adscan_internal.services.password_plausibility import (
+        CATEGORY_DISPLAY,
+        is_plausible_password,
+    )
+
     presentation = presentation or CredentialPresentationOptions()
 
     # Create panels for each credential type
@@ -3348,6 +4109,12 @@ def display_credentials_with_rich(
 
     # Sort credential types alphabetically
     sorted_types = sorted(credentials.keys())
+
+    # Aggregate plausibility counters across all credential types so we can
+    # render the post-table summary panel ("triage") in a single pass.
+    plausible_total = 0
+    implausible_total = 0
+    implausible_by_category: dict[str, int] = {}
 
     for cred_type in sorted_types:
         creds_list = credentials[cred_type]
@@ -3369,7 +4136,7 @@ def display_credentials_with_rich(
             expand=True,
         )
         table.add_column("#", style="dim", width=4, justify="right")
-        table.add_column("Value", style="cyan", no_wrap=False, max_width=72, overflow="ellipsis")
+        table.add_column("Value", style="cyan", no_wrap=False, max_width=64, overflow="ellipsis")
         if presentation.confidence_label:
             table.add_column(
                 presentation.confidence_label,
@@ -3377,12 +4144,23 @@ def display_credentials_with_rich(
                 justify="right",
                 width=12,
             )
+        # The "Plausibility" column carries operator-facing context for why a
+        # candidate will or will not enter the spraying pool. Width capped so
+        # long reasons (e.g. "structural delimiter X (JSON fragment...)") wrap
+        # cleanly without pushing the rest of the table off-screen.
+        table.add_column(
+            "Plausibility",
+            style="white",
+            no_wrap=False,
+            max_width=28,
+            overflow="fold",
+        )
         table.add_column("Seen", style="magenta", justify="right", width=6)
         table.add_column(
             presentation.source_column_label,
             style="dim",
             no_wrap=False,
-            max_width=110,
+            max_width=92,
             overflow="fold",
         )
 
@@ -3413,19 +4191,48 @@ def display_credentials_with_rich(
                 except (ValueError, TypeError):
                     ml_display = "N/A"
 
+            # Plausibility verdict — pure deterministic check, microseconds.
+            # Even when the value is empty/None we still produce a verdict so
+            # the column never carries blank cells (helps operators scanning
+            # the table for issues).
+            verdict = is_plausible_password(display_value or None)
+            if verdict.plausible:
+                plausible_total += 1
+                plausibility_cell = "[bold green]✓ plausible[/bold green]"
+                row_style = ""
+            else:
+                implausible_total += 1
+                category = verdict.category or "other"
+                implausible_by_category[category] = (
+                    implausible_by_category.get(category, 0) + 1
+                )
+                # Two-line cell: short category tag (operator scans this
+                # first) followed by the precise reason in dim text. Keeps
+                # the table scannable without losing the diagnostic detail.
+                cat_label = CATEGORY_DISPLAY.get(category, category) or category
+                plausibility_cell = (
+                    f"[bold yellow]⚠ {cat_label}[/bold yellow]\n"
+                    f"[dim]{verdict.reason}[/dim]"
+                )
+                # Dim the entire row so the eye lands on plausible rows first.
+                # The value remains visible (transparency) but its visual
+                # weight signals "do not spray me by default".
+                row_style = "dim"
+
             row = [
                 str(idx),
                 display_value,
             ]
             if presentation.confidence_label:
                 row.append(ml_display)
+            row.append(plausibility_cell)
             row.extend(
                 [
                     str(occurrence_count),
                     summarize_credential_sources(shell, sources) or "N/A",
                 ]
             )
-            table.add_row(*row)
+            table.add_row(*row, style=row_style if row_style else None)
 
         panels.append(Panel(table, border_style="blue"))
 
@@ -3434,6 +4241,87 @@ def display_credentials_with_rich(
     for panel in panels:
         shell.console.print(panel)
         shell.console.print()
+
+    # ── Triage summary ────────────────────────────────────────────────
+    # Single line/panel that tells the operator EXACTLY what will happen
+    # downstream: how many candidates pass the plausibility gate (these
+    # go to spraying), how many were filtered, and the structural reason
+    # breakdown so they can decide whether to override the gate.
+    _render_credential_triage_summary(
+        shell,
+        plausible=plausible_total,
+        implausible=implausible_total,
+        by_category=implausible_by_category,
+    )
+
+
+def _render_credential_triage_summary(
+    shell: Any,
+    *,
+    plausible: int,
+    implausible: int,
+    by_category: dict[str, int],
+) -> None:
+    """Render the post-table summary that explains what spray will and won't try.
+
+    The summary is rendered as a single low-noise line when no candidates
+    were filtered (the common case), and as a richer panel when there ARE
+    implausible candidates the operator should know about. Both modes
+    name the exact downstream consequence ("→ spray will skip N") so the
+    operator never has to reverse-engineer why one of their findings
+    isn't being tried against the DC.
+    """
+    from adscan_internal.services.password_plausibility import CATEGORY_DISPLAY
+
+    total = plausible + implausible
+    if total == 0:
+        return
+
+    if implausible == 0:
+        # Quiet path: a single one-line success message keeps the CLI tidy
+        # and avoids drawing attention away from the actual findings.
+        shell.console.print(
+            f"[bold green]✓[/bold green] "
+            f"[bold]{plausible}/{total}[/bold] candidates plausible "
+            f"→ all eligible for spraying."
+        )
+        shell.console.print()
+        return
+
+    # Loud path: explain what was filtered so the operator knows what the
+    # gate decided. Categories are surfaced in deterministic order
+    # (alphabetical by display label) so consecutive runs look stable.
+    from rich.table import Table as _RichTable
+
+    breakdown = _RichTable.grid(padding=(0, 2))
+    breakdown.add_column(justify="left", no_wrap=True)
+    breakdown.add_column(justify="right", style="dim")
+    for category in sorted(by_category.keys(), key=lambda k: CATEGORY_DISPLAY.get(k, k)):
+        label = CATEGORY_DISPLAY.get(category) or category or "other"
+        breakdown.add_row(f"  [yellow]⚠[/yellow] {label}", f"× {by_category[category]}")
+
+    headline = (
+        f"[bold green]✓ {plausible}[/bold green] plausible "
+        f"[dim]·[/dim] "
+        f"[bold yellow]⚠ {implausible}[/bold yellow] filtered from spraying"
+    )
+    note = (
+        "[dim]Filtered candidates remain visible above for review.\n"
+        "Operator can override per-candidate via `spray --include-implausible`.[/dim]"
+    )
+
+    from rich.console import Group as _RichGroup
+
+    shell.console.print(
+        Panel(
+            _RichGroup(headline, "", breakdown, "", note),
+            title="Spray candidate triage",
+            title_align="left",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+    )
+    shell.console.print()
 
 
 def display_credential_path_lookup_with_rich(
@@ -4357,3 +5245,75 @@ def handle_found_credentials(
             "No sprayable credentials found for automated spraying. "
             "All findings have been saved to files for manual review."
         )
+
+
+# ---------------------------------------------------------------------------
+# Centralized credential-metadata application
+# ---------------------------------------------------------------------------
+
+
+def _apply_credential_metadata(
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    metadata: "CredentialMetadata | None",
+) -> None:
+    """Apply :class:`CredentialMetadata` via the privilege_role helpers.
+
+    Phase-2 scope: privilege role / enabled / local-admin-host hints are
+    no longer persisted to ``credentials_meta`` — they are resolved at
+    read time from the canonical attack graph + identity-risk store by
+    :func:`pick_credential_for_local_admin`. Only the two non-derivable
+    fields are written here:
+
+    * ``secret_kind`` — how to interpret the secret string.
+    * ``aes256_key`` / ``aes128_key`` / ``kerberos_keys`` — additional
+      Kerberos key material captured during DCSync.
+
+    Exception-safe by design — every helper call is wrapped in its own
+    try/except so a failing tag does not lose the underlying credential
+    persist.
+    """
+    from adscan_internal.services.credentials import (
+        CredentialMetadata as _CredentialMetadata,
+        set_credential_kerberos_material,
+        set_credential_secret_kind,
+    )
+
+    if metadata is None:
+        return
+    if not isinstance(metadata, _CredentialMetadata):
+        # Defensive: reject malformed payloads silently (do not crash the
+        # add_credential flow on a bad caller).
+        return
+
+    # --- secret_kind --------------------------------------------------------
+    try:
+        if metadata.secret_kind is not None:
+            set_credential_secret_kind(
+                shell,
+                domain=domain,
+                username=user,
+                secret_kind=metadata.secret_kind,
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    # --- kerberos material --------------------------------------------------
+    try:
+        if (
+            metadata.aes256_key
+            or metadata.aes128_key
+            or metadata.kerberos_keys
+        ):
+            set_credential_kerberos_material(
+                shell,
+                domain=domain,
+                username=user,
+                aes256_key=metadata.aes256_key,
+                aes128_key=metadata.aes128_key,
+                kerberos_keys=tuple(metadata.kerberos_keys or ()),
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)

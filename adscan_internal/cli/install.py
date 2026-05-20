@@ -77,13 +77,8 @@ def install_system_packages(
     """
     system_packages_config = config.system_packages_config
 
-    # Build package list from SYSTEM_PACKAGES_CONFIG, excluding neo4j (handled separately)
-    packages_to_install: list[str] = []
-    for package_name in system_packages_config:
-        if package_name == "neo4j":
-            # Neo4j is handled by a dedicated installation block in the caller.
-            continue
-        packages_to_install.append(package_name)
+    # Build package list from SYSTEM_PACKAGES_CONFIG.
+    packages_to_install: list[str] = list(system_packages_config)
 
     # Remove duplicates and sort
     unique_packages_to_install: list[str] = sorted(list(set(packages_to_install)))
@@ -157,7 +152,7 @@ def install_system_packages(
                     check=True,
                     env=apt_env,
                 )
-                deps.print_success("libmagic1 installed successfully")
+                deps.print_success("libmagic1 installed")
                 successfully_installed.append("libmagic1")
             except subprocess.CalledProcessError as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
@@ -189,7 +184,7 @@ def install_system_packages(
                     env=apt_env,
                     capture_output=False,
                 )
-                deps.print_success("freerdp3-x11 installed successfully")
+                deps.print_success("freerdp3-x11 installed")
                 successfully_installed.append("freerdp3-x11")
             except subprocess.CalledProcessError as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
@@ -206,7 +201,7 @@ def install_system_packages(
                         check=True,
                         env=apt_env,
                     )
-                    deps.print_success("freerdp2-x11 installed successfully")
+                    deps.print_success("freerdp2-x11 installed (fallback)")
                     successfully_installed.append("freerdp2-x11")
                     unique_packages_to_install.remove("freerdp3-x11")
                     unique_packages_to_install.append("freerdp2-x11")
@@ -225,7 +220,7 @@ def install_system_packages(
                     check=True,
                     env=apt_env,
                 )
-                deps.print_success("hashcat installed successfully")
+                deps.print_success("hashcat installed")
                 successfully_installed.append("hashcat")
                 unique_packages_to_install.remove("hashcat")
             except subprocess.CalledProcessError as exc:  # noqa: BLE001
@@ -327,7 +322,7 @@ def install_system_packages(
                 )
                 rc = getattr(ntp_proc, "returncode", None)
                 if ntp_proc and rc == 0:
-                    deps.print_success("ntpsec-ntpdate installed successfully")
+                    deps.print_success("ntpsec-ntpdate installed")
                     successfully_installed.append("ntpsec-ntpdate")
                 else:
                     combined = "\n".join(
@@ -359,7 +354,7 @@ def install_system_packages(
                     )
                     fb_rc = getattr(ntp_fallback, "returncode", None)
                     if ntp_fallback and fb_rc == 0:
-                        deps.print_success("ntpdate installed successfully (fallback)")
+                        deps.print_success("ntpdate installed (fallback)")
                         successfully_installed.append("ntpdate")
                     else:
                         combined_fb = "\n".join(
@@ -626,7 +621,7 @@ def install_external_python_tools(
         tool_specific_python = os.path.join(tool_specific_venv_path, "bin", "python")
 
         deps.print_info(
-            f"Processing tool: {tool_dir_name} (installing '{install_spec}')"
+            f"Installing {tool_dir_name} ..."
         )
         os.makedirs(tool_specific_venv_base, exist_ok=True)
 
@@ -636,7 +631,8 @@ def install_external_python_tools(
             and not github_dns_ok
         ):
             deps.print_warning(
-                f"Skipping {tool_dir_name}: GitHub is not resolvable from this host right now."
+                f"{tool_dir_name} skipped: GitHub is not reachable from this host. "
+                "Fix: check network/VPN connectivity and retry."
             )
             all_tools_successful = False
             continue
@@ -870,7 +866,9 @@ def install_external_python_tools(
                 backoff_seconds=15,
                 label=f"pip install ({tool_dir_name})",
             )
-            deps.print_success(f"{tool_dir_name} installed successfully.")
+            spec_label = spec_info.get("vcs_reference") or spec_info.get("specifier") or ""
+            version_hint = f" ({spec_label})" if spec_label else ""
+            deps.print_success(f"{tool_dir_name} installed{version_hint}")
 
             if extra_specs:
                 deps.print_info_verbose(
@@ -935,7 +933,10 @@ def install_external_python_tools(
 
     if not all_tools_successful:
         deps.print_warning(
-            "Some external Python tools failed to install. Please check the logs above."
+            "Some external Python tools failed to install."
+        )
+        deps.print_warning(
+            "Fix: run adscan install again, or remove the failing venv and retry."
         )
 
     return all_tools_successful
@@ -996,7 +997,7 @@ def install_core_dependencies(
             env=clean_env,
             prefer_break_system_packages=True,
         )
-        deps.print_success("Core dependencies installed successfully.")
+        deps.print_success("Core dependencies installed")
         return True
     except Exception as exc:  # noqa: BLE001
         deps.telemetry_capture_installation_failed(exc)
@@ -1087,7 +1088,6 @@ class GitToolsInstallDeps:
 
     setup_external_tool: Callable[[str, Dict[str, Any], bool], bool]
     preflight_install_dns: Callable[[], bool]
-    get_bloodhound_mode: Callable[[], str]
     telemetry_capture_installation_failed: Callable[[BaseException], None]
     print_info: Callable[[str], None]
     print_error: Callable[[str], None]
@@ -1109,19 +1109,7 @@ def install_git_tools(
     """
     deps.os_makedirs(config.tools_install_dir, exist_ok=True)
 
-    # Filter tools based on conditions (e.g., legacy_only)
-    external_tools = {}
-    for tool_name, tool_config in config.external_tools_config.items():
-        if "condition" in tool_config:
-            if (
-                tool_config["condition"] == "legacy_only"
-                and deps.get_bloodhound_mode() != "legacy"
-            ):
-                deps.print_info(
-                    f"Skipping {tool_name} (not needed for BloodHound CE mode)"
-                )
-                continue
-        external_tools[tool_name] = tool_config
+    external_tools = dict(config.external_tools_config)
 
     # Check GitHub DNS resolution once and reuse for all external tools
     github_dns_ok = deps.preflight_install_dns()
@@ -1136,6 +1124,7 @@ def install_git_tools(
             deps.telemetry_capture_installation_failed(exc)
             deps.print_error(f"Failed to set up {tool_name}.")
             deps.print_exception(show_locals=False, exception=exc)
+            deps.print_error(f"Fix: run adscan install again to retry {tool_name}.")
             return False
 
     return True
@@ -1185,302 +1174,9 @@ def install_wordlists(
 
         deps.print_info(f"Ensuring {wl_name} is available...")
         if deps.ensure_wordlist_installed(wl_name, wl_config, fix=True):
-            deps.print_success(f"{wl_name} processed successfully.")
+            deps.print_success(f"{wl_name} ready")
         else:
             deps.print_error(f"Failed to download/process {wl_name}.")
-
-
-@dataclass(frozen=True)
-class BloodHoundCEInstallConfig:
-    """Configuration for installing BloodHound CE."""
-
-    bh_mode_path: str
-    install_args: Any | None  # argparse.Namespace or None
-
-
-@dataclass(frozen=True)
-class BloodHoundCEInstallDeps:
-    """Dependency bundle for BloodHound CE installation."""
-
-    is_docker_env: Callable[[], bool]
-    is_docker_official_installed: Callable[[], tuple[bool, str]]
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
-    install_bloodhound_ce: Callable[[str, bool], None]
-    telemetry_capture_exception: Callable[[BaseException], None]
-    print_info: Callable[[str], None]
-    print_info_verbose: Callable[[str], None]
-    print_warning: Callable[[str], None]
-    print_error: Callable[[str], None]
-    print_exception: Callable[..., None]
-    open_file: Callable[..., Any]  # Python's open() function
-
-
-def install_bloodhound_ce(
-    *,
-    config: BloodHoundCEInstallConfig,
-    deps: BloodHoundCEInstallDeps,
-    docker_prereqs_ok: bool,
-) -> None:
-    """Install BloodHound CE if environment is suitable.
-
-    This helper mirrors the legacy logic from ``handle_install`` for installing
-    BloodHound CE. All I/O and side effects are provided via the injected
-    dependencies to keep the function testable and to avoid circular imports
-    with ``adscan.py``.
-    """
-    # Environment detection
-    in_container = deps.is_docker_env()
-    docker_installed, docker_version = deps.is_docker_official_installed()
-    compose_available, compose_version = deps.is_docker_compose_plugin_available()
-
-    can_install_bloodhound = (
-        docker_prereqs_ok
-        and docker_installed
-        and compose_available
-        and not in_container
-    )
-
-    deps.print_info_verbose("BloodHound CE environment check:")
-    deps.print_info_verbose(f"  - Running in container: {in_container}")
-    deps.print_info_verbose(
-        f"  - Docker available: {docker_installed} ({docker_version})"
-    )
-    deps.print_info_verbose(
-        f"  - Docker Compose available: {compose_available} ({compose_version})"
-    )
-    deps.print_info_verbose(f"  - Can install BloodHound CE: {can_install_bloodhound}")
-
-    if not can_install_bloodhound:
-        deps.print_warning("BloodHound CE installation will be skipped:")
-        if not docker_prereqs_ok:
-            deps.print_warning(
-                "  - Docker prerequisites installation failed earlier in this run."
-            )
-        if in_container:
-            deps.print_warning(
-                "  - Running inside container (Docker-in-Docker not supported)"
-            )
-        if not docker_installed:
-            deps.print_warning(
-                f"  - Docker not available or not official: {docker_version}"
-            )
-        if not compose_available:
-            deps.print_warning(
-                f"  - Docker Compose plugin not available: {compose_version}"
-            )
-        deps.print_info("\nBloodHound CE requires Docker to function.")
-        deps.print_info("For full functionality:")
-        deps.print_info("  1. Run ADscan on a host machine with Docker installed")
-        deps.print_info("  2. Install Docker and Docker Compose:")
-        deps.print_info("     Ubuntu/Debian: sudo apt install docker.io docker-compose")
-        deps.print_info("     Or visit: https://docs.docker.com/engine/install/")
-        deps.print_info(
-            "\nNote: ADscan will continue installation without BloodHound CE"
-        )
-    else:
-        # Environment is suitable, proceed with installation
-        try:
-            desired_pw = (
-                getattr(config.install_args, "bh_admin_password", "Adscan4thewin!")
-                if config.install_args is not None
-                else "Adscan4thewin!"
-            )
-            no_browser = (
-                getattr(config.install_args, "no_open_browser", False)
-                if config.install_args is not None
-                else False
-            )
-            deps.install_bloodhound_ce(desired_pw, no_browser)
-            try:
-                with deps.open_file(config.bh_mode_path, "w", encoding="utf-8") as f:
-                    f.write("ce")
-            except Exception as exc:  # noqa: BLE001
-                deps.telemetry_capture_exception(exc)
-                deps.print_warning(f"Could not persist BH mode: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            deps.telemetry_capture_exception(exc)
-            deps.print_error("BloodHound CE installation failed.")
-            deps.print_exception(show_locals=False, exception=exc)
-
-
-@dataclass(frozen=True)
-class RustHoundCEInstallDeps:
-    """Dependency bundle for RustHound-CE installation."""
-
-    is_cargo_available: Callable[[], tuple[bool, str]]
-    install_rustup: Callable[[], bool]
-    install_rusthound_ce: Callable[[], tuple[bool, str]]
-    get_rusthound_verification_status: Callable[[Dict[str, str]], Dict[str, Any]]
-    configure_cargo_path: Callable[[], bool]
-    get_clean_env_for_compilation: Callable[[], Dict[str, str]]
-    run_command: Callable[..., Any]
-    subprocess_run: Callable[..., Any]
-    os_environ: Dict[str, str]
-    telemetry_capture_exception: Callable[[BaseException], None]
-    print_info: Callable[[str], None]
-    print_warning: Callable[[str], None]
-    print_success: Callable[[str], None]
-
-
-def install_rusthound_ce_helper(
-    *,
-    deps: RustHoundCEInstallDeps,
-) -> None:
-    """Install RustHound-CE (BloodHound collector in Rust).
-
-    This helper mirrors the legacy logic from ``handle_install`` for installing
-    RustHound-CE. All I/O and side effects are provided via the injected
-    dependencies to keep the function testable and to avoid circular imports
-    with ``adscan.py``.
-    """
-    deps.print_info("Installing RustHound-CE (BloodHound collector in Rust)...")
-    try:
-        # Check if cargo is available
-        cargo_available, cargo_version = deps.is_cargo_available()
-
-        # Always ensure cargo is from rustup (even if already available)
-        if cargo_available:
-            # Check if it's from rustup installation
-            cargo_path_check = deps.subprocess_run(
-                ["which", "cargo"], capture_output=True, text=True, check=False
-            )
-            if cargo_path_check.returncode == 0:
-                cargo_binary_path = cargo_path_check.stdout.strip()
-                if "/.cargo/bin/cargo" not in cargo_binary_path:
-                    # Cargo is available but NOT from rustup
-                    deps.print_warning(
-                        f"Cargo is installed but not from rustup: {cargo_binary_path}"
-                    )
-                    deps.print_info(
-                        "Installing rustup to replace apt-installed Rust..."
-                    )
-                    cargo_available = False  # Force reinstallation
-
-        if not cargo_available:
-            deps.print_info(
-                "cargo not found, installing via rustup (official installer)..."
-            )
-            deps.print_info(
-                "This ensures we get the latest version (similar to Go installation)"
-            )
-
-            if not deps.install_rustup():
-                deps.print_warning("Failed to install Rust toolchain via rustup")
-                deps.print_info("Falling back to apt installation...")
-                try:
-                    # Use clean environment to avoid PyInstaller library conflicts
-                    clean_env = deps.get_clean_env_for_compilation()
-                    deps.run_command(
-                        ["apt", "install", "cargo", "-y"], check=True, env=clean_env
-                    )
-                    deps.print_success(
-                        "cargo installed successfully via apt (fallback)"
-                    )
-
-                    # Verify installation
-                    cargo_available, cargo_version = deps.is_cargo_available()
-                    if not cargo_available:
-                        deps.print_warning(
-                            "cargo still not available after apt installation, "
-                            "skipping RustHound-CE"
-                        )
-                        deps.print_info(
-                            "You can install Rust manually: apt install cargo"
-                        )
-                    else:
-                        deps.print_success(f"cargo verified: {cargo_version}")
-                except Exception as exc:  # noqa: BLE001
-                    deps.telemetry_capture_exception(exc)
-                    deps.print_warning(f"Failed to install cargo via apt: {exc}")
-                    deps.print_info("You can install Rust manually: apt install cargo")
-            else:
-                # Verify installation after rustup install
-                cargo_available, cargo_version = deps.is_cargo_available()
-                if cargo_available:
-                    deps.print_success(f"cargo verified: {cargo_version}")
-                else:
-                    deps.print_warning(
-                        "Rust toolchain installed but cargo verification failed"
-                    )
-
-        if cargo_available:
-            # Install RustHound-CE
-            install_success, install_output = deps.install_rusthound_ce()
-            if install_success:
-                deps.print_success("RustHound-CE installed successfully")
-
-                # Verify installation and configure PATH using unified function
-                # Use current environment to include PATH updates
-                rusthound_status = deps.get_rusthound_verification_status(
-                    deps.os_environ
-                )
-                verification_results = rusthound_status["verification_results"]
-
-                if verification_results["rusthound_installed"]:
-                    deps.print_success(
-                        f"RustHound-CE binary found at: "
-                        f"{verification_results['rusthound_path']}"
-                    )
-
-                    # Configure PATH if needed
-                    if not verification_results["cargo_bin_in_path"]:
-                        deps.print_warning(
-                            "~/.cargo/bin not found in PATH, configuring..."
-                        )
-                        path_configured = deps.configure_cargo_path()
-
-                        if path_configured:
-                            deps.print_success("PATH configuration completed")
-
-                            # Test accessibility after PATH configuration
-                            updated_status = deps.get_rusthound_verification_status(
-                                deps.os_environ
-                            )
-                            if updated_status["verification_results"][
-                                "rusthound_accessible"
-                            ]:
-                                deps.print_success(
-                                    "RustHound-CE is now accessible in PATH!"
-                                )
-                            else:
-                                deps.print_warning(
-                                    "RustHound-CE may not be accessible until "
-                                    "terminal restart"
-                                )
-                        else:
-                            deps.print_warning(
-                                "Failed to configure PATH for cargo binaries"
-                            )
-                    else:
-                        deps.print_success("~/.cargo/bin already in PATH")
-
-                        # Test accessibility using unified function
-                        if verification_results["rusthound_accessible"]:
-                            deps.print_success("RustHound-CE is accessible in PATH!")
-                        else:
-                            deps.print_warning(
-                                "RustHound-CE binary exists but may not be accessible"
-                            )
-                else:
-                    deps.print_warning(
-                        f"RustHound-CE binary not found at expected location: "
-                        f"{verification_results['rusthound_path']}"
-                    )
-            else:
-                deps.print_warning(
-                    f"RustHound-CE installation failed: {install_output}"
-                )
-                deps.print_info(
-                    "You can install it manually later with: "
-                    "cargo install rusthound-ce@2.4.7 --force"
-                )
-    except Exception as exc:  # noqa: BLE001
-        deps.telemetry_capture_exception(exc)
-        deps.print_warning(f"Error installing RustHound-CE: {exc}")
-        deps.print_info(
-            "You can install it manually later with: "
-            "cargo install rusthound-ce@2.4.7 --force"
-        )
 
 
 @dataclass(frozen=True)
@@ -1560,7 +1256,7 @@ def install_go_and_htb_cli(
                         check=True,
                         env=clean_env,
                     )
-                    deps.print_success("Go installed successfully via apt (fallback)")
+                    deps.print_success("Go installed via apt (fallback)")
                 except Exception as exc:  # noqa: BLE001
                     deps.telemetry_capture_exception(exc)
                     deps.print_warning(f"Failed to install Go via apt: {exc}")
@@ -1670,7 +1366,7 @@ def install_go_and_htb_cli(
                 # Install htb-cli
                 install_success, install_output = deps.install_htb_cli()
                 if install_success:
-                    deps.print_success("htb-cli installed successfully")
+                    deps.print_success("htb-cli installed")
                     deps.print_info(
                         "htb-cli is a HackTheBox CLI tool for managing machines and challenges"
                     )
@@ -1830,7 +1526,7 @@ def install_unbound_resolver(
             env=apt_env,
         )
         if unbound_proc and unbound_proc.returncode == 0:
-            deps.print_success("Unbound installed/updated successfully")
+            deps.print_success("Unbound installed")
         else:
             combined = "\n".join(
                 [
@@ -1926,7 +1622,6 @@ class InstallConfig:
         wordlists_install_dir: Directory for wordlists.
         tool_venvs_base_dir: Base directory for tool virtual environments.
         venv_path: Path to the main virtual environment.
-        bh_mode_path: Path to BloodHound mode file.
         system_packages_config: Configuration for system packages.
         core_requirements: Core Python requirements.
         pip_tools_config: Configuration for pip tools.
@@ -1941,7 +1636,6 @@ class InstallConfig:
     wordlists_install_dir: str
     tool_venvs_base_dir: str
     venv_path: str
-    bh_mode_path: str
     system_packages_config: Dict[str, str]
     core_requirements: List[str]
     pip_tools_config: Dict[str, Any]
@@ -1960,7 +1654,6 @@ class InstallDeps:
     is_docker_env: Callable[[], bool]
     is_docker_official_installed: Callable[[], tuple[bool, str]]
     is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
-    get_bloodhound_mode: Callable[[], str]
 
     # Installation helpers
     install_docker_prerequisites: Callable[[], bool]
@@ -2098,80 +1791,11 @@ def run_install(
 
         install_success = True
 
-        # Install BloodHound CE if requested
-        if "bloodhound" in only_components:
-            deps.print_info("Installing BloodHound CE...")
-            can_install_bloodhound = (
-                docker_installed and compose_available and not in_container
-            )
-
-            if not can_install_bloodhound:
-                deps.print_error("Cannot install BloodHound CE:")
-                if in_container:
-                    deps.print_error(
-                        "  - Running inside container (Docker-in-Docker not supported)"
-                    )
-                    deps.print_info(
-                        "  BloodHound CE cannot be installed in containerized environments"
-                    )
-                    install_success = False
-                else:
-                    if not docker_installed:
-                        deps.print_error(
-                            f"  - Docker not available or not official: {docker_version}"
-                        )
-                    if not compose_available:
-                        deps.print_error(
-                            f"  - Docker Compose plugin not available: {compose_version}"
-                        )
-                    deps.print_info("\nSolutions:")
-                    deps.print_info(
-                        "  1. Run ADscan on a host machine with Docker installed (recommended)"
-                    )
-                    deps.print_info("  2. Install Docker and Docker Compose:")
-                    deps.print_info(
-                        "     Ubuntu/Debian: sudo apt install docker.io docker-compose"
-                    )
-                    deps.print_info(
-                        "     Or visit: https://docs.docker.com/engine/install/"
-                    )
-                    install_success = False
-
-                    if not deps.install_docker_prerequisites():
-                        deps.print_error(
-                            "Docker prerequisites installation failed. Cannot install BloodHound CE."
-                        )
-                        install_success = False
-                    else:
-                        # Note: _install_bloodhound_ce needs to be passed via deps
-                        # For now, we'll skip this in selective mode as it requires
-                        # additional dependencies that are complex to inject
-                        deps.print_warning(
-                            "BloodHound CE installation in selective mode requires full deps"
-                        )
-                        install_success = False
-            else:
-                if not deps.install_docker_prerequisites():
-                    deps.print_error(
-                        "Docker prerequisites installation failed. Cannot install BloodHound CE."
-                    )
-                    install_success = False
-                else:
-                    # Note: _install_bloodhound_ce needs to be passed via deps
-                    deps.print_warning(
-                        "BloodHound CE installation in selective mode requires full deps"
-                    )
-                    install_success = False
-
-        # Install RustHound-CE if requested
-        if "rusthound" in only_components:
-            deps.print_info("Installing RustHound-CE...")
-            # Note: RustHound-CE installation in selective mode requires
-            # additional dependencies that are complex to inject
+        if "bloodhound" in only_components or "rusthound" in only_components:
             deps.print_warning(
-                "RustHound-CE installation in selective mode requires full deps"
+                "BloodHound CE / RustHound-CE installation has been removed; ADscan uses the native graph collector by default."
             )
-            install_success = False
+            return True
 
         # Install pyenv if requested
         if "pyenv" in only_components:
@@ -2242,7 +1866,7 @@ def run_install(
     try:
         clean_env = deps.get_clean_env_for_compilation()
         deps.run_command(["apt-get", "update", "-y"], check=True, env=clean_env)
-        deps.print_success("Package lists updated successfully.")
+        deps.print_success("Package lists refreshed")
     except Exception as e:
         deps.telemetry_capture_exception(e)
         if isinstance(e, FileNotFoundError):
@@ -2260,23 +1884,16 @@ def run_install(
         deps.log_free_disk_space_debug("after installation (apt-get update failed)")
         return False
 
-    # Track Docker prerequisite status for later BloodHound CE installation
-    docker_prereqs_ok = True
-
     # Docker prerequisites (install early: docker engine + compose)
     if in_container:
         deps.print_info_verbose(
             "Skipping Docker installation: running inside container (Docker-in-Docker not supported)"
         )
     else:
-        docker_prereqs_ok = deps.install_docker_prerequisites()
-        if not docker_prereqs_ok:
+        if not deps.install_docker_prerequisites():
             deps.print_warning(
-                "Docker prerequisites installation failed. BloodHound CE will be skipped in this run."
+                "Docker prerequisites installation failed; some Docker-dependent features may be unavailable."
             )
-
-    # Skip Neo4j setup (BloodHound CE uses containerized graph DB)
-    deps.print_info("Skipping Neo4j setup (BloodHound CE uses containerized graph DB).")
 
     # Install/update all system packages
     install_unbound_last = "unbound" in config.system_packages_config
@@ -2363,18 +1980,7 @@ def run_install(
 
     # External Tools Installation (Git clones, curls)
     deps.os_makedirs(config.tools_install_dir, exist_ok=True)
-    external_tools = {}
-    for tool_name, tool_config in config.external_tools_config.items():
-        if "condition" in tool_config:
-            if (
-                tool_config["condition"] == "legacy_only"
-                and deps.get_bloodhound_mode() != "legacy"
-            ):
-                deps.print_info(
-                    f"Skipping {tool_name} (not needed for BloodHound CE mode)"
-                )
-                continue
-        external_tools[tool_name] = tool_config
+    external_tools = dict(config.external_tools_config)
 
     github_dns_ok = deps.preflight_install_dns()
 
@@ -2406,50 +2012,6 @@ def run_install(
             os_makedirs=deps.os_makedirs,
             os_path_exists=deps.os_path_exists,
             os_path_join=os.path.join,
-        ),
-    )
-
-    # BloodHound CE Installation
-    install_bloodhound_ce(
-        config=BloodHoundCEInstallConfig(
-            bh_mode_path=config.bh_mode_path,
-            install_args=config.install_args,
-        ),
-        deps=BloodHoundCEInstallDeps(
-            is_docker_env=deps.is_docker_env,
-            is_docker_official_installed=deps.is_docker_official_installed,
-            is_docker_compose_plugin_available=deps.is_docker_compose_plugin_available,
-            install_bloodhound_ce=lambda *args,
-            **kwargs: True,  # Placeholder - needs full deps
-            telemetry_capture_exception=deps.telemetry_capture_exception,
-            print_info=deps.print_info,
-            print_info_verbose=deps.print_info_verbose,
-            print_warning=deps.print_warning,
-            print_error=deps.print_error,
-            print_exception=deps.print_exception,
-            open_file=open,
-        ),
-        docker_prereqs_ok=docker_prereqs_ok,
-    )
-
-    # RustHound-CE Installation
-    install_rusthound_ce_helper(
-        deps=RustHoundCEInstallDeps(
-            is_cargo_available=lambda: (True, "1.0"),  # Placeholder
-            install_rustup=lambda: True,  # Placeholder
-            install_rusthound_ce=lambda: (True, ""),  # Placeholder
-            get_rusthound_verification_status=lambda env: {
-                "verification_results": {}
-            },  # Placeholder
-            configure_cargo_path=lambda: True,  # Placeholder
-            get_clean_env_for_compilation=deps.get_clean_env_for_compilation,
-            run_command=deps.run_command,
-            subprocess_run=deps.subprocess_run,
-            os_environ={},  # Placeholder
-            telemetry_capture_exception=deps.telemetry_capture_exception,
-            print_info=deps.print_info,
-            print_warning=deps.print_warning,
-            print_success=deps.print_success,
         ),
     )
 
@@ -2492,8 +2054,9 @@ def run_install(
                 sudo_validate=lambda: True,  # Placeholder
                 get_port_53_listeners_text=lambda use_sudo=False: "",  # Placeholder
                 extract_process_names_from_ss=lambda text: [],  # Placeholder
-                stop_dns_resolver_service_for_unbound=lambda *args,
-                **kwargs: None,  # Placeholder
+                stop_dns_resolver_service_for_unbound=lambda *args, **kwargs: (
+                    None
+                ),  # Placeholder
                 run_systemctl_command=lambda *args, **kwargs: None,  # Placeholder
                 telemetry_capture_exception=deps.telemetry_capture_exception,
                 print_info=deps.print_info,
@@ -2516,7 +2079,7 @@ def run_install(
     deps.install_summary["post_install_check"] = {"success": bool(post_install_ok)}
 
     deps.print_install_summary()
-    deps.print_success("ADscan installation complete")
+    deps.print_success("INSTALLED: ADscan setup complete.")
 
     # Show next steps
     next_steps = """# Launch the interactive CLI

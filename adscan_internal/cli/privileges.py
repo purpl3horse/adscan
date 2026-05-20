@@ -21,7 +21,7 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.integrations.netexec.timeouts import (
     get_recommended_internal_timeout,
 )
-from adscan_internal.cli.rdp import run_rdp_service_access_sweep_with_medusa
+from adscan_internal.cli.rdp import run_rdp_service_access_sweep
 from adscan_internal.services.service_access_probe_history import (
     load_service_access_probe_history,
     partition_targets_by_probe_history,
@@ -34,6 +34,11 @@ from adscan_internal.services.service_access_results import (
 )
 from adscan_internal.services.pivot_capability_registry import is_service_pivot_capable
 from adscan_internal.services.auth_posture_service import get_ntlm_status
+from adscan_internal.services.host_reachability_filter import (
+    filter_reachable_hosts_sync,
+    print_reachability_summary,
+    render_no_reachable_panel,
+)
 from adscan_internal.services.winrm_access_probe_service import (
     WINRM_ACCESS_PROBE_BACKEND,
     get_winrm_probe_worker_count,
@@ -114,6 +119,44 @@ def _run_winrm_psrp_service_access_sweep(
     workflow_intent: str | None = None,
 ) -> bool:
     """Run a reusable PSRP-backed WinRM access sweep and persist normalized results."""
+    posture_sink = None
+    posture_snapshot = None
+    try:
+        from adscan_internal import get_console
+        from adscan_internal.cli.widgets.intelligence_update import (
+            render_intelligence_update,
+        )
+        from adscan_internal.services.domain_posture import get_posture
+        from adscan_internal.services.posture_sink import (
+            make_workspace_posture_sink,
+        )
+
+        posture_sink = make_workspace_posture_sink(
+            shell.domains_data,
+            on_finding=lambda finding: get_console().print(
+                render_intelligence_update(finding)
+            ),
+        )
+        posture_snapshot = get_posture(shell.domains_data, domain=domain)
+    except Exception as posture_exc:  # noqa: BLE001
+        telemetry.capture_exception(posture_exc)
+        print_info_debug(
+            f"[privileges] posture wiring skipped (non-fatal): {posture_exc}"
+        )
+
+    # Pre-flight TCP probe on 5985 — WinRM negotiation has its own per-host
+    # timeout that adds up fast on offline workstations. Centralized via
+    # host_reachability_filter so the summary line matches every other sweep.
+    if len(targets) > 1:
+        winrm_reach = filter_reachable_hosts_sync(targets, port=5985)
+        print_reachability_summary(winrm_reach, service_label="WinRM")
+        if not winrm_reach.reachable:
+            render_no_reachable_panel(
+                winrm_reach, operation_label="WinRM Access Sweep"
+            )
+            return False
+        targets = list(winrm_reach.reachable)
+
     findings = run_winrm_access_probe_sweep(
         domain=domain,
         username=username,
@@ -124,6 +167,11 @@ def _run_winrm_psrp_service_access_sweep(
         domain_data=shell.domains_data.get(domain, {}),
         auth_mode="kerberos",
         max_workers=get_winrm_probe_worker_count(),
+        sync_clock_with_pdc=lambda value: bool(
+            shell.do_sync_clock_with_pdc(value, verbose=True)
+        ),
+        posture_sink=posture_sink,
+        posture_snapshot=posture_snapshot,
     )
     confirmed_findings = [finding for finding in findings if finding.is_confirmed]
     if findings:
@@ -195,14 +243,14 @@ def _resolve_winrm_psrp_backend_reason(
     domain: str,
     username: str,
     password: str,
-) -> str | None:
-    """Return whether WinRM access checks should use PSRP instead of NetExec."""
-    override = os.getenv("ADSCAN_WINRM_ACCESS_BACKEND", "").strip().lower()
-    if override in {"psrp", "pypsrp", "kerberos", "always"}:
-        return f"override:{override}"
-    if override in {"netexec", "nxc", "legacy"}:
-        return None
+) -> str:
+    """Return a label describing why this credential context routes to PSRP.
 
+    WinRM access checks always run through PSRP — NetExec's WinRM backend is
+    NTLM-only, breaks under hardened Kerberos posture (AES-only, channel
+    binding), and parses output inconsistently across versions. The returned
+    string is purely informational for logs and telemetry.
+    """
     if str(password or "").strip().lower().endswith(".ccache"):
         return "credential_ccache"
 
@@ -227,35 +275,7 @@ def _resolve_winrm_psrp_backend_reason(
         == "likely_disabled"
     ):
         return "ntlm_likely_disabled"
-    return None
-
-
-def _netexec_auth_uses_kerberos(auth_str: str) -> bool:
-    """Return whether one NetExec auth fragment requests Kerberos/kcache auth."""
-    try:
-        parts = shlex.split(str(auth_str or ""))
-    except ValueError:
-        parts = str(auth_str or "").split()
-    return "-k" in parts or "--kerberos" in parts or "--use-kcache" in parts
-
-
-def _should_use_winrm_psrp_backend(
-    shell: Any,
-    *,
-    domain: str,
-    username: str,
-    password: str,
-) -> bool:
-    """Return whether WinRM access checks should use PSRP instead of NetExec."""
-    return (
-        _resolve_winrm_psrp_backend_reason(
-            shell,
-            domain=domain,
-            username=username,
-            password=password,
-        )
-        is not None
-    )
+    return "default"
 
 
 def _build_service_sweep_target_argument(
@@ -532,7 +552,7 @@ def run_postauth_service_and_share_followup(
     1. Probe service access across SMB/WinRM/RDP/MSSQL.
     2. Enumerate authenticated SMB shares reachable by that user.
     """
-    from adscan_internal.cli.smb import run_auth_shares
+    from adscan_internal.cli.smb_shares_view import SharesViewMode, run_native_shares_view
 
     run_service_access_sweep(
         shell,
@@ -544,11 +564,12 @@ def run_postauth_service_and_share_followup(
         prompt=prompt,
         scope_preference=scope_preference,
     )
-    run_auth_shares(
+    run_native_shares_view(
         shell,
         domain=domain,
+        mode=SharesViewMode.LIVE,
         username=username,
-        password=password,
+        credential=password,
     )
 
 
@@ -760,25 +781,15 @@ def run_service_access_sweep(
                 print_info(
                     f"Starting {service} privilege enumeration for user {marked_username}"
                 )
-                winrm_psrp_reason = (
-                    _resolve_winrm_psrp_backend_reason(
-                        shell,
-                        domain=domain,
-                        username=username,
-                        password=password,
-                    )
-                    if service == "winrm"
-                    else None
-                )
                 if service == "rdp":
                     print_info_debug(
                         "[privileges] service access sweep dispatch: "
                         f"domain={marked_domain} user={marked_username} service={service} "
-                        f"backend=medusa prompt_on_success={prompt!r} "
+                        f"backend=aardwolf prompt_on_success={prompt!r} "
                         f"targets={mark_sensitive(str(targets), 'path')}"
                     )
                     found_hosts = bool(
-                        run_rdp_service_access_sweep_with_medusa(
+                        run_rdp_service_access_sweep(
                             shell,
                             domain=domain,
                             username=username,
@@ -792,9 +803,15 @@ def run_service_access_sweep(
                             ),
                         )
                     )
-                elif service == "winrm" and winrm_psrp_reason:
+                elif service == "winrm":
+                    winrm_psrp_reason = _resolve_winrm_psrp_backend_reason(
+                        shell,
+                        domain=domain,
+                        username=username,
+                        password=password,
+                    )
                     print_info(
-                        "Using PSRP Kerberos backend for WINRM access checks "
+                        "Using PSRP backend for WINRM access checks "
                         f"({mark_sensitive(winrm_psrp_reason, 'detail')})."
                     )
                     print_info_debug(
@@ -822,82 +839,6 @@ def run_service_access_sweep(
                         domain,
                         kerberos=False,
                     )
-                    if service == "winrm" and _netexec_auth_uses_kerberos(auth_str):
-                        print_info(
-                            "Using PSRP Kerberos backend for WINRM access checks "
-                            "(netexec_winrm_kerberos_unsupported)."
-                        )
-                        print_info_debug(
-                            "[privileges] refusing NetExec Kerberos for WinRM because "
-                            "NetExec's WinRM backend is NTLM-only; "
-                            f"domain={marked_domain} user={marked_username} "
-                            f"targets={mark_sensitive(str(targets), 'path')}"
-                        )
-                        found_hosts = _run_winrm_psrp_service_access_sweep(
-                            shell,
-                            workspace_dir=workspace_cwd,
-                            domains_dir=domains_dir,
-                            domain=domain,
-                            username=username,
-                            password=password,
-                            targets=effective_target_list,
-                            prompt=prompt,
-                            workflow_intent=workflow_intent,
-                        )
-                        if found_hosts:
-                            pass
-                        else:
-                            print_info_debug(
-                                "[privileges] PSRP WinRM Kerberos fallback returned no confirmed hosts."
-                            )
-                        # Skip NetExec execution for this WinRM Kerberos auth path.
-                        if True:
-                            if found_hosts or cleaned_hosts:
-                                break
-                            next_scope_preference = _resolve_next_broader_scope(
-                                service=service,
-                                source=source,
-                                current_scope_preference=current_scope_preference,
-                            )
-                            if not next_scope_preference:
-                                break
-                            next_targets_file, _next_source = (
-                                resolve_domain_service_target_file(
-                                    workspace_cwd,
-                                    domains_dir,
-                                    domain,
-                                    service=service,
-                                    domain_data=shell.domains_data.get(domain, {}),
-                                    scope_preference=next_scope_preference,
-                                )
-                            )
-                            next_target_count = count_target_file_entries(
-                                next_targets_file
-                            )
-                            if not next_targets_file or next_target_count <= 0:
-                                break
-                            next_target_entries = load_target_entries(next_targets_file)
-                            if next_target_entries and next_target_entries.issubset(
-                                effective_target_entries or current_target_entries
-                            ):
-                                print_info_debug(
-                                    "[privileges] skipping broader sweep prompt because "
-                                    f"{mark_sensitive(next_scope_preference, 'detail')} does not add "
-                                    f"new {service.upper()} targets beyond "
-                                    f"{mark_sensitive(source, 'detail')}"
-                                )
-                                break
-                            if not _prompt_broader_postauth_scope_retry(
-                                shell,
-                                service=service,
-                                domain=domain,
-                                current_source=source,
-                                next_scope_preference=next_scope_preference,
-                                next_target_count=next_target_count,
-                            ):
-                                break
-                            current_scope_preference = next_scope_preference
-                            continue
                     netexec_timeout_seconds = get_recommended_internal_timeout(service)
                     log_dir = domain_subpath(
                         workspace_cwd,
@@ -908,7 +849,7 @@ def run_service_access_sweep(
                     os.makedirs(log_dir, exist_ok=True)
                     command = (
                         f"{shlex.quote(shell.netexec_path)} {service} {shlex.quote(targets)} {auth_str} "
-                        f"-t 20 --timeout {netexec_timeout_seconds} "
+                        f"-t 20 --timeout {netexec_timeout_seconds} --smb-timeout 30 "
                         f"--log domains/{marked_domain}/{service}/{marked_username}_privs.log"
                     )
                     print_info_debug(
@@ -933,31 +874,6 @@ def run_service_access_sweep(
                             **run_service_kwargs,
                         )
                     )
-                    if (
-                        service == "winrm"
-                        and not found_hosts
-                        and _should_use_winrm_psrp_backend(
-                            shell,
-                            domain=domain,
-                            username=username,
-                            password=password,
-                        )
-                    ):
-                        print_info_debug(
-                            "[privileges] WinRM NetExec result updated NTLM posture; "
-                            f"retrying service access sweep with backend={WINRM_ACCESS_PROBE_BACKEND}"
-                        )
-                        found_hosts = _run_winrm_psrp_service_access_sweep(
-                            shell,
-                            workspace_dir=workspace_cwd,
-                            domains_dir=domains_dir,
-                            domain=domain,
-                            username=username,
-                            password=password,
-                            targets=effective_target_list,
-                            prompt=prompt,
-                            workflow_intent=workflow_intent,
-                        )
                 if found_hosts or cleaned_hosts:
                     break
 
@@ -1033,14 +949,34 @@ def run_user_postauth_access_with_orchestration(
     if include_acl_enumeration:
         shell.ask_for_enumerate_user_aces(domain, username, password)
 
-    # Check if the user has Kerberos delegations
-    if (
-        "delegations" in shell.domains_data[domain]
-        and username in shell.domains_data[domain]["delegations"]
-    ):
-        marked_username = mark_sensitive(username, "user")
-        print_warning(f"User {marked_username} has Kerberos delegations configured")
-        shell.enum_delegations_user(domain, username, password)
+    # Check if the user has Kerberos delegations in the attack graph.
+    # Data is persisted by the native LDAP collector (allowedtodelegate +
+    # hasunconstrainedauth on the user's node). No subprocess re-enum.
+    try:
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            get_node_by_label,
+        )
+
+        _node = get_node_by_label(
+            shell, domain, label=f"{username.upper()}@{domain.upper()}"
+        )
+        _props = (_node or {}).get("properties", {}) if _node else {}
+        _constrained_spns: list = list(_props.get("allowedtodelegate") or [])
+        _unconstrained: bool = bool(_props.get("hasunconstrainedauth"))
+        if _constrained_spns or _unconstrained:
+            marked_username = mark_sensitive(username, "user")
+            if _constrained_spns:
+                print_info(
+                    f"User {marked_username} has constrained delegation "
+                    f"configured for: {', '.join(_constrained_spns)}"
+                )
+            if _unconstrained:
+                print_warning(
+                    f"User {marked_username} has unconstrained delegation — "
+                    "high-value target for ticket harvesting."
+                )
+    except Exception as _exc:  # noqa: BLE001
+        telemetry.capture_exception(_exc)
 
     # Check if there is ADCS in the domain
     if shell.domains_data[domain].get("adcs"):
@@ -1104,10 +1040,8 @@ def run_enum_adcs_privs(
 ) -> None:
     """Enumerate ADCS privileges for a user and prompt for exploitation."""
     from adscan_internal.cli.adcs import ask_for_adcs_esc
-    from adscan_internal.services.exploitation import ExploitationService
 
     try:
-        auth = shell.build_auth_certipy(domain, username, password)
         pdc_ip = shell.domains_data[domain].get("pdc")
         if not pdc_ip:
             marked_domain = mark_sensitive(domain, "domain")
@@ -1123,38 +1057,41 @@ def run_enum_adcs_privs(
             f"Enumerating ADCS privileges for user {marked_username} in domain {marked_domain}"
         )
 
-        service = ExploitationService()
-        pdc_hostname = shell.domains_data[domain].get("pdc_hostname")
-        target_host = None
-        if isinstance(pdc_hostname, str) and pdc_hostname.strip():
-            target_host = (
-                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain}"
-            )
-        output_prefix = None
         domain_dir = shell.domains_data[domain].get("dir")
-        if isinstance(domain_dir, str) and domain_dir:
-            adcs_dir = os.path.join(domain_dir, "adcs")
-            os.makedirs(adcs_dir, exist_ok=True)
-            output_prefix = os.path.join(adcs_dir, "certipy_find")
-        result = service.adcs.enum_privileges(
-            certipy_path=shell.certipy_path,
-            pdc_ip=pdc_ip,
-            target_host=target_host,
-            auth_string=auth,
-            output_prefix=output_prefix,
-            timeout=300,
-            run_command=getattr(shell, "run_command", None),
-        )
+        vulnerabilities = None
 
-        if not result.success:
-            print_error("Error enumerating ADCS privileges.")
-            if result.raw_output:
-                print_error(result.raw_output)
+        # Try native collector inventory first (Phase 1 already ran).
+        if isinstance(domain_dir, str) and domain_dir:
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    _attack_path_get_recursive_groups,
+                    resolve_adcs_vulns_from_inventory,
+                )
+
+                groups = _attack_path_get_recursive_groups(
+                    shell, domain=domain, samaccountname=username
+                )
+                vulnerabilities = resolve_adcs_vulns_from_inventory(
+                    domain_dir, username=username, groups=groups
+                )
+                if vulnerabilities is not None:
+                    print_info_verbose(
+                        f"[ADCS] Loaded {len(vulnerabilities)} finding(s) from native collector inventory."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                vulnerabilities = None
+
+        if vulnerabilities is None:
+            print_info(
+                "No ADCS inventory found for this domain. "
+                "Run a full scan to populate the ADCS inventory."
+            )
             return
 
         # Process vulnerabilities
-        ca_vulns = [v for v in result.vulnerabilities if v.source == "ca"]
-        template_vulns = [v for v in result.vulnerabilities if v.source == "template"]
+        ca_vulns = [v for v in vulnerabilities if v.source == "ca"]
+        template_vulns = [v for v in vulnerabilities if v.source == "template"]
 
         if ca_vulns:
             marked_username = mark_sensitive(username, "user")
@@ -1200,49 +1137,112 @@ def run_enum_adcs_privs(
 
 
 def run_raise_child(shell: Any, *, domain: str, username: str, password: str) -> None:
-    """Escalate from child domain to parent domain using raiseChild.py."""
+    """Escalate from a child domain to the forest root using the native skelsec stack.
+
+    Uses ``raise_child_native`` (kerbad + aiosmb DRSUAPI + native ticket forging).
+    No subprocess, no impacket dependency at runtime.  Survives NTLM-disabled,
+    AES-only, and signing-required environments.
+    """
     from adscan_internal.services.exploitation import ExploitationService
 
     try:
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        if not shell.impacket_scripts_dir:
+        if domain not in shell.domains_data:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_error(f"Domain {marked_domain} is not initialized in this session.")
+            return
+
+        parts = domain.split(".", 1)
+        if len(parts) < 2 or parts[1] not in shell.domains_data:
+            marked_domain = mark_sensitive(domain, "domain")
             print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
+                f"Cannot identify a parent domain for {marked_domain}. "
+                "raise_child requires the parent (forest root) domain to be initialized first."
             )
             return
 
-        print_info_verbose("Trying to escalate from child domain to parent domain")
+        parent_domain = parts[1]
+        child_dc_ip = shell.domains_data[domain].get("pdc")
+        parent_dc_ip = shell.domains_data[parent_domain].get("pdc")
+        if not child_dc_ip or not parent_dc_ip:
+            print_error(
+                "Missing PDC IP for child or parent domain. "
+                "Re-run domain initialization."
+            )
+            return
+
+        child_dc_hostname = shell.domains_data[domain].get("pdc_hostname")
+        parent_dc_hostname = shell.domains_data[parent_domain].get("pdc_hostname")
+
+        # Decide credential shape: NT hash if password is hash-shaped, else password.
+        password_arg: str | None = password
+        nt_hash_arg: str | None = None
+        try:
+            if shell.is_hash(password):
+                password_arg = None
+                nt_hash_arg = password
+        except Exception:
+            pass
+
+        marked_child = mark_sensitive(domain, "domain")
+        marked_parent = mark_sensitive(parent_domain, "domain")
+        print_info_verbose(
+            f"[raise_child] native escalation: {marked_child} -> {marked_parent}"
+        )
 
         service = ExploitationService()
-        result = service.persistence.raise_child(
-            impacket_scripts_dir=shell.impacket_scripts_dir,
-            auth_string=auth,
-            timeout=300,
+        result = service.persistence.raise_child_native(
+            child_domain=domain,
+            child_dc_ip=child_dc_ip,
+            parent_domain=parent_domain,
+            parent_dc_ip=parent_dc_ip,
+            username=username,
+            password=password_arg,
+            nt_hash=nt_hash_arg,
+            child_dc_hostname=child_dc_hostname,
+            parent_dc_hostname=parent_dc_hostname,
         )
 
         if not result.success:
-            error_detail = (
-                result.raw_output.strip() if result.raw_output else "Unknown error"
+            stage = result.stage_failed or "unknown"
+            detail = result.error or "no error detail returned"
+            print_error(
+                f"raise_child native escalation failed at stage '{stage}': {detail}"
             )
-            print_error("Error executing raiseChild.py.")
-            if error_detail:
-                print_error(f"Details: {error_detail}")
+            # Surface partial credentials (e.g. child krbtgt) so the operator can
+            # use them downstream even if the parent dump did not complete.
+            for cred in result.credentials:
+                marked_username = mark_sensitive(cred["username"], "user")
+                marked_nt_hash = mark_sensitive(cred["nt_hash"], "password")
+                print_warning(
+                    f"Partial credential recovered - Domain: {cred['domain']}, "
+                    f"User: {marked_username}, NT Hash: {marked_nt_hash}"
+                )
+                shell.add_credential(cred["domain"], cred["username"], cred["nt_hash"], credential_origin="dcsync")
             return
 
-        # Process extracted credentials
+        # Success: surface all credentials and the forged ccache path.
         for cred in result.credentials:
             marked_username = mark_sensitive(cred["username"], "user")
             marked_nt_hash = mark_sensitive(cred["nt_hash"], "password")
             print_warning(
-                f"Credential found - Domain: {cred['domain']}, User: {marked_username}, NT Hash: {marked_nt_hash}"
+                f"Credential found - Domain: {cred['domain']}, "
+                f"User: {marked_username}, NT Hash: {marked_nt_hash}"
             )
-            shell.add_credential(cred["domain"], cred["username"], cred["nt_hash"])
+            shell.add_credential(cred["domain"], cred["username"], cred["nt_hash"], credential_origin="dcsync")
 
-        print_success("Escalation completed. The credentials have been saved.")
+        if result.forged_ticket_path:
+            print_info_debug(
+                f"[raise_child] inter-realm ccache: {result.forged_ticket_path}"
+            )
+
+        print_success(
+            f"Escalation completed. {marked_child} -> forest root "
+            f"{marked_parent} (admin: {result.parent_administrator or 'Administrator'})."
+        )
 
     except Exception as e:
         telemetry.capture_exception(e)
-        print_error("Error executing raiseChild.")
+        print_error("Error executing raise_child.")
         print_exception(show_locals=False, exception=e)
 
 

@@ -72,6 +72,7 @@ def persist_fetch_report(
     fetch_result: WindowsArtifactAcquisitionResult,
 ) -> str:
     """Persist fetch metadata for later troubleshooting."""
+    os.makedirs(phase_root_abs, exist_ok=True)
     report_path = os.path.join(phase_root_abs, "fetch_report.json")
     skipped_files = list(fetch_result.skipped_files or [])
     per_file_failures = list(fetch_result.per_file_failures or [])

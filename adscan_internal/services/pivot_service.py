@@ -51,6 +51,9 @@ from adscan_internal.services.ligolo_service import LigoloProxyService
 from adscan_internal.services.pivot_runtime_state_service import (
     reconcile_domain_pivot_runtime_state,
 )
+from adscan_internal.services.pivot_auth_context_service import (
+    build_persisted_pivot_auth_context,
+)
 
 
 @dataclass(slots=True)
@@ -887,6 +890,7 @@ def orchestrate_ligolo_pivot_tunnel(
     remote_agent_os: str = "windows",
     source_service: str = "winrm",
     pivot_method: str = "ligolo_winrm_pivot",
+    pivot_kerberos_spn_host: str | None = None,
 ) -> bool:
     """Create one Ligolo tunnel for confirmed pivot subnets and verify the routes."""
 
@@ -1268,6 +1272,13 @@ def orchestrate_ligolo_pivot_tunnel(
             "domain": domain,
             "pivot_host": pivot_host,
             "pivot_username": username,
+            "pivot_auth": build_persisted_pivot_auth_context(
+                source_service=source_service,
+                username=username,
+                secret=password,
+                kerberos_spn_host=pivot_kerberos_spn_host,
+            ),
+            "pivot_kerberos_spn_host": str(pivot_kerberos_spn_host or "").strip(),
             "source_service": str(source_service or "winrm").strip().lower() or "winrm",
             "pivot_method": str(pivot_method or "ligolo_winrm_pivot").strip()
             or "ligolo_winrm_pivot",

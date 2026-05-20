@@ -99,9 +99,22 @@ class WindowsSensitivePhaseExecutionService:
         transport_label: str,
     ) -> WindowsSensitivePhaseExecutionResult:
         """Fetch and analyze one local loot phase."""
+        from adscan_internal import print_info_debug
+
+        print_info_debug(
+            f"[execute_phase] start: transport={transport_label} phase={phase} "
+            f"loot_dir={mark_sensitive(loot_dir, 'path')} "
+            f"selected_entries={selected_entries_count}"
+        )
         fetch_started_at = time.perf_counter()
         fetch_result = fetcher()
         fetch_duration_seconds = time.perf_counter() - fetch_started_at
+        print_info_debug(
+            f"[execute_phase] fetch done: transport={transport_label} phase={phase} "
+            f"downloaded={len(list(fetch_result.downloaded_files))} "
+            f"fetch_seconds={fetch_duration_seconds:.2f} "
+            f"auth_invalid={fetch_result.auth_invalid_abort}"
+        )
         fetch_report_path = persist_fetch_report(
             phase_root_abs=phase_root_abs,
             fetch_result=fetch_result,
@@ -134,6 +147,11 @@ class WindowsSensitivePhaseExecutionService:
             SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
             SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
         }:
+            print_info_debug(
+                f"[execute_phase] starting credential analysis: "
+                f"transport={transport_label} phase={phase} "
+                f"loot_files={len(downloaded_files)}"
+            )
             analysis_started_at = time.perf_counter()
             credential_summary = analysis_service.analyze_credential_phase(
                 shell,
@@ -148,6 +166,12 @@ class WindowsSensitivePhaseExecutionService:
                 phase_root_abs=phase_root_abs,
             )
             analysis_duration_seconds = time.perf_counter() - analysis_started_at
+            print_info_debug(
+                f"[execute_phase] credential analysis done: "
+                f"transport={transport_label} phase={phase} "
+                f"summary={'None' if credential_summary is None else 'ok'} "
+                f"analysis_seconds={analysis_duration_seconds:.2f}"
+            )
             if credential_summary is None:
                 print_warning(
                     f"CredSweeper is not configured; skipping {transport_label} credential scan."
@@ -193,6 +217,11 @@ class WindowsSensitivePhaseExecutionService:
                 ),
             )
 
+        print_info_debug(
+            f"[execute_phase] starting artifact analysis: "
+            f"transport={transport_label} phase={phase} "
+            f"loot_files={len(downloaded_files)}"
+        )
         analysis_started_at = time.perf_counter()
         artifact_summary = analysis_service.analyze_artifact_phase(
             shell,
@@ -205,6 +234,12 @@ class WindowsSensitivePhaseExecutionService:
             phase_root_abs=phase_root_abs,
         )
         analysis_duration_seconds = time.perf_counter() - analysis_started_at
+        print_info_debug(
+            f"[execute_phase] artifact analysis done: "
+            f"transport={transport_label} phase={phase} "
+            f"artifact_hits={artifact_summary.artifact_hits} "
+            f"analysis_seconds={analysis_duration_seconds:.2f}"
+        )
         print_info(
             f"Deterministic {transport_label} artifact summary: "
             f"phase={mark_sensitive(phase_label, 'text')} "

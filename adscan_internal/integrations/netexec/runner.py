@@ -35,12 +35,14 @@ from adscan_internal.execution_outcomes import (
     result_is_timeout,
 )
 from adscan_internal.integrations.auth_policy import (
+    build_netexec_aeskey_command,
     build_netexec_kerberos_command,
     build_netexec_ntlm_command,
     netexec_can_use_kerberos,
     output_indicates_kerberos_auth_failure,
     output_indicates_kerberos_invalid_credentials,
     output_indicates_ntlm_disabled,
+    output_indicates_rc4_disabled,
     resolve_netexec_auth_policy_decision,
 )
 from adscan_internal.integrations.netexec.parsers import (
@@ -59,6 +61,7 @@ from adscan_internal.text_utils import normalize_cli_output
 from adscan_internal.services.auth_posture_service import (
     record_ntlm_disabled_signal,
     record_ntlm_enabled_signal,
+    record_rc4_disabled_signal,
 )
 
 ExecutionResult = subprocess.CompletedProcess[str]
@@ -214,6 +217,113 @@ def _quote_path_like_netexec_args(command: str) -> str:
         normalized = _quote_flag_value(normalized, flag)
     return normalized
 
+
+def _extract_flag_value(command: str, *flags: str) -> str | None:
+    """Extract the value for the first matching CLI flag from one shell command."""
+    try:
+        argv = shlex.split(str(command or ""))
+    except ValueError:
+        return None
+
+    for flag in flags:
+        try:
+            index = argv.index(flag)
+        except ValueError:
+            continue
+        if index + 1 < len(argv):
+            value = str(argv[index + 1]).strip()
+            return value or None
+    return None
+
+
+def _get_domain_entry_case_insensitive(
+    domains_data: Any,
+    domain: str | None,
+) -> dict[str, Any]:
+    """Return a domain entry from domains_data using case-insensitive matching."""
+    if not isinstance(domains_data, dict) or not domain:
+        return {}
+
+    normalized = str(domain).strip().casefold()
+    for key, value in domains_data.items():
+        if str(key).strip().casefold() == normalized and isinstance(value, dict):
+            return value
+
+    return {}
+
+
+def _select_stored_aes_for_principal(
+    *,
+    domains_data: Any,
+    domain: str | None,
+    username: str | None,
+) -> tuple[str, str] | None:
+    """Return preferred stored AES material for a principal as (kind, key)."""
+    if not domain or not username:
+        return None
+
+    domain_entry = _get_domain_entry_case_insensitive(domains_data, domain)
+    kerberos_keys = domain_entry.get("kerberos_keys", {})
+    if not isinstance(kerberos_keys, dict):
+        return None
+
+    normalized_user = str(username).strip().casefold()
+    material: dict[str, Any] | None = None
+
+    for stored_user, stored_material in kerberos_keys.items():
+        if str(stored_user).strip().casefold() != normalized_user:
+            continue
+        if isinstance(stored_material, dict):
+            material = stored_material
+        break
+
+    if not material:
+        return None
+
+    aes256 = str(material.get("aes256") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", aes256):
+        return "aes256", aes256
+
+    aes128 = str(material.get("aes128") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", aes128):
+        return "aes128", aes128
+
+    return None
+
+
+def _build_stored_aes_retry_command(
+    *,
+    command: str,
+    domains_data: Any,
+    effective_domain: str | None,
+) -> tuple[str, str] | None:
+    """Build an AES Kerberos retry command when -H/-k fails with RC4 disabled."""
+    try:
+        argv = shlex.split(str(command or ""))
+    except ValueError:
+        return None
+
+    if "-H" not in argv:
+        return None
+    if "--aesKey" in argv:
+        return None
+
+    username = _extract_flag_value(command, "-u")
+    command_domain = _extract_flag_value(command, "-d", "--domain") or effective_domain
+    selected_key = _select_stored_aes_for_principal(
+        domains_data=domains_data,
+        domain=command_domain,
+        username=username,
+    )
+    if not selected_key:
+        return None
+
+    key_kind, aes_key = selected_key
+    retry_command = build_netexec_aeskey_command(command, aes_key)
+    if not retry_command or retry_command == command:
+        return None
+
+    return key_kind, retry_command
 
 def _extract_service_from_command(command: str) -> str | None:
     """Return the NetExec service token from one command."""
@@ -662,6 +772,7 @@ class NetExecRunner:
             return shlex.join(fallback_argv)
 
         delegated_ticket_refresh_attempted = False
+        aes_retry_attempted_commands: set[str] = set()
 
         while True:
             needs_retry = False
@@ -916,6 +1027,51 @@ class NetExecRunner:
                     has_connection_reset = _has_connection_reset_by_peer(
                         combined_output
                     )
+                    # Detect KDC_ERR_ETYPE_NOSUPP — RC4 is disabled, so -H + -k
+                    # cannot work. Prefer stored AES material before falling back
+                    # to NTLM.
+                    if " -k " in f" {current_command} " and output_indicates_rc4_disabled(combined_output):
+                        rc4_update = record_rc4_disabled_signal(
+                            getattr(ctx.state_owner, "domains_data", None),
+                            domain=effective_domain,
+                            source="netexec",
+                            signal="KDC_ERR_ETYPE_NOSUPP",
+                            message=combined_output.strip()[:500],
+                        )
+                        print_info_debug(
+                            "[netexec] KDC_ERR_ETYPE_NOSUPP observed: RC4 disabled, "
+                            f"domain={mark_sensitive(str(effective_domain or 'unknown'), 'domain')} "
+                            "rc4_status=likely_disabled action=recorded"
+                        )
+
+                        aes_retry = _build_stored_aes_retry_command(
+                            command=current_command,
+                            domains_data=getattr(ctx.state_owner, "domains_data", None),
+                            effective_domain=effective_domain,
+                        )
+                        if aes_retry is not None:
+                            key_kind, aes_retry_command = aes_retry
+                            if aes_retry_command not in aes_retry_attempted_commands:
+                                aes_retry_attempted_commands.add(aes_retry_command)
+                                _log_attempt_once()
+                                print_warning(
+                                    "NetExec Kerberos with NT hash failed because RC4 is disabled. "
+                                    f"Retrying with stored {key_kind.upper()} Kerberos key."
+                                )
+                                print_info_debug(
+                                    "[netexec] RC4-disabled AES retry command: "
+                                    f"key_kind={key_kind} command={aes_retry_command}"
+                                )
+                                current_command = aes_retry_command
+                                needs_retry = True
+                                break
+
+                        if rc4_update is not None and rc4_update.should_notify_user:
+                            print_warning(
+                                f"Domain {mark_sensitive(str(effective_domain or ''), 'domain')} "
+                                "requires AES Kerberos (RC4 disabled). "
+                                "Future Kerberos attempts with NT hash will be skipped automatically."
+                            )
                     kerberos_ntlm_fallback_attempted = getattr(
                         ctx.state_owner,
                         "_netexec_kerberos_first_ntlm_fallback_attempted",
@@ -1026,12 +1182,13 @@ class NetExecRunner:
                         if current_timeout is not None
                         else "disabled"
                     )
-                    print_warning(
-                        "NetExec command exceeded the current ADscan execution timeout "
-                        f"({timeout_label})."
+                    scope_label = (
+                        f"{effective_target_count} target(s)"
+                        if effective_target_count > 1
+                        else "1 target"
                     )
-                    print_info(
-                        f"Scope size estimate: {effective_target_count} target(s)."
+                    print_warning(
+                        f"Target did not respond within the expected time ({timeout_label}, {scope_label})."
                     )
 
                     if (
@@ -1040,20 +1197,20 @@ class NetExecRunner:
                         or bool(getattr(ctx.state_owner, "non_interactive", False))
                     ):
                         if not allow_timeout_recovery:
-                            print_warning(
-                                "Timeout recovery is disabled for this NetExec command."
+                            print_info_debug(
+                                "[netexec] Timeout recovery is disabled for this command."
                             )
                         else:
                             print_warning(
-                                "Non-interactive mode detected; timeout recovery will not prompt."
+                                "Non-interactive mode detected; skipping timeout recovery."
                             )
                         _log_attempt_once()
                         return proc
 
                     if timeout_recovery_attempts >= max_timeout_recovery_attempts:
                         print_warning(
-                            "NetExec timeout recovery has already been attempted multiple times. "
-                            "Stopping retries to avoid an infinite loop."
+                            "Target is not responding after multiple retries. "
+                            "Check connectivity or try again later."
                         )
                         _log_attempt_once()
                         return proc
@@ -1064,10 +1221,7 @@ class NetExecRunner:
                         target_count=effective_target_count,
                     )
                     if current_timeout is not None and ctx.confirm_ask(
-                        (
-                            "Do you want to retry this NetExec command "
-                            f"with a longer ADscan timeout ({extended_timeout}s)?"
-                        ),
+                        "Keep waiting for a response?",
                         True,
                     ):
                         timeout_recovery_attempts += 1
@@ -1077,19 +1231,6 @@ class NetExecRunner:
                         print_info_debug(
                             "[netexec] Retrying after timeout with extended "
                             f"global_timeout={current_timeout}s"
-                        )
-                        break
-
-                    if current_timeout is not None and ctx.confirm_ask(
-                        "Do you want to retry this NetExec command without a global ADscan timeout?",
-                        False,
-                    ):
-                        timeout_recovery_attempts += 1
-                        current_timeout = None
-                        needs_retry = True
-                        _log_attempt_once()
-                        print_info_debug(
-                            "[netexec] Retrying after timeout with global_timeout=disabled"
                         )
                         break
 

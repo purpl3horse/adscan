@@ -29,7 +29,6 @@ from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import EnumerationService
 from adscan_internal.services.attack_graph_service import upsert_roast_entry_edge
-from adscan_internal.integrations.impacket import ImpacketContext, ImpacketRunner
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 
 
@@ -158,21 +157,6 @@ def _record_user_credential_outcome(
     )
 
 
-def _ensure_impacket_script_dir(shell: Any, *, script_name: str) -> bool:
-    scripts_dir = getattr(shell, "impacket_scripts_dir", None)
-    if not isinstance(scripts_dir, str) or not scripts_dir.strip():
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed."
-        )
-        return False
-    script_path = os.path.join(scripts_dir, script_name)
-    if not os.path.isfile(script_path) or not os.access(script_path, os.X_OK):
-        marked_path = mark_sensitive(script_path, "path")
-        print_error(f"{script_name} not found or not executable: {marked_path}")
-        return False
-    return True
-
-
 def _ensure_cracking_dir(shell: Any, domain: str) -> tuple[str, str]:
     workspace_cwd = shell._get_workspace_cwd()
     cracking_dir = getattr(shell, "cracking_dir", "cracking")
@@ -233,36 +217,60 @@ def _normalize_hashes_file_for_hashcat(
         # with "<user>:$krb5".
         return bool(re.match(r"^[^:]+:\$krb5", line or ""))
 
-    def _extract_hash_payload() -> str | None:
-        """Extract the first roast hash payload from a noisy/raw file.
+    def _hash_user(line: str) -> str | None:
+        """Return the username encoded inside a roast hash line.
 
-        The upstream tools can emit any of these forms:
-        - `$krb5...` on its own line
-        - `user:$krb5...` already ready for `hashcat --username`
-        - a wrapped hash split across multiple lines
-        - auxiliary diagnostic/header lines mixed into the file
+        Supported shapes:
+        - `user:$krb5...`               (already prefixed for `--username`)
+        - `$krb5tgs$<etype>$*user$REALM$spn*$...`   (TGS-REP / Kerberoasting)
+        - `$krb5asrep$<etype>$user@REALM:...`       (AS-REP Roasting)
         """
-
-        # Find the first logical line that contains a roast marker and then join
-        # from there forward. This preserves split hashes without dragging in
-        # preamble lines written by upstream tools.
-        for index, line in enumerate(lines):
-            if "$krb5" not in line:
-                continue
-
-            candidate = "".join(lines[index:]).strip()
-            if _is_username_prefixed_hash(line):
-                return candidate
-
-            hash_start = candidate.find("$krb5")
-            if hash_start >= 0:
-                return candidate[hash_start:].strip() or None
-
+        if not line:
+            return None
+        m = re.match(r"^([^:$]+):\$krb5", line)
+        if m:
+            return m.group(1).strip().lower() or None
+        m = re.match(r"^\$krb5tgs\$\d+\$\*([^$]+)\$", line)
+        if m:
+            return m.group(1).strip().lower() or None
+        m = re.match(r"^\$krb5asrep\$\d+\$([^@]+)@", line)
+        if m:
+            return m.group(1).strip().lower() or None
         return None
 
+    def _extract_hash_payload() -> str | None:
+        """Pick the hash line whose embedded user matches `target_user`.
+
+        The native roaster writes one hash per discovered SPN-bearing user into
+        the same file, so we must select the line that belongs to the user we
+        are about to crack — concatenating all of them would produce a single
+        malformed token that `hashcat` rejects.
+        """
+        wanted = (target_user or "").strip().lower()
+        first_marker_line: str | None = None
+        for line in lines:
+            if "$krb5" not in line:
+                continue
+            if first_marker_line is None:
+                first_marker_line = line
+            owner = _hash_user(line)
+            if owner and wanted and owner == wanted:
+                hash_start = line.find("$krb5")
+                payload = line[hash_start:].strip() if hash_start > 0 else line.strip()
+                if _is_username_prefixed_hash(line):
+                    return line.strip()
+                return payload or None
+
+        # Fallback: no per-user match (single-hash file written by older paths).
+        # Use the first marker line as-is.
+        if first_marker_line is None:
+            return None
+        hash_start = first_marker_line.find("$krb5")
+        if _is_username_prefixed_hash(first_marker_line):
+            return first_marker_line.strip()
+        return first_marker_line[hash_start:].strip() if hash_start >= 0 else None
+
     # If already in `<user>:$krb5...` form *and* single-line, keep it as-is.
-    # Some tools can emit `user:<hash>` but still wrap the hash across multiple
-    # lines; in that case we still need to normalize for hashcat.
     first = lines[0]
     if len(lines) == 1 and _is_username_prefixed_hash(first):
         print_info_debug(
@@ -280,7 +288,9 @@ def _normalize_hashes_file_for_hashcat(
         return hashes_file_abs
 
     normalized_line = (
-        extracted if _is_username_prefixed_hash(extracted) else f"{target_user}:{extracted}"
+        extracted
+        if _is_username_prefixed_hash(extracted)
+        else f"{target_user}:{extracted}"
     )
     normalized_path = f"{hashes_file_abs}.hashcat"
     try:
@@ -313,9 +323,6 @@ def run_kerberoast_for_user(
         print_warning("Kerberoast target user is missing.")
         return False
 
-    if not _ensure_impacket_script_dir(shell, script_name="GetUserSPNs.py"):
-        return False
-
     auth = _select_any_domain_credential(shell, domain)
     if not auth:
         marked_domain = mark_sensitive(domain, "domain")
@@ -323,6 +330,12 @@ def run_kerberoast_for_user(
             f"Cannot Kerberoast without an authenticated domain credential. Domain: {marked_domain}"
         )
         return False
+
+    print_warning(
+        "Kerberoasting requests RC4 tickets (etype 23) — preferred for offline cracking speed. "
+        "Microsoft Defender for Identity generates alert 'Kerberoasting attack suspected' "
+        "(Event 4769, Ticket Encryption Type 0x17). Document as expected engagement noise."
+    )
 
     upsert_roast_entry_edge(
         shell,
@@ -344,15 +357,6 @@ def run_kerberoast_for_user(
         print_error(f"Failed to write users file for Kerberoast: {marked_path}")
         return False
 
-    ctx = ImpacketContext(
-        impacket_scripts_dir=shell.impacket_scripts_dir,
-        validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
-        get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
-        sync_clock_with_pdc=lambda d: bool(shell.do_sync_clock_with_pdc(d, verbose=True)),
-        workspace_dir=_resolve_workspace_dir(shell),
-        domains_data=shell.domains_data,
-    )
-    impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
     enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
 
     try:
@@ -362,10 +366,12 @@ def run_kerberoast_for_user(
             username=auth.username,
             password=None if auth.is_hash else auth.secret,
             hashes=auth.secret if auth.is_hash else None,
-            impacket_runner=impacket_runner,
-            impacket_context=ctx,
+            auth_domain=domain,
             output_file=Path(hashes_file_abs),
             usersfile=Path(usersfile_abs),
+            workspace_dir=_resolve_workspace_dir(shell),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "sync_clock_with_pdc", None),
             scan_id=None,
         )
     except Exception as exc:  # noqa: BLE001
@@ -428,8 +434,11 @@ def run_asreproast_for_user(
         print_warning("ASREPRoast target user is missing.")
         return False
 
-    if not _ensure_impacket_script_dir(shell, script_name="GetNPUsers.py"):
-        return False
+    print_warning(
+        "AS-REP Roasting requests pre-auth disabled TGTs. "
+        "Microsoft Defender for Identity generates alert 'AS-REP Roasting attack suspected' "
+        "(Event 4768, Pre-Authentication Type 0). Document as expected engagement noise."
+    )
 
     upsert_roast_entry_edge(
         shell,
@@ -451,15 +460,6 @@ def run_asreproast_for_user(
         print_error(f"Failed to write users file for ASREPRoast: {marked_path}")
         return False
 
-    ctx = ImpacketContext(
-        impacket_scripts_dir=shell.impacket_scripts_dir,
-        validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
-        get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
-        sync_clock_with_pdc=lambda d: bool(shell.do_sync_clock_with_pdc(d, verbose=True)),
-        workspace_dir=_resolve_workspace_dir(shell),
-        domains_data=shell.domains_data,
-    )
-    impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
     enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
 
     try:
@@ -467,9 +467,10 @@ def run_asreproast_for_user(
             domain=domain,
             pdc=shell.domains_data[domain]["pdc"],
             usersfile=Path(usersfile_abs),
-            impacket_runner=impacket_runner,
-            impacket_context=ctx,
             output_file=Path(hashes_file_abs),
+            workspace_dir=_resolve_workspace_dir(shell),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "sync_clock_with_pdc", None),
             scan_id=None,
         )
     except Exception as exc:  # noqa: BLE001

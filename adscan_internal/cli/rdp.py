@@ -7,6 +7,7 @@ behaviour stable for the current CLI.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
@@ -25,13 +26,6 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
-from adscan_internal.execution_outcomes import result_is_timeout
-from adscan_internal.integrations.medusa import (
-    MedusaContext,
-    MedusaRunner,
-    get_recommended_medusa_settings,
-    parse_medusa_account_matches,
-)
 from adscan_internal.integrations.netexec.timeouts import (
     resolve_service_command_timeout_seconds,
 )
@@ -42,6 +36,12 @@ from adscan_internal.services.pivot_capability_registry import (
 from adscan_internal.services.pivot_opportunity_service import (
     ensure_host_bound_workflow_target_viable,
 )
+from adscan_internal.services.host_reachability_filter import (
+    filter_reachable_hosts_sync,
+    print_reachability_summary,
+    render_no_reachable_panel,
+)
+from adscan_internal.services.rdp_login_service import scan_rdp_hosts
 from adscan_internal.services.service_access_probe_history import (
     record_service_access_probe_batch,
 )
@@ -64,6 +64,7 @@ def _looks_like_ntlm_hash(value: str) -> bool:
         return True
     return False
 
+
 def ask_for_rdp_access(
     shell: Any, *, domain: str, host: str, username: str, password: str
 ) -> None:
@@ -82,6 +83,7 @@ def ask_for_rdp_access(
             domain=domain,
             target_host=host,
             workflow_label="RDP access workflow",
+            service="rdp",
             resume_after_pivot=True,
         )
         is None
@@ -133,6 +135,7 @@ def rdp_access(
     try:
         # Try to import from adscan if available (circular import risk, but adscan imports this module)
         import sys
+
         adscan_module = sys.modules.get("adscan")
         if adscan_module:
             _has_gui_session = getattr(adscan_module, "_has_gui_session", None)
@@ -323,9 +326,7 @@ def execute_rdp_access(shell: Any, command: str) -> bool:
         time.sleep(1)
         returncode = proc.poll()
         if returncode is None:
-            print_info(
-                "RDP session launched. Close the RDP window to end the session."
-            )
+            print_info("RDP session launched. Close the RDP window to end the session.")
             return True
 
         if returncode == 0:
@@ -345,6 +346,7 @@ def execute_rdp_access(shell: Any, command: str) -> bool:
             )
             try:
                 import sys
+
                 adscan_module = sys.modules.get("adscan")
                 if adscan_module:
                     _is_full_adscan_container_runtime = getattr(
@@ -355,6 +357,7 @@ def execute_rdp_access(shell: Any, command: str) -> bool:
                 else:
                     raise ImportError("adscan module not loaded")
             except (ImportError, AttributeError):
+
                 def _is_full_adscan_container_runtime() -> bool:
                     """Check if running in full ADscan container runtime."""
                     if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
@@ -390,7 +393,7 @@ def execute_rdp_access(shell: Any, command: str) -> bool:
         return False
 
 
-def run_rdp_service_access_sweep_with_medusa(
+def run_rdp_service_access_sweep(
     shell: Any,
     *,
     domain: str,
@@ -400,7 +403,10 @@ def run_rdp_service_access_sweep_with_medusa(
     prompt: bool = True,
     target_count: int = 1,
 ) -> bool:
-    """Enumerate RDP access with Medusa.
+    """Enumerate RDP access using the native aardwolf async stack.
+
+    Uses the native aardwolf CredSSP+NTLM client from the vendored skelsec
+    stack (vendor/aardwolf/).
 
     Args:
         shell: Active shell instance.
@@ -414,12 +420,31 @@ def run_rdp_service_access_sweep_with_medusa(
     Returns:
         True when one or more hosts grant RDP access, False otherwise.
     """
-    medusa_path = getattr(shell, "medusa_path", None) or shutil.which("medusa")
-    if not medusa_path:
-        print_error(
-            "Medusa is not available. Rebuild the ADscan runtime image so the new RDP backend is installed."
-        )
+    is_hash = bool(
+        callable(getattr(shell, "is_hash", None)) and shell.is_hash(password)
+    )
+
+    target_entries = (
+        sorted(load_target_entries(targets))
+        if os.path.isfile(str(targets))
+        else [str(targets).strip()]
+    )
+    host_list = [h for h in target_entries if h]
+
+    if not host_list:
+        print_error("No valid RDP targets to probe.")
         return False
+
+    global_timeout = resolve_service_command_timeout_seconds(
+        service="rdp",
+        target_count=target_count,
+        return_boolean=False,
+    )
+    # Per-host connect timeout: use a fraction of the global budget, capped
+    # between 5 and 30 seconds so we don't stall on a single unresponsive host.
+    connect_timeout = max(5.0, min(30.0, global_timeout / max(len(host_list), 1)))
+    # Concurrency: cap at 10 workers, minimum 3.
+    workers = min(10, max(3, len(host_list)))
 
     workspace_cwd = (
         shell._get_workspace_cwd()  # type: ignore[attr-defined]
@@ -427,98 +452,111 @@ def run_rdp_service_access_sweep_with_medusa(
         else getattr(shell, "current_workspace_dir", os.getcwd())
     )
     domains_dir = getattr(shell, "domains_dir", "domains")
-    log_abs_path = os.path.join(
-        workspace_cwd,
-        "domains",
-        domain,
-        "rdp",
-        f"{username}_privs_medusa.log",
-    )
-    os.makedirs(os.path.dirname(log_abs_path), exist_ok=True)
-
-    settings = get_recommended_medusa_settings("rdp", target_count=target_count)
-    use_ntlm_hash = bool(
-        callable(getattr(shell, "is_hash", None)) and shell.is_hash(password)
-    )
-    module_arguments = [f"DOMAIN:{domain}"]
-    if use_ntlm_hash:
-        module_arguments.append("PASS:HASH")
-
-    global_timeout = resolve_service_command_timeout_seconds(
-        service="rdp",
-        target_count=target_count,
-        return_boolean=False,
-    )
-    context = MedusaContext(
-        medusa_path=medusa_path,
-        command_runner=lambda command, timeout: shell.run_command(
-            command, timeout=timeout
-        ),
-    )
-    runner = MedusaRunner()
-    completed_process = runner.execute_login_sweep(
-        ctx=context,
-        protocol="rdp",
-        targets=targets,
-        username=username,
-        password=password,
-        settings=settings,
-        log_file=log_abs_path,
-        module_arguments=module_arguments,
-        timeout=global_timeout,
-    )
+    # DC IP for Kerberos fallback (used when NTLM is disabled by GPO).
+    dc_ip: str | None = getattr(shell, "dc_ip", None) or getattr(shell, "pdc_ip", None)
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_username = mark_sensitive(username, "user")
     print_info_debug(
-        "[rdp-medusa] dispatch: "
-        f"domain={marked_domain} user={marked_username} targets={mark_sensitive(str(targets), 'path')} "
-        f"auth_mode={'pass_the_hash' if use_ntlm_hash else 'password'} "
-        f"threads={settings.total_logins} host_threads={settings.concurrent_hosts} "
-        f"connect_timeout={settings.connect_timeout_seconds}s global_timeout={global_timeout}s"
+        "[rdp-aardwolf] dispatch: "
+        f"domain={marked_domain} user={marked_username} "
+        f"targets={mark_sensitive(str(targets), 'path')} "
+        f"auth_mode={'pass_the_hash' if is_hash else 'password'} "
+        f"hosts={len(host_list)} workers={workers} "
+        f"connect_timeout={connect_timeout:.0f}s global_timeout={global_timeout}s"
     )
-    if use_ntlm_hash:
-        print_info(
-            f"Using Medusa RDP pass-the-hash mode for user {marked_username}"
-        )
+    if is_hash:
+        print_info(f"Using RDP pass-the-hash mode for user {marked_username}")
 
-    if completed_process is None:
-        print_error("RDP enumeration failed before Medusa returned a result.")
-        return False
-
-    if result_is_timeout(completed_process, tool_name="medusa"):
-        print_warning(
-            "Medusa RDP enumeration ended due to timeout recovery being exhausted or declined."
-        )
-        return False
-
-    combined_output = "\n".join(
-        part for part in [completed_process.stdout or "", completed_process.stderr or ""] if part
-    )
-    findings = parse_medusa_account_matches(combined_output, protocol="rdp")
-    if not findings and os.path.exists(log_abs_path):
+    # Posture wiring (PR-RDP): skip doomed NTLM round-trip when the workspace
+    # already knows NTLM is disabled by GPO; record a signal when our own
+    # NTLM-then-Kerberos fallback proves it is.
+    posture_sink = None
+    posture_snapshot = None
+    domains_data = getattr(shell, "domains_data", None)
+    if domains_data is not None:
         try:
-            with open(log_abs_path, "r", encoding="utf-8", errors="ignore") as handle:
-                findings = parse_medusa_account_matches(
-                    handle.read(),
-                    protocol="rdp",
-                )
-        except OSError:
-            findings = []
+            from adscan_internal import get_console
+            from adscan_internal.cli.widgets.intelligence_update import (
+                render_intelligence_update,
+            )
+            from adscan_internal.services.domain_posture import get_posture
+            from adscan_internal.services.posture_sink import (
+                make_workspace_posture_sink,
+            )
+
+            posture_sink = make_workspace_posture_sink(
+                domains_data,
+                on_finding=lambda finding: get_console().print(
+                    render_intelligence_update(finding)
+                ),
+            )
+            posture_snapshot = get_posture(domains_data, domain=domain)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[rdp-aardwolf] posture wiring skipped: {exc}")
+
+    # Pre-flight TCP probe on 3389 — RDP credential testing waits 5-10s per
+    # offline host. Filtering them out first is the difference between minutes
+    # and seconds at corporate scale.
+    if len(host_list) > 1:
+        rdp_reach = filter_reachable_hosts_sync(host_list, port=3389)
+        print_reachability_summary(rdp_reach, service_label="RDP")
+        if not rdp_reach.reachable:
+            render_no_reachable_panel(rdp_reach, operation_label="RDP Login Sweep")
+            return
+        host_list = list(rdp_reach.reachable)
+
+    try:
+        rdp_results = asyncio.run(
+            scan_rdp_hosts(
+                host_list,
+                domain=domain,
+                username=username,
+                secret=password,
+                is_hash=is_hash,
+                dc_ip=dc_ip,
+                connect_timeout_s=connect_timeout,
+                max_workers=workers,
+                posture_snapshot=posture_snapshot,
+                posture_sink=posture_sink,
+                domain_for_posture=domain,
+            )
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_error("RDP enumeration failed.")
+        print_exception(show_locals=False, exception=exc)
+        return False
 
     service_findings = [
         ServiceAccessFinding(
             service="rdp",
-            host=str(finding.host).strip(),
-            username=str(finding.username).strip(),
-            category=finding.result_category,
-            reason=finding.result_reason,
-            status=str(finding.status).strip(),
-            backend="medusa",
+            host=r.host,
+            username=username,
+            category="confirmed"
+            if r.confirmed
+            else ("ambiguous" if r.ambiguous else "denied"),
+            reason=r.error or ("CredSSP+NTLM accepted" if r.confirmed else ""),
+            status="TRUE" if r.confirmed else ("MAYBE" if r.ambiguous else "FALSE"),
+            backend="aardwolf",
         )
-        for finding in findings
+        for r in rdp_results
+        if r.verdict != "ERROR"
     ]
-    success_findings = [finding for finding in service_findings if finding.category == "confirmed"]
+    for r in rdp_results:
+        if r.verdict == "ERROR":
+            print_info_debug(
+                f"[rdp-aardwolf] error probing {mark_sensitive(r.host, 'hostname')}: {r.error}"
+            )
+
+    success_findings = [f for f in service_findings if f.category == "confirmed"]
+    if is_hash and not success_findings and service_findings:
+        print_warning(
+            "RDP pass-the-hash returned no confirmed hosts. "
+            "If NTLM is disabled by GPO on this network, PtH is not viable — "
+            "obtain a plaintext password or Kerberos key instead."
+        )
     render_service_access_results(
         service="rdp",
         username=username,
@@ -526,9 +564,13 @@ def run_rdp_service_access_sweep_with_medusa(
         total_targets=target_count,
     )
     category_counts = summarize_service_access_categories(service_findings)
-    if category_counts["denied"] or category_counts["transport"] or category_counts["ambiguous"]:
+    if (
+        category_counts["denied"]
+        or category_counts["transport"]
+        or category_counts["ambiguous"]
+    ):
         print_info_debug(
-            "[rdp-medusa] unconfirmed result breakdown: "
+            "[rdp-aardwolf] unconfirmed result breakdown: "
             f"denied={category_counts['denied']} "
             f"transport={category_counts['transport']} "
             f"ambiguous={category_counts['ambiguous']}"
@@ -537,7 +579,6 @@ def run_rdp_service_access_sweep_with_medusa(
     found_privileged_hosts = False
     for finding in success_findings:
         found_privileged_hosts = True
-        host = finding.host
         try:
             from adscan_internal.services.attack_graph_service import (
                 upsert_netexec_privilege_edge,
@@ -548,32 +589,30 @@ def run_rdp_service_access_sweep_with_medusa(
                 domain,
                 username=finding.username,
                 relation="CanRDP",
-                target_ip=host,
+                target_ip=finding.host,
                 target_hostname=None,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
 
-    target_entries = (
-        sorted(load_target_entries(targets))
-        if os.path.isfile(targets)
-        else [str(targets).strip()]
-    )
     normalized_target_entries = {
-        str(entry).strip().lower() for entry in target_entries if str(entry).strip()
+        str(e).strip().lower() for e in target_entries if str(e).strip()
     }
     confirmed_targets = [
         entry
         for entry in target_entries
         if str(entry).strip().lower()
         in {
-            str(finding.host).strip().lower()
-            for finding in success_findings
-            if str(finding.host).strip()
+            str(f.host).strip().lower() for f in success_findings if str(f.host).strip()
         }
     ]
-    if not confirmed_targets and len(normalized_target_entries) == 1 and success_findings:
+    if (
+        not confirmed_targets
+        and len(normalized_target_entries) == 1
+        and success_findings
+    ):
         confirmed_targets = list(target_entries)
+
     try:
         record_service_access_probe_batch(
             workspace_dir=workspace_cwd,
@@ -583,27 +622,27 @@ def run_rdp_service_access_sweep_with_medusa(
             service="rdp",
             targets=target_entries,
             confirmed_hosts=confirmed_targets,
-            source="run_rdp_service_access_sweep_with_medusa",
-            backend="medusa",
+            source="run_rdp_service_access_sweep",
+            backend="aardwolf",
             pivot_capable=is_service_pivot_capable("rdp"),
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_info_debug(
-            f"[rdp-medusa] failed to persist probe history: {exc}"
-        )
+        print_info_debug(f"[rdp-aardwolf] failed to persist probe history: {exc}")
 
     if prompt and success_findings:
-        selected_followups, used_selector = select_confirmed_service_access_followup_targets(
-            shell,
-            service="rdp",
-            findings=success_findings,
+        selected_followups, used_selector = (
+            select_confirmed_service_access_followup_targets(
+                shell,
+                service="rdp",
+                findings=success_findings,
+            )
         )
         if used_selector:
             for finding in selected_followups:
                 marked_host = mark_sensitive(finding.host, "hostname")
                 print_info_debug(
-                    "[rdp-medusa] launching selected follow-up: "
+                    "[rdp-aardwolf] launching selected follow-up: "
                     f"user={marked_username} host={marked_host}"
                 )
                 rdp_access(
@@ -617,15 +656,17 @@ def run_rdp_service_access_sweep_with_medusa(
             for finding in success_findings:
                 marked_host = mark_sensitive(finding.host, "hostname")
                 print_info_debug(
-                    "[rdp-medusa] launching follow-up prompt: "
+                    "[rdp-aardwolf] launching follow-up prompt: "
                     f"user={marked_username} host={marked_host}"
                 )
-                shell.ask_for_rdp_access(domain, finding.host, finding.username, password)
+                shell.ask_for_rdp_access(
+                    domain, finding.host, finding.username, password
+                )
     elif not prompt:
         for finding in success_findings:
             marked_host = mark_sensitive(finding.host, "hostname")
             print_info_debug(
-                "[rdp-medusa] follow-up prompt suppressed: "
+                "[rdp-aardwolf] follow-up prompt suppressed: "
                 f"user={marked_username} host={marked_host}"
             )
 

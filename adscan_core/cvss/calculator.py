@@ -40,9 +40,11 @@ from adscan_core.cvss.contextual_rules import get_vuln_cvss_definition
 from adscan_core.cvss.models import (
     CONDITION_DC_TARGETS,
     CONDITION_EXPLOITATION,
+    CONDITION_RELAY_CONFIRMED,
     CONDITION_TIER_ZERO,
     CvssContext,
     CvssElevationRule,
+    FindingType,
 )
 from adscan_core.cvss.severity_mapper import score_to_severity
 
@@ -102,8 +104,22 @@ class AdscanPriorityResult:
 
 @dataclass(frozen=True)
 class FindingSeverityResult:
-    """Combined severity output for one finding instance."""
+    """Combined severity output for one finding instance.
 
+    Attributes:
+        finding_type: Canonical taxonomy classification — drives how UI/PDF
+            renders the finding (badge variant, label) and informs whether
+            a CVSS Base vector is even applicable.
+        base: Formal CVSS Base output (only meaningful for VULNERABILITY-typed
+            findings — for CHAIN_PREREQUISITE / POSTURE the score is a
+            reasonable Medium-grade baseline rather than a real CVSS).
+        adscan: ADscan contextual priority overlay.
+        context: The CvssContext used for the computation.
+        display_score / display_severity: Recommended primary value for
+            prioritization in reports and dashboards.
+    """
+
+    finding_type: FindingType
     base: BaseCvssResult
     adscan: AdscanPriorityResult
     context: CvssContext
@@ -121,6 +137,18 @@ class FindingSeverityResult:
     @property
     def adscan_effective_score(self) -> float:
         return self.adscan.score
+
+    @property
+    def is_vulnerability(self) -> bool:
+        return self.finding_type == FindingType.VULNERABILITY
+
+    @property
+    def is_chain_prerequisite(self) -> bool:
+        return self.finding_type == FindingType.CHAIN_PREREQUISITE
+
+    @property
+    def is_posture(self) -> bool:
+        return self.finding_type == FindingType.POSTURE
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +427,7 @@ def _matching_conditions(context: CvssContext) -> dict[str, bool]:
     return {
         CONDITION_TIER_ZERO: context.has_tier_zero_targets,
         CONDITION_DC_TARGETS: context.has_dc_targets,
+        CONDITION_RELAY_CONFIRMED: context.relay_confirmed,
         CONDITION_EXPLOITATION: context.exploitation_confirmed,
     }
 
@@ -494,7 +523,17 @@ def compute_finding_severity(
     *,
     catalog_base_score: float | None = None,
 ) -> FindingSeverityResult:
-    """Return the full severity model for one finding instance."""
+    """Return the full severity model for one finding instance.
+
+    Resolves the finding's canonical type from the contextual rules registry.
+    Findings not registered in ``CVSS_RULES`` default to
+    ``FindingType.VULNERABILITY`` to preserve backward compatibility with
+    legacy detectors that may not yet be classified — these still receive a
+    formal CVSS Base score from the catalog.
+    """
+    definition = get_vuln_cvss_definition(vuln_key)
+    finding_type = definition.finding_type if definition else FindingType.VULNERABILITY
+
     base = compute_base_cvss_result(
         vuln_key,
         catalog_base_score=catalog_base_score,
@@ -506,6 +545,7 @@ def compute_finding_severity(
     )
 
     return FindingSeverityResult(
+        finding_type=finding_type,
         base=base,
         adscan=adscan,
         context=context,

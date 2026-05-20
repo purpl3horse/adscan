@@ -14,7 +14,6 @@ from collections.abc import Callable
 import ipaddress
 import os
 import re
-import sys
 import tempfile
 
 from adscan_internal import telemetry
@@ -1424,7 +1423,8 @@ def preflight_domain_pdc_interactive(
     candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
 ) -> PdcPreflightResult:
     """Validate (domain, candidate_ip) and ask user to confirm corrections."""
-    if not sys.stdin.isatty():
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    if _is_non_interactive(shell):
         return preflight_domain_pdc_noninteractive(
             shell, domain=domain, candidate_ip=candidate_ip, mode_label=mode_label
         )
@@ -2087,7 +2087,8 @@ def offer_a_record_fallback(
         padding=(1, 2),
     )
 
-    if not sys.stdin.isatty():
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    if _is_non_interactive(shell):
         if len(ip_candidates) == 1:
             print_info_debug(
                 "[dns] Non-interactive mode: using single A-record candidate as DC/PDC"
@@ -2696,15 +2697,18 @@ def is_user_dc(shell: DNSShell, domain: str, target_host: str) -> bool:
 
 def get_user_dc_role(shell: DNSShell, domain: str, target_host: str) -> str:
     """Classify a machine account as writable DC, RODC, or not a DC."""
-    import re
-
     from adscan_internal.rich_output import print_exception
     from adscan_internal.services.attack_graph_service import (
+        get_node_by_label,
         is_principal_member_of_rid_from_snapshot,
     )
     from adscan_internal.services.domain_controller_classifier import (
         RID_DOMAIN_CONTROLLERS,
         RID_READ_ONLY_DOMAIN_CONTROLLERS,
+        classify_computer_node_role,
+    )
+    from adscan_internal.services.native_group_membership import (
+        is_principal_member_of_rid_native,
     )
     from adscan_internal.principal_utils import normalize_machine_account
 
@@ -2712,6 +2716,32 @@ def get_user_dc_role(shell: DNSShell, domain: str, target_host: str) -> str:
         normalized_machine = normalize_machine_account(target_host)
         marked_target_host = mark_sensitive(normalized_machine, "hostname")
 
+        # Stage 1 — node-property classification (AD-schema definitive).
+        # primaryGroupID, krbtgt/<host> SPN, and the UF_PARTIAL_SECRETS_ACCOUNT
+        # UAC bit each uniquely identify the role.  These are attributes of
+        # the Computer object itself, populated by the LDAP collector — they
+        # do not require enumerating MemberOf edges, which RODCs may block.
+        node = get_node_by_label(shell, domain, label=normalized_machine)
+        if isinstance(node, dict):
+            node_role = classify_computer_node_role(node)
+            if node_role == "rodc":
+                print_info_debug(
+                    f"[is_user_dc] {marked_target_host} is an RODC "
+                    "(node properties: primaryGroupID/krbtgt-SPN/UAC)."
+                )
+                print_success(f"{marked_target_host} is a Read-Only Domain Controller")
+                return "rodc"
+            if node_role == "writable_dc":
+                print_info_debug(
+                    f"[is_user_dc] {marked_target_host} is a DC "
+                    "(node properties: primaryGroupID=516)."
+                )
+                print_success(f"{marked_target_host} is a Domain Controller")
+                return "writable_dc"
+
+        # Stage 2 — recursive membership snapshot (RID 521 / RID 516).
+        # Used when node properties were inconclusive; this is the legacy
+        # primary path and remains useful for nested or aliased setups.
         rodc_snapshot_result = is_principal_member_of_rid_from_snapshot(
             shell, domain, normalized_machine, RID_READ_ONLY_DOMAIN_CONTROLLERS
         )
@@ -2756,48 +2786,28 @@ def get_user_dc_role(shell: DNSShell, domain: str, target_host: str) -> str:
                 print_success(f"{marked_target_host} is a Domain Controller")
                 return "writable_dc"
 
-        def _membership_matches(group_name: str) -> bool:
-            auth_str = shell.build_auth_nxc(
-                shell.domains_data[domain]["username"],
-                shell.domains_data[domain]["password"],
-                shell.domain,
-                kerberos=False,
-            )
-            command = (
-                f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth_str} "
-                f"--log domains/{domain}/ldap/is_dc_{target_host}.log "
-                f"--groups '{group_name}'"
-            )
-
-            print_info(f"Verifying if {marked_target_host} is a Domain Controller")
-            completed_process = shell.run_command(command, timeout=300)
-
-            if completed_process.returncode != 0:
-                marked_host = mark_sensitive(target_host, "hostname")
-                print_error(
-                    f"Error executing {shell.netexec_path} ldap to check if {marked_host} is a DC. "
-                    f"Return code: {completed_process.returncode}"
-                )
-                if completed_process.stderr:
-                    print_error(f"Error details: {completed_process.stderr.strip()}")
-                elif completed_process.stdout:
-                    print_error(
-                        f"Output (possibly error): {completed_process.stdout.strip()}"
-                    )
-                return False
-
-            output_str = completed_process.stdout
-            dc_matches = re.findall(r"GROUP-MEM.*?(\S+\$)", output_str)
-            dc_matches = [match.upper() for match in dc_matches]
-            return normalized_machine.upper() in dc_matches
-
         print_info_debug(
-            f"[is_user_dc] Falling back to LDAP group lookup for {marked_target_host}."
+            f"[is_user_dc] Falling back to native LDAP RID lookup for {marked_target_host}."
         )
-        if _membership_matches("read-only domain controllers"):
+        print_info(f"Verifying if {marked_target_host} is a Domain Controller")
+        rodc_native_result = is_principal_member_of_rid_native(
+            shell,
+            domain,
+            normalized_machine,
+            RID_READ_ONLY_DOMAIN_CONTROLLERS,
+            operation_name="RODC membership check",
+        )
+        if rodc_native_result is True:
             print_success(f"{marked_target_host} is a Read-Only Domain Controller")
             return "rodc"
-        if _membership_matches("domain controllers"):
+        dc_native_result = is_principal_member_of_rid_native(
+            shell,
+            domain,
+            normalized_machine,
+            RID_DOMAIN_CONTROLLERS,
+            operation_name="Domain Controller membership check",
+        )
+        if dc_native_result is True:
             print_success(f"{marked_target_host} is a Domain Controller")
             return "writable_dc"
 

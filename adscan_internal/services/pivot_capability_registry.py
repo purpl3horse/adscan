@@ -19,6 +19,12 @@ class PivotServiceCapability:
     followup_handler_name: str | None = None
     followup_workflow_intent: str | None = None
     relaunch_workflow_intent: str | None = None
+    # BloodHound-style graph relation that proves a user can use this service
+    # against a target computer (e.g. CanPSRemote for WinRM, CanRDP for RDP).
+    # When set, ADscan can pre-filter pivot offers to owned users that hold
+    # this relation in the attack graph, instead of fanning out across every
+    # owned credential blindly.
+    graph_relation: str | None = None
 
 
 _PIVOT_SERVICE_CAPABILITIES: dict[str, PivotServiceCapability] = {
@@ -31,6 +37,7 @@ _PIVOT_SERVICE_CAPABILITIES: dict[str, PivotServiceCapability] = {
         followup_handler_name="ask_for_winrm_access",
         followup_workflow_intent="pivot_search",
         relaunch_workflow_intent="pivot_relaunch",
+        graph_relation="CanPSRemote",
     ),
     "mssql": PivotServiceCapability(
         service="mssql",

@@ -11,6 +11,7 @@ from adscan_internal.rich_output import (
     mark_sensitive,
     print_info,
     print_info_debug,
+    print_panel,
     print_warning,
 )
 from adscan_internal.services.adcs_target_filter import (
@@ -31,6 +32,64 @@ HIGH_VALUE_GROUP_ENRICHMENT_MAX_DEPTH = 4
 HIGH_VALUE_GROUP_ENRICHMENT_MAX_RESULTS = 100
 
 
+# Per-group OPSEC / attack-vector summaries surfaced in the pre-flight panel.
+# Each entry covers what the membership enables, the expected escalation
+# route, and the Windows event IDs / detection signals defenders typically
+# watch for. Strings are intentionally short so they read well stacked
+# inside a single Rich panel.
+_GROUP_VECTOR_SUMMARY: dict[str, dict[str, Any]] = {
+    "Account Operators": {
+        "vector": (
+            "Members can create, modify, and reset passwords on non-protected "
+            "user, group, and computer objects. The common escalation route "
+            "is to add the controlled principal (or a backdoor account) to a "
+            "Tier 0 group such as Domain Admins or Server Operators."
+        ),
+        "expected_changes": [
+            "Group membership write on the target Tier 0 group.",
+            "Optional: password reset against a Tier 0 service account.",
+        ],
+        "opsec": [
+            "Event 4732 / 4756 on the PDC (security group member added).",
+            "Event 4724 (password reset) when the path includes a takeover.",
+            "MDI / MDE alerts on direct DA membership changes.",
+        ],
+    },
+    "Exchange Windows Permissions": {
+        "vector": (
+            "Members hold WriteDACL over the domain head in on-prem Exchange "
+            "deployments. The classic abuse grants DCSync rights to a "
+            "controlled principal and replicates secrets."
+        ),
+        "expected_changes": [
+            "DACL write on the domain head (DS-Replication-Get-Changes-All).",
+            "Optional: subsequent DRSUAPI replication (DCSync) request.",
+        ],
+        "opsec": [
+            "Event 5136 (directory object modified) on the domain NC.",
+            "Event 4662 carrying the replication GUIDs.",
+            "MDI rule on suspicious directory services object modification.",
+        ],
+    },
+    "Exchange Trusted Subsystem": {
+        "vector": (
+            "Nested inside Exchange Windows Permissions in most deployments. "
+            "Effective rights mirror Exchange Windows Permissions and enable "
+            "the same DCSync escalation."
+        ),
+        "expected_changes": [
+            "DACL write on the domain head via the nested group chain.",
+            "Optional: subsequent DRSUAPI replication (DCSync) request.",
+        ],
+        "opsec": [
+            "Event 5136 attributed to the Exchange subsystem.",
+            "Event 4662 carrying the replication GUIDs.",
+            "MDI replication-rights audit signals on the domain head.",
+        ],
+    },
+}
+
+
 def _account_operators_canonical(domain: str) -> str:
     return f"ACCOUNT OPERATORS@{(domain or '').strip().upper()}"
 
@@ -41,6 +100,55 @@ def _exchange_windows_permissions_canonical(domain: str) -> str:
 
 def _exchange_trusted_subsystem_canonical(domain: str) -> str:
     return f"EXCHANGE TRUSTED SUBSYSTEM@{(domain or '').strip().upper()}"
+
+
+def _print_high_value_group_preflight(
+    *,
+    display_name: str,
+    marked_user: str,
+    marked_domain: str,
+) -> None:
+    """Render a premium pre-flight panel for a high-value group finding.
+
+    Color and glyph are paired (NO_COLOR safe): the leading bullet plus the
+    "Detection signals" header carry the meaning even when the terminal
+    strips styling. The body stays under the natural width so the panel
+    works at 80x24.
+    """
+    summary = _GROUP_VECTOR_SUMMARY.get(display_name)
+    if summary is None:
+        # Fallback to the legacy one-liner if a new caller appears without
+        # a registered summary. Keeps the surface forgiving instead of
+        # silently dropping the warning.
+        print_warning(
+            f"User {marked_user} is in {display_name} for {marked_domain}. "
+            "This often leads to domain compromise."
+        )
+        return
+
+    body_lines: list[str] = []
+    body_lines.append(
+        f"[bold]Principal:[/bold] {marked_user} (member of {display_name})"
+    )
+    body_lines.append(f"[bold]Domain:[/bold]    {marked_domain}")
+    body_lines.append("")
+    body_lines.append("[bold]Why it matters[/bold]")
+    body_lines.append(f"  {summary['vector']}")
+    body_lines.append("")
+    body_lines.append("[bold]Planned AD changes if exploited[/bold]")
+    for item in summary["expected_changes"]:
+        body_lines.append(f"  - {item}")
+    body_lines.append("")
+    body_lines.append("[bold]Detection signals[/bold]")
+    for item in summary["opsec"]:
+        body_lines.append(f"  ! {item}")
+
+    print_panel(
+        "\n".join(body_lines),
+        title=f"[bold yellow]{display_name} -> Domain Compromise (preview)[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    )
 
 
 def _get_attack_step_sample_limit() -> int:
@@ -116,7 +224,9 @@ def _extract_candidate_paths(
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return []
 
-    canonical_start = str(source_group_label or "").strip() or _account_operators_canonical(domain)
+    canonical_start = str(
+        source_group_label or ""
+    ).strip() or _account_operators_canonical(domain)
     start_node_id: str | None = None
     for node_id, node_data in nodes_map.items():
         if not isinstance(node_data, dict):
@@ -141,7 +251,9 @@ def _extract_candidate_paths(
 
     results: list[tuple[list[str], list[str]]] = []
 
-    def dfs(current: str, visited: set[str], path_nodes: list[str], rels: list[str]) -> None:
+    def dfs(
+        current: str, visited: set[str], path_nodes: list[str], rels: list[str]
+    ) -> None:
         if len(rels) >= max_depth:
             return
         current_node = nodes_map.get(current)
@@ -180,7 +292,11 @@ def _extract_candidate_paths(
         name = _node_name_for_attack_graph(node_data)
         if not name:
             return None
-        out: dict[str, Any] = {"name": name, "kind": [_node_kind(node_data)], "properties": props}
+        out: dict[str, Any] = {
+            "name": name,
+            "kind": [_node_kind(node_data)],
+            "properties": props,
+        }
         object_id = _node_object_id(node_data)
         if object_id:
             out["objectId"] = object_id
@@ -233,7 +349,9 @@ def _select_best_path(
         return None
 
     # Prefer shortest; stable tie-breaker by target name.
-    filtered.sort(key=lambda item: (len(item[1]), str(item[0][-1].get("name") or "").lower()))
+    filtered.sort(
+        key=lambda item: (len(item[1]), str(item[0][-1].get("name") or "").lower())
+    )
     return filtered[0]
 
 
@@ -251,12 +369,33 @@ def _offer_group_tier_zero_enrichment(
     marked_domain = mark_sensitive(domain, "domain")
     marked_user = mark_sensitive(username, "user")
 
-    print_warning(
-        f"User {marked_user} is in {display_name} for {marked_domain}. This can often lead to domain compromise."
+    _print_high_value_group_preflight(
+        display_name=display_name,
+        marked_user=marked_user,
+        marked_domain=marked_domain,
     )
 
+    # In native mode the collector already wrote ACL/AdminTo/CanRDP edges
+    # for these groups into attack_graph.json. Phase 2 BFS now includes
+    # compromise enabler groups as start nodes, so paths from this group
+    # to Tier-0 are surfaced by the standard attack-path flow without a
+    # separate BloodHound CE Cypher query.
+    print_info_debug(
+        f"[acct-ops] native mode: skipping BH CE enrichment for {display_name} "
+        f"(paths will surface via Phase 2 BFS from compromise enabler group nodes)"
+    )
+    return True
+
     try:
-        service = shell._get_bloodhound_service()
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if not callable(service_getter):
+            print_info_debug("[acct-ops] graph service unavailable")
+            return False
+        service = service_getter()
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
         print_info_debug(f"[acct-ops] BloodHound service unavailable: {exc}")
@@ -346,7 +485,7 @@ def _offer_group_tier_zero_enrichment(
             nodes=nodes,
             relations=rels,
             status="discovered",
-            edge_type="bloodhound_ce",
+            edge_type="graph_collection",
             shell=shell,
         )
 
@@ -356,7 +495,11 @@ def _offer_group_tier_zero_enrichment(
 
             # Wrap raw BloodHound properties into our node shape to avoid
             # persisting Users as kind=Unknown (which would use SID-based IDs).
-            user_record = {"name": user_label, "kind": ["User"], "properties": user_node}
+            user_record = {
+                "name": user_label,
+                "kind": ["User"],
+                "properties": user_node,
+            }
             upsert_nodes(graph, [user_record])
 
         # Account Operators node must exist from the candidate path; if not, add a minimal one.
@@ -374,7 +517,9 @@ def _offer_group_tier_zero_enrichment(
             relations = ["MemberOf"] + list(rels)
             step_str = f"{mark_sensitive(node_labels[0], 'node')}"
             for idx, rel in enumerate(relations):
-                step_str += f" -> {str(rel)} -> {mark_sensitive(node_labels[idx + 1], 'node')}"
+                step_str += (
+                    f" -> {str(rel)} -> {mark_sensitive(node_labels[idx + 1], 'node')}"
+                )
             if step_str not in sampled_seen and len(sampled_steps) < sample_limit:
                 sampled_seen.add(step_str)
                 sampled_steps.append(step_str)
@@ -386,7 +531,9 @@ def _offer_group_tier_zero_enrichment(
         )
         sample_targets = sorted(added_targets)[:5]
         if sample_targets:
-            sample_text = ", ".join(mark_sensitive(target, "group") for target in sample_targets)
+            sample_text = ", ".join(
+                mark_sensitive(target, "group") for target in sample_targets
+            )
             remaining = max(0, len(added_targets) - len(sample_targets))
             suffix = f" (+{remaining} more)" if remaining else ""
             print_info(
@@ -404,7 +551,7 @@ def _offer_group_tier_zero_enrichment(
                     f"{display_name} enrichment - discovered steps "
                     f"(showing {len(sampled_steps)}/{total_edges_added})"
                 )
-            print_info_list(sampled_steps, title=title, icon="→")
+            print_info_list(sampled_steps, title=title, icon="->")
 
     return bool(total_edges_added)
 

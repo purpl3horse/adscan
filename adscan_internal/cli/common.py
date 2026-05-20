@@ -70,7 +70,7 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "clear_all": "exempt",
     "clear_auths": "exempt",
     "clear_creds_and_auths": "exempt",
-    "clear_responder_db": "exempt",
+    "clear_poisoning": "exempt",
     "cp": "exempt",
     "cracking": "requires_initialized_domain",
     "cracking_history": "exempt",
@@ -110,7 +110,7 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "netexec_user_privs": "requires_initialized_domain",
     "quit": "exempt",
     "raise_child": "requires_initialized_domain",
-    "responder": "exempt",
+    "poisoning": "exempt",
     "rm": "exempt",
     "session": "exempt",
     "set": "exempt",
@@ -120,7 +120,7 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "smb_sensitive_benchmark": "exempt",
     "start_auth": "exempt",
     "start_unauth": "exempt",
-    "stop_responder": "exempt",
+    "stop_poisoning": "exempt",
     "system": "exempt",
     "unauth_scan": "requires_initialized_domain",
     "update": "exempt",
@@ -142,7 +142,6 @@ _AUTH_INIT_RECOMMENDED_COMMANDS = {
     "dump_sam",
     "enum_authenticated",
     "enum_configs",
-    "enum_delegations",
     "enum_domain_auth",
     "enum_domain_auth_phase1",
     "generate_relay_list",
@@ -166,18 +165,13 @@ _UNAUTH_INIT_RECOMMENDED_COMMANDS = {
     "kerberos_enum_users",
     "ldap_anonymous",
     "netexec_guest",
-    "netexec_null_general",
-    "netexec_null_shares",
     "rid_cycling",
     "smb_scan",
     "spraying",
     "unauth_scan",
 }
 _COMMAND_INITIALIZER_RECOMMENDATIONS: dict[str, str] = {
-    **{
-        command_name: "start_auth"
-        for command_name in _AUTH_INIT_RECOMMENDED_COMMANDS
-    },
+    **{command_name: "start_auth" for command_name in _AUTH_INIT_RECOMMENDED_COMMANDS},
     **{
         command_name: "start_unauth"
         for command_name in _UNAUTH_INIT_RECOMMENDED_COMMANDS
@@ -556,7 +550,9 @@ def command_requires_initialized_domain_context(
         ``True`` when the command should only run after ``start_unauth`` or
         ``start_auth`` initialized the domain in ``domains_data``.
     """
-    policy, _source = classify_command_domain_context_policy(command_name, command_method)
+    policy, _source = classify_command_domain_context_policy(
+        command_name, command_method
+    )
     return policy in {"auto_by_signature", "requires_initialized_domain"}
 
 
@@ -713,59 +709,6 @@ def ensure_initialized_domain_context_for_command(
     return False
 
 
-def load_bloodhound_ce_display_config() -> tuple[str, str, str]:
-    """Return BloodHound CE login URL and credentials for CLI info/logging views."""
-    default_base_url = "http://localhost:8442"
-    base_url = default_base_url
-    username = "admin"
-    password = "Not configured"
-    config_path: str | None = None
-
-    try:
-        from adscan_internal.bloodhound_ce_compose import BLOODHOUND_CE_DEFAULT_WEB_PORT
-        from adscan_internal.integrations.bloodhound_cli.core.settings import (
-            CONFIG_FILE as BLOODHOUND_CONFIG_FILE,
-            load_ce_config,
-        )
-
-        default_base_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
-        base_url = default_base_url
-        config_path = str(BLOODHOUND_CONFIG_FILE)
-
-        ce_config = load_ce_config()
-        base_url_candidate = str(getattr(ce_config, "base_url", "") or "").strip()
-        username_candidate = str(getattr(ce_config, "username", "") or "").strip()
-        password_candidate = str(getattr(ce_config, "password", "") or "").strip()
-
-        if base_url_candidate:
-            base_url = base_url_candidate.rstrip("/")
-        if username_candidate:
-            username = username_candidate
-        if password_candidate:
-            password = password_candidate
-        else:
-            marked_path = (
-                mark_sensitive(config_path, "path")
-                if config_path
-                else mark_sensitive("~/.bloodhound_config", "path")
-            )
-            print_info_debug(
-                f"BloodHound CE password missing in {marked_path}; showing fallback value."
-            )
-    except Exception as exc:
-        marked_path = (
-            mark_sensitive(config_path, "path")
-            if config_path
-            else mark_sensitive("~/.bloodhound_config", "path")
-        )
-        print_info_debug(
-            f"Failed to load BloodHound CE config from {marked_path}; using defaults. Error: {exc}"
-        )
-
-    login_url = f"{base_url.rstrip('/')}/ui/login"
-    return login_url, username, password
-
-
 def build_cli_runtime_snapshot(
     *,
     shell: Any,
@@ -810,8 +753,6 @@ def build_cli_runtime_snapshot(
                 "credentials_count": creds_count,
             }
 
-    login_url, bh_user, bh_password = load_bloodhound_ce_display_config()
-
     telemetry_enabled = False
     telemetry_source = "persisted"
     try:
@@ -833,9 +774,6 @@ def build_cli_runtime_snapshot(
         "automatic_mode": getattr(shell, "auto", None),
         "pentest_type": getattr(shell, "type", None),
         "current_workspace": getattr(shell, "current_workspace_dir", None),
-        "bloodhound_ce_url": login_url,
-        "bloodhound_ce_user": bh_user,
-        "bloodhound_ce_password": bh_password,
         "telemetry_enabled": telemetry_enabled,
         "telemetry_source": telemetry_source,
         "context_domain": context_domain,
@@ -891,7 +829,9 @@ def log_cli_command_context(
         marked_pdc_host = mark_sensitive(
             str(domain_state.get("pdc_hostname", "N/A")), "hostname"
         )
-        marked_username = mark_sensitive(str(domain_state.get("username", "N/A")), "user")
+        marked_username = mark_sensitive(
+            str(domain_state.get("username", "N/A")), "user"
+        )
         creds_count = int(domain_state.get("credentials_count", 0) or 0)
         print_info_debug(
             f"[{source}] Domain state: "

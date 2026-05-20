@@ -24,6 +24,9 @@ from adscan_internal.services.base_service import BaseService
 
 CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
 _NTLM_HASH_DUMP_TEXT_EXTENSIONS = (".txt", ".log", ".csv")
+_OFFICE_ENCRYPTED_EXTENSIONS = (
+    ".xlsx", ".xlsm", ".xls", ".docx", ".doc", ".pptx", ".ppt"
+)
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,34 @@ class ShareFileAnalyzerService(BaseService):
                 ],
                 notes=[],
             )
+        if lowered_path.endswith(_OFFICE_ENCRYPTED_EXTENSIONS):
+            try:
+                encrypted = False
+                with zipfile.ZipFile(io.BytesIO(file_bytes)):
+                    pass
+            except zipfile.BadZipFile:
+                encrypted = True
+            except Exception:
+                encrypted = False
+            if encrypted:
+                return ShareFileAnalyzerResult(
+                    handled=True,
+                    continue_with_ai=False,
+                    summary=(
+                        "Encrypted Office document detected — office2john will "
+                        "attempt hash extraction and cracking."
+                    ),
+                    findings=[
+                        ShareFileAnalyzerFinding(
+                            credential_type="office_artifact",
+                            username="-",
+                            secret="-",
+                            confidence="high",
+                            evidence=f"Encrypted {Path(lowered_path).suffix.upper()} document",
+                        )
+                    ],
+                    notes=[],
+                )
         if lowered_path.endswith((".yml", ".yaml")):
             text = file_bytes.decode("utf-8", errors="replace")
             findings, notes = self._analyze_ansible_vault_text(

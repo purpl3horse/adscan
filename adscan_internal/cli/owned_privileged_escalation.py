@@ -12,8 +12,6 @@ centralized in ``adscan.py``.
 
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any
 
 from rich.prompt import Confirm
@@ -68,8 +66,8 @@ def offer_owned_privileged_escalation(shell: Any, domain: str) -> bool:
     if not creds_map:
         return False
 
-    is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
-    interactive = bool(sys.stdin.isatty() and not is_ci)
+    from adscan_internal.interaction import is_non_interactive as _is_non_interactive
+    interactive = not _is_non_interactive(shell)
 
     marked_domain = mark_sensitive(domain, "domain")
     print_info_verbose(

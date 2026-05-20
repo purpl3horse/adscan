@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 import json
 import os
-import shlex
 import time
 
 from rich.prompt import Confirm
@@ -17,8 +16,6 @@ from adscan_internal import (
     print_error,
     print_info,
     print_info_debug,
-    print_operation_header,
-    print_success,
     print_warning,
     telemetry,
 )
@@ -26,7 +23,6 @@ from adscan_internal.cli import cracking as cracking_cli
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.integrations.netexec.parsers import (
     ParsedTimeroastHash,
-    parse_netexec_timeroast_hashes,
 )
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.path_utils import get_adscan_home
@@ -66,7 +62,7 @@ class TimeroastShell(Protocol):
 
     def _get_workspace_cwd(self) -> str: ...
 
-    def _get_bloodhound_service(self) -> Any: ...
+    def _get_graph_service(self) -> Any: ...
 
     def _run_netexec(
         self,
@@ -282,9 +278,16 @@ def _get_timeroast_candidates(
     shell: TimeroastShell,
     domain: str,
 ) -> list[TimeroastCandidate]:
-    """Query BloodHound and normalize Timeroast candidates."""
+    """Query the graph service and normalize Timeroast candidates."""
     try:
-        service = shell._get_bloodhound_service()
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if not callable(service_getter):
+            return []
+        service = service_getter()
         raw_rows = service.get_timeroast_candidates(
             domain,
             max_results=_DEFAULT_MAX_RESULTS,
@@ -293,7 +296,7 @@ def _get_timeroast_candidates(
         telemetry.capture_exception(exc)
         marked_domain = mark_sensitive(domain, "domain")
         print_warning(
-            f"BloodHound Timeroast candidate query failed for {marked_domain}."
+            f"Graph Timeroast candidate query failed for {marked_domain}."
         )
         print_info_debug(
             f"[timeroast] candidate query failed for {marked_domain}: {exc}"
@@ -551,105 +554,91 @@ def _collect_timeroast_hashes(
     domain: str,
     candidates: list[TimeroastCandidate],
 ) -> str | None:
-    """Run NetExec Timeroast and write hashcat-ready hashes for candidate RIDs."""
-    if not shell.netexec_path:
-        print_error(
-            "NetExec is not installed or configured. Please run 'adscan install'."
-        )
-        return None
+    """Run native Timeroast (MS-SNTP UDP) and write hashcat-ready hashes."""
+    import asyncio
+
+    from adscan_internal.services.timeroasting.config import TimeroastConfig
+    from adscan_internal.services.timeroasting.display import (
+        print_timeroast_preflight,
+        print_timeroast_results,
+        run_timeroast_with_display,
+    )
+    from adscan_internal.integrations.netexec.parsers import ParsedTimeroastHash
 
     pdc = str(shell.domains_data.get(domain, {}).get("pdc") or "").strip()
     if not pdc:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(f"PDC is not configured for {marked_domain}.")
-        return None
-    domain_creds = shell.domains_data.get(domain, {})
-    username = str(domain_creds.get("username") or "").strip()
-    password = str(domain_creds.get("password") or "").strip()
-    if not username or not password:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(
-            f"Missing credentials for {marked_domain}. Timeroast requires authenticated SMB access."
-        )
+        print_error(f"PDC is not configured for {mark_sensitive(domain, 'domain')}.")
         return None
 
-    pdc_target = pdc
-    use_kerberos = False
-    if hasattr(shell, "do_sync_clock_with_pdc"):
-        try:
-            use_kerberos = bool(shell.do_sync_clock_with_pdc(domain, verbose=True))
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[timeroast] kerberos clock sync precheck failed for "
-                f"{mark_sensitive(domain, 'domain')}: {exc}"
-            )
-            use_kerberos = False
-    pdc_hostname = str(domain_creds.get("pdc_hostname") or "").strip()
-    if use_kerberos and pdc_hostname:
-        pdc_target = f"{pdc_hostname}.{domain}"
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=use_kerberos)
+    if not candidates:
+        print_warning("No timeroast candidates — nothing to probe.")
+        return None
+
+    candidates_by_rid = {c.rid: c for c in candidates}
+    rids = tuple(c.rid for c in candidates)
 
     paths = _build_timeroast_paths(shell, domain)
     os.makedirs(os.path.dirname(paths["log_abs"]), exist_ok=True)
 
-    print_operation_header(
-        "Timeroasting",
-        details={
-            "Domain": domain,
-            "Target": pdc,
-            "Candidates": str(len(candidates)),
-            "Log": paths["log_rel"],
-        },
-        icon="⏱️",
+    cfg = TimeroastConfig(
+        dc_ip=pdc,
+        rids=rids,
+        rate=180,
+        timeout=24.0,
     )
 
-    command = (
-        f"{shlex.quote(shell.netexec_path)} smb {shlex.quote(pdc_target)} "
-        f"{auth} -M timeroast --log {shlex.quote(paths['log_abs'])}"
-    )
-    print_info_debug(f"[timeroast] command: {command}")
-
-    completed = shell._run_netexec(
-        command,
+    print_timeroast_preflight(
+        dc_ip=pdc,
         domain=domain,
-        timeout=300,
-        pre_sync=False,
+        candidate_count=len(candidates),
+        rate=cfg.rate,
+        timeout=cfg.timeout,
     )
-    if completed is None:
-        print_error("Timeroast command failed to execute.")
+
+    try:
+        result = asyncio.run(
+            run_timeroast_with_display(cfg, candidates_by_rid=candidates_by_rid)
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_error(f"Native timeroast failed: {exc}")
         return None
 
-    combined_output = (
-        (getattr(completed, "stdout", "") or "")
-        + "\n"
-        + (getattr(completed, "stderr", "") or "")
-    )
-    parsed_hashes = parse_netexec_timeroast_hashes(combined_output)
-    if not parsed_hashes:
-        print_warning("NetExec Timeroast did not return any hashes.")
+    if result.error:
+        print_error(f"Timeroast error: {result.error}")
         return None
 
-    candidates_by_rid = {candidate.rid: candidate for candidate in candidates}
+    if not result.hashes:
+        print_warning(
+            "No NTP responses captured. Verify UDP/123 is reachable from this host "
+            "and the candidate RIDs correspond to existing accounts."
+        )
+        return None
+
+    # Convert native results → ParsedTimeroastHash for shared persistence logic
+    parsed_hashes = [
+        ParsedTimeroastHash(rid=h.rid, hash_value=h.hashcat_line.split(":", 1)[1])
+        for h in result.hashes
+    ]
+
     normalized_hash_file, matched_candidates = _write_timeroast_hash_files(
         paths=paths,
         candidates_by_rid=candidates_by_rid,
         parsed_hashes=parsed_hashes,
     )
+
+    print_timeroast_results(
+        result,
+        candidates_by_rid=candidates_by_rid,
+        hash_file_path=normalized_hash_file,
+    )
+
     if not normalized_hash_file:
-        print_warning(
-            "NetExec returned Timeroast hashes, but none matched the selected "
-            "BloodHound candidates."
-        )
+        print_warning("Hashes captured but none matched candidate RIDs for filtering.")
         return None
 
-    print_success(
-        "Collected Timeroast hashes for "
-        f"{len(matched_candidates)} candidate machine account(s)."
-    )
     print_info(
-        "Filtered Timeroast hashes stored in "
-        f"{mark_sensitive(paths['normalized_hash_rel'], 'path')}."
+        f"Hashes saved to {mark_sensitive(paths['normalized_hash_rel'], 'path')}."
     )
     return normalized_hash_file
 

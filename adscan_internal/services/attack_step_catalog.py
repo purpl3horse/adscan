@@ -45,6 +45,7 @@ CompromiseSemantics = Literal[
     "direct_target_compromise",
     "access_capability_only",
     "context_only",
+    "credential_access_only",
     "other",
 ]
 CompromiseEffort = Literal[
@@ -54,6 +55,12 @@ CompromiseEffort = Literal[
     "medium",
     "high",
     "other",
+]
+SourceContextRequirement = Literal[
+    "user_credentials",      # DEFAULT — any authenticated principal (most edges)
+    "none",                  # No auth needed (coercion, ASREPRoasting, Timeroasting)
+    "local_admin_session",   # Admin shell on host required (dump-type edges)
+    "machine_credential",    # Machine account TGT/hash required (AllowedToDelegate, RBCD)
 ]
 
 _COMPLEXITY_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "very_high": 3}
@@ -83,7 +90,9 @@ class AttackStepCatalogEntry:
     bh_cypher_names: tuple[
         str, ...
     ] = ()  # Cypher relationship type(s) for BH CE queries
-    is_acl_edge: bool = False  # True = ACL/ACE-derived object-control or extended-right edge
+    is_acl_edge: bool = (
+        False  # True = ACL/ACE-derived object-control or extended-right edge
+    )
     execution_relation_alias: str | None = None  # canonical execution-family relation
     requires_execution_context: bool = False
     counts_for_execution_readiness: bool = False
@@ -103,6 +112,10 @@ class AttackStepCatalogEntry:
     # Structured remediation steps (ordered). Each string may also contain
     # the same placeholder set as narrative_template.
     remediation_steps: tuple[str, ...] = ()
+    # What credential/session context the *source* principal must have before
+    # this edge can be traversed.  Used by the DFS to block semantically-wrong
+    # chains (e.g. AdminTo → AllowedToDelegate).
+    source_context_requirement: SourceContextRequirement = "user_credentials"
 
 
 def _entry(
@@ -131,6 +144,7 @@ def _entry(
     narrative_template: str = "",
     short_narrative_template: str = "",
     remediation_steps: tuple[str, ...] = (),
+    source_context_requirement: SourceContextRequirement = "user_credentials",
 ) -> AttackStepCatalogEntry:
     """Build a normalized catalog entry."""
     return AttackStepCatalogEntry(
@@ -160,6 +174,7 @@ def _entry(
         narrative_template=narrative_template.strip(),
         short_narrative_template=short_narrative_template.strip(),
         remediation_steps=tuple(remediation_steps),
+        source_context_requirement=source_context_requirement,
     )
 
 
@@ -194,15 +209,22 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "backupoperatorescalation",
-        support_kind="unsupported",
-        support_reason="Backup Operators follow-up is modeled but not executed automatically yet",
+        support_kind="supported",
+        support_reason=(
+            "Native async RRP hive dump (NativeDumpService.backup_operator_dump): "
+            "opens HKLM\\SAM/SECURITY/SYSTEM with REG_OPTION_BACKUP_RESTORE, "
+            "downloads via ADMIN$, parses DC machine account hash in-process."
+        ),
         compromise_semantics="direct_target_compromise",
         compromise_effort="medium",
         category="privilege",
-        description="Potential domain compromise path via Backup Operators follow-up abuse",
+        description="Domain compromise via Backup Operators: remote registry hive extraction → DC machine account hash",
         remediation_complexity="medium",
         remediation_effort="Remove unnecessary membership from Backup Operators and constrain backup privileges.",
         can_fully_mitigate=True,
+        mitre_technique_id="T1003.002",
+        mitre_technique_name="OS Credential Dumping: Security Account Manager",
+        detection_event_ids=("4656", "4663", "4624"),
     ),
     _entry(
         "printoperatorabuse",
@@ -400,6 +422,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         support_reason="High-risk / potentially disruptive (disabled by design)",
         category="cve",
         description="Netlogon cryptographic flaw exploitation path",
+        source_context_requirement="none",
         vuln_key="zerologon",
         remediation_complexity="low",
         remediation_effort=(
@@ -418,6 +441,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         support_reason="High-risk / potentially disruptive (disabled by design)",
         category="cve",
         description="NoPac domain takeover path",
+        source_context_requirement="none",
         vuln_key="nopac",
         remediation_complexity="low",
         remediation_effort=(
@@ -471,6 +495,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "mseven",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        source_context_requirement="none",
         category="cve",
         description="MSEven coercion-style authentication trigger path",
         vuln_key="mseven",
@@ -491,6 +516,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "allowedtodelegate",
         support_kind="supported",
         support_reason="Kerberos constrained delegation enumeration/exploitation",
+        source_context_requirement="machine_credential",
         category="delegation",
         description="Abuse AllowedToDelegate paths to impersonate users to delegated services",
         vuln_key="constrained_delegation",
@@ -511,6 +537,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "allowedtoact",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        source_context_requirement="machine_credential",
         category="delegation",
         description="Resource-based constrained delegation attack path",
         vuln_key="rbcd_exploitable",
@@ -591,6 +618,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         support_reason="Extract and crack Kerberos AS-REP hashes for a target user",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
+        source_context_requirement="none",
         category="kerberos",
         description="Offline crack AS-REP material from users without preauth",
         vuln_key="asreproast",
@@ -609,6 +637,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "timeroasting",
         support_kind="supported",
         support_reason="Extract and crack MS-SNTP machine-account material",
+        source_context_requirement="none",
         category="credential_access",
         description="Offline crack MS-SNTP challenge material from machine accounts",
         remediation_complexity="medium",
@@ -621,6 +650,44 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1110.002",
         mitre_technique_name="Brute Force: Password Cracking",
         bh_cypher_names=("Timeroasting",),
+    ),
+    _entry(
+        "HasShadowCredentials",
+        support_kind="supported",
+        support_reason=(
+            "Object already has msDS-KeyCredentialLink — authenticate via PKINIT "
+            "to retrieve NT hash without knowing the account password"
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="credential_access",
+        description=(
+            "Existing shadow credentials allow PKINIT authentication "
+            "and NT hash retrieval"
+        ),
+        vuln_key="shadow_credentials_present",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Audit all msDS-KeyCredentialLink values via LDAP. "
+            "Remove unexpected entries. Enable Event ID 5136 auditing on the "
+            "msDS-KeyCredentialLink attribute. Deploy Windows Hello for Business "
+            "only through sanctioned Group Policy."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1606.002",
+        mitre_technique_name="Forge Web Credentials: SAML Tokens",
+        detection_event_ids=("5136",),
+        bh_cypher_names=("HasShadowCredentials",),
+        remediation_steps=(
+            "Enumerate: ldapsearch -b <domain_dn> '(msDS-KeyCredentialLink=*)' "
+            "msDS-KeyCredentialLink",
+            "Remove unexpected entries via ADSIEdit or: "
+            "Set-ADObject -Identity <DN> -Clear msDS-KeyCredentialLink",
+            "Enable DS Access auditing on msDS-KeyCredentialLink (Event ID 5136) "
+            "in Default Domain Controller Policy.",
+            "Legitimate WHfB entries are created by the DC — entries from "
+            "non-DC principals are suspicious.",
+        ),
     ),
     # ── Lateral movement / execution ────────────────────────────────────────
     _entry(
@@ -685,6 +752,220 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624",),
         bh_native=True,
         bh_cypher_names=("SQLAdmin",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    # ── MSSQL post-exploitation escalation steps ──────────────────────────────
+    # These steps are emitted live during adscan mssql takeover execution.
+    # They connect a SQLAdmin node to a SystemCompromise node on the same host.
+    # technique_variant (pentester-facing) is stored in evidence; the step
+    # relation itself (client-facing) is the same regardless of technique.
+    _entry(
+        "mssql_seimpersonate_escalation",
+        support_kind="supported",
+        support_reason=(
+            "MSSQL sysadmin with SeImpersonatePrivilege → SYSTEM via CLR potato chain "
+            "(GodPotato RPCSS coercion on WS2019, SweetPotato DCOM/BITS on WS2016). "
+            "Bypasses Defender write-time scan: assembly bytes loaded as T-SQL hex, no PE on disk."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="privilege",
+        description=(
+            "The SQL Server service account's SeImpersonatePrivilege allows escalating "
+            "to NT AUTHORITY\\SYSTEM on the database server via a CLR stored procedure. "
+            "No file is written to disk: the exploit assembly is loaded directly into "
+            "SQL Server memory as a hexadecimal literal, bypassing AV write-time scanning."
+        ),
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Remove SeImpersonatePrivilege from the SQL Server service account "
+            "(configure the service to run as a least-privilege named account rather than "
+            "NETWORK SERVICE or LocalSystem). Note: even after removal, the token theft "
+            "technique (MssqlTokenTheftEscalation) may still apply — see that step."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1134.001",
+        mitre_technique_name="Access Token Manipulation: Token Impersonation/Theft",
+        detection_event_ids=("4688", "7045"),
+        bh_native=False,
+        bh_cypher_names=("MssqlSeImpersonateEscalation",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
+        "mssql_token_theft_escalation",
+        support_kind="supported",
+        support_reason=(
+            "MSSQL sysadmin WITHOUT SeImpersonatePrivilege → SYSTEM via shared logon session "
+            "token recovery (Forshaw 2020). The stored service startup token in LSASS retains "
+            "SeImpersonatePrivilege even when the process token has been stripped. "
+            "Recovery uses SMB loopback named pipe auth: kernel authenticates with stored token, "
+            "then GodPotato RPCSS coercion escalates to SYSTEM."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="privilege",
+        description=(
+            "Even when SeImpersonatePrivilege has been removed from the SQL Server process token "
+            "(a common hardening measure), the original service startup token stored in LSASS "
+            "retains the privilege. A CLR stored procedure recovers this token via SMB loopback "
+            "named pipe authentication (Forshaw shared logon session technique) and escalates "
+            "to NT AUTHORITY\\SYSTEM. This bypass is architectural — removing the privilege from "
+            "the process token is insufficient."
+        ),
+        remediation_complexity="high",
+        remediation_effort=(
+            "Run the SQL Server service as a dedicated named service account (not NETWORK SERVICE "
+            "or LocalSystem) with a fresh, isolated logon session. Ensure the account has the "
+            "minimum required privileges and is not shared with other services. "
+            "Additionally, consider Windows Defender Credential Guard to protect stored tokens, "
+            "and audit SMB loopback connections (\\\\localhost\\pipe\\*) for unusual authentication."
+        ),
+        can_fully_mitigate=False,
+        mitre_technique_id="T1134.001",
+        mitre_technique_name="Access Token Manipulation: Token Impersonation/Theft",
+        detection_event_ids=("4688", "7045", "5145"),
+        bh_native=False,
+        bh_cypher_names=("MssqlTokenTheftEscalation",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
+        "mssql_linked_server_lateral",
+        support_kind="supported",
+        support_reason=(
+            "MSSQL linked server chain: sysadmin on source SQL instance executes "
+            "EXEC ('...') AT [linked_server], gaining sysadmin-equivalent access on "
+            "a second SQL Server instance. Combined with SeImpersonate or token theft "
+            "on the target instance, this extends the blast radius across multiple hosts."
+        ),
+        compromise_semantics="access_capability_only",
+        compromise_effort="low",
+        category="lateral_movement",
+        description=(
+            "A SQL Server linked server relationship allows an attacker with sysadmin "
+            "access on the source instance to execute arbitrary SQL on a second SQL Server "
+            "instance (the linked target). This effectively extends the attack surface: "
+            "each linked server hop can be chained with local privilege escalation "
+            "(SeImpersonate or token theft) to achieve SYSTEM on additional hosts."
+        ),
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Audit and remove unnecessary linked server relationships "
+            "(sp_droplinkedsrvlogin / sp_dropserver). "
+            "If linked servers are required, restrict the linked server login to the minimum "
+            "necessary permissions (avoid sysadmin mapping). "
+            "Use Windows Authentication with a dedicated low-privilege service account "
+            "rather than 'Be Made Using the Login's Current Security Context'."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1210",
+        mitre_technique_name="Exploitation of Remote Services",
+        detection_event_ids=("4624", "4648"),
+        bh_native=False,
+        bh_cypher_names=("MssqlLinkedServerLateral",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
+        "mssql_impersonate_login",
+        support_kind="supported",
+        support_reason=(
+            "EXECUTE AS LOGIN privilege on a high-priv login (e.g. sa) confirmed via "
+            "native TDS query; xp_cmdshell enabled and OS command executed under the "
+            "impersonated identity. Classic GOAD path: samwell.tarly → EXECUTE AS LOGIN='sa'."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="privilege",
+        description=(
+            "A low-privilege SQL login that has been granted IMPERSONATE rights on a "
+            "higher-privileged login (e.g. 'sa') can assume that identity within the "
+            "SQL Server session using EXECUTE AS LOGIN. This effectively grants sysadmin "
+            "access, enabling xp_cmdshell execution, CLR assembly loading, and all other "
+            "sysadmin capabilities — without knowing the target login's password."
+        ),
+        remediation_complexity="low",
+        remediation_effort=(
+            "Revoke the IMPERSONATE grant: "
+            "REVOKE IMPERSONATE ON LOGIN::[target] FROM [grantee]. "
+            "Audit all IMPERSONATE grants with: "
+            "SELECT grantee_principal_name, entity_name FROM sys.server_permissions "
+            "WHERE permission_name = 'IMPERSONATE'."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1078.002",
+        mitre_technique_name="Valid Accounts: Domain Accounts",
+        detection_event_ids=("33205",),
+        bh_native=False,
+        bh_cypher_names=("MssqlImpersonateLogin",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
+        "mssql_trustworthy_db_escalation",
+        support_kind="supported",
+        support_reason=(
+            "TRUSTWORTHY database owned by sysadmin found; EXECUTE AS USER = 'dbo' "
+            "within that database grants effective sysadmin. Confirmed via "
+            "IS_SRVROLEMEMBER('sysadmin') check. Classic GOAD path: "
+            "arya.stark → USE msdb; EXECUTE AS USER='dbo' → sysadmin."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="privilege",
+        description=(
+            "A TRUSTWORTHY database owned by a sysadmin account allows any user with "
+            "db_owner rights (or EXECUTE AS USER='dbo') to escalate to effective sysadmin "
+            "server-wide. When EXECUTE AS USER impersonates the database owner context "
+            "inside a TRUSTWORTHY database, SQL Server grants server-level permissions "
+            "equivalent to the database owner's server role — giving sysadmin access to "
+            "any db_owner in that database."
+        ),
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable TRUSTWORTHY on all non-system databases: "
+            "ALTER DATABASE [dbname] SET TRUSTWORTHY OFF. "
+            "For msdb, ensure no untrusted users have db_owner rights. "
+            "Audit with: SELECT name, is_trustworthy_on FROM sys.databases "
+            "WHERE is_trustworthy_on = 1 AND name NOT IN ('msdb','model','tempdb','master')."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1078.002",
+        mitre_technique_name="Valid Accounts: Domain Accounts",
+        detection_event_ids=("33205",),
+        bh_native=False,
+        bh_cypher_names=("MssqlTrustworthyDbEscalation",),
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
+        "mssql_ntlmv2_theft",
+        support_kind="supported",
+        support_reason=(
+            "xp_dirtree or similar built-in stored procedure forced to authenticate "
+            "to an attacker-controlled SMB server, capturing the SQL service account's "
+            "NTLMv2 hash for offline cracking or relay."
+        ),
+        compromise_semantics="access_capability_only",
+        compromise_effort="medium",
+        category="credential_access",
+        description=(
+            "A SQL sysadmin (or any user with EXECUTE rights on xp_dirtree / xp_fileexist) "
+            "can force the SQL Server service account to authenticate to an attacker-controlled "
+            "SMB share, capturing its NTLMv2 response hash. If the service account is "
+            "a domain user, the hash can be cracked offline or relayed to authenticate "
+            "as that account on other network resources."
+        ),
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Restrict outbound SMB from SQL Server hosts via firewall rules (block TCP 445 "
+            "outbound). Revoke EXECUTE on xp_dirtree, xp_fileexist, xp_subdirs from "
+            "non-sysadmin roles. Run SQL Server under a Managed Service Account (MSA) or "
+            "gMSA whose password cannot be cracked. "
+            "Enable Extended Protection for Authentication on IIS/SMB to block relay."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1557.001",
+        mitre_technique_name="Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning and SMB Relay",
+        detection_event_ids=("4624", "4648", "5145"),
+        bh_native=False,
+        bh_cypher_names=("MssqlNtlmv2Theft",),
         execution_target_access_requirement="computer_reachable",
     ),
     _entry(
@@ -790,8 +1071,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc2",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async enrollment-agent chain via MS-ICPR",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -874,8 +1155,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc6",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async EDITF_ATTRIBUTESUBJECTALTNAME2 exploitation",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -895,8 +1176,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc7",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async ManageCA via LDAP then SubCA cert request",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -916,8 +1197,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc8",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async coercion plus SMB-to-HTTP ADCS relay",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -939,8 +1220,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc9",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async UPN manipulation via LDAP + shadow credentials chain",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -982,8 +1263,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc11",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async coercion plus SMB-to-RPC ADCS relay",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -1004,11 +1285,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "adcsesc13",
         support_kind="supported",
-        support_reason="Not implemented yet in ADscan",
+        support_reason="Supported via Certipy req/auth with linked group follow-up",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
-        description="ADCS ESC13 privilege escalation path",
+        description="ADCS ESC13 effective linked-group membership path",
         vuln_key="adcs_esc13",
         remediation_complexity="medium",
         remediation_effort=(
@@ -1024,8 +1305,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc14",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async altSecurityIdentities X509 binding write",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -1045,8 +1326,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc15",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async application-policy OID injection enrollment chain",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -1108,8 +1389,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "coerceandrelayntlmtoadcs",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Native async coercion plus ADCS NTLM relay",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -1196,8 +1477,10 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "owns",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="ACL/ACE abuse (Owns → dacledit FullControl → target-specific chain)",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="immediate",
         category="acl_ace",
         description="Object ownership grants implicit GenericAll-equivalent rights",
         remediation_complexity="medium",
@@ -1302,7 +1585,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "readlapspassword",
         support_kind="supported",
         support_reason="ACL/ACE abuse (ReadLAPSPassword)",
-        compromise_semantics="direct_target_compromise",
+        compromise_semantics="access_capability_only",
         compromise_effort="low",
         category="acl_ace",
         description="Read LAPS local administrator password",
@@ -1384,7 +1667,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "writeaccountrestrictions",
         support_kind="supported",
-        support_reason="Not implemented yet in ADscan",
+        support_reason="ACL/ACE abuse (WriteAccountRestrictions -> RBCD on Computer targets)",
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
         category="acl_ace",
@@ -1474,8 +1757,11 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "writesmbpath",
-        support_kind="supported",
-        support_reason="Validated theoretically via Impacket SMB share ACL and path ACL analysis",
+        support_kind="context",
+        support_reason=(
+            "Contextual staging capability discovered via SMB ACL analysis; "
+            "not a standalone executable attack step"
+        ),
         compromise_semantics="context_only",
         compromise_effort="none",
         category="acl_ace",
@@ -1588,9 +1874,30 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         is_acl_edge=True,
     ),
     _entry(
+        "getchangesinfilteredset",
+        support_kind="unsupported",
+        support_reason="Not implemented yet in ADscan (supplemental DCSync right)",
+        category="credential_access",
+        description="Replication right over filtered attribute set data",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Remove DS-Replication-Get-Changes-In-Filtered-Set permission from non-DC accounts "
+            "on the domain object."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1003.006",
+        mitre_technique_name="OS Credential Dumping: DCSync",
+        detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("GetChangesInFilteredSet",),
+        is_acl_edge=True,
+    ),
+    _entry(
         "dumplsa",
         support_kind="supported",
         support_reason="Execute LSA secrets dump via NetExec",
+        compromise_semantics="direct_target_compromise",
+        source_context_requirement="local_admin_session",
         category="credential_access",
         description="Credential extraction from LSA secrets",
         remediation_complexity="medium",
@@ -1624,8 +1931,14 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "dumplsass",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason=(
+            "Execute LSASS minidump via native async stack — ppldump (KnownDlls PPL bypass), "
+            "wsass (WerFaultSecure PPL bypass with Defender evasion), comsvcs, nanodump, "
+            "procdump, pss, rtlcp. Method selection is fingerprint-driven."
+        ),
+        compromise_semantics="direct_target_compromise",
+        source_context_requirement="local_admin_session",
         category="credential_access",
         description="Credential extraction from LSASS memory",
         remediation_complexity="medium",
@@ -1644,6 +1957,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "dfscoerce",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        source_context_requirement="none",
         category="coercion",
         description="Coerce machine authentication via DFS endpoint behavior",
         vuln_key="dfscoerce",
@@ -1663,6 +1977,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "petitpotam",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        source_context_requirement="none",
         category="coercion",
         description="MS-EFSRPC coercion path (PetitPotam)",
         vuln_key="petitpotam",
@@ -1682,6 +1997,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "printerbug",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        source_context_requirement="none",
         category="coercion",
         description="Spooler coercion path (PrinterBug)",
         vuln_key="printerbug",
@@ -1847,6 +2163,64 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=(),
         bh_cypher_names=("GPPPassword",),
     ),
+    # ── Share access ────────────────────────────────────────────────────────
+    _entry(
+        "ReadShare",
+        support_kind="supported",
+        support_reason="Principal has GENERIC_READ on a network share — can access share contents",
+        compromise_semantics="access_capability_only",
+        compromise_effort="low",
+        category="credential_access",
+        description="Principal has read access to a network SMB share",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Review share permissions and restrict read access to required accounts only. "
+            "Remove broad groups such as Everyone or Authenticated Users from share ACLs."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1039",
+        mitre_technique_name="Data from Network Shared Drive",
+        detection_event_ids=("5140",),
+        bh_cypher_names=("ReadShare",),
+    ),
+    _entry(
+        "WriteShare",
+        support_kind="supported",
+        support_reason="Principal has GENERIC_WRITE on a network share — can write to share",
+        compromise_semantics="access_capability_only",
+        compromise_effort="low",
+        category="lateral_movement",
+        description="Principal has write access to a network SMB share",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Restrict write permissions on shares to accounts that genuinely require it. "
+            "Enable share auditing (Event ID 5145) to monitor writes."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1570",
+        mitre_technique_name="Lateral Tool Transfer",
+        detection_event_ids=("5145",),
+        bh_cypher_names=("WriteShare",),
+    ),
+    _entry(
+        "FullControlShare",
+        support_kind="supported",
+        support_reason="Principal has GENERIC_ALL on a network share — full share control",
+        compromise_semantics="access_capability_only",
+        compromise_effort="low",
+        category="lateral_movement",
+        description="Principal has full control over a network SMB share",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Remove FullControl share permissions from non-admin accounts. "
+            "Apply least-privilege share ACLs and audit with Event ID 5140/5145."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1570",
+        mitre_technique_name="Lateral Tool Transfer",
+        detection_event_ids=("5140", "5145"),
+        bh_cypher_names=("FullControlShare",),
+    ),
     _entry(
         "userdescription",
         support_kind="unsupported",
@@ -1868,6 +2242,68 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
 )
 
+
+# ── Credential-context helpers ────────────────────────────────────────────────
+
+_SEMANTICS_TO_PROVIDES: dict[str, str] = {
+    "direct_target_compromise": "credential_recovered",
+    "access_capability_only":   "local_admin_session",
+    "context_only":             "none",
+    "credential_access_only":   "credential_recovered",
+    "other":                    "none",
+}
+
+_CONTEXT_COMPAT: dict[str, frozenset[str]] = {
+    # user_credentials intentionally does NOT satisfy local_admin_session:
+    # AdminTo / CanPSRemote produce a session, not credentials, so they
+    # cannot chain directly into dump-type edges (DumpLSASS, DumpLSA, DumpDPAPI etc.).
+    "user_credentials":     frozenset({"user_credentials", "none"}),
+    "credential_recovered": frozenset({"user_credentials", "none", "machine_credential"}),
+    "local_admin_session":  frozenset({"local_admin_session", "none"}),
+    "none":                 frozenset({"none"}),
+}
+
+
+def provides_context_from_semantics(compromise_semantics: str) -> str:
+    """Return the credential context produced by an edge with the given semantics.
+
+    Derived from the existing ``compromise_semantics`` field — no new catalog
+    annotation required for most edges.
+    """
+    return _SEMANTICS_TO_PROVIDES.get(str(compromise_semantics or ""), "none")
+
+
+def edges_chain_compatible(
+    prev_compromise_semantics: str | None,
+    next_source_context_requirement: str,
+) -> bool:
+    """Return True when an edge may immediately follow another in a DFS path.
+
+    Args:
+        prev_compromise_semantics: The ``compromise_semantics`` of the previous
+            edge, or ``None`` when the next edge is the first in a path
+            (implicit ``user_credentials`` at path start).
+        next_source_context_requirement: The ``source_context_requirement`` of
+            the candidate next edge.
+    """
+    if prev_compromise_semantics is None:
+        provides = "user_credentials"
+    else:
+        provides = _SEMANTICS_TO_PROVIDES.get(str(prev_compromise_semantics or ""), "none")
+    allowed = _CONTEXT_COMPAT.get(provides, frozenset())
+    return next_source_context_requirement in allowed
+
+
+def get_attack_step_catalog() -> tuple[AttackStepCatalogEntry, ...]:
+    """Return all raw catalog entries as a tuple (pre-narrative-enrichment).
+
+    Use this for validation and testing of catalog-level fields.
+    For runtime lookups, use :data:`ATTACK_STEP_CATALOG` or
+    :func:`get_attack_step_entry`.
+    """
+    return _CATALOG_ENTRIES
+
+
 ATTACK_STEP_CATALOG: dict[str, AttackStepCatalogEntry] = {
     entry.relation: entry for entry in _CATALOG_ENTRIES if entry.relation
 }
@@ -1884,6 +2320,9 @@ _RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
         "adcsesc1",
         "adcsesc3",
         "adcsesc4",
+        "adcsesc8",
+        "adcsesc11",
+        "coerceandrelayntlmtoadcs",
         "dumplsa",
         "dumpdpapi",
         "genericall",
@@ -1896,6 +2335,8 @@ _RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
         "writedacl",
         "writeowner",
         "writespn",
+        "writeaccountrestrictions",
+        "owns",
         "dcsync",
         "kerberoasting",
         "writelogonscript",
@@ -2430,8 +2871,12 @@ for _rel, _entry_obj in ATTACK_STEP_CATALOG.items():
         _CATALOG_WITH_NARRATIVES[_rel] = replace(
             _entry_obj,
             narrative_template=_overlay.get("long", _entry_obj.narrative_template),
-            short_narrative_template=_overlay.get("short", _entry_obj.short_narrative_template),
-            remediation_steps=tuple(_overlay.get("remediation", _entry_obj.remediation_steps)),
+            short_narrative_template=_overlay.get(
+                "short", _entry_obj.short_narrative_template
+            ),
+            remediation_steps=tuple(
+                _overlay.get("remediation", _entry_obj.remediation_steps)
+            ),
         )
     else:
         _CATALOG_WITH_NARRATIVES[_rel] = _entry_obj
@@ -2462,7 +2907,9 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     """Extract placeholder values from a raw attack-path step dict."""
     details = step.get("details") if isinstance(step.get("details"), dict) else {}
 
-    def _get_display(primary_keys: tuple[str, ...], fallback_keys: tuple[str, ...]) -> str:
+    def _get_display(
+        primary_keys: tuple[str, ...], fallback_keys: tuple[str, ...]
+    ) -> str:
         for k in primary_keys:
             v = details.get(k) if isinstance(details, dict) else None
             if isinstance(v, str) and v.strip():
@@ -2489,6 +2936,7 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         from adscan_internal.pro.reporting.attack_path_narratives import (
             format_relation_label,
         )
+
         relation_label = format_relation_label(str(relation_raw))
     except Exception:
         relation_label = str(relation_raw or "Step")
@@ -2622,8 +3070,10 @@ def render_path_summary(path: dict[str, Any]) -> str:
         from adscan_internal.pro.reporting.attack_path_narratives import (
             format_relation_label,
         )
+
         label_fn = format_relation_label
     except Exception:
+
         def label_fn(s: str) -> str:  # type: ignore[misc]
             return str(s)
 

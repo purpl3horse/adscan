@@ -23,14 +23,36 @@ class WinRMExecutionBackend(Protocol):
     ) -> WinRMPSRPExecutionResult:
         """Execute one PowerShell script remotely."""
 
+    async def async_execute_powershell(
+        self,
+        script: str,
+        *,
+        operation_name: str | None = None,
+        require_logon_bypass: bool = False,
+    ) -> WinRMPSRPExecutionResult:
+        """Execute one PowerShell script remotely from async flows."""
+
     def fetch_file(self, remote_path: str, save_path: str) -> str:
         """Fetch one remote file to one local path."""
+
+    async def async_fetch_file(self, remote_path: str, save_path: str) -> str:
+        """Fetch one remote file to one local path from async flows."""
 
     def fetch_files(self, paths: Iterable[str], download_dir: str) -> list[str]:
         """Fetch multiple remote files into one local directory."""
 
+    async def async_fetch_files(
+        self,
+        paths: Iterable[str],
+        download_dir: str,
+    ) -> list[str]:
+        """Fetch multiple remote files into one local directory from async flows."""
+
     def upload_file(self, local_path: str, remote_path: str) -> bool:
         """Upload one local file to one remote path."""
+
+    async def async_upload_file(self, local_path: str, remote_path: str) -> bool:
+        """Upload one local file to one remote path from async flows."""
 
 
 def build_winrm_backend(

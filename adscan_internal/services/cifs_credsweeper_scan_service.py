@@ -91,9 +91,7 @@ class CIFSCredSweeperScanService(BaseService):
         if not mount_root_path.is_dir():
             self.logger.warning("CIFS mount root is not a directory: %s", mount_root)
             return result
-        if not credsweeper_path:
-            self.logger.warning("CredSweeper path missing for CIFS share scan.")
-            return result
+        _ = credsweeper_path
 
         mapping_service = CIFSShareMappingService()
         unique_hosts = self._unique_non_empty(hosts)

@@ -1,7 +1,12 @@
 """Network preflight primitives shared by start and DNS flows.
 
-This module centralizes route and TCP reachability checks so UX layers can
-reuse the same diagnostics logic without duplicating subprocess parsing.
+This module is the **sync entry point** for route + TCP reachability checks.
+The TCP probe semantics are owned by ``network_probe_service`` (async); this
+module is a thin sync facade plus the route-assessment helpers that depend on
+the host's ``run_command`` shell.
+
+Single source of truth for TCP probing: ``network_probe_service.tcp_probe``.
+Use it directly from async code; use this module from sync CLI flows.
 """
 
 from __future__ import annotations
@@ -11,9 +16,13 @@ from typing import Any, Protocol
 import ipaddress
 import re
 import shlex
-import socket
 
 from adscan_internal import telemetry
+from adscan_internal.services.async_bridge import run_async_sync
+from adscan_internal.services.network_probe_service import (
+    tcp_probe,
+    tcp_probe_batch,
+)
 
 
 class NetworkPreflightHost(Protocol):
@@ -135,12 +144,14 @@ def assess_route_to_target(
 
 
 def is_tcp_port_open(host: str, port: int, *, timeout_seconds: float = 2.0) -> bool:
-    """Return True when a TCP port is reachable."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout_seconds):
-            return True
-    except OSError:
-        return False
+    """Return True when a TCP port is reachable.
+
+    Sync wrapper over the canonical async ``tcp_probe``. From async code, call
+    ``tcp_probe`` directly to avoid the thread-pool detour built into
+    ``run_async_sync``.
+    """
+    result = run_async_sync(tcp_probe(host, port, timeout=timeout_seconds))
+    return result.status == "open"
 
 
 def assess_target_reachability(
@@ -151,20 +162,30 @@ def assess_target_reachability(
     tcp_ports: tuple[int, ...] = (53,),
     timeout_seconds: float = 2.0,
 ) -> TargetReachabilityAssessment:
-    """Assess route and TCP port reachability for a target IP."""
+    """Assess route and TCP port reachability for a target IP.
+
+    Port probes run concurrently — checking N ports costs ~one timeout window,
+    not N. Probing 53/389/445 on a slow target now completes in ~timeout
+    seconds instead of ~3*timeout.
+    """
     route = assess_route_to_target(
         host, target_ip=target_ip, expected_interface=expected_interface
     )
-    open_ports: list[int] = []
-    closed_ports: list[int] = []
-    for port in tcp_ports:
-        if is_tcp_port_open(target_ip, port, timeout_seconds=timeout_seconds):
-            open_ports.append(port)
-        else:
-            closed_ports.append(port)
+    if not tcp_ports:
+        return TargetReachabilityAssessment(
+            target_ip=target_ip,
+            route=route,
+            open_ports=(),
+            closed_ports=(),
+        )
+    batch = run_async_sync(
+        tcp_probe_batch(target_ip, list(tcp_ports), timeout=timeout_seconds)
+    )
+    open_ports = tuple(sorted(p for p, r in batch.items() if r.status == "open"))
+    closed_ports = tuple(sorted(p for p, r in batch.items() if r.status != "open"))
     return TargetReachabilityAssessment(
         target_ip=target_ip,
         route=route,
-        open_ports=tuple(open_ports),
-        closed_ports=tuple(closed_ports),
+        open_ports=open_ports,
+        closed_ports=closed_ports,
     )

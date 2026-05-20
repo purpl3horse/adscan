@@ -7,6 +7,7 @@ separate from the LDAP service layer.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -26,7 +27,6 @@ from adscan_core.username_patterns import (
     build_username_pattern_candidates,
     format_username_pattern_option,
     normalize_username_candidate,
-    rank_username_patterns_from_observed_pairs,
 )
 from adscan_internal import (
     print_error,
@@ -42,7 +42,6 @@ from adscan_internal import (
 )
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.core import AuthMode
-from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
 from adscan_internal.cli.ntlm_hash_finding_flow import (
     render_ntlm_hash_findings_flow,
@@ -52,10 +51,6 @@ from adscan_internal.cli.host_file_picker import (
     is_full_container_runtime,
     maybe_import_host_file_to_workspace,
     select_host_file_via_gui,
-)
-from adscan_internal.integrations.netexec.parsers import (
-    parse_machine_account_quota,
-    parse_netexec_group_members,
 )
 from adscan_internal.execution_outcomes import output_has_exact_ldap_connection_timeout
 from adscan_internal.path_utils import get_effective_user_home
@@ -80,7 +75,10 @@ from adscan_internal.services.linkedin_username_discovery_service import (
 from adscan_internal.services.enumeration.ldap import LDAPAnonymousUserRecord
 from adscan_internal.services.credsweeper_service import (
     CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION,
-    CredSweeperService,
+)
+from adscan_internal.services.credsweeper_library_service import (
+    CredSweeperLibraryService,
+    InMemoryCredSweeperTarget,
 )
 from adscan_internal.services.attack_graph_service import (
     CredentialSourceStep,
@@ -90,11 +88,6 @@ from adscan_internal.services.attack_path_target_viability_service import (
     assess_computer_target_viability,
 )
 from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
-from adscan_internal.integrations.impacket.runner import (
-    ImpacketContext,
-    ImpacketKerberosRetryContext,
-    run_raw_impacket_command,
-)
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 
 
@@ -194,7 +187,7 @@ class LdapShell(Protocol):
 
     def do_sync_clock_with_pdc(self, domain: str) -> None: ...
 
-    def ask_for_bloodhound(
+    def ask_for_graph_collection(
         self, target_domain: str, callback=None
     ) -> list[str] | None: ...
 
@@ -237,6 +230,7 @@ def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
     try:
         from adscan_internal.text_utils import strip_ansi_codes
     except Exception:  # pragma: no cover
+
         def strip_ansi_codes(value: str) -> str:
             return value
 
@@ -350,7 +344,9 @@ def _enrich_obsolete_entries_with_current_vantage(
         entry["current_vantage_summary"] = viability.operator_summary
         entry["matched_ips"] = list(viability.matched_ips)
         entry["matched_hostnames"] = list(viability.matched_hostnames)
-        entry["reachable_from_current_vantage"] = viability.reachable_from_current_vantage
+        entry["reachable_from_current_vantage"] = (
+            viability.reachable_from_current_vantage
+        )
         entry["resolved_in_current_vantage_inventory"] = (
             viability.resolved_in_current_vantage_inventory
         )
@@ -403,6 +399,46 @@ def _build_obsolete_inventory_drift_candidates(
     ]
 
 
+_OBSOLETE_OS_AGE_BANDS = (
+    # (substring matchers, glyph, color slot, age label); older first wins.
+    (("windows 2000", "windows nt", "windows xp", "windows 2003", "windows server 2003"), "X", "crimson", "EOL > 15 yrs"),
+    (("windows 2008", "windows server 2008", "windows vista", "windows 7"), "X", "crimson", "EOL > 5 yrs"),
+    (("windows 2012", "windows server 2012", "windows 8"), "!", "amber", "EOL 2023"),
+    (("windows 2016", "windows server 2016", "windows server 2019"), ".", "muted", "Aging"),
+)
+
+
+def _classify_obsolete_os(operating_system: str) -> tuple[str, str, str]:
+    """Return (glyph, color_slot, age_label) for an obsolete OS string."""
+    lower = (operating_system or "").lower()
+    for needles, glyph, slot, label in _OBSOLETE_OS_AGE_BANDS:
+        if any(needle in lower for needle in needles):
+            return glyph, slot, label
+    return ".", "muted", "Aging"
+
+
+def _color_for_slot(slot: str) -> str:
+    """Map a semantic slot name to the bundled theme color."""
+    from adscan_core.theme import (
+        COLOR_AMBER,
+        COLOR_CRIMSON,
+        COLOR_MUTED,
+        COLOR_SAGE,
+        COLOR_STEEL,
+        ADSCAN_PRIMARY,
+    )
+
+    mapping = {
+        "crimson": COLOR_CRIMSON,
+        "amber": COLOR_AMBER,
+        "sage": COLOR_SAGE,
+        "steel": COLOR_STEEL,
+        "muted": COLOR_MUTED,
+        "primary": ADSCAN_PRIMARY,
+    }
+    return mapping.get(slot, COLOR_MUTED)
+
+
 def _render_obsolete_computers_summary(
     shell: LdapShell,
     *,
@@ -415,6 +451,14 @@ def _render_obsolete_computers_summary(
         marked_domain = mark_sensitive(domain, "domain")
         print_info(f"No obsolete operating systems were identified in {marked_domain}.")
         return
+
+    from adscan_core.theme import (
+        COLOR_AMBER,
+        COLOR_CRIMSON,
+        COLOR_MUTED,
+        COLOR_SAGE,
+        COLOR_STEEL,
+    )
 
     current_vantage_summary = (
         parsed.get("current_vantage_summary")
@@ -430,7 +474,25 @@ def _render_obsolete_computers_summary(
     marked_domain = mark_sensitive(domain, "domain")
     report_available = bool(current_vantage_summary.get("report_available"))
 
-    summary_parts = [f"{total_hosts} enabled AD host(s) flagged as obsolete in {marked_domain}."]
+    # Verdict-first headline: count + worst-band.
+    worst_slot = "muted"
+    worst_label = "Aging"
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        _g, slot, label = _classify_obsolete_os(str(item.get("operating_system") or ""))
+        if slot == "crimson":
+            worst_slot, worst_label = "crimson", label
+            break
+        if slot == "amber" and worst_slot != "crimson":
+            worst_slot, worst_label = "amber", label
+    verdict_glyph = "X" if worst_slot == "crimson" else ("!" if worst_slot == "amber" else ".")
+    verdict_color = _color_for_slot(worst_slot)
+
+    summary_parts = [
+        f"[{verdict_color}]{verdict_glyph} {total_hosts} obsolete host(s)[/{verdict_color}] "
+        f"in {marked_domain} ({worst_label} worst-case)."
+    ]
     if operating_system_counts:
         top_os = sorted(
             (
@@ -448,9 +510,9 @@ def _render_obsolete_computers_summary(
     if report_available:
         summary_parts.append(
             "Current-vantage triage: "
-            f"{int(current_vantage_summary.get('reachable_count') or 0)} reachable now, "
-            f"{int(current_vantage_summary.get('resolved_but_unreachable_count') or 0)} resolved but not reachable, "
-            f"{int(current_vantage_summary.get('enabled_but_unresolved_count') or 0)} enabled without IP resolution."
+            f"[{COLOR_SAGE}]{int(current_vantage_summary.get('reachable_count') or 0)} reachable now[/{COLOR_SAGE}], "
+            f"[{COLOR_AMBER}]{int(current_vantage_summary.get('resolved_but_unreachable_count') or 0)} resolved but not reachable[/{COLOR_AMBER}], "
+            f"[{COLOR_MUTED}]{int(current_vantage_summary.get('enabled_but_unresolved_count') or 0)} enabled without IP resolution[/{COLOR_MUTED}]."
         )
     else:
         summary_parts.append(
@@ -461,13 +523,15 @@ def _render_obsolete_computers_summary(
     table = Table(
         title="Obsolete Operating Systems",
         show_header=True,
-        header_style=f"bold {BRAND_COLORS['warning']}",
+        header_style=f"bold {COLOR_AMBER}",
     )
+    table.add_column("", width=2, justify="center")
     table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Host", style="cyan", no_wrap=False, max_width=34)
-    table.add_column("OS", style="white", no_wrap=False, max_width=30)
-    table.add_column("Current Vantage", style="yellow", no_wrap=False, max_width=26)
-    table.add_column("IP Context", style="magenta", no_wrap=False, max_width=28)
+    table.add_column("Host", style=COLOR_STEEL, no_wrap=False, max_width=32)
+    table.add_column("Operating System", no_wrap=False, max_width=30)
+    table.add_column("Age Band", no_wrap=False, max_width=14)
+    table.add_column("Current Vantage", no_wrap=False, max_width=24)
+    table.add_column("IP Context", style=COLOR_MUTED, no_wrap=False, max_width=26)
 
     shown_entries = entries[:12]
     for idx, item in enumerate(shown_entries, 1):
@@ -475,9 +539,16 @@ def _render_obsolete_computers_summary(
             continue
         host = mark_sensitive(str(item.get("host") or "unknown"), "hostname")
         operating_system = str(item.get("operating_system") or "Unknown").strip()
+        glyph, slot, age_label = _classify_obsolete_os(operating_system)
+        os_color = _color_for_slot(slot)
         status_label = _status_label_for_obsolete_entry(
             str(item.get("current_vantage_status") or "")
         )
+        status_color = COLOR_MUTED
+        if "Reachable now" in status_label:
+            status_color = COLOR_CRIMSON  # legacy + reachable = critical
+        elif "Resolved" in status_label:
+            status_color = COLOR_AMBER
         matched_ips = [
             mark_sensitive(str(ip), "ip")
             for ip in item.get("matched_ips", [])
@@ -490,10 +561,12 @@ def _render_obsolete_computers_summary(
         if not ip_context:
             ip_context = "N/A"
         table.add_row(
+            f"[{os_color}]{glyph}[/{os_color}]",
             str(idx),
             host,
-            operating_system,
-            status_label,
+            f"[{os_color}]{operating_system}[/{os_color}]",
+            f"[{os_color}]{age_label}[/{os_color}]",
+            f"[{status_color}]{status_label}[/{status_color}]",
             ip_context,
         )
 
@@ -511,10 +584,25 @@ def _render_obsolete_computers_summary(
     print_panel_with_table(
         table,
         title="[bold]Obsolete Operating Systems[/bold]",
-        border_style=BRAND_COLORS["warning"],
+        border_style=verdict_color,
     )
     if subtitle:
         print_info(subtitle)
+
+    # Action-oriented Next-step hint.
+    next_hint: str | None = None
+    if worst_slot == "crimson":
+        next_hint = (
+            f"[{COLOR_CRIMSON}]Next:[/{COLOR_CRIMSON}] prioritize patching or isolating EOL hosts; "
+            "they are likely exploitable with public PoCs."
+        )
+    elif worst_slot == "amber":
+        next_hint = (
+            f"[{COLOR_AMBER}]Next:[/{COLOR_AMBER}] schedule extended-support review or migration; "
+            "EOL window has passed or is imminent."
+        )
+    if next_hint:
+        print_info(next_hint)
 
     drift_candidates = _build_obsolete_inventory_drift_candidates(
         [item for item in entries if isinstance(item, dict)]
@@ -584,6 +672,7 @@ def parse_netexec_ldap_security_output(output: str) -> dict[str, object]:
     try:
         from adscan_internal.text_utils import strip_ansi_codes
     except Exception:  # pragma: no cover
+
         def strip_ansi_codes(value: str) -> str:
             return value
 
@@ -666,7 +755,9 @@ def parse_netexec_ldap_security_output(output: str) -> dict[str, object]:
     }
 
 
-def _build_ldap_security_targets(shell: LdapShell, *, domain: str) -> list[dict[str, str]]:
+def _build_ldap_security_targets(
+    shell: LdapShell, *, domain: str
+) -> list[dict[str, str]]:
     """Build a stable per-DC target list for LDAP posture checks."""
     domain_info = shell.domains_data.get(domain, {})
     targets: list[dict[str, str]] = []
@@ -729,11 +820,7 @@ def _summarize_ldap_security_entries(
 
     for result in dc_results:
         target_label = str(result.get("target_label") or "").strip()
-        parsed = (
-            result.get("parsed")
-            if isinstance(result.get("parsed"), dict)
-            else {}
-        )
+        parsed = result.get("parsed") if isinstance(result.get("parsed"), dict) else {}
         per_target_entries = parsed.get("entries") if isinstance(parsed, dict) else None
         if not isinstance(per_target_entries, list) or not per_target_entries:
             entries.append(
@@ -748,7 +835,9 @@ def _summarize_ldap_security_entries(
             continue
 
         entry = dict(per_target_entries[0])
-        entry["target"] = target_label or entry.get("server_name") or entry.get("target_name")
+        entry["target"] = (
+            target_label or entry.get("server_name") or entry.get("target_name")
+        )
         entries.append(entry)
 
         effective_target = str(entry.get("target") or target_label or "unknown")
@@ -756,9 +845,8 @@ def _summarize_ldap_security_entries(
             insecure_signing_targets.append(effective_target)
         if not bool(entry.get("channel_binding_hardened")):
             insecure_channel_binding_targets.append(effective_target)
-        if (
-            not bool(entry.get("signing_hardened"))
-            or not bool(entry.get("channel_binding_hardened"))
+        if not bool(entry.get("signing_hardened")) or not bool(
+            entry.get("channel_binding_hardened")
         ):
             risky_targets.append(effective_target)
 
@@ -778,56 +866,121 @@ def _render_ldap_security_summary(
     summary: dict[str, object],
 ) -> None:
     """Render a premium LDAP signing/channel binding summary."""
+    from adscan_core.theme import (
+        COLOR_AMBER,
+        COLOR_CRIMSON,
+        COLOR_MUTED,
+        COLOR_SAGE,
+        COLOR_STEEL,
+    )
+
     entries = summary.get("entries") if isinstance(summary.get("entries"), list) else []
     dc_count = int(summary.get("dc_count") or 0)
     insecure_signing = summary.get("insecure_signing_targets") or []
     insecure_channel_binding = summary.get("insecure_channel_binding_targets") or []
     risky_targets = summary.get("risky_targets") or []
 
-    risk_label = "Hardened"
+    # Verdict-first headline with glyph + color.
     if risky_targets:
-        risk_label = "Risky posture detected"
+        verdict_glyph = "X"
+        verdict_color = COLOR_CRIMSON
+        verdict_label = "Risky posture detected"
+        implication = (
+            "  -> Unsigned LDAP and missing channel binding leave the domain open to NTLM relay "
+            "and credential interception against the DC."
+        )
+    else:
+        verdict_glyph = "+"
+        verdict_color = COLOR_SAGE
+        verdict_label = "Hardened"
+        implication = "  -> Signed LDAP path is enforced; NTLM relay to LDAP is blocked here."
+
+    marked_domain = mark_sensitive(domain, "domain")
+    panel_body = "\n".join(
+        [
+            f"[{verdict_color}]{verdict_glyph} {verdict_label}[/{verdict_color}] for {marked_domain}",
+            implication,
+            "",
+            f"  [{COLOR_STEEL}].[/{COLOR_STEEL}] DCs checked.................. {dc_count}",
+            f"  [{COLOR_AMBER if insecure_signing else COLOR_SAGE}]"
+            f"{'!' if insecure_signing else '+'}[/"
+            f"{COLOR_AMBER if insecure_signing else COLOR_SAGE}]"
+            f" DCs without LDAP signing..... {len(insecure_signing)}",
+            f"  [{COLOR_AMBER if insecure_channel_binding else COLOR_SAGE}]"
+            f"{'!' if insecure_channel_binding else '+'}[/"
+            f"{COLOR_AMBER if insecure_channel_binding else COLOR_SAGE}]"
+            f" DCs without channel binding.. {len(insecure_channel_binding)}",
+            f"  [{COLOR_CRIMSON if risky_targets else COLOR_SAGE}]"
+            f"{'X' if risky_targets else '+'}[/"
+            f"{COLOR_CRIMSON if risky_targets else COLOR_SAGE}]"
+            f" DCs needing remediation...... {len(risky_targets)}",
+        ]
+    )
 
     print_panel(
-        (
-            f"Domain: {mark_sensitive(domain, 'domain')}\n"
-            f"DCs checked: {dc_count}\n"
-            f"DCs without LDAP signing hardening: {len(insecure_signing)}\n"
-            f"DCs without channel binding hardening: {len(insecure_channel_binding)}\n"
-            f"DCs requiring remediation: {len(risky_targets)}\n"
-            f"Assessment: {risk_label}"
-        ),
+        panel_body,
         title="LDAP Security Posture",
+        border_style=verdict_color,
     )
 
     if not entries:
         return
 
-    table = Table(show_header=True, header_style=f"bold {BRAND_COLORS['info']}")
-    table.add_column("DC")
-    table.add_column("Signing")
+    table = Table(
+        show_header=True,
+        header_style=f"bold {COLOR_STEEL}",
+    )
+    table.add_column("", width=2, justify="center")
+    table.add_column("Domain Controller", style=COLOR_STEEL)
+    table.add_column("LDAP Signing")
     table.add_column("Channel Binding")
-    table.add_column("Risk")
+    table.add_column("Verdict")
 
     for entry in entries:
         target = mark_sensitive(str(entry.get("target") or "unknown"), "host")
         signing = str(entry.get("signing") or "Unknown")
         channel_binding = str(entry.get("channel_binding") or "Unknown")
         if not bool(entry.get("reachable", True)):
-            risk = "Unreachable"
+            glyph, glyph_color = "...", COLOR_MUTED
+            verdict = f"[{COLOR_MUTED}]Unreachable[/{COLOR_MUTED}]"
+            signing_styled = f"[{COLOR_MUTED}]{signing}[/{COLOR_MUTED}]"
+            channel_styled = f"[{COLOR_MUTED}]{channel_binding}[/{COLOR_MUTED}]"
         elif bool(entry.get("signing_hardened")) and bool(
             entry.get("channel_binding_hardened")
         ):
-            risk = "Hardened"
+            glyph, glyph_color = "+", COLOR_SAGE
+            verdict = f"[{COLOR_SAGE}]Hardened[/{COLOR_SAGE}]"
+            signing_styled = f"[{COLOR_SAGE}]{signing}[/{COLOR_SAGE}]"
+            channel_styled = f"[{COLOR_SAGE}]{channel_binding}[/{COLOR_SAGE}]"
         else:
-            risk = "Remediate"
-        table.add_row(target, signing, channel_binding, risk)
+            glyph, glyph_color = "X", COLOR_CRIMSON
+            verdict = f"[{COLOR_CRIMSON}]Remediate[/{COLOR_CRIMSON}]"
+            sign_color = COLOR_SAGE if entry.get("signing_hardened") else COLOR_CRIMSON
+            cb_color = COLOR_SAGE if entry.get("channel_binding_hardened") else COLOR_CRIMSON
+            signing_styled = f"[{sign_color}]{signing}[/{sign_color}]"
+            channel_styled = f"[{cb_color}]{channel_binding}[/{cb_color}]"
+
+        table.add_row(
+            f"[{glyph_color}]{glyph}[/{glyph_color}]",
+            target,
+            signing_styled,
+            channel_styled,
+            verdict,
+        )
 
     print_panel_with_table(
         table,
         title="LDAP Signing and Channel Binding by Domain Controller",
-        border_style=BRAND_COLORS["info"],
+        border_style=COLOR_STEEL,
     )
+
+    # Action-oriented "Next:" hint.
+    if risky_targets:
+        print_info(
+            f"[{COLOR_CRIMSON}]Next:[/{COLOR_CRIMSON}] enable LDAP signing and channel binding on the "
+            "flagged DC(s) via Group Policy (Domain controller: LDAP server signing requirements = Require signing) "
+            "and audit NTLM relay exposure with ntlmrelayx."
+        )
 
 
 def _record_ldap_security_posture_finding(
@@ -1115,8 +1268,7 @@ def run_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
     log_path = domain_relpath(shell.domains_dir, domain, "ldap", "obsolete.log")
     marked_domain = mark_sensitive(domain, "domain")
     command = (
-        f"{shell.netexec_path} ldap {pdc_target} {auth} "
-        f"-M obsolete --log {log_path}"
+        f"{shell.netexec_path} ldap {pdc_target} {auth} -M obsolete --log {log_path}"
     )
     print_info_verbose(
         f"Auditing obsolete operating systems for domain {marked_domain}"
@@ -1178,21 +1330,6 @@ def extract_base_dn(shell: LdapShell, domain: str) -> str:
     return base_dn
 
 
-def ask_for_ldap_users(shell: LdapShell, target_domain: str) -> None:
-    """Prompt to enumerate LDAP users for a domain and run the action if confirmed."""
-    if target_domain not in shell.domains:
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        print_error(
-            f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
-        )
-        return
-
-    marked_target_domain = mark_sensitive(target_domain, "domain")
-    answer = Confirm.ask(
-        f"Do you want to enumerate LDAP users for the domain {marked_target_domain}?"
-    )
-    if answer:
-        run_ldap_active_users(shell, target_domain)
 
 
 def ask_for_ldap_computers(shell: LdapShell, target_domain: str) -> None:
@@ -1269,17 +1406,19 @@ def _display_ldap_anonymous_pattern_preview(
     if not records:
         return
 
+    from adscan_core.theme import COLOR_MUTED, COLOR_STEEL
+
     table = Table(
         title=(
-            "Anonymous LDAP Username Inference Preview "
+            "Username Inference Preview "
             f"({USERNAME_PATTERN_LABELS.get(pattern_key, pattern_key)})"
         ),
         show_header=True,
-        header_style="bold magenta",
+        header_style=f"bold {COLOR_STEEL}",
     )
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("CN", style="cyan", max_width=32)
-    table.add_column("Inferred Username", style="white", max_width=40)
+    table.add_column("#", style=COLOR_MUTED, width=4, justify="right")
+    table.add_column("CN observed", style=COLOR_STEEL, max_width=32)
+    table.add_column("Inferred username", max_width=40)
 
     shown_records = records[: max(1, max_rows)]
     for idx, record in enumerate(shown_records, 1):
@@ -1289,10 +1428,10 @@ def _display_ldap_anonymous_pattern_preview(
 
     if len(records) > max_rows:
         table.caption = (
-            f"Showing first {max_rows}. {len(records) - max_rows} more not shown."
+            f"Showing first {max_rows}. {len(records) - max_rows} additional rows omitted."
         )
 
-    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+    print_panel_with_table(table, border_style=COLOR_MUTED)
 
 
 def _select_recommended_username_pattern(
@@ -1463,30 +1602,49 @@ def _display_ldap_anonymous_unresolved_users(
     if not unresolved:
         return
 
+    from adscan_core.theme import COLOR_AMBER, COLOR_MUTED, COLOR_STEEL
+
     table = Table(
-        title=f"Anonymous LDAP Users Requiring Username Inference ({len(unresolved)})",
+        title=f"! Unresolved LDAP user objects ({len(unresolved)})",
         show_header=True,
-        header_style="bold magenta",
+        header_style=f"bold {COLOR_AMBER}",
     )
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("CN", style="cyan", max_width=32)
+    table.add_column("", width=2, justify="center")
+    table.add_column("#", style=COLOR_MUTED, width=4, justify="right")
+    table.add_column("CN", style=COLOR_STEEL, max_width=32)
     if pattern_key:
-        table.add_column("Inferred Username", style="white", max_width=40)
+        table.add_column("Inferred username", max_width=40)
 
     for idx, record in enumerate(unresolved[: max(1, max_rows)], 1):
         if pattern_key:
-            candidates = build_username_pattern_candidates(str(record.common_name or ""))
+            candidates = build_username_pattern_candidates(
+                str(record.common_name or "")
+            )
             inferred = candidates.get(pattern_key) or candidates.get("single") or "-"
-            table.add_row(str(idx), str(record.common_name), str(inferred))
+            table.add_row(
+                f"[{COLOR_AMBER}]?[/{COLOR_AMBER}]",
+                str(idx),
+                str(record.common_name),
+                str(inferred),
+            )
         else:
-            table.add_row(str(idx), str(record.common_name))
+            table.add_row(
+                f"[{COLOR_AMBER}]?[/{COLOR_AMBER}]",
+                str(idx),
+                str(record.common_name),
+            )
 
     if len(unresolved) > max_rows:
         table.caption = (
-            f"Showing first {max_rows}. {len(unresolved) - max_rows} more not shown."
+            f"Showing first {max_rows}. {len(unresolved) - max_rows} additional rows omitted."
         )
 
-    print_panel_with_table(table, border_style=BRAND_COLORS["warning"])
+    print_panel_with_table(table, border_style=COLOR_AMBER)
+    if pattern_key:
+        print_info(
+            f"[{COLOR_AMBER}]Next:[/{COLOR_AMBER}] kerbrute these inferred CNs against the KDC to "
+            "promote them from CN candidates to confirmed sAMAccountNames."
+        )
 
 
 def _display_ldap_anonymous_confirmed_users(
@@ -1496,24 +1654,42 @@ def _display_ldap_anonymous_confirmed_users(
     if not usernames:
         return
 
-    table = Table(
-        title=f"Anonymous LDAP Confirmed Enabled Users ({len(usernames)})",
-        show_header=True,
-        header_style="bold magenta",
+    from adscan_core.theme import COLOR_CRIMSON, COLOR_MUTED, COLOR_SAGE
+
+    # This is a high-value finding: anonymous LDAP exposed enabled usernames.
+    # The row should JUMP. Verdict-first headline with crimson glyph.
+    print_info(
+        f"[{COLOR_CRIMSON}]* Anonymous LDAP leaked {len(usernames)} enabled sAMAccountName(s)[/{COLOR_CRIMSON}] "
+        f"  -> usable for AS-REP roasting, password spraying, and Kerberos pre-auth probing."
     )
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Username", style="cyan", max_width=40)
+
+    table = Table(
+        title=f"* Anonymous LDAP confirmed enabled users ({len(usernames)})",
+        show_header=True,
+        header_style=f"bold {COLOR_CRIMSON}",
+    )
+    table.add_column("", width=2, justify="center")
+    table.add_column("#", style=COLOR_MUTED, width=4, justify="right")
+    table.add_column("sAMAccountName", style=COLOR_SAGE, max_width=40)
 
     shown = usernames[: max(1, max_rows)]
     for idx, username in enumerate(shown, 1):
-        table.add_row(str(idx), username)
+        table.add_row(
+            f"[{COLOR_CRIMSON}]*[/{COLOR_CRIMSON}]",
+            str(idx),
+            username,
+        )
 
     if len(usernames) > max_rows:
         table.caption = (
-            f"Showing first {max_rows}. {len(usernames) - max_rows} more not shown."
+            f"Showing first {max_rows}. {len(usernames) - max_rows} additional rows omitted."
         )
 
-    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+    print_panel_with_table(table, border_style=COLOR_CRIMSON)
+    print_info(
+        f"[{COLOR_CRIMSON}]Next:[/{COLOR_CRIMSON}] feed this list into AS-REP roasting and a targeted "
+        "password-spray round before falling back to wordlist guessing."
+    )
 
 
 def _is_likely_ldap_user_candidate(record: LDAPAnonymousUserRecord) -> bool:
@@ -1545,28 +1721,129 @@ def _is_likely_ldap_user_candidate(record: LDAPAnonymousUserRecord) -> bool:
     return ",cn=users," in f",{dn_lower}" or ",ou=" in f",{dn_lower}"
 
 
+@dataclass
+class _CNInferenceResult:
+    """Structured result from CN-only anonymous LDAP username inference."""
+
+    validated: set[str]
+    inferred_pattern: str | None
+    pattern_score: int
+    known_users_analyzed: int
+    rows: list[tuple[str, str, bool]]
+    cn_only_count: int
+
+
+def _infer_username_pattern_from_known_users(
+    known_users: list,
+) -> tuple[str | None, int, int]:
+    """Infer the dominant username format from users that have both a DN and SAM.
+
+    Returns a three-tuple: ``(pattern_key, score, analyzed_count)``.
+    ``pattern_key`` is ``None`` when inference is inconclusive.
+    """
+    from adscan_core.username_patterns import rank_username_patterns_from_observed_pairs
+
+    pairs: list[tuple[str, str]] = []
+    for u in known_users:
+        dn = str(getattr(u, "distinguished_name", "") or "")
+        sam = str(getattr(u, "samaccountname", "") or "").strip()
+        if not dn or not sam:
+            continue
+        cn_part = dn.split(",")[0]
+        if cn_part.upper().startswith("CN="):
+            display_name = cn_part[3:].strip()
+            if display_name:
+                pairs.append((display_name, sam))
+
+    if not pairs:
+        return None, 0, 0
+
+    ranked = rank_username_patterns_from_observed_pairs(pairs)
+    if not ranked:
+        return None, 0, len(pairs)
+
+    top_pattern, top_score = ranked[0]
+    print_info_debug(
+        f"[ldap-cn-inference] pattern inference from {len(pairs)} known users: "
+        f"dominant={top_pattern!r} score={top_score} "
+        f"(all: {[(p, s) for p, s in ranked[:3]]})"
+    )
+    return top_pattern, top_score, len(pairs)
+
+
 def _validate_ldap_anonymous_username_candidates(
     shell: LdapShell,
     domain: str,
     candidates: list[str],
-) -> set[str]:
-    """Validate inferred usernames with Kerberos pre-auth enumeration."""
-    normalized = sorted(
-        {
-            normalize_username_candidate(candidate)
-            for candidate in candidates
-            if normalize_username_candidate(candidate)
-        }
+    *,
+    known_users: list | None = None,
+) -> _CNInferenceResult:
+    """Validate inferred usernames with Kerberos pre-auth enumeration.
+
+    When ``known_users`` (list of LDAPActiveUser) is supplied, the dominant
+    username format is inferred from their DN+SAM pairs and applied to each
+    CN-only candidate to generate format-correct wordlist entries.  Without
+    known_users the function falls back to naive normalization — which only
+    works when the CN itself is the username.
+
+    Returns a :class:`_CNInferenceResult` with the full inference context so
+    the caller can render a rich diagnostic panel.
+    """
+    from adscan_core.username_patterns import build_username_pattern_candidates
+
+    cn_only_count = len(candidates)
+    print_info_debug(
+        f"[ldap-cn-inference] {cn_only_count} CN-only record(s) to validate: {candidates}"
     )
+
+    inferred_pattern, pattern_score, known_users_analyzed = (
+        _infer_username_pattern_from_known_users(known_users or [])
+    )
+
+    cn_to_candidate: dict[str, str] = {}
+    candidate_set: set[str] = set()
+    for cn_name in candidates:
+        if not cn_name:
+            continue
+        if inferred_pattern:
+            variants = build_username_pattern_candidates(
+                cn_name, pattern_keys=[inferred_pattern]
+            )
+            generated = set(v for v in variants.values() if v)
+            if not generated:
+                generated = {normalize_username_candidate(cn_name)}
+        else:
+            variants = build_username_pattern_candidates(cn_name)
+            generated = set(v for v in variants.values() if v)
+            if not generated:
+                generated = {normalize_username_candidate(cn_name)}
+
+        chosen = sorted(generated)[0] if generated else normalize_username_candidate(cn_name)
+        cn_to_candidate[cn_name] = chosen
+        print_info_debug(
+            f"[ldap-cn-inference] CN={cn_name!r} pattern={inferred_pattern!r} → {sorted(generated)}"
+        )
+        candidate_set.update(generated)
+
+    normalized = sorted(c for c in candidate_set if c)
+    empty_result = _CNInferenceResult(
+        validated=set(),
+        inferred_pattern=inferred_pattern,
+        pattern_score=pattern_score,
+        known_users_analyzed=known_users_analyzed,
+        rows=[],
+        cn_only_count=cn_only_count,
+    )
+
     if not normalized:
-        return set()
+        return empty_result
 
     kerbrute_path = os.path.join(TOOLS_INSTALL_DIR, "kerbrute", "kerbrute")
     if not os.path.isfile(kerbrute_path) or not os.access(kerbrute_path, os.X_OK):
         print_warning(
             "kerbrute is not available; skipping validation of anonymous LDAP username candidates."
         )
-        return set()
+        return empty_result
 
     workspace_cwd = shell._get_workspace_cwd()
     kerberos_dir = domain_subpath(
@@ -1584,7 +1861,7 @@ def _validate_ldap_anonymous_username_candidates(
     )
     enum_service = EnumerationService()
     executor = shell._get_service_executor()
-    validated = enum_service.kerberos.enumerate_users_kerberos(
+    validated_raw = enum_service.kerberos.enumerate_users_kerberos(
         domain=domain,
         pdc=shell.domains_data[domain]["pdc"],
         wordlist=str(wordlist_path),
@@ -1595,13 +1872,26 @@ def _validate_ldap_anonymous_username_candidates(
         timeout=300,
     )
     validated_set = {
-        normalize_username_candidate(username) for username in validated if username
+        normalize_username_candidate(username) for username in validated_raw if username
     }
     print_info_debug(
         f"[ldap] Validated {len(validated_set)}/{len(normalized)} inferred username "
         "candidate(s) through Kerberos."
     )
-    return validated_set
+
+    rows: list[tuple[str, str, bool]] = [
+        (cn_name, candidate, candidate in validated_set)
+        for cn_name, candidate in cn_to_candidate.items()
+    ]
+
+    return _CNInferenceResult(
+        validated=validated_set,
+        inferred_pattern=inferred_pattern,
+        pattern_score=pattern_score,
+        known_users_analyzed=known_users_analyzed,
+        rows=rows,
+        cn_only_count=cn_only_count,
+    )
 
 
 def run_post_user_discovery_followups(
@@ -1621,6 +1911,7 @@ def run_post_user_discovery_followups(
     prompts by skipping the ``with_users`` transition when the domain is
     already authenticated or already marked as ``with_users``.
     """
+
     def _capture_followup_event(action: str, **extra: object) -> None:
         """Emit a telemetry event for post-user-discovery flow transitions."""
         try:
@@ -1706,178 +1997,78 @@ def run_post_user_discovery_followups(
 
 
 def _run_ldap_anonymous_followups(shell: LdapShell, domain: str) -> None:
-    """Expand an anonymous LDAP bind into user discovery and standard follow-ups."""
-    if not shell.netexec_path:
+    """Expand an anonymous LDAP bind into native Phase 2.5 enrichment.
+
+    This was historically a NetExec-backed flow (``nxc ldap -u "" -p "" -M
+    user-desc -M get-desc-users …``) wrapped around a sync badldap helper that
+    crashed with ``Connected, but not bound.`` on hardened DCs because the
+    NONE-protocol path never issued a real anonymous SIMPLE bind.
+
+    The Phase 2.5 enrichment service (``unauth_enrichment_service``) now
+    covers the same surface natively (anonymous LDAP active users with a real
+    ``ldap+simple://`` bind, SAMR over null SMB, GPP cpassword harvest with
+    AES decryption). The unauth scan flow calls it directly. This function
+    exists so that callers OUTSIDE the unauth flow (e.g. the standalone
+    ``ldap_anonymous`` command in this module) get the same coverage.
+
+    Behaviour:
+      * Builds a one-shot ``UnauthEnrichmentConfig`` from ``shell.domains_data``.
+      * Runs the native enrichment.
+      * Routes results through ``_apply_unauth_enrichment_results`` so the
+        same artifacts (LDAP active users JSON, SAMR users JSON, GPP leaks
+        as credentials + technical findings) are persisted.
+    """
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    pdc = str(domain_data.get("pdc") or "").strip()
+    if not pdc:
+        print_warning(
+            "[ldap-anon] Cannot run native enrichment: no PDC recorded for domain"
+        )
         return
 
-    enum_service = EnumerationService()
-    executor = shell._get_service_executor()
-    workspace_cwd = shell._get_workspace_cwd()
+    smb_null_open = bool(domain_data.get("smb_null_session"))
+    workspace_dir = shell.current_workspace_dir or os.getcwd()
 
-    active_log_abs = domain_subpath(
-        workspace_cwd,
-        shell.domains_dir,
-        domain,
-        shell.ldap_dir,
-        "ldap_anonymous_active_users.log",
-    )
-    query_log_abs = domain_subpath(
-        workspace_cwd,
-        shell.domains_dir,
-        domain,
-        shell.ldap_dir,
-        "ldap_anonymous_discovery.log",
-    )
-    os.makedirs(os.path.dirname(active_log_abs), exist_ok=True)
-
-    active_users = enum_service.ldap.enumerate_active_users_anonymous(
-        pdc=shell.domains_data[domain]["pdc"],
-        netexec_path=shell.netexec_path,
-        log_file=active_log_abs,
-        executor=executor,
-        scan_id=None,
-        timeout=120,
-    )
-    records = enum_service.ldap.query_anonymous_user_inventory(
-        pdc=shell.domains_data[domain]["pdc"],
-        netexec_path=shell.netexec_path,
-        log_file=query_log_abs,
-        ldap_filter=_LDAP_ANONYMOUS_DISCOVERY_FILTER,
-        executor=executor,
-        scan_id=None,
-        timeout=180,
-    )
-
-    inventory_json = _save_ldap_anonymous_inventory_json(shell, records, domain)
-    if inventory_json:
-        marked_inventory_json = mark_sensitive(inventory_json, "path")
-        print_info_debug(
-            f"[ldap] Saved anonymous LDAP inventory to {marked_inventory_json}"
+    try:
+        from adscan_internal.services.unauth_enrichment_service import (
+            UnauthEnrichmentConfig,
+            run_unauth_enrichment,
         )
 
-    confirmed_users = {
-        normalize_username_candidate(username)
-        for username in active_users
-        if normalize_username_candidate(username)
-    }
-    if confirmed_users:
-        confirmed_sorted = sorted(confirmed_users)
-        _display_ldap_anonymous_confirmed_users(confirmed_sorted)
-        print_info(
-            f"Anonymous LDAP confirmed {len(confirmed_sorted)} enabled user(s) directly."
-        )
-
-    resolved_user_by_dn: dict[str, str] = {}
-    direct_sam_records: list[LDAPAnonymousUserRecord] = []
-    unresolved_records: list[LDAPAnonymousUserRecord] = []
-    active_users_keys = {user.casefold() for user in confirmed_users}
-
-    for record in records:
-        record_dn = str(record.distinguished_name or "").strip()
-        samaccountname = normalize_username_candidate(record.samaccountname)
-        if samaccountname and samaccountname.casefold() in active_users_keys:
-            resolved_user_by_dn[record_dn] = samaccountname
-            direct_sam_records.append(record)
-        elif not samaccountname and _is_likely_ldap_user_candidate(record):
-            unresolved_records.append(record)
-
-    # De-duplicate unresolved records by DN while preserving discovery order.
-    unresolved_by_dn: dict[str, LDAPAnonymousUserRecord] = {}
-    for record in unresolved_records:
-        record_dn = str(record.distinguished_name or "").strip()
-        if record_dn and record_dn not in unresolved_by_dn:
-            unresolved_by_dn[record_dn] = record
-    unresolved_records = list(unresolved_by_dn.values())
-
-    if unresolved_records:
-        observed_pairs = [
-            (str(record.common_name or ""), str(record.samaccountname or ""))
-            for record in direct_sam_records
-        ]
-        ranked_patterns = rank_username_patterns_from_observed_pairs(observed_pairs)
-        recommended_pattern = _select_recommended_username_pattern(ranked_patterns)
-        _display_ldap_anonymous_unresolved_users(
-            unresolved_records,
-            pattern_key=recommended_pattern,
-        )
-        selected_pattern = _choose_username_pattern(
-            shell,
+        config = UnauthEnrichmentConfig(
             domain=domain,
-            unresolved_records=unresolved_records,
-            ranked_patterns=ranked_patterns,
+            dc_ip=pdc,
+            smb_null_open=smb_null_open,
+            ldap_anon_open=True,
+            smb_readable_targets=[pdc] if smb_null_open else [],
+            workspace_dir=workspace_dir,
+            timeout=60,
         )
-        candidate_to_dn: dict[str, str] = {}
-        for record in unresolved_records:
-            candidates = build_username_pattern_candidates(record.common_name)
-            candidate = candidates.get(selected_pattern) or candidates.get("single")
-            candidate = normalize_username_candidate(candidate or "")
-            if not candidate or candidate in candidate_to_dn:
-                continue
-            candidate_to_dn[candidate] = str(record.distinguished_name or "").strip()
+        results = run_unauth_enrichment(config)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error(f"Native LDAP anonymous enrichment failed: {exc}")
+        return
 
-        if candidate_to_dn:
-            print_info(
-                f"Anonymous LDAP also exposed {len(candidate_to_dn)} CN-only user candidate(s); validating them via Kerberos."
-            )
-            validated_candidates = _validate_ldap_anonymous_username_candidates(
-                shell, domain, list(candidate_to_dn.keys())
-            )
-            for candidate in validated_candidates:
-                record_dn = candidate_to_dn.get(candidate)
-                if not record_dn:
-                    continue
-                confirmed_users.add(candidate)
-                resolved_user_by_dn[record_dn] = candidate
+    try:
+        from adscan_internal.cli.scan import _apply_unauth_enrichment_results
 
-    if confirmed_users:
-        shell._write_user_list_file(
-            domain,
-            "users.txt",
-            sorted(confirmed_users),
-            merge_existing=True,
-            update_source="Anonymous LDAP",
-        )
-        try:
-            shell._postprocess_user_list_file(
-                domain,
-                "users.txt",
-                trigger_followups=False,
-                source="ldap_anonymous",
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            print_warning(f"Failed to postprocess anonymous LDAP users.txt: {exc}")
-        print_success(
-            f"Recovered {len(confirmed_users)} unique username(s) from anonymous LDAP."
-        )
-    else:
-        print_warning(
-            "Anonymous LDAP bind succeeded, but no reusable usernames were recovered."
-        )
-
-    run_post_user_discovery_followups(
-        shell,
-        domain,
-        source="ldap_anonymous",
-        pre_with_users_callback=lambda: run_ldap_descriptions(
-            shell, domain, anonymous=True
-        ),
-        pre_with_users_step="ldap_descriptions_anonymous",
-        allow_with_users=bool(confirmed_users),
-    )
+        _apply_unauth_enrichment_results(shell, domain=domain, results=results)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(f"Failed to apply enrichment results for {domain}: {exc}")
 
 
 def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | None:
-    """Test anonymous LDAP access via the LDAP service."""
+    """Test anonymous LDAP access via the native probe service.
+
+    The netexec_path guard is gone — anonymous LDAP probing is fully native
+    (via :func:`_run_ldap_anonymous_followups` which uses the unauth enrichment
+    service and ``ldap+simple://`` bind, not netexec).
+    """
     if domain not in shell.domains_data:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Unknown domain: {marked_domain}")
-        return None
-
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
         return None
 
     if shell.type == "ctf" and shell.domains_data[domain].get("auth") in [
@@ -1897,20 +2088,11 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
         icon="🔓",
     )
 
-    workspace_cwd = shell._get_workspace_cwd()
-    log_file_abs = domain_subpath(
-        workspace_cwd, shell.domains_dir, domain, shell.ldap_dir, "ldap_anonymous.log"
-    )
-    os.makedirs(os.path.dirname(log_file_abs), exist_ok=True)
-
+    # Native probe — no netexec required.
     enum_service = EnumerationService()
-    executor = shell._get_service_executor()
     result = enum_service.ldap.test_anonymous_access(
         pdc=shell.domains_data[domain]["pdc"],
-        netexec_path=shell.netexec_path,
-        log_file=log_file_abs,
-        executor=executor,
-        scan_id=None,
+        netexec_path="",  # compat shim — unused by native implementation
         timeout=60,
     )
 
@@ -1940,6 +2122,7 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
         try:
             from adscan_internal.services.report_service import record_technical_finding
 
+            # Gate the evidence block on whether domain_data confirms the bind.
             record_technical_finding(
                 shell,
                 domain,
@@ -1948,13 +2131,6 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
                 details={
                     "pdc": shell.domains_data[domain]["pdc"],
                 },
-                evidence=[
-                    {
-                        "type": "log",
-                        "summary": "LDAP anonymous bind output",
-                        "artifact_path": log_file_abs,
-                    }
-                ],
             )
         except Exception as exc:  # pragma: no cover
             if not handle_optional_report_service_exception(
@@ -1969,13 +2145,6 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
         shell.update_report_field(domain, "ldap_anonymous", False)
 
     return result
-
-
-def run_bloodhound_collector(shell: LdapShell, target_domain: str) -> None:
-    """Backward-compatible wrapper for BloodHound collection orchestration."""
-    from adscan_internal.cli.bloodhound import run_bloodhound_collector as _runner
-
-    _runner(shell, target_domain)
 
 
 def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None:
@@ -2054,239 +2223,6 @@ def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None
     return hostnames
 
 
-def run_enum_delegations(shell: LdapShell, domain: str) -> None:
-    """Enumerate Kerberos delegations in the specified domain using the service layer."""
-    if domain not in shell.domains_data:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(f"Domain '{marked_domain}' is not configured.")
-        return
-
-    if not shell.netexec_path and not getattr(shell, "impacket_scripts_dir", None):
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-        )
-        return
-
-    if not getattr(shell, "impacket_scripts_dir", None):
-        print_error(
-            "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-        )
-        return
-
-    find_delegation_path = os.path.join(shell.impacket_scripts_dir, "findDelegation.py")
-    if not os.path.isfile(find_delegation_path) or not os.access(
-        find_delegation_path, os.X_OK
-    ):
-        print_error(
-            f"findDelegation.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-        )
-        return
-
-    auth_domain = shell.domain or domain
-    auth_username = shell.domains_data.get(auth_domain, {}).get("username")
-    auth_password = shell.domains_data.get(auth_domain, {}).get("password")
-    if not auth_username or not auth_password:
-        print_error(
-            "Missing credentials (username/password) for delegation enumeration."
-        )
-        return
-
-    # Build Impacket auth string using existing helper on the shell.
-    auth = shell.build_auth_impacket_no_host(auth_username, auth_password, auth_domain)
-    marked_domain = mark_sensitive(domain, "domain")
-    command = f"{find_delegation_path} {auth} -target-domain {marked_domain}"
-
-    print_operation_header(
-        "Kerberos Delegation Enumeration",
-        details={
-            "Domain": domain,
-            "Auth Domain": auth_domain,
-            "Username": auth_username,
-            "Tool": "findDelegation.py",
-        },
-        icon="🔗",
-    )
-    print_info_debug(f"Command: {command}")
-
-    def _executor(command_to_run: str, timeout: int) -> subprocess.CompletedProcess[str]:
-        kerberos_command = (
-            command_to_run
-            if " -k" in f" {command_to_run}"
-            else f"{command_to_run} -k"
-        )
-        result = run_raw_impacket_command(
-            command_to_run,
-            script_name="findDelegation.py",
-            timeout=timeout,
-            ctx=ImpacketContext(
-                impacket_scripts_dir=str(shell.impacket_scripts_dir or ""),
-                validate_script_exists=lambda path: os.path.isfile(path)
-                and os.access(path, os.X_OK),
-                get_domain_pdc=lambda realm: str(
-                    (shell.domains_data.get(realm) or {}).get("pdc") or ""
-                )
-                or None,
-                sync_clock_with_pdc=lambda realm: bool(
-                    shell.do_sync_clock_with_pdc(realm, verbose=True)
-                ),
-                workspace_dir=shell.current_workspace_dir,
-                domains_data=shell.domains_data,
-            ),
-            kerberos_retry_context=ImpacketKerberosRetryContext(
-                domain=auth_domain,
-                username=auth_username,
-                credential=auth_password,
-                dc_ip=str((shell.domains_data.get(auth_domain) or {}).get("pdc") or "")
-                or None,
-            ),
-            auth_policy_protocol="ldap",
-            kerberos_command=kerberos_command,
-        )
-        if result is None:
-            return subprocess.CompletedProcess(command_to_run, 1, "", "Impacket command failed")
-        return result
-
-    enum_service = EnumerationService()
-    delegations, delegation_type_counts = enum_service.delegation.enumerate_delegations(
-        domain=domain,
-        command=command,
-        executor=_executor,
-        timeout=300,
-        scan_id=None,
-    )
-
-    # Update in-memory state: list of accounts with any delegation.
-    shell.domains_data.setdefault(domain, {})
-    shell.domains_data[domain]["delegations"] = [
-        d.account for d in delegations if d.account
-    ]
-
-    # Update report fields based on delegation types.
-    has_unconstrained = delegation_type_counts.get("unconstrained", 0) > 0
-    has_constrained = any(
-        delegation_type_counts.get(key, 0) > 0
-        for key in (
-            "constrained",
-            "constrained_protocol_transition",
-            "resource_based_constrained",
-        )
-    )
-    shell.update_report_field(domain, "unconstrained_delegation", has_unconstrained)
-    shell.update_report_field(domain, "constrained_delegation", has_constrained)
-
-    # Telemetry
-    try:
-        properties = {
-            "total_delegations": len(delegations),
-            "unconstrained_count": delegation_type_counts.get("unconstrained", 0),
-            "constrained_count": delegation_type_counts.get("constrained", 0),
-            "constrained_protocol_transition_count": delegation_type_counts.get(
-                "constrained_protocol_transition", 0
-            ),
-            "resource_based_constrained_count": delegation_type_counts.get(
-                "resource_based_constrained", 0
-            ),
-            "unknown_count": delegation_type_counts.get("unknown", 0),
-            "scan_mode": getattr(shell, "scan_mode", None),
-            "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-            "workspace_type": shell.type,
-            "auto_mode": shell.auto,
-        }
-        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
-        telemetry.capture("delegations_enumerated", properties)
-    except Exception as exc:  # pragma: no cover
-        telemetry.capture_exception(exc)
-
-    # Pretty-print delegations using existing helper.
-    if delegations:
-        from adscan_internal.rich_output import print_delegations_summary
-        from adscan_internal.services.enumeration.network import (
-            is_computer_dc_for_domain,
-        )
-
-        try:
-            from adscan_internal.services.report_service import record_attack_path
-        except ImportError:  # pragma: no cover - public LITE repo excludes reports
-            record_attack_path = None
-
-        delegations_full_data = [
-            {
-                "account": d.account,
-                "account_type": d.account_type,
-                "delegation_type": d.delegation_type,
-                "delegation_to": d.delegation_to,
-            }
-            for d in delegations
-        ]
-        print_delegations_summary(domain, delegations_full_data)
-
-        domain_info = shell.domains_data.get(domain, {})
-        for delegation in delegations:
-            delegation_type_lower = (delegation.delegation_type or "").lower()
-            if (
-                "constrained" not in delegation_type_lower
-                and "resource-based" not in delegation_type_lower
-            ):
-                continue
-            target = delegation.delegation_to or ""
-            if not target or target.lower() in {"n/a", "any", "-"}:
-                continue
-            if "/" in target:
-                target_host = target.split("/", 1)[1]
-            else:
-                target_host = target
-            target_host = target_host.split(":", 1)[0].split("@", 1)[0].strip()
-            if not target_host:
-                continue
-            if not is_computer_dc_for_domain(
-                domain=domain,
-                target_host=target_host,
-                domain_info=domain_info,
-            ):
-                continue
-            if record_attack_path is None:
-                continue
-            record_attack_path(
-                shell,
-                domain,
-                title=f"Delegation path to Domain Admin via {target_host}",
-                source="delegation_enumeration",
-                confidence="medium",
-                status="theoretical",
-                steps=[
-                    {
-                        "step": 1,
-                        "action": "Compromise delegatable account",
-                        "details": {
-                            "account": delegation.account,
-                            "account_type": delegation.account_type,
-                        },
-                    },
-                    {
-                        "step": 2,
-                        "action": "Leverage delegation to target service",
-                        "details": {
-                            "delegation_type": delegation.delegation_type,
-                            "delegation_to": delegation.delegation_to,
-                        },
-                    },
-                    {
-                        "step": 3,
-                        "action": "Impersonate to Domain Controller service",
-                        "details": {
-                            "target_host": target_host,
-                            "domain": domain,
-                        },
-                    },
-                ],
-                details={
-                    "account": delegation.account,
-                    "delegation_type": delegation.delegation_type,
-                    "delegation_to": delegation.delegation_to,
-                    "target_host": target_host,
-                },
-            )
-
 
 def _run_enum_domain_auth(
     shell: LdapShell,
@@ -2296,20 +2232,101 @@ def _run_enum_domain_auth(
 ) -> None:
     """Shared authenticated domain scan flow with optional early stop."""
     from adscan_internal.rich_output import ScanProgressTracker, mark_sensitive
-    from adscan_internal.bloodhound_legacy import get_bloodhound_mode
+
+    # Mint a fresh timeline run id at the top so every phase span emitted
+    # below — Topology, Collection, the analysis pipeline — shares the same
+    # grouping key. ``adscan show timeline`` and the web dashboard use this
+    # to render one run per row group.
+    try:
+        from adscan_internal.services.scan_timeline import begin_timeline_run
+
+        begin_timeline_run(shell)
+    except Exception:  # noqa: BLE001
+        pass
 
     username = shell.domains_data.get(domain, {}).get("username", "N/A")
     pdc = shell.domains_data.get(domain, {}).get("pdc", "N/A")
-    bh_mode = get_bloodhound_mode()
-    phase1_complete = bool(shell.domains_data.get(domain, {}).get("phase1_complete"))
+    is_dev_session = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
+    native_graph_enabled = True
+    graph_mode = (
+        "Native Graph"
+        if native_graph_enabled
+        else "Collector Selector"
+        if is_dev_session
+        else "Legacy Graph Collector"
+    )
+    # Resume / Refresh / Replay / Inspect — the operator's intent when prior
+    # results exist drives whether we re-collect, re-analyse, or just resume
+    # downstream phases. The decision is taken once here so the rest of the
+    # flow has a single source of truth for what to skip.
+    workspace_action: str | None = None
+    if stop_after_phase is None:
+        from adscan_internal.cli.workspace_resume_panel import (
+            resolve_workspace_action,
+        )
+        from adscan_internal.services.workspace_resume import (
+            WorkspaceAction,
+            inspect_workspace,
+        )
 
-    if phase1_complete and stop_after_phase is None:
-        try:
-            shell.do_sync_clock_with_pdc(domain)  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            print_info_debug(f"[DEBUG] Clock sync skipped due to error: {exc}")
-        shell.run_enumeration(domain)  # type: ignore[attr-defined]
-        return
+        snapshot = inspect_workspace(shell, domain)
+        print_info_debug(
+            f"[ldap._run_enum_domain_auth] snapshot for {domain}: "
+            f"has_attack_graph={snapshot.has_attack_graph} "
+            f"phase1_complete={snapshot.phase1_complete} "
+            f"domain_auth={snapshot.domain_auth!r}"
+        )
+        if snapshot.has_attack_graph or snapshot.phase1_complete:
+            action, _ = resolve_workspace_action(shell, domain, snapshot=snapshot)
+            workspace_action = action.value
+            print_info_debug(
+                f"[ldap._run_enum_domain_auth] resolved action={action.value!r} for {domain}"
+            )
+
+            if action is WorkspaceAction.INSPECT:
+                print_info(
+                    "Workspace opened for inspection. Run `adscan show` "
+                    "or re-invoke the scan when ready."
+                )
+                return
+
+            if action is WorkspaceAction.RESUME:
+                # Skip collection entirely, jump to analysis with cached graph.
+                print_info_debug(
+                    "[ldap._run_enum_domain_auth] RESUME branch: clock sync + run_enumeration (no collection)"
+                )
+                try:
+                    shell.do_sync_clock_with_pdc(domain)  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001
+                    print_info_debug(f"[DEBUG] Clock sync skipped due to error: {exc}")
+                shell.domains_data.setdefault(domain, {})["_workspace_action"] = (
+                    workspace_action
+                )
+                shell.run_enumeration(domain)  # type: ignore[attr-defined]
+                return
+
+            if action is WorkspaceAction.REPLAY:
+                # Keep the cached graph but force the analysis pipeline to
+                # re-run end to end (new attack rules, updated reporting, ...).
+                print_info_debug(
+                    "[ldap._run_enum_domain_auth] REPLAY branch: clock sync + run_enumeration (no collection)"
+                )
+                shell.domains_data.setdefault(domain, {})["phase1_complete"] = False
+                shell.domains_data[domain]["_workspace_action"] = workspace_action
+                try:
+                    shell.do_sync_clock_with_pdc(domain)  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001
+                    print_info_debug(f"[DEBUG] Clock sync skipped due to error: {exc}")
+                shell.run_enumeration(domain)  # type: ignore[attr-defined]
+                return
+
+            # REFRESH falls through to the full collection flow below, but we
+            # invalidate phase1_complete so the analysis pipeline re-runs too.
+            print_info_debug(
+                "[ldap._run_enum_domain_auth] REFRESH branch: falling through to tracker + collection flow"
+            )
+            shell.domains_data.setdefault(domain, {})["phase1_complete"] = False
+            shell.domains_data[domain]["_workspace_action"] = workspace_action
 
     # Clock sync must be done against the KDC/realm used for Kerberos authentication.
     # In multi-domain setups, we may be scanning a target domain without having
@@ -2334,6 +2351,10 @@ def _run_enum_domain_auth(
         )
 
     # Initialize progress tracker for authenticated scan.
+    print_info_debug(
+        f"[ldap._run_enum_domain_auth] entering tracker section for {domain}: "
+        f"workspace_action={workspace_action!r} sync_domain={sync_domain}"
+    )
     tracker = ScanProgressTracker(
         "Authenticated Domain Scan",
         total_steps=2,
@@ -2345,7 +2366,7 @@ def _run_enum_domain_auth(
             "Domain": domain,
             "PDC": pdc,
             "Username": username,
-            "BloodHound Mode": bh_mode.upper(),
+            "Graph Mode": graph_mode,
         }
     )
 
@@ -2362,53 +2383,72 @@ def _run_enum_domain_auth(
     except Exception as exc:  # noqa: BLE001
         tracker.fail_step(details=f"Clock sync error: {str(exc)[:50]}")
 
-    # Step 2: BloodHound Collection
-    tracker.start_step(
-        "BloodHound Collection",
-        details=f"Running BloodHound {bh_mode.upper()} data collector",
+    # Step 2: Graph Collection
+    collection_details = (
+        "Running ADscan native graph collector"
+        if native_graph_enabled
+        else "Running selected graph collector"
+        if is_dev_session
+        else "Running legacy graph collector"
     )
-    try:
-        from adscan_internal.bloodhound_legacy import get_legacy_bloodhound_config_path
-        from adscan_internal.cli.post_bloodhound import (
-            run_post_bloodhound,
-            run_post_bloodhound_ce,
-        )
+    tracker.start_step(
+        "Graph Collection",
+        details=collection_details,
+    )
 
-        if get_bloodhound_mode() == "ce":
-            collector_results = shell.ask_for_bloodhound(  # type: ignore[attr-defined]
+    # Surface graph collection as a top-level chapter (numbered alongside
+    # Topology & Trusts and the analysis pipeline) and capture deltas to
+    # the workspace timeline so the operator and the web service both see
+    # the +nodes/+edges produced by this phase.
+    try:
+        from adscan_internal.services.scan_phases import emit_chapter
+        from adscan_internal.services.scan_timeline import phase_span
+
+        _scan_type = getattr(shell, "type", "default")
+        emit_chapter("domain_collection", scan_type=_scan_type)
+        _collection_phase_cm = phase_span(
+            shell,
+            domain,
+            phase_id="domain_collection",
+            phase_title="Domain Collection",
+        )
+        _collection_phase_cm.__enter__()
+    except Exception:  # noqa: BLE001
+        _collection_phase_cm = None
+
+    try:
+
+        def _continue_after_collection() -> None:
+            shell.run_enumeration(  # type: ignore[attr-defined]
                 domain,
-                callback=lambda: run_post_bloodhound_ce(
-                    shell,
-                    domain,
-                    stop_after_phase=stop_after_phase,  # type: ignore[arg-type]
-                ),
+                stop_after_phase=stop_after_phase,
             )
-        else:
-            legacy_config_path = get_legacy_bloodhound_config_path()
-            collector_results = shell.ask_for_bloodhound(  # type: ignore[attr-defined]
-                domain,
-                callback=lambda: run_post_bloodhound(
-                    shell,
-                    domain,
-                    stop_after_phase=stop_after_phase,  # type: ignore[arg-type]
-                    legacy_config_path=legacy_config_path,
-                ),
-            )
+
+        collector_results = shell.ask_for_graph_collection(  # type: ignore[attr-defined]
+            domain,
+            callback=_continue_after_collection,
+        )
         if collector_results == []:
             tracker.complete_step(
-                details="BloodHound collection skipped in dev mode; continuing with Phase 1"
+                details="Graph collection completed; continuing with Phase 1"
             )
         else:
-            tracker.complete_step(details="BloodHound data collection completed")
+            tracker.complete_step(details="Graph collection completed")
     except Exception as exc:  # noqa: BLE001
-        tracker.fail_step(details=f"BloodHound error: {str(exc)[:50]}")
+        tracker.fail_step(details=f"Graph collection error: {str(exc)[:50]}")
+    finally:
+        try:
+            if _collection_phase_cm is not None:
+                _collection_phase_cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Print workflow summary
     tracker.print_summary()
 
 
 def run_enum_domain_auth(shell: LdapShell, domain: str) -> None:
-    """Perform an authenticated domain scan orchestrated around BloodHound."""
+    """Perform an authenticated domain scan around ADscan's local graph collection."""
     _run_enum_domain_auth(shell, domain, stop_after_phase=None)
 
 
@@ -2431,114 +2471,6 @@ def run_enum_with_users(shell: LdapShell, domain: str) -> None:
         shell.ask_for_spraying(domain)  # type: ignore[attr-defined]
 
 
-def run_ldap_active_users(shell: LdapShell, target_domain: str) -> list[str] | None:
-    """Enumerate enabled users via LDAP and persist `enabled_users.txt`."""
-    if target_domain not in shell.domains:
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        print_error(
-            f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
-        )
-        return None
-
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return None
-
-    if not shell.domain or shell.domain not in shell.domains_data:
-        print_error("No authenticated domain selected. Select a domain first.")
-        return None
-
-    username = shell.domains_data[shell.domain].get("username")
-    password = shell.domains_data[shell.domain].get("password")
-    if not username or not password:
-        print_error(
-            "Missing credentials (username/password) for LDAP user enumeration."
-        )
-        return None
-
-    log_file_rel = domain_relpath(
-        shell.domains_dir, target_domain, shell.ldap_dir, "enabled_users.log"
-    )
-    output_rel = domain_relpath(shell.domains_dir, target_domain, "enabled_users.txt")
-    print_operation_header(
-        "LDAP User Enumeration",
-        details={
-            "Target Domain": target_domain,
-            "Auth Domain": shell.domain,
-            "Username": username,
-            "LDAP Server": shell.domains_data[target_domain]["pdc"],
-            "Mode": "Active users only",
-            "Log": log_file_rel,
-            "Output": output_rel,
-        },
-        icon="👤",
-    )
-
-    workspace_cwd = shell._get_workspace_cwd()
-    log_file_abs = domain_subpath(
-        workspace_cwd,
-        shell.domains_dir,
-        target_domain,
-        shell.ldap_dir,
-        "enabled_users.log",
-    )
-    os.makedirs(os.path.dirname(log_file_abs), exist_ok=True)
-
-    enum_service = EnumerationService()
-    executor = shell._get_service_executor()
-    usernames = enum_service.ldap.enumerate_active_users(
-        domain=target_domain,
-        pdc=shell.domains_data[target_domain]["pdc"],
-        auth_mode=AuthMode.AUTHENTICATED,
-        username=username,
-        password=password,
-        netexec_path=shell.netexec_path,
-        log_file=log_file_abs,
-        executor=executor,
-        scan_id=None,
-        timeout=120,
-    )
-
-    shell._write_domain_list_file(target_domain, "enabled_users.txt", usernames)
-    try:
-        shell._postprocess_user_list_file(
-            target_domain,
-            "enabled_users.txt",
-            source="ldap_active_users",
-        )
-    except Exception as e:  # pragma: no cover
-        telemetry.capture_exception(e)
-        marked_domain = mark_sensitive(target_domain, "domain")
-        print_warning(f"Failed to postprocess enabled users for {marked_domain}: {e}")
-
-    try:
-        properties = {
-            "count": len(usernames),
-            "scan_mode": getattr(shell, "scan_mode", None),
-            "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
-        }
-        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
-        telemetry.capture("ldap_users_enumerated", properties)
-    except Exception as e:  # pragma: no cover
-        telemetry.capture_exception(e)
-
-    try:
-        emit_event(
-            "coverage",
-            phase="domain_analysis",
-            phase_label="Domain Analysis",
-            category="identity_inventory",
-            domain=target_domain,
-            metric_type="enabled_users",
-            count=len(usernames),
-            message=f"Enabled identity inventory updated: {len(usernames)} active users discovered.",
-        )
-    except Exception as exc:  # pragma: no cover
-        telemetry.capture_exception(exc)
-
-    return usernames
 
 
 def run_ldap_admincount_and_signing(
@@ -2552,14 +2484,14 @@ def run_ldap_admincount_and_signing(
     """Check `adminCount` for a user via native LDAP, handling transport fallback.
 
     This helper keeps the legacy return contract:
-      - ``True``  → adminCount == 1
-      - ``False`` → adminCount != 1 (sin error)
-      - ``None``  → credenciales inválidas / error de ejecución
+      - ``True``  : adminCount == 1
+      - ``False`` : adminCount != 1 (no error)
+      - ``None``  : invalid credentials or execution failure
     """
     from adscan_internal import (
         print_info,
         print_success,
-    )  # import local para evitar ciclos
+    )  # local import to avoid circular dependency
 
     if domain not in shell.domains_data:
         marked_domain = mark_sensitive(domain, "domain")
@@ -2690,7 +2622,7 @@ def run_ldap_groupmembership_privileged(
         return None
 
     output_str = completed_process.stdout or ""
-    # Reutilizar el parser existente en el shell, si está disponible
+    # Reuse the parser already exposed by the shell, when available.
     parser = getattr(shell, "_parse_privileged_group_output", None)
     if callable(parser):
         return parser(output_str)
@@ -2753,7 +2685,7 @@ def _is_exact_ldap_connection_timeout_result(
     )
 
 
-def _run_netexec_ldap_query_attribute_values(
+def _run_native_ldap_query_attribute_values(
     shell: LdapShell,
     *,
     domain: str,
@@ -2865,13 +2797,13 @@ def get_recursive_user_groups_in_chain(
     This is a runtime helper used when we need accurate group memberships even
     after in-engagement changes (e.g., adding the operator to a group).
 
-    It performs 2 LDAP queries via NetExec:
+    It performs 2 LDAP queries via native LDAP:
       1) Resolve the principal's distinguishedName (DN) using sAMAccountName.
       2) Query groups whose ``member`` chain contains that DN using:
             member:1.2.840.113556.1.4.1941:=<USER_DN>
 
     Args:
-        shell: Shell instance providing NetExec execution.
+        shell: Shell instance providing LDAP context.
         domain: Target AD domain.
         target_username: Principal sAMAccountName whose groups we want. This
             works for both Users and Computers (including trailing ``$``).
@@ -2895,13 +2827,17 @@ def get_recursive_user_groups_in_chain(
     if not auth_username or not auth_password or not pdc:
         return None
 
-    # Fast path: resolve the principal DN from BloodHound when available.
-    # This avoids an extra LDAP query and stays aligned with the "prefer BH,
-    # fallback to NetExec" approach used elsewhere for node enrichment.
+    # Fast path: resolve the principal DN from the graph when available.
+    # This avoids an extra LDAP query and keeps node enrichment consistent.
     user_dn = ""
     try:
-        if hasattr(shell, "_get_bloodhound_service"):
-            service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if callable(service_getter):
+            service = service_getter()
             resolver = getattr(service, "get_user_node_by_samaccountname", None)
             if callable(resolver):
                 node_props = resolver(domain, str(target_username or "").strip())
@@ -2921,11 +2857,11 @@ def get_recursive_user_groups_in_chain(
     except Exception:
         user_dn = ""
 
-    # 1) Resolve DN for the principal (fallback to NetExec query when BH is unavailable).
+    # 1) Resolve DN for the principal (fallback to native LDAP query when BH is unavailable).
     if not user_dn:
         sanitized_target = str(target_username).replace("'", "\\'")
         dn_query = f"(&(|(objectClass=user)(objectClass=computer))(sAMAccountName={sanitized_target}))"
-        dn_values = _run_netexec_ldap_query_attribute_values(
+        dn_values = _run_native_ldap_query_attribute_values(
             shell,
             domain=domain,
             ldap_query=dn_query,
@@ -2952,7 +2888,7 @@ def get_recursive_user_groups_in_chain(
     group_query = (
         f"(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:={user_dn}))"
     )
-    groups = _run_netexec_ldap_query_attribute_values(
+    groups = _run_native_ldap_query_attribute_values(
         shell,
         domain=domain,
         ldap_query=group_query,
@@ -3002,7 +2938,7 @@ def get_recursive_principal_group_sids_in_chain(
     group checks because group names can be localized.
 
     Args:
-        shell: Shell instance providing NetExec execution.
+        shell: Shell instance providing LDAP context.
         domain: Target AD domain.
         target_samaccountname: Principal sAMAccountName (user or computer).
         auth_username/auth_password/pdc/timeout: Same meaning as in
@@ -3020,11 +2956,16 @@ def get_recursive_principal_group_sids_in_chain(
     if not auth_username or not auth_password or not pdc:
         return None
 
-    # Resolve principal DN (BH first, fallback NetExec query).
+    # Resolve principal DN (graph first, fallback native LDAP query).
     user_dn = ""
     try:
-        if hasattr(shell, "_get_bloodhound_service"):
-            service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if callable(service_getter):
+            service = service_getter()
             resolver = getattr(service, "get_user_node_by_samaccountname", None)
             if callable(resolver):
                 node_props = resolver(domain, str(target_samaccountname or "").strip())
@@ -3047,7 +2988,7 @@ def get_recursive_principal_group_sids_in_chain(
     if not user_dn:
         sanitized_target = str(target_samaccountname).replace("'", "\\'")
         dn_query = f"(&(|(objectClass=user)(objectClass=computer))(sAMAccountName={sanitized_target}))"
-        dn_values = _run_netexec_ldap_query_attribute_values(
+        dn_values = _run_native_ldap_query_attribute_values(
             shell,
             domain=domain,
             ldap_query=dn_query,
@@ -3074,7 +3015,7 @@ def get_recursive_principal_group_sids_in_chain(
     group_query = (
         f"(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:={user_dn}))"
     )
-    sids = _run_netexec_ldap_query_attribute_values(
+    sids = _run_native_ldap_query_attribute_values(
         shell,
         domain=domain,
         ldap_query=group_query,
@@ -3122,8 +3063,27 @@ def get_recursive_principal_groups_in_chain(
     )
 
 
+def _get_domain_admins_via_native_ldap(shell: LdapShell, domain: str) -> list[str] | None:
+    """Return enabled Domain Admin members using ADscan's native LDAP transport."""
+    try:
+        from adscan_internal.services.native_group_membership import (
+            resolve_enabled_group_members_by_rid_native,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return None
+
+    return resolve_enabled_group_members_by_rid_native(
+        shell,
+        domain,
+        512,
+        member_kind="user",
+        operation_name="Domain Admins lookup",
+    )
+
+
 def get_domain_admins(shell: LdapShell, domain: str) -> list[str]:
-    """Return members of the Domain Admins group via NetExec LDAP."""
+    """Return members of the Domain Admins group from local artifacts or native LDAP."""
     try:
         marked_domain = mark_sensitive(domain, "domain")
         snapshot_admins = resolve_group_members_by_rid(
@@ -3139,42 +3099,11 @@ def get_domain_admins(shell: LdapShell, domain: str) -> list[str]:
         else:
             print_info_debug(
                 f"[ldap] RID 512 resolution unavailable for {marked_domain}; "
-                "falling back to LDAP."
+                "falling back to native LDAP."
             )
 
-        auth = shell.build_auth_nxc(
-            shell.domains_data[domain]["username"],
-            shell.domains_data[domain]["password"],
-            domain,
-            kerberos=False,
-        )
-        log_path = domain_relpath(
-            shell.domains_dir, domain, shell.ldap_dir, "domain_admins.log"
-        )
-        command = (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth} "
-            f"--log {log_path} --groups 'Domain Admins'"
-        )
         print_info_verbose("Retrieving Domain Admins")
-        print_info_debug(f"Command: {command}")
-        completed_process = shell.run_command(command, timeout=300)
-        output = completed_process.stdout or ""
-        errors = completed_process.stderr or ""
-
-        if completed_process.returncode != 0:
-            print_error(f"Error retrieving Domain Admins: {errors}")
-            return []
-
-        admins: list[str] = []
-        filtered_lines = [line for line in output.splitlines() if "[" not in line]
-        if not filtered_lines:
-            admins = []
-        else:
-            for line in filtered_lines:
-                columns = line.split()
-                if len(columns) >= 5:
-                    admins.append(columns[4])
-
+        admins = _get_domain_admins_via_native_ldap(shell, domain)
         if admins:
             return admins
 
@@ -3266,28 +3195,10 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
 
     shell.domains_data[domain]["auth"] = "user_enum"
 
-    # Wordlist selection via interactive menu
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    options = _get_kerberos_wordlist_strategy_options(workspace_type)
-    choice_idx = shell._questionary_select(
-        "Select an option for Kerberos enumeration", options
-    )
-    if choice_idx is None:
-        print_error("Selection cancelled.")
+    # Wordlist selection via single-tree strategy selector
+    wordlist = _select_kerberos_wordlist_strategy(shell, domain)
+    if not wordlist:
         return
-
-    if choice_idx == 0:
-        wordlist = _build_targeted_kerberos_wordlist(shell, domain)
-        if not wordlist:
-            return
-    elif choice_idx == 1:
-        wordlist = _resolve_general_kerberos_username_wordlist(domain)
-        if not wordlist:
-            return
-    else:
-        wordlist = _prompt_custom_kerberos_username_wordlist(shell, domain)
-        if not wordlist:
-            return
 
     workspace_cwd = shell._get_workspace_cwd()
     kerberos_dir = domain_subpath(
@@ -3552,36 +3463,93 @@ def _prompt_for_repeated_kerberos_wordlist_if_needed(
     return choice_idx == 0
 
 
-def _get_kerberos_wordlist_strategy_options(workspace_type: str) -> list[str]:
-    """Return top-level Kerberos username wordlist strategy options."""
-    focused_label = (
-        "Generate a focused corporate username wordlist"
-        if workspace_type == "audit"
-        else "Generate a targeted username wordlist"
-    )
-    return [
-        f"{focused_label} (Recommended)",
-        "Use a general common username wordlist",
-        "Use my own username wordlist",
+def _select_kerberos_wordlist_strategy(shell: LdapShell, domain: str) -> str | None:
+    """Single-tree strategy selector for Kerberos username wordlist generation.
+
+    Replaces the old two-level redundant menu (top-level + nested confirm) with one
+    clean decision: how does the operator know (or not know) the username format?
+    The "general common wordlist" option is intentionally absent — it is too slow
+    (~300s+ timeout) and adds no value when targeted generation is available.
+    """
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    is_audit = workspace_type == "audit"
+
+    # ── Context panel ────────────────────────────────────────────────────────
+    strategy_rows = [
+        (
+            "[bold #00D4FF]Detect format automatically[/bold #00D4FF]",
+            "Runs a compact Kerberos probe (~30–90 s) to identify\n"
+            "the naming convention, then generates a focused list.",
+        ),
+        (
+            "[bold #00D4FF]I know the format[/bold #00D4FF]",
+            "Pick the naming pattern and choose sources:\n"
+            "statistically-likely names, LinkedIn employees, or manual entry.",
+        ),
+        (
+            "[bold #00D4FF]Use my own wordlist[/bold #00D4FF]",
+            "Provide a file; ADscan will pass it directly to kerbrute.",
+        ),
     ]
+    table = Table(show_header=False, box=None, padding=(0, 2), expand=False)
+    table.add_column(style="bold", no_wrap=True)
+    table.add_column(style="dim")
+    for label, desc in strategy_rows:
+        table.add_row(label, desc)
 
-
-def _resolve_general_kerberos_username_wordlist(domain: str) -> str | None:
-    """Return the built-in general Kerberos username wordlist."""
-    service = KerberosUsernameWordlistService()
-    path = service.get_general_common_wordlist_path()
-    marked_domain = mark_sensitive(domain, "domain")
-    if path is None:
-        print_warning(
-            "The built-in general Kerberos username wordlist is not available in this runtime. "
-            f"Use a custom wordlist instead for {marked_domain}."
-        )
-        return None
-    marked_path = mark_sensitive(str(path), "path")
-    print_info(
-        f"Using the built-in general Kerberos username wordlist for {marked_domain}: {marked_path}"
+    print_panel(
+        table,
+        title="[bold]How should ADscan build the username list?[/bold]",
+        border_style=BRAND_COLORS["info"],
+        expand=False,
+        spacing="before",
     )
-    return str(path)
+
+    options = [
+        "Detect the format automatically" + (" (Recommended)" if not is_audit else ""),
+        "I know the username format" + (" (Recommended)" if is_audit else ""),
+        "Use my own wordlist",
+    ]
+    choice_idx = shell._questionary_select("Select a strategy", options, default_idx=0)
+    if choice_idx is None:
+        print_error("Selection cancelled.")
+        return None
+
+    if choice_idx == 0:
+        return _kerberos_auto_detect_then_build(shell, domain)
+    if choice_idx == 1:
+        return _kerberos_known_format_build(shell, domain)
+    return _prompt_custom_kerberos_username_wordlist(shell, domain)
+
+
+def _kerberos_auto_detect_then_build(shell: LdapShell, domain: str) -> str | None:
+    """Run the compact inference probe then build a focused wordlist from the result.
+
+    This is the "Detect format automatically" branch. It runs kerbrute with a
+    small inference wordlist, identifies the dominant naming pattern, and hands
+    off to source selection. On failure it offers manual pattern selection or a
+    custom file — never the slow general wordlist.
+    """
+    strategy, value = _infer_kerberos_username_pattern_via_runtime_probe(shell, domain)
+    if strategy == "pattern" and value:
+        return _build_focused_kerberos_wordlist_for_pattern(
+            shell, domain, pattern_key=value
+        )
+    if strategy == "manual":
+        return _kerberos_known_format_build(shell, domain)
+    if strategy == "custom":
+        return _prompt_custom_kerberos_username_wordlist(shell, domain)
+    return None
+
+
+def _kerberos_known_format_build(shell: LdapShell, domain: str) -> str | None:
+    """Build a focused wordlist when the operator already knows the naming convention."""
+    pattern_key = _prompt_kerberos_username_pattern(shell, domain)
+    if not pattern_key:
+        return None
+    return _build_focused_kerberos_wordlist_for_pattern(
+        shell, domain, pattern_key=pattern_key
+    )
 
 
 def _prompt_custom_kerberos_username_wordlist(
@@ -3618,7 +3586,9 @@ def _prompt_custom_kerberos_username_wordlist(
                 or ""
             ).strip()
         if not wordlist:
-            print_warning("Kerberos user enumeration skipped: no wordlist path was provided.")
+            print_warning(
+                "Kerberos user enumeration skipped: no wordlist path was provided."
+            )
             return None
 
         imported_wordlist = maybe_import_host_file_to_workspace(
@@ -3653,9 +3623,32 @@ def _prompt_custom_kerberos_username_wordlist(
 
 
 def _prompt_kerberos_username_pattern(shell: LdapShell, domain: str) -> str | None:
-    """Prompt for a known corporate username format."""
+    """Prompt for a known corporate username format with a live preview panel."""
     sample_domain = mark_sensitive(domain, "domain")
     sample_name = "John Smith"
+
+    preview_table = Table(
+        show_header=True,
+        header_style=f"bold {BRAND_COLORS['info']}",
+        box=None,
+        padding=(0, 2),
+    )
+    preview_table.add_column("Format key")
+    preview_table.add_column("Example for 'John Smith'", style="dim")
+    for pattern_key in SUPPORTED_KERBEROS_PATTERN_KEYS:
+        label = format_supported_pattern_label(pattern_key, sample_value=sample_name)
+        key_part = label.split("(")[0].strip()
+        example_part = f"({label.split('(')[1].rstrip(')')})" if "(" in label else label
+        preview_table.add_row(key_part, example_part)
+
+    print_panel(
+        preview_table,
+        title=f"[bold]Username formats · {sample_domain}[/bold]",
+        border_style=BRAND_COLORS["info"],
+        expand=False,
+        spacing="before",
+    )
+
     option_map: dict[str, str] = {}
     options: list[str] = []
     for pattern_key in SUPPORTED_KERBEROS_PATTERN_KEYS:
@@ -3739,7 +3732,9 @@ def _prompt_linkedin_ready(shell: LdapShell) -> bool:
         border_style="cyan",
         expand=False,
     )
-    return Confirm.ask("Have you completed the LinkedIn login in the browser?", default=True)
+    return Confirm.ask(
+        "Have you completed the LinkedIn login in the browser?", default=True
+    )
 
 
 def _prompt_validated_linkedin_company_slug(shell: LdapShell) -> str | None:
@@ -3747,15 +3742,21 @@ def _prompt_validated_linkedin_company_slug(shell: LdapShell) -> str | None:
     linkedin_service = LinkedInUsernameDiscoveryService()
     while True:
         company_slug = (
-            Prompt.ask(
-                "Specify the LinkedIn company slug "
-                "(for https://www.linkedin.com/company/<slug>/)",
-                default="",
+            (
+                Prompt.ask(
+                    "Specify the LinkedIn company slug "
+                    "(for https://www.linkedin.com/company/<slug>/)",
+                    default="",
+                )
+                or ""
             )
-            or ""
-        ).strip().strip("/")
+            .strip()
+            .strip("/")
+        )
         if not company_slug:
-            print_warning("Skipping LinkedIn source because no company slug was provided.")
+            print_warning(
+                "Skipping LinkedIn source because no company slug was provided."
+            )
             return None
 
         marked_slug = mark_sensitive(company_slug, "company")
@@ -3799,12 +3800,14 @@ def _infer_kerberos_username_pattern_via_runtime_probe(
         print_warning(
             "The Kerberos username-format inference assets are not available in this runtime."
         )
-        return "general", None
+        return "manual", None
 
     kerbrute_path = os.path.join(TOOLS_INSTALL_DIR, "kerbrute", "kerbrute")
     if not os.path.isfile(kerbrute_path) or not os.access(kerbrute_path, os.X_OK):
-        print_warning("Kerbrute is not available, so username-format inference cannot run.")
-        return "general", None
+        print_warning(
+            "Kerbrute is not available, so username-format inference cannot run."
+        )
+        return "manual", None
 
     kerberos_dir = domain_subpath(
         shell._get_workspace_cwd(),
@@ -3849,53 +3852,71 @@ def _infer_kerberos_username_pattern_via_runtime_probe(
                 "were discovered with the compact inference list."
             )
         fallback_options = [
-            "Use the built-in general common username wordlist (Recommended)",
-            "Use my own username wordlist",
-            "Choose a username format manually",
+            "Choose the username format manually (Recommended)",
+            "Use my own wordlist",
+            "Skip Kerberos enumeration",
         ]
         fallback_idx = shell._questionary_select(
-            "Username format inference did not produce a clear result. How do you want to continue?",
+            "No format detected. How do you want to continue?",
             fallback_options,
             default_idx=0,
         )
         if fallback_idx == 1:
             return "custom", None
         if fallback_idx == 2:
-            return "pattern", _prompt_kerberos_username_pattern(shell, domain)
-        return "general", None
+            return "skip", None
+        return "manual", None
 
-    preview_lines = [f"Validated usernames from inference probe: {len(sorted(set(users)))}"]
-    preview_lines.append("Likely formats:")
     sample_name = "John Smith"
+    unique_count = len(set(users))
+
+    result_table = Table(
+        show_header=True,
+        header_style=f"bold {BRAND_COLORS['info']}",
+        box=None,
+        padding=(0, 2),
+    )
+    result_table.add_column("Format", style="bold")
+    result_table.add_column("Example", style="dim")
+    result_table.add_column(
+        "Hits", justify="right", style=f"bold {BRAND_COLORS['success']}"
+    )
     for pattern_key, score in ranked_patterns[:5]:
-        preview_lines.append(
-            f"- {format_supported_pattern_label(pattern_key, sample_value=sample_name)}: "
-            f"{score} hit(s)"
+        label = format_supported_pattern_label(pattern_key, sample_value=sample_name)
+        result_table.add_row(
+            label.split("(")[0].strip(),
+            f"({label.split('(')[1].rstrip(')')})" if "(" in label else "",
+            str(score),
         )
+
     print_panel(
-        "\n".join(preview_lines),
-        title=f"🧠 Kerberos Username Format Detected for {marked_domain}",
+        [
+            f"[dim]Confirmed usernames from probe:[/dim] [bold]{unique_count}[/bold]",
+            "",
+            result_table,
+        ],
+        title=f"[bold]Format detected · {marked_domain}[/bold]",
         border_style=BRAND_COLORS["info"],
         expand=False,
     )
 
     detected_pattern = ranked_patterns[0][0]
+    detected_label = format_supported_pattern_label(
+        detected_pattern, sample_value=sample_name
+    )
     options = [
-        f"Use detected format: {format_supported_pattern_label(detected_pattern, sample_value=sample_name)} (Recommended)",
+        f"Use detected format: {detected_label} (Recommended)",
         "Choose another format manually",
-        "Use the built-in general common username wordlist",
-        "Use my own username wordlist",
+        "Use my own wordlist",
     ]
     choice_idx = shell._questionary_select(
-        f"Select how to continue for {marked_domain} after the inference probe",
+        f"Format detected for {marked_domain}. How do you want to continue?",
         options,
         default_idx=0,
     )
     if choice_idx == 1:
-        return "pattern", _prompt_kerberos_username_pattern(shell, domain)
+        return "manual", None
     if choice_idx == 2:
-        return "general", None
-    if choice_idx == 3:
         return "custom", None
     return "pattern", detected_pattern
 
@@ -3919,25 +3940,45 @@ def _build_focused_kerberos_wordlist_for_pattern(
         )
     )
 
+    # Estimate statistically-likely count for display hint
+    stat_path = wordlist_service.get_statistically_likely_wordlist_path(pattern_key)
+    stat_count_hint = ""
+    if stat_path and stat_path.exists():
+        try:
+            stat_count_hint = f" (~{sum(1 for _ in stat_path.open(encoding='utf-8', errors='ignore') if _.strip()):,} candidates)"
+        except OSError:
+            pass
+
     if workspace_type == "audit":
         source_options = [
-            "Statistically likely usernames",
-            "LinkedIn company employees",
-            "Known employee names / manual generation",
+            f"Statistically likely usernames{stat_count_hint}",
+            "LinkedIn company employees  (requires browser login)",
+            "Known employee names / manual entry",
         ]
-        default_sources = ["Statistically likely usernames"]
+        default_sources = [f"Statistically likely usernames{stat_count_hint}"]
     else:
         source_options = [
-            "Statistically likely usernames",
-            "Known employee names / manual generation",
+            f"Statistically likely usernames{stat_count_hint}",
+            "Known employee names / manual entry",
         ]
-        default_sources = ["Statistically likely usernames"]
+        default_sources = [f"Statistically likely usernames{stat_count_hint}"]
 
     selected_sources = shell._questionary_checkbox(
-        f"Select the username sources to use for {marked_domain}",
+        f"Select username sources for {marked_domain}",
         source_options,
         default_values=default_sources,
     )
+
+    # Normalise keys back to canonical labels regardless of hint suffix
+    def _normalise_source(s: str) -> str:
+        s = s.split("(")[0].strip()
+        if s.startswith("Statistically"):
+            return "Statistically likely usernames"
+        if s.startswith("LinkedIn"):
+            return "LinkedIn company employees"
+        return "Known employee names / manual generation"
+
+    selected_sources = [_normalise_source(s) for s in (selected_sources or [])]
     if not selected_sources:
         print_warning("No username sources were selected.")
         return None
@@ -4004,12 +4045,16 @@ def _build_focused_kerberos_wordlist_for_pattern(
                     )
                     raw_name_lines = [employee.full_name for employee in employees]
                     if raw_name_lines:
-                        generated_candidates = wordlist_service.generate_candidates_from_linkedin_names(
-                            raw_name_lines,
-                            pattern_key=pattern_key,
+                        generated_candidates = (
+                            wordlist_service.generate_candidates_from_linkedin_names(
+                                raw_name_lines,
+                                pattern_key=pattern_key,
+                            )
                         )
                         merged_candidates.update(generated_candidates)
-                        (kerberos_dir / f"linkedin_{company_slug}_raw_names.txt").write_text(
+                        (
+                            kerberos_dir / f"linkedin_{company_slug}_raw_names.txt"
+                        ).write_text(
                             "\n".join(sorted(set(raw_name_lines))) + "\n",
                             encoding="utf-8",
                         )
@@ -4058,51 +4103,8 @@ def _build_focused_kerberos_wordlist_for_pattern(
 
 
 def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | None:
-    """Build a focused Kerberos username wordlist based on workspace type and known format."""
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    marked_domain = mark_sensitive(domain, "domain")
-
-    knows_format = Confirm.ask(
-        f"Do you know the username format used in {marked_domain}?",
-        default=(workspace_type == "audit"),
-    )
-    if not knows_format:
-        fallback_options = [
-            "Try to infer the username format first (Recommended)",
-            "Use the built-in general common username wordlist",
-            "Use my own username wordlist",
-        ]
-        fallback_idx = shell._questionary_select(
-            "Username format unknown. How do you want to continue?",
-            fallback_options,
-            default_idx=0,
-        )
-        if fallback_idx is None:
-            print_error("Selection cancelled.")
-            return None
-        if fallback_idx == 0:
-            strategy, value = _infer_kerberos_username_pattern_via_runtime_probe(
-                shell, domain
-            )
-            if strategy == "pattern" and value:
-                return _build_focused_kerberos_wordlist_for_pattern(
-                    shell,
-                    domain,
-                    pattern_key=value,
-                )
-            return _resolve_general_kerberos_username_wordlist(domain)
-        if fallback_idx == 1:
-            return _resolve_general_kerberos_username_wordlist(domain)
-        return _prompt_custom_kerberos_username_wordlist(shell, domain)
-
-    pattern_key = _prompt_kerberos_username_pattern(shell, domain)
-    if not pattern_key:
-        return None
-    return _build_focused_kerberos_wordlist_for_pattern(
-        shell,
-        domain,
-        pattern_key=pattern_key,
-    )
+    """Legacy entry point — delegates to the unified strategy selector."""
+    return _select_kerberos_wordlist_strategy(shell, domain)
 
 
 def _show_kerberos_enum_shortcut_hint(
@@ -4139,41 +4141,31 @@ def _show_kerberos_enum_shortcut_hint(
             "you can come back to this step directly."
         )
 
+    from adscan_core.theme import ADSCAN_PRIMARY
+
     print_panel(
         "\n".join(lines),
-        title="[bold cyan]Kerberos User Enumeration Shortcut[/bold cyan]",
-        border_style="cyan",
+        title=f"[bold {ADSCAN_PRIMARY}]Shortcut: Kerberos user enumeration[/bold {ADSCAN_PRIMARY}]",
+        border_style=ADSCAN_PRIMARY,
         expand=False,
     )
 
 
 def get_domain_controllers(shell: LdapShell, domain: str) -> list[str]:
-    """Return members of the Domain Controllers group via NetExec LDAP."""
+    """Return members of the Domain Controllers group via native LDAP."""
     try:
-        auth = shell.build_auth_nxc(
-            shell.domains_data[domain]["username"],
-            shell.domains_data[domain]["password"],
+        from adscan_internal.services.native_group_membership import (
+            resolve_enabled_group_members_by_rid_native,
+        )
+
+        members = resolve_enabled_group_members_by_rid_native(
+            shell,
             domain,
-            kerberos=False,
+            516,
+            member_kind="computer",
+            operation_name="Domain Controllers lookup",
         )
-        log_path = domain_relpath(
-            shell.domains_dir, domain, shell.ldap_dir, "domain_controllers.log"
-        )
-        auth_domain = shell.domain or domain
-        command = (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth} "
-            f"-d {auth_domain} --log {log_path} --groups 'Domain Controllers'"
-        )
-        print_info_debug(f"Command: {command}")
-        completed_process = shell.run_command(command, timeout=300)
-        output = completed_process.stdout or ""
-        errors = completed_process.stderr or ""
-
-        if completed_process.returncode != 0:
-            print_error(f"Error retrieving Domain Controllers: {errors}")
-            return []
-
-        return parse_netexec_group_members(output)
+        return members or []
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_error("Error in get_domain_controllers.")
@@ -4205,7 +4197,10 @@ def get_not_delegated_users(shell: LdapShell, domain: str) -> list[str]:
         )
         if values is None:
             return []
-        return sorted({str(value).strip() for value in values if str(value).strip()}, key=str.lower)
+        return sorted(
+            {str(value).strip() for value in values if str(value).strip()},
+            key=str.lower,
+        )
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_error("Error in get_not_delegated_users.")
@@ -4214,20 +4209,15 @@ def get_not_delegated_users(shell: LdapShell, domain: str) -> list[str]:
 
 
 def check_maq(shell: LdapShell, domain: str, username: str, password: str) -> int:
-    """Check MachineAccountQuota using NetExec LDAP module."""
+    """Check MachineAccountQuota using ADscan's native LDAP transport."""
     try:
-        auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-        log_path = domain_relpath(shell.domains_dir, domain, shell.ldap_dir, "maq.log")
-        command = (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth} -k "
-            f"--log {log_path} -M maq"
-        )
         print_success("Checking MachineAccountQuota")
-        print_info_debug(f"Command: {command}")
-        proc = shell.run_command(command, timeout=300)
-
-        output = (proc.stdout or "") + (proc.stderr or "")
-        value = parse_machine_account_quota(output)
+        value = _read_machine_account_quota_native(
+            domain=domain,
+            dc_ip=str(shell.domains_data[domain]["pdc"]),
+            username=username,
+            password=password,
+        )
         if value is None:
             print_error("Could not retrieve the MachineAccountQuota")
             return 0
@@ -4240,13 +4230,64 @@ def check_maq(shell: LdapShell, domain: str, username: str, password: str) -> in
         return 0
 
 
+def _read_machine_account_quota_native(
+    *,
+    domain: str,
+    dc_ip: str,
+    username: str,
+    password: str,
+) -> int | None:
+    """Read ``ms-DS-MachineAccountQuota`` directly from the domain object.
+
+    Args:
+        domain: Target domain FQDN.
+        dc_ip: Target domain controller IP or hostname.
+        username: Authenticating username.
+        password: Authenticating password.
+
+    Returns:
+        The configured domain MAQ value, or ``None`` when it cannot be read.
+    """
+    from adscan_internal.services.ldap_transport_service import ADscanLDAPConfig  # noqa: PLC0415
+    from adscan_internal.services.machine_account_provisioning_service import (  # noqa: PLC0415
+        assess_machine_account_capacity,
+    )
+
+    config = ADscanLDAPConfig(
+        domain=domain,
+        dc_ip=dc_ip,
+        use_ldaps=True,
+        use_kerberos=False,
+        username=username,
+        password=password,
+    )
+    capacity = assess_machine_account_capacity(
+        ldap_config=config,
+        actor_username=username,
+    )
+    return capacity.domain_quota
+
+
 def run_ldap_descriptions(
     shell: LdapShell, target_domain: str, *, anonymous: bool = False
 ) -> None:
     """Enumerate user descriptions and analyze them for leaked credentials.
 
-    Primary flow: execute NetExec LDAP description-focused modules and parse the
-    generated ``UserDesc-*.log`` output artifact.
+    Native badldap implementation: a single paged search for
+    ``(&(objectCategory=person)(objectClass=user))`` over an explicit
+    ``ldap+simple://`` (anonymous) or authenticated ``ADscanLDAPConnection``
+    bind, requesting ``sAMAccountName``, ``description``, ``info``,
+    ``comment``, ``unixUserPassword``, ``userPassword``. Replaces the
+    five-NetExec-modules subprocess fan-out (-M user-desc, get-desc-users,
+    get-unixUserPassword, get-userPassword, get-info-users).
+
+    Backwards-compatible artefacts:
+      * ``domains/<domain>/ldap/descriptions.log`` text dump (parsed by
+        downstream credsweeper analysis)
+      * ``domains/<domain>/ldap/descriptions.json`` structured findings
+
+    Sensitive-keyword matches in any of the description-class fields are
+    surfaced as ``ldap_user_description_password_leak`` technical findings.
     """
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -4255,21 +4296,24 @@ def run_ldap_descriptions(
         )
         return
 
-    username = ""
-    password = ""
-    pdc_hostname = str(shell.domains_data[target_domain].get("pdc_hostname") or "").strip()
-    pdc_target = shell.domains_data[target_domain]["pdc"]
-    use_kerberos = False
+    pdc_target = str(shell.domains_data[target_domain].get("pdc") or "").strip()
+    if not pdc_target:
+        print_error(
+            f"No PDC recorded for domain {mark_sensitive(target_domain, 'domain')}; "
+            "cannot enumerate LDAP descriptions."
+        )
+        return
 
     if anonymous:
+        username = ""
+        password = ""
+        nt_hash = ""
         auth_label = "Anonymous"
     else:
-        username = shell.domains_data[shell.domain]["username"]
-        password = shell.domains_data[shell.domain]["password"]
-        if pdc_hostname:
-            pdc_target = f"{pdc_hostname}.{target_domain}"
-        use_kerberos = bool(shell.do_sync_clock_with_pdc(target_domain))
-        auth_label = "Kerberos" if use_kerberos else "Password"
+        username = str(shell.domains_data[shell.domain].get("username") or "")
+        password = str(shell.domains_data[shell.domain].get("password") or "")
+        nt_hash = str(shell.domains_data[shell.domain].get("nt_hash") or "")
+        auth_label = "Password / Hash"
 
     print_operation_header(
         "LDAP User Descriptions Enumeration",
@@ -4277,34 +4321,370 @@ def run_ldap_descriptions(
             "Domain": target_domain,
             "PDC": pdc_target,
             "Authentication": auth_label,
-            "Modules": "user-desc, get-desc-users, get-unixUserPassword, get-userPassword, get-info-users",
+            "Mode": "Native badldap (single paged search)",
             "Username": username if username else "Anonymous",
         },
         icon="📝",
     )
 
-    # Run the description-focused NetExec modules directly (no --users pre-pass).
-    if anonymous:
-        auth = '-u "" -p ""'
-    else:
-        auth = shell.build_auth_nxc(
-            username,
-            password,
-            shell.domain,
-            kerberos=use_kerberos,
+    sensitive_attrs = (
+        "sAMAccountName",
+        "description",
+        "info",
+        "comment",
+        "unixUserPassword",
+        "userPassword",
+    )
+    ldap_filter = "(&(objectCategory=person)(objectClass=user))"
+
+    # ── Native query ─────────────────────────────────────────────────────
+    try:
+        rows = _native_user_description_query(
+            domain=target_domain,
+            dc_ip=pdc_target,
+            anonymous=anonymous,
+            username=username,
+            password=password,
+            nt_hash=nt_hash,
+            ldap_filter=ldap_filter,
+            attributes=list(sensitive_attrs),
+            timeout=120,
         )
-    marked_pdc_target = mark_sensitive(str(pdc_target), "hostname")
-    command = (
-        f"{shell.netexec_path} ldap {marked_pdc_target} {auth} "
-        "-M user-desc -M get-desc-users -M get-unixUserPassword -M get-userPassword -M get-info-users"
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error(f"Error executing native LDAP description query: {exc}")
+        print_exception(show_locals=False, exception=exc)
+        return
+
+    if not rows:
+        print_warning("No user descriptions returned from LDAP.")
+        return
+
+    # ── Persist artefacts (text + JSON) ──────────────────────────────────
+    workspace_cwd = shell._get_workspace_cwd()
+    ldap_dir = domain_subpath(
+        workspace_cwd, shell.domains_dir, target_domain, shell.ldap_dir
     )
-    print_info_debug(f"Command: {command}")
-    execute_netexec_ldap_descriptions(
-        shell,
-        command=command,
-        domain=target_domain,
-        anonymous=anonymous,
+    os.makedirs(ldap_dir, exist_ok=True)
+    descriptions_log = os.path.join(ldap_dir, "descriptions.log")
+    descriptions_json = os.path.join(ldap_dir, "descriptions.json")
+
+    user_descriptions: dict[str, str] = {}
+    json_records: list[dict[str, object]] = []
+    sensitive_pattern = re.compile(r"(?i)password|pwd|pass|secret|cred|key|p@ss|p4ss")
+    sensitive_findings: list[dict[str, object]] = []
+
+    try:
+        with open(descriptions_log, "w", encoding="utf-8") as log_fp:
+            log_fp.write("User:                     Description:\n")
+            for row in rows:
+                sam = str(row.get("sAMAccountName") or "").strip()
+                if not sam:
+                    continue
+                desc = str(row.get("description") or "").strip()
+                info = str(row.get("info") or "").strip()
+                comment = str(row.get("comment") or "").strip()
+                unix_pw = str(row.get("unixUserPassword") or "").strip()
+                user_pw = str(row.get("userPassword") or "").strip()
+                # Primary description for parity with the legacy parser.
+                if desc:
+                    user_descriptions[sam] = desc
+                    log_fp.write(f"{sam:<25} {desc}\n")
+                # Side-channel password fields are tracked in JSON only.
+                json_records.append(
+                    {
+                        "samaccountname": sam,
+                        "description": desc,
+                        "info": info,
+                        "comment": comment,
+                        "unixUserPassword": unix_pw,
+                        "userPassword": user_pw,
+                    }
+                )
+                blob = " || ".join(
+                    filter(None, [desc, info, comment, unix_pw, user_pw])
+                )
+                if blob and sensitive_pattern.search(blob):
+                    sensitive_findings.append(
+                        {
+                            "samaccountname": sam,
+                            "matched_text": blob[:300],
+                            "fields": {
+                                "description": desc,
+                                "info": info,
+                                "comment": comment,
+                                "unixUserPassword": unix_pw,
+                                "userPassword": user_pw,
+                            },
+                        }
+                    )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(f"Failed to write descriptions.log: {exc}")
+
+    try:
+        import json as _json
+
+        with open(descriptions_json, "w", encoding="utf-8") as jfp:
+            _json.dump(
+                {
+                    "domain": target_domain,
+                    "anonymous": anonymous,
+                    "count": len(json_records),
+                    "records": json_records,
+                    "sensitive_findings": sensitive_findings,
+                },
+                jfp,
+                indent=2,
+                ensure_ascii=False,
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(f"Failed to write descriptions.json: {exc}")
+
+    # ── Render + analysis (reuse existing helpers for parity) ────────────
+    if user_descriptions:
+        _display_ldap_descriptions_with_rich(user_descriptions)
+        try:
+            _analyze_descriptions_for_passwords(
+                shell,
+                descriptions_log,
+                user_descriptions,
+                target_domain,
+                anonymous=anonymous,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(f"Description analysis failed: {exc}")
+
+    # ── Surface sensitive findings into the report ───────────────────────
+    if sensitive_findings:
+        try:
+            from adscan_internal.services.report_service import record_technical_finding
+
+            record_technical_finding(
+                shell,
+                target_domain,
+                key="ldap_user_description_password_leak",
+                value={"count": len(sensitive_findings)},
+                details={
+                    "anonymous": anonymous,
+                    "samples": [
+                        {
+                            "samaccountname": entry["samaccountname"],
+                            "matched_text": entry["matched_text"],
+                        }
+                        for entry in sensitive_findings[:10]
+                    ],
+                },
+                evidence=[
+                    {
+                        "type": "log",
+                        "summary": "LDAP user description / password fields",
+                        "artifact_path": descriptions_log,
+                    },
+                    {
+                        "type": "json",
+                        "summary": "Structured LDAP description findings",
+                        "artifact_path": descriptions_json,
+                    },
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not handle_optional_report_service_exception(
+                exc,
+                action="LDAP description password leak finding sync",
+                debug_printer=print_info_debug,
+                prefix="[ldap-desc]",
+            ):
+                telemetry.capture_exception(exc)
+
+
+def _native_user_description_query(
+    *,
+    domain: str,
+    dc_ip: str,
+    anonymous: bool,
+    username: str,
+    password: str,
+    nt_hash: str,
+    ldap_filter: str,
+    attributes: list[str],
+    timeout: int,
+) -> list[dict[str, object]]:
+    """Run the native LDAP description-attribute search.
+
+    Anonymous path uses the same ``ldap+simple://`` simple-bind pattern as
+    :func:`adscan_internal.services.unauth_enrichment_service._enrich_ldap_active_users_native`.
+    Authenticated path goes through ``ADscanLDAPConnection`` so LDAPS→LDAP
+    fallback, sign/seal toggles, and Kerberos ccache plumbing all stay
+    centralized.
+    """
+    if anonymous:
+        return _native_user_description_query_anonymous(
+            dc_ip=dc_ip,
+            ldap_filter=ldap_filter,
+            attributes=attributes,
+            timeout=timeout,
+        )
+
+    from adscan_internal.services.ldap_transport_service import (
+        ADscanLDAPConfig,
+        ADscanLDAPConnection,
     )
+
+    secret = nt_hash or password
+    if not username or not secret:
+        raise ValueError(
+            "Authenticated LDAP descriptions query requires username + password/nt_hash."
+        )
+
+    config = ADscanLDAPConfig(
+        domain=domain,
+        dc_ip=dc_ip,
+        use_ldaps=True,
+        use_kerberos=False,
+        username=username,
+        password=secret,
+    )
+
+    rows: list[dict[str, object]] = []
+    with ADscanLDAPConnection(config) as conn:
+        # The connection's domain_dn is derived from `domain`; that's the
+        # canonical search base.
+        conn.search(
+            search_base=conn.domain_dn,
+            search_filter=ldap_filter,
+            attributes=attributes,
+            search_scope="SUBTREE",
+            paged_size=1000,
+        )
+        for entry in conn.entries:
+            attrs = entry.entry_attributes_as_dict
+            row: dict[str, object] = {}
+            for attr in attributes:
+                values = attrs.get(attr)
+                if isinstance(values, list):
+                    row[attr] = values[0] if values else ""
+                elif values is not None:
+                    row[attr] = values
+                else:
+                    row[attr] = ""
+            rows.append(row)
+    return rows
+
+
+def _native_user_description_query_anonymous(
+    *,
+    dc_ip: str,
+    ldap_filter: str,
+    attributes: list[str],
+    timeout: int,
+) -> list[dict[str, object]]:
+    """Anonymous variant — explicit simple-bind, then paged search."""
+    import asyncio as _asyncio
+    from badldap.commons.factory import LDAPConnectionFactory
+
+    async def _run() -> list[dict[str, object]]:
+        conn = None
+        last_exc: Exception | None = None
+        for transport, port in (("ldaps", 636), ("ldap", 389)):
+            url = f"{transport}+simple://@{dc_ip}:{port}"
+            try:
+                factory = LDAPConnectionFactory.from_url(url)
+                client = factory.get_client()
+                if hasattr(client, "_disable_signing"):
+                    client._disable_signing = True
+                if hasattr(client, "_disable_channel_binding"):
+                    client._disable_channel_binding = True
+                ok, err = await _asyncio.wait_for(client.connect(), timeout=timeout)
+                if not ok:
+                    raise err or RuntimeError(
+                        f"{transport.upper()} connect returned ok=False"
+                    )
+                conn = client
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+        if conn is None:
+            if last_exc is not None:
+                raise last_exc
+            return []
+
+        try:
+            server_info = None
+            if hasattr(conn, "get_server_info"):
+                server_info = conn.get_server_info()
+            if not server_info:
+                server_info = getattr(conn, "_serverinfo", None)
+            base_dn = ""
+            if isinstance(server_info, dict):
+                raw = server_info.get("defaultNamingContext")
+                if isinstance(raw, list):
+                    base_dn = str(raw[0]) if raw else ""
+                elif raw:
+                    base_dn = str(raw)
+                if not base_dn:
+                    ncs = server_info.get("namingContexts")
+                    if isinstance(ncs, list) and ncs:
+                        base_dn = str(ncs[0])
+            if not base_dn:
+                return []
+
+            collected: list[dict[str, object]] = []
+            try:
+                async for item, err in conn.pagedsearch(
+                    ldap_filter,
+                    attributes,
+                    controls=None,
+                    tree=base_dn,
+                    search_scope=2,
+                ):
+                    if err is not None:
+                        raise err
+                    attrs = dict(item.get("attributes", {}) or {})
+                    row: dict[str, object] = {}
+                    for attr in attributes:
+                        v = attrs.get(attr)
+                        if v is None:
+                            v = attrs.get(attr.lower())
+                        if isinstance(v, list):
+                            row[attr] = v[0] if v else ""
+                        elif v is not None:
+                            row[attr] = v
+                        else:
+                            row[attr] = ""
+                    collected.append(row)
+            except Exception as exc:  # noqa: BLE001
+                # Bind OK but search denied — return what we have.
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[ldap-desc] anonymous search denied on {dc_ip}: {exc}"
+                )
+                return collected
+            return collected
+        finally:
+            try:
+                disconnect = getattr(conn, "disconnect", None)
+                if disconnect is not None:
+                    maybe = disconnect()
+                    if _asyncio.iscoroutine(maybe):
+                        await maybe
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        return _asyncio.run(_run())
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" in str(exc) or "running event loop" in str(
+            exc
+        ):
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(_asyncio.run, _run()).result()
+        raise
 
 
 def run_enumerate_user_aces(shell: LdapShell, args: str) -> None:
@@ -4513,24 +4893,23 @@ def _display_ldap_descriptions_with_rich(
     if not user_descriptions:
         return
 
+    from adscan_core.theme import COLOR_MUTED, COLOR_STEEL
+
     max_rows = max(1, int(max_rows))
 
-    # Create table
     table = Table(
-        title=f"User Descriptions ({len(user_descriptions)} found)",
+        title=f"User descriptions harvested via LDAP ({len(user_descriptions)})",
         show_header=True,
-        header_style="bold magenta",
+        header_style=f"bold {COLOR_STEEL}",
     )
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Username", style="cyan", no_wrap=False, max_width=30)
-    table.add_column("Description", style="white", no_wrap=False, max_width=80)
+    table.add_column("#", style=COLOR_MUTED, width=4, justify="right")
+    table.add_column("sAMAccountName", style=COLOR_STEEL, no_wrap=False, max_width=30)
+    table.add_column("description", no_wrap=False, max_width=80)
 
-    # Sort by username and limit to a reasonable number of rows.
     sorted_users = sorted(user_descriptions.items())
     shown_users = sorted_users[:max_rows]
 
     for idx, (username, description) in enumerate(shown_users, 1):
-        # Truncate description if too long
         display_description = (
             description[:77] + "..." if len(description) > 80 else description
         )
@@ -4538,12 +4917,13 @@ def _display_ldap_descriptions_with_rich(
 
     if len(sorted_users) > max_rows:
         remaining = len(sorted_users) - max_rows
-        table.caption = f"Showing first {max_rows}. {remaining} more not shown."
+        table.caption = (
+            f"Showing first {max_rows}. {remaining} additional rows omitted."
+        )
 
-    # Display panel
     print_panel_with_table(
         table,
-        border_style=BRAND_COLORS["info"],
+        border_style=COLOR_STEEL,
     )
 
 
@@ -4553,7 +4933,7 @@ def _display_ldap_description_candidates_with_rich(
     title: str,
     max_rows: int = 30,
 ) -> None:
-    """Display a subset of user descriptions (e.g., those with candidates).
+    """Display a subset of user descriptions (e.g., those with credential candidates).
 
     Args:
         user_descriptions: Dictionary mapping usernames to descriptions.
@@ -4563,11 +4943,25 @@ def _display_ldap_description_candidates_with_rich(
     if not user_descriptions:
         return
 
+    from adscan_core.theme import COLOR_CRIMSON, COLOR_MUTED, COLOR_SAGE
+
+    # Credential patterns in user descriptions are rare and high-value. The row
+    # must JUMP: crimson glyph, prominent header, action-oriented "Next:" line.
+    print_info(
+        f"[{COLOR_CRIMSON}]* {len(user_descriptions)} description(s) match credential patterns[/{COLOR_CRIMSON}] "
+        "  -> review each for plaintext passwords, shared secrets, or onboarding hints."
+    )
+
     max_rows = max(1, int(max_rows))
-    table = Table(title=title, show_header=True, header_style="bold magenta")
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Username", style="cyan", no_wrap=False, max_width=30)
-    table.add_column("Description", style="white", no_wrap=False, max_width=80)
+    table = Table(
+        title=f"* {title}",
+        show_header=True,
+        header_style=f"bold {COLOR_CRIMSON}",
+    )
+    table.add_column("", width=2, justify="center")
+    table.add_column("#", style=COLOR_MUTED, width=4, justify="right")
+    table.add_column("sAMAccountName", style=COLOR_SAGE, no_wrap=False, max_width=30)
+    table.add_column("description (candidate)", no_wrap=False, max_width=80)
 
     sorted_users = sorted(user_descriptions.items())
     shown_users = sorted_users[:max_rows]
@@ -4576,13 +4970,24 @@ def _display_ldap_description_candidates_with_rich(
         display_description = (
             description[:77] + "..." if len(description) > 80 else description
         )
-        table.add_row(str(idx), username, display_description)
+        table.add_row(
+            f"[{COLOR_CRIMSON}]*[/{COLOR_CRIMSON}]",
+            str(idx),
+            username,
+            display_description,
+        )
 
     if len(sorted_users) > max_rows:
         remaining = len(sorted_users) - max_rows
-        table.caption = f"Showing first {max_rows}. {remaining} more not shown."
+        table.caption = (
+            f"Showing first {max_rows}. {remaining} additional rows omitted."
+        )
 
-    print_panel_with_table(table, border_style=BRAND_COLORS["warning"])
+    print_panel_with_table(table, border_style=COLOR_CRIMSON)
+    print_info(
+        f"[{COLOR_CRIMSON}]Next:[/{COLOR_CRIMSON}] try each candidate as a password for its owning account "
+        "(and for common shared accounts) before discarding."
+    )
 
 
 def _find_user_for_password_from_line(
@@ -4696,9 +5101,10 @@ def _extract_ntlm_hash_candidates_from_descriptions(
 
         parsed_hashes = parse_secretsdump_output(description_text)
         for parsed in parsed_hashes:
-            username = str(getattr(parsed, "username", "") or "").strip() or str(
-                owner_username or ""
-            ).strip()
+            username = (
+                str(getattr(parsed, "username", "") or "").strip()
+                or str(owner_username or "").strip()
+            )
             ntlm_hash = str(getattr(parsed, "ntlm_hash", "") or "").strip().lower()
             if not username or not ntlm_hash:
                 continue
@@ -4742,35 +5148,61 @@ def _analyze_descriptions_for_passwords(
     *,
     anonymous: bool = False,
 ) -> None:
-    """Analyze LDAP descriptions with CredSweeper CLI but avoid ML-based filtering.
+    """Analyze LDAP descriptions with CredSweeper library (in-memory, no subprocess).
 
-    CredSweeper's ML validator can drop low-entropy, human-readable passwords
-    embedded in natural-language descriptions. For this workflow we set
-    ``ml_threshold=0.0`` (export everything that matches the rules) and then
-    ask the operator to confirm candidates manually.
+    Mirrors the same settings used by the unauth description scan so both
+    flows behave identically: ldap_description rules, ml_threshold=0.0,
+    no_filters=True, doc=True. The library avoids the CLI subprocess and
+    credsweeper_path dependency entirely.
     """
-    if not os.path.exists(descriptions_file):
+    if not user_descriptions:
         return
 
-    if not getattr(shell, "credsweeper_path", None):
-        print_info_verbose(
-            "CredSweeper is not available; skipping description analysis."
+    targets: list[InMemoryCredSweeperTarget] = []
+    path_index: dict[str, str] = {}  # file_path → samaccountname
+
+    for sam, description in user_descriptions.items():
+        value = (description or "").strip()
+        if not value:
+            continue
+        key = f"ldap/{sam}/description"
+        targets.append(
+            InMemoryCredSweeperTarget(
+                content=value.encode("utf-8", errors="replace"),
+                file_path=key,
+                file_type=".txt",
+                info=f"{sam}/description",
+            )
         )
+        path_index[key] = sam
+
+    if not targets:
         return
 
     try:
-        service = CredSweeperService(command_executor=shell.run_command)
-        findings = service.analyze_file_with_options(
-            descriptions_file,
-            credsweeper_path=shell.credsweeper_path,
-            include_custom_rules=True,
+        raw = CredSweeperLibraryService().analyze_targets_with_options(
+            targets,
             rules_profile=CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION,
-            drop_ml_none=False,
+            include_custom_rules=True,
             ml_threshold="0.0",
-            doc=True,
             no_filters=True,
-            timeout=300,
+            doc=True,
         )
+
+        # Map findings back to users via path_index — no filename heuristics needed.
+        findings: dict[str, list] = {}
+        for rule_name, entries in (raw or {}).items():
+            mapped = []
+            for value, ml_probability, context_line, line_num, file_path in entries:
+                sam = path_index.get(file_path)
+                if not sam:
+                    continue
+                # Re-emit as (value, ml_probability, context_line, line_num, file_path)
+                # but replace file_path with the descriptions_file for downstream
+                # compatibility with _extract_password_candidates_from_credsweeper_findings.
+                mapped.append((value, ml_probability, context_line, line_num, file_path))
+            if mapped:
+                findings[rule_name] = mapped
 
         ntlm_hash_candidates = _extract_ntlm_hash_candidates_from_descriptions(
             user_descriptions,
@@ -4789,6 +5221,7 @@ def _analyze_descriptions_for_passwords(
                         anonymous=anonymous,
                         secret=ntlm_hash,
                     ),
+                    credential_origin="userdescription",
                 )
 
             descriptions_dir = os.path.dirname(descriptions_file) or "."
@@ -4808,9 +5241,30 @@ def _analyze_descriptions_for_passwords(
                 fallback_source_shares=["ldap"],
             )
 
-        candidates = _extract_password_candidates_from_credsweeper_findings(
-            findings, user_descriptions
-        )
+        # Build candidates directly from path_index — avoids the old
+        # filename-heuristic approach in _extract_password_candidates_from_credsweeper_findings.
+        seen_cands: set[tuple[str, str]] = set()
+        candidates: list[dict] = []
+        for rule_name, entries in findings.items():
+            for value, ml_probability, context_line, _line_num, file_path in entries:
+                sam = path_index.get(file_path)
+                if not sam:
+                    continue
+                v = str(value or "").strip()
+                if not v or len(v) < 3:
+                    continue
+                ckey = (sam.lower(), v)
+                if ckey in seen_cands:
+                    continue
+                seen_cands.add(ckey)
+                candidates.append({
+                    "username": sam,
+                    "password": v,
+                    "rule": str(rule_name or ""),
+                    "ml_probability": ml_probability,
+                    "context": str(context_line or ""),
+                })
+
         if not candidates and not ntlm_hash_candidates:
             print_info_verbose("No passwords detected in LDAP descriptions.")
             return
@@ -4856,6 +5310,7 @@ def _analyze_descriptions_for_passwords(
                     anonymous=anonymous,
                     secret=value_norm,
                 ),
+                credential_origin="userdescription",
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -4879,7 +5334,9 @@ def _build_user_description_source_steps(
                 "source_username": username_clean,
                 "source_protocol": "ldap",
                 "auth_mechanism": auth_mechanism,
-                **({"secret": str(secret).strip()} if str(secret or "").strip() else {}),
+                **(
+                    {"secret": str(secret).strip()} if str(secret or "").strip() else {}
+                ),
             },
         )
     ]
@@ -5063,9 +5520,7 @@ def execute_ldap_computers(
                         "computer_type": comp_type,
                         "count": len(computers),
                         "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get(
-                            "auth", "unknown"
-                        ),
+                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
                     }
                     properties.update(
                         build_lab_event_fields(shell=shell, include_slug=True)
@@ -5108,3 +5563,18 @@ def execute_ldap_computers(
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Error enumerating computers in domain {marked_domain}.")
         print_exception(show_locals=False, exception=e)
+
+
+def ask_for_ldap_users(shell: "LdapShell", target_domain: str) -> None:
+    """Prompt to enumerate LDAP users for a domain — mirrors ask_for_ldap_computers."""
+    from rich.prompt import Confirm as _Confirm
+    from adscan_internal.rich_output import mark_sensitive as _ms
+    marked = _ms(target_domain, "domain")
+    if _Confirm.ask(f"Do you want to enumerate LDAP users for the domain {marked}?"):
+        run_ldap_active_users(shell, target_domain)
+
+
+def run_ldap_active_users(shell: "LdapShell", target_domain: str) -> None:
+    """Enumerate active/enabled users via LDAP for a domain."""
+    from adscan_internal.cli.intelligence import run_identity_inventory
+    run_identity_inventory(shell, target_domain)

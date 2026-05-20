@@ -1,4 +1,4 @@
-"""Generic SMB path access checks backed by Impacket.
+"""Generic SMB path access checks backed by aiosmb.
 
 This service intentionally stays generic: callers provide the target host,
 share name, and directory path they care about. The service supports two
@@ -18,6 +18,7 @@ and paths.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, cast
 from uuid import uuid4
 import re
 
@@ -31,6 +32,13 @@ from adscan_internal import (
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.privileged_group_classifier import normalize_sid
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.smb_transport import (
+    SMBConfig,
+    SMBAccessDeniedError,
+    SMBTransportError,
+    smb_machine_for,
+    run_smb_operation,
+)
 
 
 def _looks_like_ntlm_hash(value: str | None) -> bool:
@@ -44,21 +52,16 @@ def _looks_like_ntlm_hash(value: str | None) -> bool:
 
 
 def _extract_status_code(exc: Exception) -> str | None:
-    """Return an NTSTATUS-like code from an Impacket SMB exception when available."""
-    getter = getattr(exc, "getErrorString", None)
-    if callable(getter):
-        try:
-            message = getter()
-            if isinstance(message, tuple):
-                for item in message:
-                    text = str(item or "").strip()
-                    if text:
-                        return text
-            text = str(message or "").strip()
-            if text:
-                return text
-        except Exception:  # noqa: BLE001
-            return None
+    """Return an NTSTATUS-like code from an SMB exception when available."""
+    # aiosmb exceptions often carry the NTSTATUS in their string representation
+    msg = str(exc or "").strip()
+    # Look for STATUS_ patterns
+    match = re.search(r"STATUS_[A-Z0-9_]+", msg)
+    if match:
+        return match.group(0)
+    # Fallback: return the full message if short enough
+    if msg and len(msg) < 120:
+        return msg
     return None
 
 
@@ -81,14 +84,14 @@ def _looks_like_kerberos_auth_failure(
 
 
 def _normalize_directory_path(directory_path: str | None) -> str:
-    """Normalize one SMB directory path for Impacket operations."""
+    """Normalize one SMB directory path for aiosmb operations."""
     normalized = str(directory_path or "").strip().replace("/", "\\")
     normalized = normalized.strip("\\")
     return normalized
 
 
 def _coerce_bytes(value: object) -> bytes:
-    """Return raw bytes for NDR/security-descriptor payloads when possible."""
+    """Return raw bytes for security-descriptor payloads when possible."""
     if isinstance(value, bytes):
         return value
     if isinstance(value, bytearray):
@@ -99,25 +102,12 @@ def _coerce_bytes(value: object) -> bytes:
         except Exception:  # noqa: BLE001
             return b""
     try:
-        return bytes(value or b"")
+        try:
+            return bytes(cast(bytes, value))
+        except Exception:  # noqa: BLE001
+            return b""
     except Exception:  # noqa: BLE001
         return b""
-
-
-def _unwrap_ndr_data(value: object) -> object:
-    """Return the underlying NDR payload when wrapped in a ``Data`` pointer."""
-    current = value
-    for _ in range(2):
-        if isinstance(current, dict) and "Data" in current:
-            current = current["Data"]
-            continue
-        try:
-            current = current["Data"]  # type: ignore[index]
-            continue
-        except Exception:  # noqa: BLE001
-            pass
-        break
-    return current
 
 
 def _candidate_directory_open_paths(directory_path: str) -> tuple[str, ...]:
@@ -159,27 +149,26 @@ def _evaluate_security_descriptor_write(
     if not descriptor_bytes:
         return False, ()
     try:
-        from impacket.ldap import ldaptypes  # type: ignore
+        from winacl.dtyp.security_descriptor import SECURITY_DESCRIPTOR
     except Exception:
         return False, ()
 
     try:
-        descriptor = ldaptypes.SR_SECURITY_DESCRIPTOR(data=descriptor_bytes)
+        descriptor = SECURITY_DESCRIPTOR.from_bytes(descriptor_bytes)
     except Exception:
         return False, ()
 
-    dacl = descriptor["Dacl"]
-    if dacl == b"":
+    dacl = getattr(descriptor, "Dacl", None)
+    if dacl is None:
         return True, ("NULL_DACL",)
 
     denied_mask = 0
     granted_mask = 0
     matched_sids: list[str] = []
     for ace in getattr(dacl, "aces", []):
-        ace_body = ace["Ace"]
         ace_sid_raw = ""
         try:
-            ace_sid_raw = ace_body["Sid"].formatCanonical()
+            ace_sid_raw = str(getattr(ace, "Sid", "") or "")
         except Exception:  # noqa: BLE001
             continue
         ace_sid = normalize_sid(ace_sid_raw or "")
@@ -187,13 +176,10 @@ def _evaluate_security_descriptor_write(
             continue
         matched_sids.append(ace_sid)
         try:
-            ace_mask = int(ace_body["Mask"]["Mask"])
+            ace_mask = int(getattr(ace, "Mask", 0) or 0)
         except Exception:  # noqa: BLE001
             continue
-        try:
-            type_name = str(ace["TypeName"] or "").upper()
-        except Exception:  # noqa: BLE001
-            type_name = ""
+        type_name = str(getattr(ace, "AceType", "") or "").upper()
         if "DENIED" in type_name:
             denied_mask |= ace_mask
             granted_mask &= ~ace_mask
@@ -202,6 +188,29 @@ def _evaluate_security_descriptor_write(
             granted_mask |= ace_mask & ~denied_mask
 
     return _mask_includes_write(granted_mask), tuple(dict.fromkeys(matched_sids))
+
+
+def _sd_object_to_bytes(sd_object: object) -> bytes:
+    """Serialize a winacl SECURITY_DESCRIPTOR object back to raw bytes."""
+    if sd_object is None:
+        return b""
+    if isinstance(sd_object, bytes):
+        return sd_object
+    to_bytes = getattr(sd_object, "to_bytes", None)
+    if callable(to_bytes):
+        try:
+            return bytes(to_bytes())
+        except Exception:  # noqa: BLE001
+            return b""
+    return b""
+
+
+def _unc_path(host: str, share: str, file_path: str) -> str:
+    """Build a UNC path for aiosmb SMBFile/SMBDirectory operations."""
+    clean = file_path.strip("\\")
+    if clean:
+        return f"\\\\{host}\\{share}\\{clean}"
+    return f"\\\\{host}\\{share}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,71 +309,606 @@ class SMBPathAccessEvaluationResult:
 
 
 class SMBPathAccessService(BaseService):
-    """Perform generic SMB share/path write probes with Impacket."""
+    """Perform generic SMB share/path write probes with aiosmb."""
 
-    def _build_connection(
+    # ------------------------------------------------------------------
+    # Internal async helpers
+    # ------------------------------------------------------------------
+
+    async def _async_get_share_security_descriptor(
         self,
         *,
-        target_host: str,
-        timeout_seconds: int,
-    ) -> object:
-        """Return one authenticated-capable SMB connection object."""
-        from impacket.smbconnection import SMBConnection  # type: ignore
+        smb_connection: Any,
+        share_name: str,
+    ) -> tuple[bytes, str]:
+        """Return the share security descriptor bytes and backing path for one SMB share.
 
-        return SMBConnection(
-            remoteName=target_host,
-            remoteHost=target_host,
-            sess_port=445,
-            timeout=timeout_seconds,
+        Uses SMBShare.get_security_descriptor() which issues an SMB2 QueryInfo
+        (INFO_TYPE_SECURITY) on the share root tree — more reliable than
+        hNetrShareGetInfo(502) which returns rpc_x_bad_stub_data on many Windows
+        versions when ServerName is NULL.
+
+        Returns (sd_bytes, backing_path).  backing_path is empty because the
+        SMB2 SD query does not carry the filesystem path; callers that need the
+        backing path should use a separate SRVSVC call.
+        """
+        from aiosmb.commons.interfaces.share import SMBShare
+
+        share = SMBShare(
+            name=share_name,
+            fullpath=f"\\\\{smb_connection.target.get_hostname_or_ip()}\\{share_name}",
         )
+        sd_object, err = await share.get_security_descriptor(smb_connection)
+        if err is not None:
+            raise err
+        descriptor_bytes = _sd_object_to_bytes(sd_object)
+        return descriptor_bytes, ""
 
-    def _authenticate_connection(
+    async def _async_get_path_security_descriptor(
         self,
         *,
-        connection: object,
-        username: str,
+        smb_connection: Any,
+        host: str,
+        share_name: str,
+        directory_path: str,
+    ) -> bytes:
+        """Return one directory security descriptor from the target share/path.
+
+        Uses aiosmb SMBDirectory.get_security_descriptor() which returns a
+        parsed winacl SECURITY_DESCRIPTOR object; we serialise it back to bytes
+        so the caller-side ``_evaluate_security_descriptor_write`` can work
+        unchanged.
+        """
+        from aiosmb.commons.interfaces.directory import SMBDirectory
+
+        last_error: Exception | None = None
+        for candidate_path in _candidate_directory_open_paths(directory_path):
+            unc = _unc_path(host, share_name, candidate_path)
+            try:
+                directory = SMBDirectory.from_uncpath(unc)
+                sd_object, err = await directory.get_security_descriptor(smb_connection)
+                if err is not None:
+                    last_error = err
+                    continue
+                return _sd_object_to_bytes(sd_object)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return b""
+
+    async def _async_collect_security_snapshot(
+        self,
+        *,
+        host_clean: str,
+        share_clean: str,
+        directory_clean: str,
+        username_clean: str,
+        domain_clean: str,
         credential: str,
-        auth_domain: str,
         auth_mode: str,
+        use_kerberos: bool,
         kdc_host: str | None,
-    ) -> None:
-        """Authenticate one SMB connection according to the selected auth mode."""
-        if auth_mode == "kerberos":
-            lmhash = ""
-            nthash = ""
-            if _looks_like_ntlm_hash(credential):
-                if ":" in credential:
-                    lmhash, nthash = credential.split(":", 1)
-                else:
-                    nthash = credential
-            connection.kerberosLogin(  # type: ignore[attr-defined]
-                user=username,
-                password="" if _looks_like_ntlm_hash(credential) else credential,
-                domain=auth_domain,
-                lmhash=lmhash,
-                nthash=nthash,
-                kdcHost=str(kdc_host or "").strip() or None,
-                useCache=True,
-            )
-            return
-        if auth_mode == "hash":
-            lmhash = "aad3b435b51404eeaad3b435b51404ee"
-            nthash = credential
-            if ":" in credential:
-                lmhash, nthash = credential.split(":", 1)
-            connection.login(  # type: ignore[attr-defined]
-                user=username,
-                password="",
-                domain=auth_domain,
-                lmhash=lmhash,
-                nthash=nthash,
-            )
-            return
-        connection.login(  # type: ignore[attr-defined]
-            user=username,
-            password=credential,
-            domain=auth_domain,
+        timeout_seconds: int,
+        marked_host: str,
+        marked_share: str,
+        marked_directory: str,
+        marked_username: str,
+        marked_domain: str,
+    ) -> SMBPathSecuritySnapshot:
+        """Async implementation of collect_security_snapshot."""
+        is_hash = _looks_like_ntlm_hash(credential)
+        config = SMBConfig(
+            target_ip=host_clean,
+            target_hostname=host_clean,
+            domain=domain_clean,
+            username=username_clean,
+            password=None if is_hash or use_kerberos else credential,
+            nt_hash=credential if is_hash else None,
+            auth_domain=domain_clean,
+            kdc_ip=kdc_host,
+            timeout=timeout_seconds,
+            use_kerberos=use_kerberos,
         )
+
+        share_descriptor_readable = False
+        path_descriptor_readable = False
+        share_descriptor = b""
+        path_descriptor = b""
+        share_backing_path = ""
+
+        try:
+            async with smb_machine_for(config) as machine:
+                try:
+                    share_descriptor, share_backing_path = await self._async_get_share_security_descriptor(
+                        smb_connection=machine.connection,
+                        share_name=share_clean,
+                    )
+                    share_descriptor_readable = bool(share_descriptor)
+                    if share_descriptor_readable:
+                        print_info_verbose(
+                            "[smb-path] share security descriptor collected: "
+                            f"host={marked_host} share={marked_share}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print_warning_debug(
+                        "[smb-path] failed to read share security descriptor: "
+                        f"host={marked_host} share={marked_share} "
+                        f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                        f"error={mark_sensitive(str(exc), 'text')}"
+                    )
+
+                try:
+                    path_descriptor = await self._async_get_path_security_descriptor(
+                        smb_connection=machine.connection,
+                        host=host_clean,
+                        share_name=share_clean,
+                        directory_path=directory_clean,
+                    )
+                    path_descriptor_readable = bool(path_descriptor)
+                    if path_descriptor_readable:
+                        print_info_verbose(
+                            "[smb-path] path security descriptor collected: "
+                            f"host={marked_host} share={marked_share} path={marked_directory}"
+                        )
+                except SMBAccessDeniedError as exc:
+                    print_warning_debug(
+                        "[smb-path] failed to read path security descriptor: "
+                        f"host={marked_host} share={marked_share} path={marked_directory} "
+                        f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                        f"error={mark_sensitive(str(exc), 'text')}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print_warning_debug(
+                        "[smb-path] failed to read path security descriptor: "
+                        f"host={marked_host} share={marked_share} path={marked_directory} "
+                        f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                        f"error={mark_sensitive(str(exc), 'text')}"
+                    )
+
+            success = share_descriptor_readable and path_descriptor_readable
+            return SMBPathSecuritySnapshot(
+                success=success,
+                target_host=host_clean,
+                share_name=share_clean,
+                directory_path=directory_clean,
+                auth_mode=auth_mode,
+                share_descriptor_readable=share_descriptor_readable,
+                path_descriptor_readable=path_descriptor_readable,
+                share_security_descriptor=share_descriptor,
+                path_security_descriptor=path_descriptor,
+                share_backing_path=share_backing_path,
+                error_message=None if success else "SMB security descriptor snapshot incomplete.",
+                auth_username=username_clean,
+                auth_domain=domain_clean,
+            )
+        except SMBTransportError as exc:
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "[smb-path] ACL snapshot collection failed: "
+                f"host={marked_host} share={marked_share} path={marked_directory} "
+                f"user={marked_username} domain={marked_domain} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
+                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                f"error={mark_sensitive(str(exc), 'text')}"
+            )
+            return SMBPathSecuritySnapshot(
+                success=False,
+                target_host=host_clean,
+                share_name=share_clean,
+                directory_path=directory_clean,
+                auth_mode=auth_mode,
+                share_descriptor_readable=share_descriptor_readable,
+                path_descriptor_readable=path_descriptor_readable,
+                share_security_descriptor=share_descriptor,
+                path_security_descriptor=path_descriptor,
+                share_backing_path=share_backing_path,
+                error_message=str(exc),
+                status_code=_extract_status_code(exc),
+                auth_username=username_clean,
+                auth_domain=domain_clean,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "[smb-path] ACL snapshot collection failed: "
+                f"host={marked_host} share={marked_share} path={marked_directory} "
+                f"user={marked_username} domain={marked_domain} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
+                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                f"error={mark_sensitive(str(exc), 'text')}"
+            )
+            return SMBPathSecuritySnapshot(
+                success=False,
+                target_host=host_clean,
+                share_name=share_clean,
+                directory_path=directory_clean,
+                auth_mode=auth_mode,
+                share_descriptor_readable=share_descriptor_readable,
+                path_descriptor_readable=path_descriptor_readable,
+                share_security_descriptor=share_descriptor,
+                path_security_descriptor=path_descriptor,
+                share_backing_path=share_backing_path,
+                error_message=str(exc),
+                status_code=_extract_status_code(exc),
+                auth_username=username_clean,
+                auth_domain=domain_clean,
+            )
+
+    async def _async_probe_write_access(
+        self,
+        *,
+        host_clean: str,
+        share_clean: str,
+        directory_clean: str,
+        username_clean: str,
+        domain_clean: str,
+        credential: str,
+        auth_mode: str,
+        is_hash: bool,
+        use_kerberos: bool,
+        kdc_host: str | None,
+        timeout_seconds: int,
+        marked_host: str,
+        marked_share: str,
+        marked_directory: str,
+        marked_username: str,
+        marked_domain: str,
+    ) -> SMBPathWriteProbeResult:
+        """Async implementation of probe_write_access."""
+        config = SMBConfig(
+            target_ip=host_clean,
+            target_hostname=host_clean,
+            domain=domain_clean,
+            username=username_clean,
+            password=None if is_hash or use_kerberos else credential,
+            nt_hash=credential if is_hash else None,
+            auth_domain=domain_clean,
+            kdc_ip=kdc_host,
+            timeout=timeout_seconds,
+            use_kerberos=use_kerberos,
+        )
+
+        can_list_directory = False
+        probe_path = ""
+
+        try:
+            async with smb_machine_for(config) as machine:
+                connection = machine.connection
+
+                # Directory listing probe
+                try:
+                    from aiosmb.commons.interfaces.directory import SMBDirectory
+                    list_unc = _unc_path(host_clean, share_clean, directory_clean)
+                    directory = SMBDirectory.from_uncpath(list_unc)
+                    _, err = await directory.open(connection)  # pylint: disable=no-member
+                    if err is None:
+                        can_list_directory = True
+                        await directory.close()  # pylint: disable=no-member
+                        print_info_verbose(
+                            "[smb-path] directory listing succeeded: "
+                            f"host={marked_host} share={marked_share} path={marked_directory}"
+                        )
+                    else:
+                        print_warning_debug(
+                            "[smb-path] directory listing was denied but write probe will continue: "
+                            f"host={marked_host} share={marked_share} path={marked_directory}"
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Write probe: create a temporary file with FILE_DELETE_ON_CLOSE equivalent.
+                # aiosmb opens with FILE_OPEN_IF — we create + write + delete.
+                from aiosmb.commons.interfaces.file import SMBFile
+
+                probe_name = f".adscan-write-probe-{uuid4().hex}.tmp"
+                probe_path = (
+                    f"{directory_clean}\\{probe_name}" if directory_clean else probe_name
+                )
+                file_unc = _unc_path(host_clean, share_clean, probe_path)
+                smbfile = SMBFile.from_uncpath(file_unc)
+                _, err = await smbfile.open(connection, mode="w")
+                if err is not None:
+                    raise err
+                try:
+                    _, werr = await smbfile.write(b"")
+                    if werr is not None:
+                        pass  # zero-byte write error is non-fatal
+                finally:
+                    await smbfile.close()
+                # Cleanup — best-effort
+                try:
+                    await SMBFile.delete_rempath(connection, file_unc)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            print_success_debug(
+                "[smb-path] write probe succeeded: "
+                f"host={marked_host} share={marked_share} "
+                f"path={mark_sensitive(probe_path, 'path')} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')}"
+            )
+            return SMBPathWriteProbeResult(
+                success=True,
+                target_host=host_clean,
+                share_name=share_clean,
+                directory_path=directory_clean,
+                can_list_directory=can_list_directory,
+                auth_mode=auth_mode,
+                can_write=True,
+                probed_file_path=probe_path,
+                auth_username=username_clean,
+                auth_domain=domain_clean,
+            )
+        except SMBTransportError as exc:
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "[smb-path] write probe failed: "
+                f"host={marked_host} share={marked_share} path={marked_directory} "
+                f"user={marked_username} domain={marked_domain} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
+                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                f"error={mark_sensitive(str(exc), 'text')}"
+            )
+            return SMBPathWriteProbeResult(
+                success=False,
+                target_host=host_clean,
+                share_name=share_clean,
+                directory_path=directory_clean,
+                can_list_directory=can_list_directory,
+                auth_mode=auth_mode,
+                can_write=False,
+                probed_file_path=probe_path,
+                error_message=str(exc),
+                status_code=_extract_status_code(exc),
+                auth_username=username_clean,
+                auth_domain=domain_clean,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "[smb-path] write probe failed: "
+                f"host={marked_host} share={marked_share} path={marked_directory} "
+                f"user={marked_username} domain={marked_domain} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
+                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
+                f"error={mark_sensitive(str(exc), 'text')}"
+            )
+            return SMBPathWriteProbeResult(
+                success=False,
+                target_host=host_clean,
+                share_name=share_clean,
+                directory_path=directory_clean,
+                can_list_directory=can_list_directory,
+                auth_mode=auth_mode,
+                can_write=False,
+                probed_file_path=probe_path,
+                error_message=str(exc),
+                status_code=_extract_status_code(exc),
+                auth_username=username_clean,
+                auth_domain=domain_clean,
+            )
+
+    async def _async_upload_file(
+        self,
+        *,
+        host_clean: str,
+        share_clean: str,
+        directory_clean: str,
+        username_clean: str,
+        domain_clean: str,
+        credential: str,
+        auth_mode: str,
+        is_hash: bool,
+        use_kerberos: bool,
+        kdc_host: str | None,
+        timeout_seconds: int,
+        remote_name_clean: str,
+        file_contents: bytes,
+        delete_after: bool,
+        marked_host: str,
+        marked_share: str,
+        marked_directory: str,
+        marked_username: str,
+        marked_domain: str,
+    ) -> tuple[SMBFileUploadResult, Exception | None]:
+        """Async implementation of upload_file (single attempt)."""
+        config = SMBConfig(
+            target_ip=host_clean,
+            target_hostname=host_clean,
+            domain=domain_clean,
+            username=username_clean,
+            password=None if is_hash or use_kerberos else credential,
+            nt_hash=credential if is_hash else None,
+            auth_domain=domain_clean,
+            kdc_ip=kdc_host,
+            timeout=timeout_seconds,
+            use_kerberos=use_kerberos,
+        )
+
+        can_list_directory = False
+        uploaded_path = ""
+        deleted_after_successfully = False
+
+        try:
+            async with smb_machine_for(config) as machine:
+                connection = machine.connection
+
+                # Directory listing probe
+                try:
+                    from aiosmb.commons.interfaces.directory import SMBDirectory
+                    list_unc = _unc_path(host_clean, share_clean, directory_clean)
+                    directory = SMBDirectory.from_uncpath(list_unc)
+                    _, err = await directory.open(connection)  # pylint: disable=no-member
+                    if err is None:
+                        can_list_directory = True
+                        await directory.close()  # pylint: disable=no-member
+                        print_info_verbose(
+                            "[smb-path] directory listing succeeded before upload probe: "
+                            f"host={marked_host} share={marked_share} path={marked_directory}"
+                        )
+                    else:
+                        print_warning_debug(
+                            "[smb-path] directory listing was denied before file upload; "
+                            f"upload will continue: host={marked_host} share={marked_share} "
+                            f"path={marked_directory}"
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+
+                from aiosmb.commons.interfaces.file import SMBFile
+
+                uploaded_path = (
+                    f"{directory_clean}\\{remote_name_clean}" if directory_clean else remote_name_clean
+                )
+                file_unc = _unc_path(host_clean, share_clean, uploaded_path)
+                smbfile = SMBFile.from_uncpath(file_unc)
+                _, err = await smbfile.open(connection, mode="w")
+                if err is not None:
+                    raise err
+                try:
+                    _, werr = await smbfile.write(file_contents)
+                    if werr is not None:
+                        raise werr
+                finally:
+                    await smbfile.close()
+
+                if delete_after:
+                    try:
+                        await SMBFile.delete_rempath(connection, file_unc)
+                        deleted_after_successfully = True
+                    except Exception as exc:  # noqa: BLE001
+                        print_warning_debug(
+                            "[smb-path] uploaded file but cleanup failed: "
+                            f"host={marked_host} share={marked_share} "
+                            f"path={mark_sensitive(uploaded_path, 'path')} "
+                            f"error={mark_sensitive(str(exc), 'text')}"
+                        )
+
+            print_success_debug(
+                "[smb-path] file upload succeeded: "
+                f"host={marked_host} share={marked_share} "
+                f"path={mark_sensitive(uploaded_path, 'path')} "
+                f"delete_after={mark_sensitive(str(delete_after).lower(), 'text')} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')}"
+            )
+            return (
+                SMBFileUploadResult(
+                    success=True,
+                    target_host=host_clean,
+                    share_name=share_clean,
+                    directory_path=directory_clean,
+                    can_list_directory=can_list_directory,
+                    auth_mode=auth_mode,
+                    uploaded_file_path=uploaded_path,
+                    deleted_after=deleted_after_successfully,
+                    bytes_written=len(file_contents),
+                    auth_username=username_clean,
+                    auth_domain=domain_clean,
+                ),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (
+                SMBFileUploadResult(
+                    success=False,
+                    target_host=host_clean,
+                    share_name=share_clean,
+                    directory_path=directory_clean,
+                    can_list_directory=can_list_directory,
+                    auth_mode=auth_mode,
+                    uploaded_file_path=uploaded_path,
+                    error_message=str(exc),
+                    status_code=_extract_status_code(exc),
+                    auth_username=username_clean,
+                    auth_domain=domain_clean,
+                ),
+                exc,
+            )
+
+    async def _async_delete_file(
+        self,
+        *,
+        host_clean: str,
+        share_clean: str,
+        file_path_clean: str,
+        username_clean: str,
+        domain_clean: str,
+        credential: str,
+        auth_mode: str,
+        is_hash: bool,
+        use_kerberos: bool,
+        kdc_host: str | None,
+        timeout_seconds: int,
+        marked_host: str,
+        marked_share: str,
+        marked_file_path: str,
+        marked_username: str,
+        marked_domain: str,
+    ) -> tuple[SMBFileDeleteResult, Exception | None]:
+        """Async implementation of delete_file (single attempt)."""
+        config = SMBConfig(
+            target_ip=host_clean,
+            target_hostname=host_clean,
+            domain=domain_clean,
+            username=username_clean,
+            password=None if is_hash or use_kerberos else credential,
+            nt_hash=credential if is_hash else None,
+            auth_domain=domain_clean,
+            kdc_ip=kdc_host,
+            timeout=timeout_seconds,
+            use_kerberos=use_kerberos,
+        )
+
+        try:
+            async with smb_machine_for(config) as machine:
+                connection = machine.connection
+                from aiosmb.commons.interfaces.file import SMBFile
+                # delete_rempath calls from_remotepath() which prepends the host from the
+                # connection; passing a full UNC (\host\share\path) would cause double-host
+                # expansion. Pass \share\path so from_remotepath builds the correct UNC.
+                share_rel_path = f"\\{share_clean}\\{file_path_clean.lstrip(chr(92))}"
+                _, err = await SMBFile.delete_rempath(connection, share_rel_path)
+                if err is not None:
+                    raise err
+
+            print_success_debug(
+                "[smb-path] file delete succeeded: "
+                f"host={marked_host} share={marked_share} file={marked_file_path} "
+                f"auth_mode={mark_sensitive(auth_mode, 'text')}"
+            )
+            return (
+                SMBFileDeleteResult(
+                    success=True,
+                    target_host=host_clean,
+                    share_name=share_clean,
+                    file_path=file_path_clean,
+                    auth_mode=auth_mode,
+                    auth_username=username_clean,
+                    auth_domain=domain_clean,
+                ),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (
+                SMBFileDeleteResult(
+                    success=False,
+                    target_host=host_clean,
+                    share_name=share_clean,
+                    file_path=file_path_clean,
+                    auth_mode=auth_mode,
+                    error_message=str(exc),
+                    status_code=_extract_status_code(exc),
+                    auth_username=username_clean,
+                    auth_domain=domain_clean,
+                ),
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Private sync helpers
+    # ------------------------------------------------------------------
 
     def _should_retry_with_ntlm(
         self,
@@ -384,112 +928,9 @@ class SMBPathAccessService(BaseService):
             error_message=error_message,
         )
 
-    def _get_share_security_descriptor(
-        self,
-        *,
-        connection: object,
-        share_name: str,
-    ) -> tuple[bytes, str]:
-        """Return the share security descriptor and backing path for one SMB share."""
-        from impacket.dcerpc.v5 import srvs, transport  # type: ignore
-
-        rpc_transport = transport.SMBTransport(
-            connection.getRemoteName(),  # type: ignore[attr-defined]
-            connection.getRemoteHost(),  # type: ignore[attr-defined]
-            filename=r"\srvsvc",
-            smb_connection=connection,
-        )
-        dce = rpc_transport.get_dce_rpc()
-        dce.connect()
-        dce.bind(srvs.MSRPC_UUID_SRVS)
-        try:
-            response = srvs.hNetrShareGetInfo(dce, share_name, 502)
-        finally:
-            try:
-                dce.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-
-        share_info = _unwrap_ndr_data(response["InfoStruct"]["ShareInfo502"])
-        descriptor_bytes = _coerce_bytes(
-            share_info["shi502_security_descriptor"] if isinstance(share_info, dict) else share_info["shi502_security_descriptor"]
-        )
-        backing_path = str(
-            share_info["shi502_path"] if isinstance(share_info, dict) else share_info["shi502_path"]
-        ).strip()
-        return descriptor_bytes, backing_path
-
-    def _get_path_security_descriptor(
-        self,
-        *,
-        connection: object,
-        share_name: str,
-        directory_path: str,
-    ) -> bytes:
-        """Return one directory security descriptor from the target share/path."""
-        from impacket import smb  # type: ignore
-        from impacket.smb3structs import (  # type: ignore
-            DACL_SECURITY_INFORMATION,
-            FILE_DIRECTORY_FILE,
-            FILE_OPEN,
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_DELETE,
-            FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
-            GROUP_SECURITY_INFORMATION,
-            OWNER_SECURITY_INFORMATION,
-            READ_CONTROL,
-            SMB2_0_INFO_SECURITY,
-        )
-
-        tree_id = connection.connectTree(share_name)  # type: ignore[attr-defined]
-        security_information = (
-            OWNER_SECURITY_INFORMATION
-            | GROUP_SECURITY_INFORMATION
-            | DACL_SECURITY_INFORMATION
-        )
-        last_error: Exception | None = None
-        for candidate_path in _candidate_directory_open_paths(directory_path):
-            file_id = None
-            try:
-                file_id = connection.openFile(  # type: ignore[attr-defined]
-                    tree_id,
-                    candidate_path,
-                    desiredAccess=READ_CONTROL | FILE_READ_ATTRIBUTES,
-                    shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    creationOption=FILE_DIRECTORY_FILE,
-                    creationDisposition=FILE_OPEN,
-                )
-                smb_server = connection.getSMBServer()  # type: ignore[attr-defined]
-                if connection.getDialect() == smb.SMB_DIALECT:  # type: ignore[attr-defined]
-                    return _coerce_bytes(
-                        smb_server.query_sec_info(
-                            tree_id,
-                            file_id,
-                            additional_information=security_information,
-                        )
-                    )
-                return _coerce_bytes(
-                    smb_server.queryInfo(
-                        tree_id,
-                        file_id,
-                        infoType=SMB2_0_INFO_SECURITY,
-                        fileInfoClass=0,
-                        additionalInformation=security_information,
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                continue
-            finally:
-                if file_id is not None:
-                    try:
-                        connection.closeFile(tree_id, file_id)  # type: ignore[attr-defined]
-                    except Exception:  # noqa: BLE001
-                        pass
-        if last_error is not None:
-            raise last_error
-        return b""
+    # ------------------------------------------------------------------
+    # Public API — all sync, same signatures as before
+    # ------------------------------------------------------------------
 
     def collect_security_snapshot(
         self,
@@ -540,127 +981,26 @@ class SMBPathAccessService(BaseService):
             f"auth_mode={mark_sensitive(auth_mode, 'text')}"
         )
 
-        connection = None
-        share_descriptor_readable = False
-        path_descriptor_readable = False
-        share_descriptor = b""
-        path_descriptor = b""
-        share_backing_path = ""
-        try:
-            from impacket.smbconnection import SessionError  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return SMBPathSecuritySnapshot(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                auth_mode="unavailable",
-                share_descriptor_readable=False,
-                path_descriptor_readable=False,
-                error_message=f"Impacket SMB support is unavailable: {exc}",
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-
-        try:
-            connection = self._build_connection(
-                target_host=host_clean,
-                timeout_seconds=timeout_seconds,
-            )
-            self._authenticate_connection(
-                connection=connection,
-                username=username_clean,
+        # ASYNC_BOUNDARY: sync callers bridge to async here.
+        return run_smb_operation(
+            self._async_collect_security_snapshot(
+                host_clean=host_clean,
+                share_clean=share_clean,
+                directory_clean=directory_clean,
+                username_clean=username_clean,
+                domain_clean=domain_clean,
                 credential=credential,
-                auth_domain=domain_clean,
                 auth_mode=auth_mode,
+                use_kerberos=use_kerberos,
                 kdc_host=kdc_host,
+                timeout_seconds=timeout_seconds,
+                marked_host=marked_host,
+                marked_share=marked_share,
+                marked_directory=marked_directory,
+                marked_username=marked_username,
+                marked_domain=marked_domain,
             )
-            try:
-                share_descriptor, share_backing_path = self._get_share_security_descriptor(
-                    connection=connection,
-                    share_name=share_clean,
-                )
-                share_descriptor_readable = bool(share_descriptor)
-                if share_descriptor_readable:
-                    print_info_verbose(
-                        "[smb-path] share security descriptor collected: "
-                        f"host={marked_host} share={marked_share}"
-                    )
-            except Exception as exc:  # noqa: BLE001
-                print_warning_debug(
-                    "[smb-path] failed to read share security descriptor: "
-                    f"host={marked_host} share={marked_share} "
-                    f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
-                    f"error={mark_sensitive(str(exc), 'text')}"
-                )
-            try:
-                path_descriptor = self._get_path_security_descriptor(
-                    connection=connection,
-                    share_name=share_clean,
-                    directory_path=directory_clean,
-                )
-                path_descriptor_readable = bool(path_descriptor)
-                if path_descriptor_readable:
-                    print_info_verbose(
-                        "[smb-path] path security descriptor collected: "
-                        f"host={marked_host} share={marked_share} path={marked_directory}"
-                    )
-            except SessionError as exc:
-                print_warning_debug(
-                    "[smb-path] failed to read path security descriptor: "
-                    f"host={marked_host} share={marked_share} path={marked_directory} "
-                    f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
-                    f"error={mark_sensitive(str(exc), 'text')}"
-                )
-            success = share_descriptor_readable and path_descriptor_readable
-            return SMBPathSecuritySnapshot(
-                success=success,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                auth_mode=auth_mode,
-                share_descriptor_readable=share_descriptor_readable,
-                path_descriptor_readable=path_descriptor_readable,
-                share_security_descriptor=share_descriptor,
-                path_security_descriptor=path_descriptor,
-                share_backing_path=share_backing_path,
-                error_message=None if success else "SMB security descriptor snapshot incomplete.",
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_warning_debug(
-                "[smb-path] ACL snapshot collection failed: "
-                f"host={marked_host} share={marked_share} path={marked_directory} "
-                f"user={marked_username} domain={marked_domain} "
-                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
-                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
-                f"error={mark_sensitive(str(exc), 'text')}"
-            )
-            return SMBPathSecuritySnapshot(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                auth_mode=auth_mode,
-                share_descriptor_readable=share_descriptor_readable,
-                path_descriptor_readable=path_descriptor_readable,
-                share_security_descriptor=share_descriptor,
-                path_security_descriptor=path_descriptor,
-                share_backing_path=share_backing_path,
-                error_message=str(exc),
-                status_code=_extract_status_code(exc),
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-        finally:
-            if connection is not None:
-                try:
-                    connection.logoff()  # type: ignore[attr-defined]
-                except Exception:  # noqa: BLE001
-                    pass
+        )
 
     def evaluate_snapshot_write_access(
         self,
@@ -751,32 +1091,6 @@ class SMBPathAccessService(BaseService):
                 auth_domain=domain_clean,
             )
 
-        try:
-            from impacket.smbconnection import SMBConnection, SessionError  # type: ignore
-            from impacket.smb3structs import (  # type: ignore
-                FILE_CREATE,
-                FILE_DELETE_ON_CLOSE,
-                FILE_NON_DIRECTORY_FILE,
-                FILE_SHARE_DELETE,
-                FILE_SHARE_READ,
-                FILE_SHARE_WRITE,
-                GENERIC_WRITE,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return SMBPathWriteProbeResult(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                auth_mode="unavailable",
-                can_list_directory=False,
-                can_write=False,
-                error_message=f"Impacket SMB support is unavailable: {exc}",
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-
         credential = str(password or "").strip()
         is_hash = _looks_like_ntlm_hash(credential)
         if use_kerberos:
@@ -798,127 +1112,27 @@ class SMBPathAccessService(BaseService):
             f"auth_mode={mark_sensitive(auth_mode, 'text')}"
         )
 
-        connection = None
-        can_list_directory = False
-        probe_path = ""
-        try:
-            connection = SMBConnection(
-                remoteName=host_clean,
-                remoteHost=host_clean,
-                sess_port=445,
-                timeout=timeout_seconds,
-            )
-            if use_kerberos:
-                lmhash = ""
-                nthash = ""
-                if is_hash:
-                    if ":" in credential:
-                        lmhash, nthash = credential.split(":", 1)
-                    else:
-                        nthash = credential
-                connection.kerberosLogin(
-                    user=username_clean,
-                    password="" if is_hash else credential,
-                    domain=domain_clean,
-                    lmhash=lmhash,
-                    nthash=nthash,
-                    kdcHost=str(kdc_host or "").strip() or None,
-                    useCache=True,
-                )
-            elif is_hash:
-                lmhash = "aad3b435b51404eeaad3b435b51404ee"
-                nthash = credential
-                if ":" in credential:
-                    lmhash, nthash = credential.split(":", 1)
-                connection.login(
-                    user=username_clean,
-                    password="",
-                    domain=domain_clean,
-                    lmhash=lmhash,
-                    nthash=nthash,
-                )
-            else:
-                connection.login(
-                    user=username_clean,
-                    password=credential,
-                    domain=domain_clean,
-                )
-
-            list_pattern = f"{directory_clean}\\*" if directory_clean else "*"
-            try:
-                connection.listPath(share_clean, list_pattern)
-                can_list_directory = True
-                print_info_verbose(
-                    "[smb-path] directory listing succeeded: "
-                    f"host={marked_host} share={marked_share} path={marked_directory}"
-                )
-            except SessionError:
-                can_list_directory = False
-                print_warning_debug(
-                    "[smb-path] directory listing was denied but write probe will continue: "
-                    f"host={marked_host} share={marked_share} path={marked_directory}"
-                )
-
-            probe_name = f".adscan-write-probe-{uuid4().hex}.tmp"
-            probe_path = f"{directory_clean}\\{probe_name}" if directory_clean else probe_name
-            tree_id = connection.connectTree(share_clean)
-            file_id = connection.createFile(
-                tree_id,
-                probe_path,
-                desiredAccess=GENERIC_WRITE,
-                shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                creationOption=FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE,
-                creationDisposition=FILE_CREATE,
-            )
-            connection.closeFile(tree_id, file_id)
-            print_success_debug(
-                "[smb-path] write probe succeeded: "
-                f"host={marked_host} share={marked_share} "
-                f"path={mark_sensitive(probe_path, 'path')} "
-                f"auth_mode={mark_sensitive(auth_mode, 'text')}"
-            )
-            return SMBPathWriteProbeResult(
-                success=True,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                can_list_directory=can_list_directory,
+        # ASYNC_BOUNDARY: sync callers bridge to async here.
+        return run_smb_operation(
+            self._async_probe_write_access(
+                host_clean=host_clean,
+                share_clean=share_clean,
+                directory_clean=directory_clean,
+                username_clean=username_clean,
+                domain_clean=domain_clean,
+                credential=credential,
                 auth_mode=auth_mode,
-                can_write=True,
-                probed_file_path=probe_path,
-                auth_username=username_clean,
-                auth_domain=domain_clean,
+                is_hash=is_hash,
+                use_kerberos=use_kerberos,
+                kdc_host=kdc_host,
+                timeout_seconds=timeout_seconds,
+                marked_host=marked_host,
+                marked_share=marked_share,
+                marked_directory=marked_directory,
+                marked_username=marked_username,
+                marked_domain=marked_domain,
             )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_warning_debug(
-                "[smb-path] write probe failed: "
-                f"host={marked_host} share={marked_share} path={marked_directory} "
-                f"user={marked_username} domain={marked_domain} "
-                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
-                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
-                f"error={mark_sensitive(str(exc), 'text')}"
-            )
-            return SMBPathWriteProbeResult(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                can_list_directory=can_list_directory,
-                auth_mode=auth_mode,
-                can_write=False,
-                probed_file_path=probe_path,
-                error_message=str(exc),
-                status_code=_extract_status_code(exc),
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-        finally:
-            if connection is not None:
-                try:
-                    connection.logoff()
-                except Exception:  # noqa: BLE001
-                    pass
+        )
 
     def upload_file(
         self,
@@ -968,30 +1182,6 @@ class SMBPathAccessService(BaseService):
                 auth_domain=domain_clean,
             )
 
-        try:
-            from impacket.smbconnection import SessionError  # type: ignore
-            from impacket.smb3structs import (  # type: ignore
-                FILE_CREATE,
-                FILE_NON_DIRECTORY_FILE,
-                FILE_SHARE_DELETE,
-                FILE_SHARE_READ,
-                FILE_SHARE_WRITE,
-                GENERIC_WRITE,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return SMBFileUploadResult(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                auth_mode="unavailable",
-                can_list_directory=False,
-                error_message=f"Impacket SMB support is unavailable: {exc}",
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-
         credential = str(password or "").strip()
         is_hash = _looks_like_ntlm_hash(credential)
         auth_mode = "kerberos" if use_kerberos else ("hash" if is_hash else "password")
@@ -1007,113 +1197,31 @@ class SMBPathAccessService(BaseService):
             f"auth_mode={mark_sensitive(auth_mode, 'text')}"
         )
 
-        def _attempt_upload(attempt_auth_mode: str, attempt_use_kerberos: bool) -> tuple[SMBFileUploadResult, Exception | None]:
-            connection = None
-            can_list_directory = False
-            uploaded_path = ""
-            deleted_after_successfully = False
-            try:
-                connection = self._build_connection(
-                    target_host=host_clean,
-                    timeout_seconds=timeout_seconds,
-                )
-                self._authenticate_connection(
-                    connection=connection,
-                    username=username_clean,
-                    credential=credential,
-                    auth_domain=domain_clean,
-                    auth_mode=attempt_auth_mode,
-                    kdc_host=kdc_host if attempt_use_kerberos else None,
-                )
-                list_pattern = f"{directory_clean}\\*" if directory_clean else "*"
-                try:
-                    connection.listPath(share_clean, list_pattern)  # type: ignore[attr-defined]
-                    can_list_directory = True
-                    print_info_verbose(
-                        "[smb-path] directory listing succeeded before upload probe: "
-                        f"host={marked_host} share={marked_share} path={marked_directory}"
-                    )
-                except SessionError:
-                    print_warning_debug(
-                        "[smb-path] directory listing was denied before file upload; "
-                        f"upload will continue: host={marked_host} share={marked_share} "
-                        f"path={marked_directory}"
-                    )
-                uploaded_path = (
-                    f"{directory_clean}\\{remote_name_clean}" if directory_clean else remote_name_clean
-                )
-                tree_id = connection.connectTree(share_clean)  # type: ignore[attr-defined]
-                file_id = connection.createFile(  # type: ignore[attr-defined]
-                    tree_id,
-                    uploaded_path,
-                    desiredAccess=GENERIC_WRITE,
-                    shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    creationOption=FILE_NON_DIRECTORY_FILE,
-                    creationDisposition=FILE_CREATE,
-                )
-                try:
-                    connection.writeFile(tree_id, file_id, file_contents)  # type: ignore[attr-defined]
-                finally:
-                    connection.closeFile(tree_id, file_id)  # type: ignore[attr-defined]
-                if delete_after:
-                    try:
-                        connection.deleteFile(share_clean, uploaded_path)  # type: ignore[attr-defined]
-                        deleted_after_successfully = True
-                    except Exception as exc:  # noqa: BLE001
-                        print_warning_debug(
-                            "[smb-path] uploaded file but cleanup failed: "
-                            f"host={marked_host} share={marked_share} "
-                            f"path={mark_sensitive(uploaded_path, 'path')} "
-                            f"error={mark_sensitive(str(exc), 'text')}"
-                        )
-                print_success_debug(
-                    "[smb-path] file upload succeeded: "
-                    f"host={marked_host} share={marked_share} "
-                    f"path={mark_sensitive(uploaded_path, 'path')} "
-                    f"delete_after={mark_sensitive(str(delete_after).lower(), 'text')} "
-                    f"auth_mode={mark_sensitive(attempt_auth_mode, 'text')}"
-                )
-                return (
-                    SMBFileUploadResult(
-                        success=True,
-                        target_host=host_clean,
-                        share_name=share_clean,
-                        directory_path=directory_clean,
-                        can_list_directory=can_list_directory,
-                        auth_mode=attempt_auth_mode,
-                        uploaded_file_path=uploaded_path,
-                        deleted_after=deleted_after_successfully,
-                        bytes_written=len(file_contents),
-                        auth_username=username_clean,
-                        auth_domain=domain_clean,
-                    ),
-                    None,
-                )
-            except Exception as exc:  # noqa: BLE001
-                return (
-                    SMBFileUploadResult(
-                        success=False,
-                        target_host=host_clean,
-                        share_name=share_clean,
-                        directory_path=directory_clean,
-                        can_list_directory=can_list_directory,
-                        auth_mode=attempt_auth_mode,
-                        uploaded_file_path=uploaded_path,
-                        error_message=str(exc),
-                        status_code=_extract_status_code(exc),
-                        auth_username=username_clean,
-                        auth_domain=domain_clean,
-                    ),
-                    exc,
-                )
-            finally:
-                if connection is not None:
-                    try:
-                        connection.logoff()
-                    except Exception:  # noqa: BLE001
-                        pass
+        # ASYNC_BOUNDARY: sync callers bridge to async here.
+        result, exc = run_smb_operation(
+            self._async_upload_file(
+                host_clean=host_clean,
+                share_clean=share_clean,
+                directory_clean=directory_clean,
+                username_clean=username_clean,
+                domain_clean=domain_clean,
+                credential=credential,
+                auth_mode=auth_mode,
+                is_hash=is_hash,
+                use_kerberos=use_kerberos,
+                kdc_host=kdc_host,
+                timeout_seconds=timeout_seconds,
+                remote_name_clean=remote_name_clean,
+                file_contents=file_contents,
+                delete_after=delete_after,
+                marked_host=marked_host,
+                marked_share=marked_share,
+                marked_directory=marked_directory,
+                marked_username=marked_username,
+                marked_domain=marked_domain,
+            )
+        )
 
-        result, exc = _attempt_upload(auth_mode, use_kerberos)
         if result.success:
             return result
         if exc is not None:
@@ -1138,7 +1246,29 @@ class SMBPathAccessService(BaseService):
                 f"host={marked_host} share={marked_share} path={marked_directory} "
                 f"user={marked_username} domain={marked_domain}"
             )
-            retry_result, retry_exc = _attempt_upload(retry_auth_mode, False)
+            retry_result, retry_exc = run_smb_operation(
+                self._async_upload_file(
+                    host_clean=host_clean,
+                    share_clean=share_clean,
+                    directory_clean=directory_clean,
+                    username_clean=username_clean,
+                    domain_clean=domain_clean,
+                    credential=credential,
+                    auth_mode=retry_auth_mode,
+                    is_hash=is_hash,
+                    use_kerberos=False,
+                    kdc_host=None,
+                    timeout_seconds=timeout_seconds,
+                    remote_name_clean=remote_name_clean,
+                    file_contents=file_contents,
+                    delete_after=delete_after,
+                    marked_host=marked_host,
+                    marked_share=marked_share,
+                    marked_directory=marked_directory,
+                    marked_username=marked_username,
+                    marked_domain=marked_domain,
+                )
+            )
             if retry_result.success:
                 return retry_result
             if retry_exc is not None:
@@ -1185,21 +1315,6 @@ class SMBPathAccessService(BaseService):
                 auth_domain=domain_clean,
             )
 
-        try:
-            from impacket.smbconnection import SMBConnection  # type: ignore  # noqa: F401
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return SMBFileDeleteResult(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                file_path=file_path_clean,
-                auth_mode="unavailable",
-                error_message=f"Impacket SMB support is unavailable: {exc}",
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-
         credential = str(password or "").strip()
         is_hash = _looks_like_ntlm_hash(credential)
         auth_mode = "kerberos" if use_kerberos else ("hash" if is_hash else "password")
@@ -1215,62 +1330,28 @@ class SMBPathAccessService(BaseService):
             f"auth_mode={mark_sensitive(auth_mode, 'text')}"
         )
 
-        def _attempt_delete(attempt_auth_mode: str, attempt_use_kerberos: bool) -> tuple[SMBFileDeleteResult, Exception | None]:
-            connection = None
-            try:
-                connection = self._build_connection(
-                    target_host=host_clean,
-                    timeout_seconds=timeout_seconds,
-                )
-                self._authenticate_connection(
-                    connection=connection,
-                    username=username_clean,
-                    credential=credential,
-                    auth_domain=domain_clean,
-                    auth_mode=attempt_auth_mode,
-                    kdc_host=kdc_host if attempt_use_kerberos else None,
-                )
-                connection.deleteFile(share_clean, file_path_clean)  # type: ignore[attr-defined]
-                print_success_debug(
-                    "[smb-path] file delete succeeded: "
-                    f"host={marked_host} share={marked_share} file={marked_file_path} "
-                    f"auth_mode={mark_sensitive(attempt_auth_mode, 'text')}"
-                )
-                return (
-                    SMBFileDeleteResult(
-                        success=True,
-                        target_host=host_clean,
-                        share_name=share_clean,
-                        file_path=file_path_clean,
-                        auth_mode=attempt_auth_mode,
-                        auth_username=username_clean,
-                        auth_domain=domain_clean,
-                    ),
-                    None,
-                )
-            except Exception as exc:  # noqa: BLE001
-                return (
-                    SMBFileDeleteResult(
-                        success=False,
-                        target_host=host_clean,
-                        share_name=share_clean,
-                        file_path=file_path_clean,
-                        auth_mode=attempt_auth_mode,
-                        error_message=str(exc),
-                        status_code=_extract_status_code(exc),
-                        auth_username=username_clean,
-                        auth_domain=domain_clean,
-                    ),
-                    exc,
-                )
-            finally:
-                if connection is not None:
-                    try:
-                        connection.logoff()
-                    except Exception:  # noqa: BLE001
-                        pass
+        # ASYNC_BOUNDARY: sync callers bridge to async here.
+        result, exc = run_smb_operation(
+            self._async_delete_file(
+                host_clean=host_clean,
+                share_clean=share_clean,
+                file_path_clean=file_path_clean,
+                username_clean=username_clean,
+                domain_clean=domain_clean,
+                credential=credential,
+                auth_mode=auth_mode,
+                is_hash=is_hash,
+                use_kerberos=use_kerberos,
+                kdc_host=kdc_host,
+                timeout_seconds=timeout_seconds,
+                marked_host=marked_host,
+                marked_share=marked_share,
+                marked_file_path=marked_file_path,
+                marked_username=marked_username,
+                marked_domain=marked_domain,
+            )
+        )
 
-        result, exc = _attempt_delete(auth_mode, use_kerberos)
         if result.success:
             return result
         if exc is not None:
@@ -1295,7 +1376,26 @@ class SMBPathAccessService(BaseService):
                 f"host={marked_host} share={marked_share} file={marked_file_path} "
                 f"user={marked_username} domain={marked_domain}"
             )
-            retry_result, retry_exc = _attempt_delete(retry_auth_mode, False)
+            retry_result, retry_exc = run_smb_operation(
+                self._async_delete_file(
+                    host_clean=host_clean,
+                    share_clean=share_clean,
+                    file_path_clean=file_path_clean,
+                    username_clean=username_clean,
+                    domain_clean=domain_clean,
+                    credential=credential,
+                    auth_mode=retry_auth_mode,
+                    is_hash=is_hash,
+                    use_kerberos=False,
+                    kdc_host=None,
+                    timeout_seconds=timeout_seconds,
+                    marked_host=marked_host,
+                    marked_share=marked_share,
+                    marked_file_path=marked_file_path,
+                    marked_username=marked_username,
+                    marked_domain=marked_domain,
+                )
+            )
             if retry_result.success:
                 return retry_result
             if retry_exc is not None:

@@ -14,6 +14,10 @@ from typing import Any
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.services.compromise_class import (
+    CompromiseClass,
+    derive_compromise_class_from_semantics,
+)
 from adscan_internal.services.control_semantics import (
     classify_group_control_semantics,
     classify_membership_control_semantics,
@@ -36,10 +40,17 @@ HIGH_IMPACT_PRIVILEGES_FILENAME = "high_impact_privileges.txt"
 
 @dataclass(frozen=True)
 class IdentityRiskRecord:
-    """One persisted ADscan-owned user risk record."""
+    """One persisted ADscan-owned user risk record.
+
+    The canonical customer-facing classification is :attr:`compromise_class`
+    (see :class:`adscan_internal.services.compromise_class.CompromiseClass`).
+    The legacy boolean flags are kept during the migration period so existing
+    call sites continue to work; new code should consume ``compromise_class``.
+    """
 
     username: str
     control_level: str = "standard"
+    compromise_class: str = CompromiseClass.NONE.value
     has_direct_domain_control: bool = False
     is_domain_compromise_enabler: bool = False
     has_high_impact_privilege: bool = False
@@ -167,20 +178,24 @@ def _classify_record(
 
     control_level = str(semantics.get("control_level") or "standard")
     has_direct_domain_control = bool(semantics.get("is_direct_control"))
-    is_domain_compromise_enabler = bool(semantics.get("is_enabler"))
+    is_privileged_escalator = bool(
+        semantics.get("is_privileged_escalator") or semantics.get("is_enabler")
+    )
     has_high_impact_privilege = bool(semantics.get("is_high_impact"))
+    compromise_class = derive_compromise_class_from_semantics(semantics)
     is_control_exposed = any(
         (
             has_direct_domain_control,
-            is_domain_compromise_enabler,
+            is_privileged_escalator,
             has_high_impact_privilege,
         )
     )
     return IdentityRiskRecord(
         username=username,
         control_level=control_level,
+        compromise_class=compromise_class.value,
         has_direct_domain_control=has_direct_domain_control,
-        is_domain_compromise_enabler=is_domain_compromise_enabler,
+        is_domain_compromise_enabler=is_privileged_escalator,
         has_high_impact_privilege=has_high_impact_privilege,
         is_control_exposed=is_control_exposed,
         reasons=tuple(sorted(set(reasons))),
@@ -269,6 +284,7 @@ def build_identity_risk_snapshot(shell: object, domain: str) -> dict[str, Any]:
         )
         payload = {
             "control_level": record.control_level,
+            "compromise_class": record.compromise_class,
             "has_direct_domain_control": record.has_direct_domain_control,
             "is_domain_compromise_enabler": record.is_domain_compromise_enabler,
             "has_high_impact_privilege": record.has_high_impact_privilege,

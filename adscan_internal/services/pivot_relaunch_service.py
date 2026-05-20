@@ -21,6 +21,7 @@ from adscan_internal.services.ligolo_service import LigoloProxyService
 from adscan_internal.services.pivot_capability_registry import (
     get_pivot_service_capability,
 )
+from adscan_internal.services.pivot_auth_context_service import resolve_pivot_auth_secret
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ class PivotRelaunchCandidate:
     pivot_method: str
     pivot_tool: str
     routes: tuple[str, ...]
+    pivot_auth: dict[str, Any]
     credential_available: bool
     service_reachable: bool
 
@@ -65,20 +67,35 @@ def _load_tunnel_records(shell: Any) -> list[dict[str, Any]]:
     return service.load_tunnels_state()
 
 
-def _resolve_credential(shell: Any, *, domain: str, username: str) -> str | None:
-    """Return the current reusable credential for one user if still present."""
+def _resolve_credential(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    source_service: str,
+    record: dict[str, Any] | None = None,
+) -> str | None:
+    """Return the reusable credential that matches a persisted pivot record."""
+    return resolve_pivot_auth_secret(
+        shell,
+        domain=domain,
+        username=username,
+        source_service=source_service,
+        record=record,
+    )
 
-    domains_data = getattr(shell, "domains_data", {})
-    domain_data = domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
-    credentials = domain_data.get("credentials", {}) if isinstance(domain_data, dict) else {}
-    if not isinstance(credentials, dict):
-        return None
-    secret = str(credentials.get(username) or "").strip()
-    if not secret:
-        return None
-    if getattr(shell, "is_hash", lambda _: False)(secret):
-        return None
-    return secret
+
+def _tcp_probe_host(host: str, ports: tuple[int, ...], timeout: float = 3.0) -> bool:
+    """Return True if *host* accepts a TCP connection on any of *ports*."""
+    import socket
+
+    for port in ports:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _is_service_reachable_from_current_vantage(
@@ -88,8 +105,13 @@ def _is_service_reachable_from_current_vantage(
     host: str,
     service_name: str,
 ) -> bool:
-    """Return whether the pivot host is reachable on the service's required ports."""
+    """Return whether the pivot host is reachable on the service's required ports.
 
+    First consults the cached current-vantage reachability report.  If the host
+    is not found there (e.g. because the lab rotated IPs and only the tunnel
+    records were updated but the report was not yet refreshed), falls back to a
+    live TCP probe so that a rotated pivot host can still be relaunched.
+    """
     capability = get_pivot_service_capability(service_name)
     required_ports = capability.required_ports if capability else ()
     resolution = resolve_targets_from_current_vantage(
@@ -99,7 +121,19 @@ def _is_service_reachable_from_current_vantage(
         targets=[host],
         required_ports=required_ports,
     )
-    return bool(resolution.reachable_targets)
+    if resolution.reachable_targets:
+        return True
+
+    # Cached report doesn't include this host — try a live TCP probe as fallback.
+    if required_ports:
+        from adscan_internal.rich_output import print_info_debug, mark_sensitive
+        live = _tcp_probe_host(host, required_ports)
+        print_info_debug(
+            f"[pivot-relaunch] reachability report miss for {mark_sensitive(host, 'hostname')}; "
+            f"live TCP probe ports={list(required_ports)} → {live}"
+        )
+        return live
+    return False
 
 
 def list_relaunch_candidates(
@@ -127,6 +161,8 @@ def list_relaunch_candidates(
             shell,
             domain=domain,
             username=pivot_username,
+            source_service=source_service,
+            record=record,
         )
         candidates.append(
             PivotRelaunchCandidate(
@@ -138,6 +174,7 @@ def list_relaunch_candidates(
                 pivot_method=str(record.get("pivot_method") or "ligolo_winrm_pivot").strip(),
                 pivot_tool=str(record.get("pivot_tool") or "Ligolo").strip(),
                 routes=tuple(str(route) for route in (record.get("routes") or []) if str(route).strip()),
+                pivot_auth=dict(record.get("pivot_auth") or {}) if isinstance(record.get("pivot_auth"), dict) else {},
                 credential_available=credential is not None,
                 service_reachable=_is_service_reachable_from_current_vantage(
                     shell,
@@ -173,7 +210,13 @@ def assess_persisted_tunnel_relaunchability(
             status_label="No",
             reason=f"{source_service.upper()} relaunch not supported yet",
         )
-    credential = _resolve_credential(shell, domain=domain, username=pivot_username)
+    credential = _resolve_credential(
+        shell,
+        domain=domain,
+        username=pivot_username,
+        source_service=source_service,
+        record=record,
+    )
     if not credential:
         return PivotRelaunchAssessment(
             tunnel_id=tunnel_id,
@@ -218,6 +261,8 @@ def relaunch_persisted_pivot(
         shell,
         domain=candidate.domain,
         username=candidate.pivot_username,
+        source_service=candidate.source_service,
+        record={"pivot_auth": candidate.pivot_auth},
     )
     if not credential:
         print_warning(

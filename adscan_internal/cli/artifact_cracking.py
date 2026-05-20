@@ -17,7 +17,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.cli.cracking import resolve_cracking_wordlist
-from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.rich_output import mark_sensitive, print_info_debug, print_panel
 from adscan_internal.services.john_artifact_cracking_service import (
     JohnArtifactCrackingService,
 )
@@ -26,9 +26,216 @@ from adscan_internal.services.cracking_history_service import (
     find_matching_attempt,
     register_cracking_attempt,
 )
+from adscan_core.theme import (
+    COLOR_AMBER,
+    COLOR_CRIMSON,
+    COLOR_MUTED,
+    COLOR_SAGE,
+    COLOR_STEEL,
+)
+import rich.box
 import time
 import subprocess
+from rich.console import Group
 from rich.prompt import Confirm
+from rich.table import Table
+from rich.text import Text
+
+
+# Glyph + label table for each artifact family. The reveal panel reads from
+# this map so adding a new artifact type updates the UX in one place.
+_ARTIFACT_PROFILES: dict[str, dict[str, str]] = {
+    "pfx": {
+        "label": "PFX / PKCS#12 certificate",
+        "glyph": "🪪",
+        "next": (
+            "Use the recovered password with certipy auth / PKINIT to obtain "
+            "a TGT for the certificate's subject."
+        ),
+    },
+    "p12": {
+        "label": "PKCS#12 keystore",
+        "glyph": "🪪",
+        "next": (
+            "Import the keystore with the recovered password and authenticate "
+            "via PKINIT against the issuing CA."
+        ),
+    },
+    "keepass": {
+        "label": "KeePass database (KDBX)",
+        "glyph": "🔐",
+        "next": (
+            "Open the database with the recovered passphrase and harvest stored "
+            "credentials. Cross-check entries against domain accounts."
+        ),
+    },
+    "kdbx": {
+        "label": "KeePass database (KDBX)",
+        "glyph": "🔐",
+        "next": (
+            "Open the database with the recovered passphrase and harvest stored "
+            "credentials. Cross-check entries against domain accounts."
+        ),
+    },
+    "zip": {
+        "label": "Password-protected ZIP",
+        "glyph": "🗜",
+        "next": (
+            "Archive extraction will continue automatically. Inspect the contents "
+            "for credentials, certs, or scripts."
+        ),
+    },
+    "ansible": {
+        "label": "Ansible Vault",
+        "glyph": "📦",
+        "next": (
+            "Vault decryption will run automatically. Review the plaintext for "
+            "secrets, inventory hosts, and SSH keys."
+        ),
+    },
+}
+
+
+def _artifact_profile(file_type: str) -> dict[str, str]:
+    """Return label/glyph/next-action metadata for a file_type, with fallback."""
+    return _ARTIFACT_PROFILES.get(
+        (file_type or "").lower(),
+        {
+            "label": f"{file_type} artifact" if file_type else "Artifact",
+            "glyph": "📄",
+            "next": "Review the recovered secret and apply it to the relevant service.",
+        },
+    )
+
+
+def _render_artifact_cracked_panel(
+    shell: Any,
+    *,
+    file_type: str,
+    password: str,
+    original_paths: Sequence[str],
+    wordlist_name: str | None,
+) -> None:
+    """Render the celebratory reveal when an artifact secret is recovered.
+
+    Uses a heavy-bordered sage panel with a star glyph to make the row jump
+    out of a long hashcat/john log. The "Next" line tells the operator the
+    very next operational step so the panel is action-driving, not just
+    informative.
+    """
+    profile = _artifact_profile(file_type)
+    marked_password = mark_sensitive(password, "password")
+
+    table = Table(
+        show_header=False,
+        show_edge=False,
+        box=None,
+        padding=(0, 1),
+        expand=False,
+    )
+    table.add_column("label", style=f"bold {COLOR_STEEL}", no_wrap=True)
+    table.add_column("value", overflow="fold")
+
+    table.add_row("Artifact", f"{profile['glyph']} {profile['label']}")
+    if original_paths:
+        joined = ", ".join(
+            mark_sensitive(str(path), "path") for path in list(original_paths)[:3]
+        )
+        if len(original_paths) > 3:
+            joined = f"{joined}, +{len(original_paths) - 3} more"
+        table.add_row("Source", joined)
+    table.add_row("Password", f"[bold {COLOR_SAGE}]★ {marked_password}[/]")
+    if wordlist_name:
+        table.add_row("Wordlist", wordlist_name)
+
+    body = Group(
+        table,
+        Text(""),
+        Text.from_markup(f"[bold]Next:[/bold] {profile['next']}"),
+    )
+
+    console = getattr(shell, "console", None)
+    title = (
+        f"[bold {COLOR_SAGE}]★ Artifact Unlocked[/] "
+        f"[{COLOR_MUTED}]· {profile['label']}[/]"
+    )
+    if console is not None:
+        try:
+            from rich.panel import Panel
+
+            console.print(
+                Panel(
+                    body,
+                    title=title,
+                    title_align="left",
+                    border_style=COLOR_SAGE,
+                    box=rich.box.HEAVY,
+                    padding=(1, 2),
+                )
+            )
+            return
+        except Exception:  # noqa: BLE001 - fall back to shared helper on any rendering issue
+            pass
+
+    print_panel(
+        body,
+        title=title,
+        title_align="left",
+        border_style=COLOR_SAGE,
+        box=rich.box.HEAVY,
+        padding=(1, 2),
+    )
+
+
+def _render_artifact_failure_panel(
+    shell: Any,
+    *,
+    file_type: str,
+    wordlist_name: str | None,
+    reason: str = "no_match",
+) -> None:
+    """Render a clear verdict panel when the artifact secret is not recovered."""
+    profile = _artifact_profile(file_type)
+    headline = {
+        "no_match": "Wordlist did not contain the artifact's secret.",
+        "error": "John the Ripper exited with an error before completing.",
+    }.get(reason, "John the Ripper did not recover a secret.")
+
+    next_text = (
+        "Retry with a focused wordlist (kaonashi14M, hashmob medium) "
+        "or apply ruleset transformations (e.g. john --rules)."
+        if reason == "no_match"
+        else "Inspect the john output and confirm the hash file is well-formed."
+    )
+
+    body_lines: list[str] = [
+        f"[bold]Diagnosis:[/bold] {headline}",
+    ]
+    if wordlist_name and reason == "no_match":
+        body_lines.append(
+            f"[{COLOR_MUTED}]• Wordlist used: {wordlist_name}[/]"
+        )
+    body_lines.append("")
+    body_lines.append(f"[bold]Next:[/bold] {next_text}")
+
+    body = Group(
+        Text.from_markup(
+            f"[{COLOR_CRIMSON}]✗[/] [bold]{profile['label']}[/] "
+            f"[{COLOR_MUTED}]· not unlocked[/]"
+        ),
+        Text(""),
+        *(Text.from_markup(line) for line in body_lines),
+    )
+
+    border = COLOR_AMBER if reason == "no_match" else COLOR_CRIMSON
+    print_panel(
+        body,
+        title=f"[bold]Artifact Cracking[/bold] [{COLOR_MUTED}]· {profile['label']}[/]",
+        title_align="left",
+        border_style=border,
+        box=rich.box.ROUNDED,
+        padding=(1, 2),
+    )
 
 
 def run_file2john_artifact_flow(
@@ -69,8 +276,10 @@ def run_file2john_artifact_flow(
             return None
 
         print_success_verbose(f"Hash saved in {hash_file}")
-        print_warning(
-            f"Cracking {file_type} file. Please be patient, this can take a while."
+        profile = _artifact_profile(file_type)
+        print_info(
+            f"Cracking {profile['glyph']} {profile['label']}. "
+            "Hold tight, this can take a while."
         )
         wordlist = resolve_cracking_wordlist(
             shell=shell,
@@ -90,6 +299,7 @@ def run_file2john_artifact_flow(
             wordlist=wordlist,
             domain=domain,
             original_file=original_file or input_files,
+            file_type=file_type,
         )
         if password:
             apply_artifact_post_action(
@@ -114,6 +324,7 @@ def run_john_cracking(
     wordlist: str,
     domain: str,
     original_file: object | None = None,
+    file_type: str | None = None,
 ) -> str | None:
     """Run John against one hash file and return the cracked secret when available."""
     try:
@@ -159,7 +370,13 @@ def run_john_cracking(
 
         if proc and proc.returncode == 0:
             print_success_verbose("Cracking with john completed")
-            password = check_john_result(shell, hash_file=hash_file)
+            password = check_john_result(
+                shell,
+                hash_file=hash_file,
+                file_type=file_type,
+                original_paths=original_paths,
+                wordlist_name=wordlist_name,
+            )
             register_cracking_attempt(
                 shell,
                 domain=domain,
@@ -174,6 +391,13 @@ def run_john_cracking(
                     cracked_count=1 if password else 0,
                 ),
             )
+            if not password and file_type is not None:
+                _render_artifact_failure_panel(
+                    shell,
+                    file_type=file_type,
+                    wordlist_name=wordlist_name,
+                    reason="no_match",
+                )
             return password
         error_text = str(getattr(proc, "stderr", "") or "").strip()
         if error_text:
@@ -192,6 +416,13 @@ def run_john_cracking(
                 cracked_count=0,
             ),
         )
+        if file_type is not None:
+            _render_artifact_failure_panel(
+                shell,
+                file_type=file_type,
+                wordlist_name=wordlist_name,
+                reason="error",
+            )
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -200,8 +431,20 @@ def run_john_cracking(
         return None
 
 
-def check_john_result(shell: Any, *, hash_file: str) -> str | None:
-    """Parse ``john --show`` output using the shared John helper semantics."""
+def check_john_result(
+    shell: Any,
+    *,
+    hash_file: str,
+    file_type: str | None = None,
+    original_paths: Sequence[str] | None = None,
+    wordlist_name: str | None = None,
+) -> str | None:
+    """Parse ``john --show`` output using the shared John helper semantics.
+
+    When ``file_type`` is provided, a celebratory reveal panel is rendered on
+    success so the operator sees the artifact unlock as a distinct event,
+    not just another log line.
+    """
     try:
         john_path = JohnArtifactCrackingService.resolve_john_path() or "john"
         command = f"{shlex.quote(john_path)} --show {shlex.quote(str(hash_file))}"
@@ -209,10 +452,19 @@ def check_john_result(shell: Any, *, hash_file: str) -> str | None:
         if proc and getattr(proc, "returncode", 1) == 0 and getattr(proc, "stdout", ""):
             password = JohnArtifactCrackingService.parse_john_show_output(proc.stdout)
             if password:
-                marked_password = mark_sensitive(password, "password")
-                print_warning(f"Password found: {marked_password}")
+                if file_type is not None:
+                    _render_artifact_cracked_panel(
+                        shell,
+                        file_type=file_type,
+                        password=password,
+                        original_paths=list(original_paths or []),
+                        wordlist_name=wordlist_name,
+                    )
+                else:
+                    marked_password = mark_sensitive(password, "password")
+                    print_warning(f"Password found: {marked_password}")
                 return password
-            print_warning("Password not found")
+            print_warning("Password not found.")
         return None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -403,7 +655,7 @@ def extract_zip(shell: Any, *, zip_file: object, domain: str) -> None:
                 return
 
         if is_encrypted:
-            print_warning("ZIP file is password protected")
+            print_warning("ZIP file is password protected.")
             hash_file = f"{zip_file}.hash"
             shell.file2john(domain, zip_file, hash_file, "zip")
             return
@@ -429,7 +681,7 @@ def extract_zip(shell: Any, *, zip_file: object, domain: str) -> None:
                 shell.process_found_file(file_path, domain, "ext")
     except subprocess.TimeoutExpired as exc:
         telemetry.capture_exception(exc)
-        print_error("Timeout reached while processing the ZIP")
+        print_error("Timeout reached while processing the ZIP.")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Error processing ZIP.")

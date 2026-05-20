@@ -1,0 +1,31 @@
+changelog:
+  exclude:
+    labels:
+      - "ignore-for-release"
+      - "dependencies"
+  categories:
+    - title: "New Attack Techniques"
+      labels:
+        - "attack-technique"
+        - "adcs"
+        - "kerberos"
+        - "smb"
+    - title: "Enumeration & Collection"
+      labels:
+        - "enumeration"
+        - "bloodhound"
+        - "ldap"
+    - title: "Bug Fixes"
+      labels:
+        - "bug"
+        - "fix"
+    - title: "Installer & Docker"
+      labels:
+        - "installer"
+        - "docker"
+        - "launcher"
+    - title: "Documentation"
+      labels:
+        - "documentation"
+        - "docs"
+    - title: "Other Changes"

@@ -49,12 +49,8 @@ def _emit_pull_failure_dns_guidance(*, diagnostic: str) -> None:
     """Emit targeted guidance when docker pull fails due to DNS resolution."""
     if not _DOCKER_PULL_DNS_FAILURE_RE.search(diagnostic or ""):
         return
-    print_warning(
-        "Docker registry DNS resolution failed while pulling images."
-    )
-    print_instruction(
-        "Verify host DNS settings and internet connectivity, then retry."
-    )
+    print_warning("Docker registry DNS resolution failed while pulling images.")
+    print_instruction("Verify host DNS settings and internet connectivity, then retry.")
     print_instruction(
         "If needed, test resolver health with: getent hosts registry-1.docker.io"
     )
@@ -129,6 +125,12 @@ class DockerRunConfig:
     # Extra environment variables to pass into the container via `-e KEY=VALUE`.
     # This is preferred over mutating `os.environ` at call sites.
     extra_env: tuple[tuple[str, str], ...] = ()
+    # Host directory bind-mounted into the container at /run/adscan. When
+    # None, defaults to ``workspaces_host_dir.parent / "run"`` for backwards
+    # compatibility. Per-launcher session directories live under
+    # ``run/sessions/<token>/`` and are passed in here so two launchers do
+    # not share the same host-helper socket path.
+    run_host_dir: Path | None = None
 
 
 def _get_effective_home() -> Path:
@@ -697,8 +699,18 @@ def build_adscan_run_command(
     config_host_dir = cfg.workspaces_host_dir.parent / ".config"
     codex_host_dir = cfg.workspaces_host_dir.parent / ".codex-container"
     logs_host_dir = cfg.workspaces_host_dir.parent / "logs"
-    run_host_dir = cfg.workspaces_host_dir.parent / "run"
+    run_host_dir = cfg.run_host_dir or (cfg.workspaces_host_dir.parent / "run")
     state_host_dir = cfg.workspaces_host_dir.parent / "state"
+    # ``bonuses/`` holds the standalone deliverable PDFs produced by
+    # ``adscan cheatsheet`` and the LITE-tier kit fast-path. Without a host
+    # bind-mount these end up inside the container's ephemeral layer and
+    # disappear when the container exits — the operator runs the command,
+    # sees ``Wrote N bytes to ~/.adscan/bonuses/...``, then finds nothing
+    # on the host. Mounting it as a sibling of ``workspaces/`` makes the
+    # artefact persist (and keeps the host helper's `open_file` route
+    # honest: the path it receives actually exists on disk).
+    bonuses_host_dir = cfg.workspaces_host_dir.parent / "bonuses"
+    bonuses_host_dir.mkdir(parents=True, exist_ok=True)
     cmd.extend(
         [
             "--mount",
@@ -718,6 +730,8 @@ def build_adscan_run_command(
             f"{run_host_dir}:/run/adscan",
             "-v",
             f"{state_host_dir}:/opt/adscan/state",
+            "-v",
+            f"{bonuses_host_dir}:/opt/adscan/bonuses",
         ]
     )
 
@@ -832,8 +846,6 @@ def build_adscan_run_command(
     # even when the host did not explicitly set them. For those, we pass an
     # explicit default so we don't accidentally inherit image/env defaults.
     attack_path_env_defaults = {
-        "ADSCAN_ATTACK_PATH_GROUP_MEMBERSHIP_PRIMARY": "bloodhound",
-        "ADSCAN_ATTACK_PATH_GROUP_MEMBERSHIP_ALLOW_FALLBACK": "0",
         "ADSCAN_ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS": "1",
         "ADSCAN_ATTACK_GRAPH_PERSIST_MEMBERSHIPS": "1",
     }
@@ -890,12 +902,12 @@ def build_adscan_run_command(
     # Docker container.  We rewrite these to the special `host-gateway` hostname
     # that Docker maps to the host's bridge IP, and add --add-host so Docker
     # resolves it correctly on Linux (where host.docker.internal is unavailable).
-    _interactive_sink = str(os.environ.get("ADSCAN_INTERACTIVE_SINK", "") or "").strip().lower()
+    _interactive_sink = (
+        str(os.environ.get("ADSCAN_INTERACTIVE_SINK", "") or "").strip().lower()
+    )
     if _interactive_sink == "redis":
         _host_redis_url = str(
-            os.environ.get("ADSCAN_REDIS_URL")
-            or os.environ.get("REDIS_URL")
-            or ""
+            os.environ.get("ADSCAN_REDIS_URL") or os.environ.get("REDIS_URL") or ""
         ).strip()
         if _host_redis_url:
             _docker_redis_url = _make_docker_accessible_url(_host_redis_url)

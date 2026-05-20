@@ -22,7 +22,6 @@ import re
 import shlex
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -38,7 +37,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 if TYPE_CHECKING:
     from adscan_internal.core import LicenseMode
     from adscan_internal.services import (
-        BloodHoundService,
         DNSDiscoveryService,
         DNSResolverService,
         SpideringService,
@@ -111,7 +109,6 @@ from adscan_internal.logging_config import init_logging
 from adscan_internal.reporting_compat import (
     handle_optional_report_service_exception,
     load_optional_pro_attr,
-    load_optional_report_service_attr,
     is_optional_report_service_import_error,
 )
 from adscan_internal.session_summary import (
@@ -145,7 +142,6 @@ from adscan_internal.services.pivot_capability_registry import (
 from adscan_internal.services.session_compromise_state_service import (
     SESSION_COMPROMISE_STATUS_UNKNOWN,
     build_session_compromise_metadata,
-    mark_session_domain_compromised,
 )
 from adscan_internal.version import get_version, get_version_tag
 from adscan_internal.workspaces import (
@@ -154,7 +150,6 @@ from adscan_internal.workspaces import (
 )
 from adscan_internal.integrations.netexec.timeouts import (
     get_recommended_internal_timeout,
-    resolve_netexec_cve_timeout_seconds,
     resolve_service_command_timeout_seconds,
 )
 from adscan_internal.docker_commands import (
@@ -182,26 +177,6 @@ from adscan_internal.docker_status import (
     ensure_docker_daemon_running as _ensure_docker_daemon_running_internal,
     is_docker_compose_plugin_available as _is_docker_compose_plugin_available,
     is_official_docker_installed as _is_docker_official_installed,
-)
-from adscan_internal.bloodhound_ce_compose import (
-    BLOODHOUND_CE_VERSION,
-    BLOODHOUND_CE_DEFAULT_WEB_PORT,
-    compose_config_changed,
-    compose_pull,
-    compose_recreate,
-    compose_up,
-    ensure_bloodhound_compose_file,
-)
-from adscan_internal.bloodhound_ce_password import (
-    ensure_bloodhound_admin_password,
-    validate_bloodhound_admin_password_policy,
-)
-from adscan_internal.bloodhound_legacy import (
-    LegacyNeo4jConfig,
-    ensure_neo4j_not_running,
-    ensure_neo4j_running,
-    load_legacy_neo4j_config,
-    update_legacy_neo4j_config,
 )
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.theme import ADSCAN_THEME
@@ -1064,9 +1039,6 @@ def _is_adscan_hosts_line_for_domain(stripped_line: str, domain: str) -> bool:
 
 
 # Kerberos time error detection moved to adscan_internal.cli.kerberos
-from adscan_internal.cli.kerberos import (  # noqa: E402
-    detect_kerberos_time_error as _detect_kerberos_time_error,
-)
 
 
 # Import from tools_env to avoid circular dependencies
@@ -1074,11 +1046,10 @@ from adscan_internal.cli.tools_env import (  # noqa: E402
     maybe_wrap_hashcat_for_container as _maybe_wrap_hashcat_for_container,
 )
 
-# Import from responder to avoid circular dependencies
-from adscan_internal.cli.responder import (  # noqa: E402
-    clear_responder_db,
-    start_responder,
-    stop_responder,
+from adscan_internal.cli.poisoning import (  # noqa: E402
+    clear_poisoning_state,
+    start_poisoning,
+    stop_poisoning,
 )
 
 
@@ -1872,6 +1843,18 @@ def _guard_container_runtime_launcher_contract(command: str | None) -> None:
     if command in (None, "version", "host-helper"):
         return
 
+    # Build-time bake escape hatch. ``scripts/bake_cheatsheet.sh`` invokes the
+    # cheatsheet renderer inside the PRO image to produce the LITE static
+    # asset; that one-shot pipeline has no host helper / resolver / launcher
+    # marker — and doesn't need any of them, since it renders to a bind-
+    # mounted file and exits. The env var is set ONLY by the bake script,
+    # never by users, and the bypass is limited to safe pure-render verbs.
+    if str(os.getenv("ADSCAN_BAKE_MODE") or "").strip() == "1" and command in (
+        "cheatsheet",
+        "demo",
+    ):
+        return
+
     issues = _container_runtime_launcher_contract_issues()
     if not issues:
         return
@@ -1947,19 +1930,9 @@ WORDLISTS_INSTALL_DIR = os.path.join(ADSCAN_BASE_DIR, "wordlists")  # Local word
 TOOL_VENVS_BASE_DIR = os.path.join(
     ADSCAN_BASE_DIR, "tool_venvs"
 )  # Base for isolated tool venvs
-BLOODHOUND_CE_DIR = os.path.join(TOOLS_INSTALL_DIR, "bloodhound_ce")
 _BH_CE_CONFIG_LEGACY_PATH = Path(ADSCAN_BASE_DIR) / "bh_ce.json"
 _BH_MODE_LEGACY_PATH = Path(ADSCAN_BASE_DIR) / "bh_mode"
 BH_CE_CONFIG_PATH = str(Path(ADSCAN_STATE_DIR) / "bh_ce.json")
-BH_MODE_PATH = str(Path(ADSCAN_STATE_DIR) / "bh_mode")
-try:
-    from adscan_internal.bloodhound_legacy import get_legacy_bloodhound_config_path
-
-    LEGACY_BLOODHOUND_CONFIG_PATH = get_legacy_bloodhound_config_path()
-except Exception:
-    LEGACY_BLOODHOUND_CONFIG_PATH = os.path.join(ADSCAN_BASE_DIR, "bloodhound_config")
-
-
 def _ensure_state_dir_exists() -> Path:
     """Return the persisted ADscan state directory, creating it if needed (best effort)."""
     state_dir = Path(ADSCAN_STATE_DIR)
@@ -2150,8 +2123,6 @@ SYSTEM_PACKAGES_CONFIG = {
     "hashcat": "hashcat",
     "john": "john",
     "ntpsec-ntpdate": "ntpdate",
-    # Skipped in loop - handled separately by Neo4j specific install block
-    "neo4j": "neo4j",
     "xz-utils": "xz",
     "libkrb5-dev": "krb5-config",
     "krb5-user": "kinit",
@@ -2159,7 +2130,7 @@ SYSTEM_PACKAGES_CONFIG = {
     "unzip": "unzip",
     "p7zip-full": "7z",
     "hydra": "hydra",
-    "medusa": "medusa",
+    "aardwolf": "aardwolf",
     "freerdp3-x11": "xfreerdp",
     "tesseract-ocr": "tesseract",
     "antiword": "antiword",
@@ -2244,12 +2215,6 @@ EXTERNAL_TOOLS_CONFIG = {
         "check_path": "kerbrute/kerbrute",
         "check_venv_link": True,
     },
-    "responder": {
-        "url": "https://github.com/lgandx/Responder.git",
-        "type": "git",
-        "req_file": "requirements.txt",
-        "check_path": "responder/Responder.py",
-    },
     "coercer": {
         "url": "https://github.com/p0dalirius/Coercer.git",
         "type": "git",
@@ -2278,13 +2243,6 @@ EXTERNAL_TOOLS_CONFIG = {
     #     "type": "curl_nxc_module",
     #     "script_name": "rdplogin.py",
     #     "check_path": "~/.nxc/modules/rdplogin.py",  # Will be expanded at runtime
-    # },
-    # "bloodhound_gui": {
-    #     "url": "https://github.com/BloodHoundAD/BloodHound/releases/download/v4.3.3/BloodHound-linux-x64.zip",
-    #     "type": "curl_zip",
-    #     "name": "bloodhound_gui",
-    #     "check_path": "bloodhound_gui/BloodHound-linux-x64/BloodHound",
-    #     "condition": "legacy_only",  # Only install/check when bloodhound mode is legacy
     # },
 }
 
@@ -3054,57 +3012,6 @@ def _assess_version_compliance(
     return ("ok", f"{package_name} {installed_version} is installed.")
 
 
-def get_bloodhound_mode() -> str:
-    """Return 'ce', 'legacy', or 'unknown'.
-    Prefers persisted mode file, then runtime detection via Docker, then legacy GUI present.
-    Defaults to 'ce' since it's now the default installation method.
-    """
-    try:
-        if os.path.exists(BH_MODE_PATH):
-            try:
-                with open(BH_MODE_PATH, "r", encoding="utf-8") as f:
-                    val = (f.read() or "").strip().lower()
-                    if val in ("ce", "legacy"):
-                        return val
-            except (OSError, IOError, FileNotFoundError):
-                pass
-        # Runtime hint via docker
-        if shutil.which("docker"):
-            try:
-                proc = run_docker(
-                    ["docker", "ps", "--format", "{{.Names}}"],
-                    check=False,
-                    capture_output=True,
-                    timeout=10,
-                )
-                if proc and proc.returncode == 0:
-                    names = (proc.stdout or "").lower()
-                    if (
-                        "bloodhound-bloodhound" in names
-                        or "bloodhound_graph-db" in names
-                        or "specterops/bloodhound" in names
-                    ):
-                        return "ce"
-            except (subprocess.SubprocessError, OSError):
-                pass
-        # Legacy GUI hint
-        try:
-            gui_path = os.path.join(
-                TOOLS_INSTALL_DIR,
-                "bloodhound_gui",
-                "BloodHound-linux-x64",
-                "BloodHound",
-            )
-            if os.path.exists(gui_path):
-                return "legacy"
-        except OSError:
-            pass
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return "ce"  # Default to CE since it's now the standard method
-
-
-# --- Configuration for Python-based tools installed in isolated venvs ---
 PipToolsConfig = {  # pylint: disable=invalid-name
     "impacket": {
         "spec": "impacket==0.13.0",
@@ -3130,7 +3037,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         "exe_name": "certipy",
     },
     "bloodyad": {
-        "spec": "bloodyAD==2.5.1",
+        "spec": "bloodyAD==2.5.4",
         "check_target": "bloodyAD",
         "check_type": "executable",
         "exe_name": "bloodyAD",
@@ -3138,18 +3045,6 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         # dependency chains don't pull it in reliably. Install it explicitly
         # inside the bloodyad isolated venv so `bloodyAD --help` works.
         "extra_specs": ["minikerberos==0.4.9"],
-    },
-    # "bloodhound-cli": {
-    #     "spec": "bloodhound-cli",
-    #     "check_target": "bloodhound-cli",
-    #     "check_type": "executable",
-    #     "exe_name": "bloodhound-cli",
-    # },
-    "bloodhound-ce-py": {
-        "spec": "bloodhound-ce==1.9.1",  # Module name is 'bloodhound' for bloodhound-ce
-        "check_target": "bloodhound",
-        "check_type": "module",
-        "exe_name": "bloodhound-ce-python",  # Executable name for bloodhound.py
     },
     "enum-trusts": {
         "spec": "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14",
@@ -3244,6 +3139,19 @@ logger = init_logging(
 # telemetry console so high-level helpers mirror output to it.
 init_rich_output(console, VERBOSE_MODE, DEBUG_MODE, SECRET_MODE, logger=logger)
 set_telemetry_console(TELEMETRY_CONSOLE)
+
+# Tame third-party native-stack stdlib loggers (aiosmb, msldap, kerbad, ...)
+# so their output flows through the unified Rich console instead of writing
+# raw stdlib lines to stderr, and benign post-teardown noise (e.g. SMB
+# CONNECTION_ABORTED tracebacks emitted by aiosmb after a successful session)
+# is suppressed.
+try:
+    from adscan_internal.services.native_log_taming import tame_native_stack_loggers
+
+    tame_native_stack_loggers()
+except Exception:
+    # Never let logger taming prevent the main CLI from starting.
+    pass
 
 # If running inside the ADscan Docker runtime, ingest any entrypoint diagnostics
 # that were recorded before the Python process started so they are visible in
@@ -3938,7 +3846,8 @@ def should_show_victory_hint(victory_type: str, tier: str = "subtle") -> bool:
         return True  # Never shown before
 
     # Check cooldown period
-    cooldown_days = 7 if tier == "subtle" else 30
+    # scan_complete_report fires at peak goodwill (attack paths found) — shorter cooldown
+    cooldown_days = 1 if victory_type == "scan_complete_report" else (7 if tier == "subtle" else 30)
     try:
         last_shown_dt = datetime.fromisoformat(last_shown)
         now = datetime.now()
@@ -4203,24 +4112,24 @@ def _maybe_show_report_cta(shell) -> None:
     if workspace_type != "audit":
         return
     shell.console.print()
-    _reports_url = mark_passthrough("https://adscanpro.com/reports")
+    _pro_url = mark_passthrough("https://adscanpro.com/pro")
     if "domain_compromise" in victories:
         print_info(
-            f"[dim]You have a Domain Admin finding — document it before the engagement closes. "
-            f"PRO generates a Word/PDF in minutes: exec summary, attack chains, "
-            f"MITRE mapping, remediation roadmap → {_reports_url}[/dim]"
+            f"Domain Admin achieved — document it before the engagement closes. "
+            f"PRO generates a client-ready PDF in 90 seconds: exec summary, attack chains, "
+            f"MITRE mapping, remediation roadmap → {_pro_url}"
         )
     elif attack_paths > 0:
         print_info(
-            f"[dim]You found {attack_paths} attack path(s) — turn them into a client deliverable "
-            f"before session data is gone. PRO generates exec summary + remediation roadmap "
-            f"→ {_reports_url}[/dim]"
+            f"[bold]{attack_paths} attack path(s) found[/bold] — turn them into a client deliverable "
+            f"before session data is gone. PRO: exec summary + remediation roadmap in 90 seconds "
+            f"→ {_pro_url}"
         )
     else:
         print_info(
-            f"[dim]You collected credentials this session — document the evidence. "
-            f"PRO generates a Word/PDF report with findings and remediation steps "
-            f"→ {_reports_url}[/dim]"
+            f"Credentials collected this session — document the evidence. "
+            f"PRO generates a PDF report with findings and remediation steps "
+            f"→ {_pro_url}"
         )
 
 
@@ -8493,166 +8402,6 @@ def _verify_system_packages(packages_config, mode="check"):
         return results
 
 
-def stop_neo4j_if_running():
-    """Stops Neo4j service if active to avoid port 7687 conflicts with BloodHound CE."""
-    try:
-        # systemctl path might not exist in containers; handle gracefully
-        rc = subprocess.run(
-            ["systemctl", "is-active", "--quiet", "neo4j"],
-            capture_output=True,
-            check=False,
-        ).returncode
-        if rc == 0:
-            print_warning(
-                "Neo4j service is active; stopping it to avoid port conflicts with BloodHound CE (bolt 7687)..."
-            )
-            subprocess.run(["systemctl", "stop", "neo4j"], check=False)
-            print_success("Neo4j service stopped.")
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_warning(f"Could not verify/stop Neo4j service: {e}")
-
-
-def _install_bloodhound_ce(
-    desired_admin_password: str = "Adscan4thewin!", suppress_browser: bool = False
-) -> bool:
-    """Install BloodHound Community Edition using docker compose helpers.
-
-    This wraps the high-level helpers in ``adscan_internal.bloodhound_ce_compose``
-    and ``adscan_internal.bloodhound_ce_password`` so that ``adscan.py`` only
-    orchestrates the CLI flow instead of implementing the full install logic.
-    """
-    from adscan_internal.rich_output import mark_sensitive, print_panel
-
-    # Ensure Docker is available and the daemon is reachable before attempting
-    # any BloodHound CE operations.
-    if not docker_available() or not _ensure_docker_daemon_running():
-        print_error(
-            "Cannot start BloodHound CE stack because the Docker daemon is not running "
-            "or not accessible."
-        )
-        print_info(
-            "Please start Docker (for example, with 'sudo systemctl start docker') "
-            "and rerun 'adscan install --only bloodhound'."
-        )
-        return False
-
-    # 1) Ensure the docker-compose.yml is present and pinned to our version.
-    compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
-    if not compose_path:
-        # Helper already printed rich guidance and telemetry.
-        return False
-
-    # 2) Pull required images (idempotent).
-    if not compose_pull(compose_path, stream_output=True):
-        # Helper already printed errors and suggestions.
-        return False
-
-    # 3) Bring the stack up (includes port/Neo4j preflight in helpers).
-    if not compose_up(compose_path):
-        return False
-
-    # 4) Ensure admin password is set to the desired value (best effort).
-    automation_success = ensure_bloodhound_admin_password(
-        desired_password=desired_admin_password,
-        suppress_browser=suppress_browser,
-    )
-
-    final_password_display = desired_admin_password or "UNKNOWN"
-    raw_login_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}/ui/login"
-    login_url = mark_passthrough(raw_login_url)
-    INSTALL_SUMMARY["bloodhound_ce"] = {
-        "automation_success": automation_success,
-        "final_password": final_password_display,
-        "login_url": login_url,
-    }
-
-    masked_password = mark_sensitive(final_password_display, "password")
-    panel_intro = (
-        "BloodHound CE admin password configured automatically."
-        if automation_success
-        else "BloodHound CE admin password ready for use."
-    )
-
-    url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}/ui/login"
-    url = mark_passthrough(url)
-
-    print_panel(
-        f"{panel_intro}\n"
-        f"Access the UI at: {url}\n"
-        "Login: admin\n"
-        f"Password: {masked_password}",
-        title="BloodHound CE",
-        border_style="green",
-        fit=True,
-    )
-
-    # 5) Best-effort: ensure bloodhound-cli is installed and generate an auth
-    #    token so subsequent CLI operations are ready to use.
-    print_info(
-        "Ensuring bloodhound-cli is available for other BloodHound operations..."
-    )
-    try:
-        bh_cli = get_bloodhound_cli_executable_path()
-        if not bh_cli:
-            print_warning(
-                "bloodhound-cli not available; skipping initial authentication token generation."
-            )
-        else:
-            auth_cmd = [bh_cli, "auth", "--password", final_password_display]
-            auth_result = run_command(
-                auth_cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            if (
-                auth_result
-                and auth_result.returncode == 0
-                and auth_result.stdout
-                and "Authentication successful. Token saved to configuration."
-                in auth_result.stdout
-            ):
-                print_success(
-                    "Authentication token generated successfully for bloodhound-cli."
-                )
-            else:
-                error_msg = (
-                    auth_result.stderr
-                    if auth_result and auth_result.stderr
-                    else auth_result.stdout
-                    if auth_result and auth_result.stdout
-                    else "Unknown error"
-                )
-                print_warning(f"Failed to generate authentication token: {error_msg}")
-                print_info(
-                    "You may need to run 'bloodhound-cli auth --password <your_password>' manually later."
-                )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_warning(f"Error generating authentication token: {exc}")
-        print_info(
-            "You may need to run 'bloodhound-cli auth --password <your_password>' manually later."
-        )
-
-    # Indicate install completed (even if some optional steps failed).
-    return True
-
-
-def _parse_bh_admin_password_arg(value: str) -> str:
-    """argparse type validator for BloodHound CE admin password."""
-    candidate = str(value or "")
-    is_valid, error_message = validate_bloodhound_admin_password_policy(candidate)
-    if not is_valid:
-        raise argparse.ArgumentTypeError(
-            error_message
-            or "Invalid BloodHound CE admin password (minimum length is 12)."
-        )
-    return candidate
-
-
 def _print_install_summary():
     """Render a professional installation summary panel at the end of installation."""
     from rich.console import Group
@@ -8669,35 +8418,6 @@ def _print_install_summary():
     console = _get_console()
     telemetry_console = _get_telemetry_console()
     renderables = []
-
-    # ── BloodHound CE section ──
-    bh_info = INSTALL_SUMMARY.get("bloodhound_ce")
-    raw_login_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}/ui/login"
-    login_url = mark_passthrough(raw_login_url)
-
-    bh_header = Text("BloodHound CE", style=f"bold {BRAND_COLORS['info']}")
-    renderables.append(bh_header)
-
-    if bh_info:
-        if bh_info.get("automation_success"):
-            status = Text("  Ready ", style="bold white on green")
-        else:
-            status = Text("  Manual setup needed ", style="bold white on yellow")
-        renderables.append(status)
-        renderables.append(Text(""))
-
-        bh_table = Table.grid(padding=(0, 1))
-        bh_table.add_column(justify="right", style="dim", no_wrap=True, min_width=12)
-        bh_table.add_column(justify="left")
-        bh_table.add_row("URL", f"{bh_info.get('login_url', login_url)}")
-        bh_table.add_row("Username", "admin")
-        bh_table.add_row(
-            "Password",
-            f"{bh_info.get('final_password', 'UNKNOWN')}",
-        )
-        renderables.append(bh_table)
-    else:
-        renderables.append(Text("  Not installed during this run", style="dim"))
 
     # ── htb-cli section ──
     htb_cli_info = INSTALL_SUMMARY.get("htb_cli")
@@ -8779,203 +8499,6 @@ def _print_install_summary():
         telemetry_console.print()
 
 
-def _check_bloodhound_ce_running() -> bool:
-    """Check if BloodHound CE containers are running using Docker.
-
-    This is a wrapper around the modularized check_bloodhound_ce_running function
-    from adscan_internal.bloodhound_ce_compose that passes the necessary dependencies.
-    """
-    stack_mode = str(os.getenv("ADSCAN_BLOODHOUND_STACK_MODE", "")).strip().lower()
-    if stack_mode and stack_mode != "managed":
-        print_warning(
-            "Only managed BloodHound stack mode is supported. "
-            "Continuing with managed checks."
-        )
-        print_info_debug(
-            f"[bloodhound-ce] unsupported stack mode requested in environment: {stack_mode}"
-        )
-
-    from adscan_internal.bloodhound_ce_compose import check_bloodhound_ce_running
-
-    return check_bloodhound_ce_running(
-        is_full_adscan_container_runtime_func=_is_full_adscan_container_runtime,
-        host_helper_client_request_func=None,  # Will be imported inside if needed
-        run_docker_command_func=_run_docker_command,
-    )
-
-
-def _preflight_bloodhound_port_8080(action_context: str) -> bool:
-    """Ensure port 8080 is available (or user-approved to stop the occupant).
-
-    Args:
-        action_context: Human context string (e.g., "installation", "check").
-
-    Returns:
-        True if we can proceed, False if we should abort.
-    """
-    # If BloodHound CE already appears running, we shouldn't try to start it again.
-    if _check_bloodhound_ce_running():
-        print_info_verbose(
-            "BloodHound CE containers already appear to be running; skipping startup."
-        )
-        return True
-
-    # This legacy helper is retained only for backward-compatibility in older
-    # code paths. New BloodHound CE flows should rely on the helpers in
-    # ``adscan_internal.bloodhound_ce_compose`` which implement a more robust
-    # and well-tested port/Neo4j preflight.
-    # For now, just check if BloodHound CE is running (port will be handled by compose helpers)
-    return _check_bloodhound_ce_running()
-
-
-def _start_bloodhound_ce():
-    """Start BloodHound CE containers.
-
-    Ensures the pinned BloodHound CE stack is started, using the shared compose
-    helpers for host runtime and the host helper when running inside the FULL
-    ADscan Docker image.
-
-    Returns:
-        bool: True if containers started successfully, False otherwise
-    """
-    stack_mode = str(os.getenv("ADSCAN_BLOODHOUND_STACK_MODE", "")).strip().lower()
-    if stack_mode and stack_mode != "managed":
-        print_warning(
-            "Only managed BloodHound stack mode is supported. "
-            "Continuing with managed startup."
-        )
-        print_info_debug(
-            f"[bloodhound-ce] unsupported stack mode requested in environment: {stack_mode}"
-        )
-
-    try:
-        # Container runtime: delegate BloodHound CE startup to the host helper.
-        if _is_full_adscan_container_runtime():
-            sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
-            compose_path = os.getenv("ADSCAN_HOST_BLOODHOUND_COMPOSE", "").strip()
-            if not sock_path or not compose_path:
-                print_error(
-                    "Cannot start BloodHound CE from container runtime: missing host helper context."
-                )
-                return False
-            try:
-                from adscan_internal.host_privileged_helper import (
-                    HostHelperError,
-                    host_helper_client_request,
-                )
-
-                resp = host_helper_client_request(
-                    sock_path,
-                    op="bloodhound_ce_compose_up",
-                    payload={"compose_path": compose_path},
-                )
-                if not resp.ok:
-                    print_error("Failed to start BloodHound CE containers on the host.")
-                    if resp.stderr:
-                        print_info_debug(f"[DEBUG] host-helper stderr:\n{resp.stderr}")
-                    if resp.stdout:
-                        print_info_debug(f"[DEBUG] host-helper stdout:\n{resp.stdout}")
-                    return False
-                # Verify running state (best effort).
-                return _check_bloodhound_ce_running()
-            except (HostHelperError, OSError) as exc:
-                telemetry.capture_exception(exc)
-                print_error("Failed to start BloodHound CE via host helper.")
-                marked_sock = mark_sensitive(sock_path, "path")
-                marked_compose = mark_sensitive(compose_path, "path")
-                print_info_debug(
-                    "[bloodhound-ce] host-helper startup failure context: "
-                    f"socket={marked_sock} socket_exists={Path(sock_path).exists()} "
-                    f"compose_path={marked_compose}"
-                )
-                print_instruction(
-                    "Inspect host-helper logs at ~/.adscan/logs/host-helper.log "
-                    "and retry `adscan start`."
-                )
-                print_exception(show_locals=False, exception=exc)
-                return False
-
-        # Host runtime: rely on the shared BloodHound CE compose helpers so that
-        # both Docker-mode and host-mode use the same stack management logic.
-        if not docker_available() or not _ensure_docker_daemon_running():
-            print_error(
-                "Cannot start BloodHound CE containers because the Docker daemon is not running "
-                "or not accessible."
-            )
-            return False
-
-        compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
-        if not compose_path:
-            return False
-
-        # Detect configuration changes since the last recorded startup.
-        # This covers both users upgrading from a previous ADscan version (no hash
-        # file yet → treated as changed) and updates to the managed compose template
-        # (e.g. new env vars).  Data volumes are always preserved during recreation.
-        if compose_config_changed(compose_path):
-            print_info(
-                "BloodHound CE configuration has been updated — "
-                "recreating containers to apply the new settings..."
-            )
-            print_info_verbose(
-                "Your data (Neo4j graph, Postgres) is stored in Docker volumes "
-                "and will not be affected."
-            )
-            if not compose_recreate(compose_path):
-                return False
-            return True
-
-        # No configuration change — start normally (no-op if already running).
-        if _check_bloodhound_ce_running():
-            print_info_verbose("BloodHound CE containers already appear to be running")
-            return True
-
-        print_info("Starting BloodHound CE containers...")
-        if not compose_up(compose_path):
-            return False
-
-        print_success("BloodHound CE containers started successfully.")
-        return True
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_error("Error starting BloodHound CE.")
-        print_exception(show_locals=False, exception=exc)
-        return False
-
-
-def launch_bloodhound_ce_suite(zip_path):  # pylint: disable=unused-argument
-    """Launch BloodHound CE suite - check containers and start if needed.
-
-    Args:
-        zip_path: Path to BloodHound ZIP file (kept for API compatibility)
-    """
-    try:
-        print_info("Launching BloodHound CE suite...")
-
-        # Check if BloodHound CE is already running
-        if _check_bloodhound_ce_running():
-            print_info_verbose("BloodHound CE is already running")
-        else:
-            # Start BloodHound CE containers
-            if not _start_bloodhound_ce():
-                print_error(
-                    "Failed to start BloodHound CE. Please check the installation."
-                )
-                return False
-
-        print_info("BloodHound CE is ready!")
-        raw_login_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}/ui/login"
-        login_url = mark_passthrough(raw_login_url)
-        print_instruction(f"Access the UI at: {login_url}")
-        return True
-
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("Error launching BloodHound CE suite.")
-        print_exception(show_locals=False, exception=e)
-        return False
-
-
 # --- Installation Logic ---
 def handle_install(install_args=None):
     """Handles the installation process for ADscan.
@@ -8993,7 +8516,6 @@ def handle_install(install_args=None):
             wordlists_install_dir=WORDLISTS_INSTALL_DIR,
             tool_venvs_base_dir=TOOL_VENVS_BASE_DIR,
             venv_path=VENV_PATH,
-            bh_mode_path=BH_MODE_PATH,
             system_packages_config=SYSTEM_PACKAGES_CONFIG,
             core_requirements=CORE_REQUIREMENTS,
             pip_tools_config=PipToolsConfig,
@@ -9007,8 +8529,7 @@ def handle_install(install_args=None):
             is_docker_env=is_docker_env,
             is_docker_official_installed=_is_docker_official_installed,
             is_docker_compose_plugin_available=_is_docker_compose_plugin_available,
-            get_bloodhound_mode=get_bloodhound_mode,
-            install_docker_prerequisites=_install_docker_prerequisites,
+                install_docker_prerequisites=_install_docker_prerequisites,
             install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
             setup_external_tool=_setup_external_tool,
             preflight_install_dns=preflight_install_dns,
@@ -9231,20 +8752,6 @@ class PentestShell:
     isolated as much as possible.
     """
 
-    def _get_bloodhound_cli_path(self) -> str | None:
-        """Return the preferred bloodhound-cli path for this run.
-
-        This avoids conflicts with globally installed bloodhound-cli binaries by
-        preferring the isolated tool venv. Falls back to a bundled CE CLI, and
-        finally PATH as a last resort.
-        """
-        cli_path = get_bloodhound_cli_executable_path()
-        if cli_path:
-            return cli_path
-
-        print_warning("bloodhound-cli not found; BloodHound features may not work.")
-        return None
-
     def _is_ctf_domain_pwned(self, domain: str) -> bool:
         """Return True when we should treat the domain flow as completed in CTF mode.
 
@@ -9347,17 +8854,31 @@ class PentestShell:
         """Execute queued post-compromise actions for a CTF pwned domain.
 
         Allowed actions are intentionally minimal to keep the CTF workflow clean.
+
+        Note: this intentionally re-runs every time it's invoked. The compromise
+        panel is shown once (gated by ``_ctf_compromise_panel_shown``), but the
+        flag-collection prompt is always offered again — newly extracted
+        credentials may unlock paths that were not probable on the first run,
+        and the operator may want to retry even after a clean miss or a
+        previous capture they did not save.
         """
         if self.type != "ctf":
             return
-        if domain in self._ctf_post_compromise_executed:
+
+        # Idempotency guard — this function may be called from multiple
+        # code paths (inline from attack-step completion AND from post-Phase
+        # flow).  Only the first call per domain does the work.
+        if domain in self._ctf_post_compromise_dispatched:
+            print_info_debug(
+                f"[ctf-post-compromise] already dispatched for {domain}; skipping"
+            )
             return
+        self._ctf_post_compromise_dispatched.add(domain)
 
         actions = self._ctf_post_compromise_actions.get(domain) or set()
         ctx = self._ctf_post_compromise_context.get(domain)
         if not actions or not ctx:
             # Nothing queued (or no credentials stored) -> nothing to do.
-            self._ctf_post_compromise_executed.add(domain)
             return
 
         username = ctx.get("username", "")
@@ -9379,13 +8900,80 @@ class PentestShell:
                 )
                 self._ctf_compromise_panel_shown.add(domain)
 
-        # Deterministic order for UX.
+        # Deterministic order for UX. Always offered — operator may want to
+        # retry with newly extracted credentials, or re-capture flags they
+        # didn't save the first time.
+        #
+        # Credential selection: prefer the highest-tier admin credential
+        # currently known for this domain. The queued (username, password)
+        # context that triggered the post-compromise flow may belong to a
+        # low-priv kerberoastable account (e.g. svc_tgs on HTB Active);
+        # using it for SMB \C$\ byte-reads silently fails because the
+        # account is not a local admin on the DC. The picker filters
+        # disabled accounts and routes the right secret_kind so hash /
+        # password / AES key all work natively.
         if "flags" in actions:
-            self.ask_for_flags(domain, username, password)
+            picked_user, picked_secret, picked_kind = username, password, None
+            try:
+                from adscan_internal.services.credentials import (
+                    pick_credential_for_local_admin,
+                )
+
+                pdc_host = (
+                    self.domains_data.get(domain, {}).get("pdc_hostname")
+                    or self.domains_data.get(domain, {}).get("pdc")
+                )
+                best = pick_credential_for_local_admin(
+                    self, domain=domain, target_host=pdc_host
+                )
+                if best is not None:
+                    picked_user, picked_secret, kind_enum = best
+                    picked_kind = kind_enum.value
+                    # If the picked credential is an NT hash and no TGT exists
+                    # yet (DCSync just added it; TGT generation runs later in
+                    # handle_auth_and_optional_privs), obtain it now so the flag
+                    # collector can use Kerberos PTH instead of NTLM — required
+                    # when NTLM is disabled on the DC.
+                    from adscan_internal.services.credentials import CredentialKind
+                    if kind_enum is CredentialKind.NT_HASH:
+                        try:
+                            _existing_ticket = (
+                                self.domains_data.get(domain, {})
+                                .get("kerberos_tickets", {})
+                                .get(picked_user)
+                            )
+                            if not _existing_ticket:
+                                _pdc_ip = (
+                                    self.domains_data.get(domain, {}).get("pdc") or ""
+                                )
+                                if _pdc_ip:
+                                    self._auto_generate_kerberos_ticket_result(
+                                        picked_user,
+                                        picked_secret,
+                                        domain,
+                                        _pdc_ip,
+                                    )
+                        except Exception as _tgt_exc:  # noqa: BLE001
+                            telemetry.capture_exception(_tgt_exc)
+                            print_info_debug(
+                                f"[ctf-flags] TGT pre-fetch for "
+                                f"{mark_sensitive(picked_user, 'user')} failed "
+                                f"({type(_tgt_exc).__name__}); flag collector will "
+                                "use NTLM PTH fallback"
+                            )
+                else:
+                    print_info_verbose(
+                        f"[ctf-flags] no domain-admin credential available for "
+                        f"{domain}; falling back to queued credential "
+                        f"(may not have C$ access)"
+                    )
+            except Exception as _exc:  # noqa: BLE001
+                telemetry.capture_exception(_exc)
+            self.ask_for_flags(
+                domain, picked_user, picked_secret, secret_kind=picked_kind
+            )
         if "dcsync" in actions:
             self.ask_for_dcsync(domain, username, password)
-
-        self._ctf_post_compromise_executed.add(domain)
 
     def _get_domain_post_da_state(self, domain: str) -> dict[str, object]:
         """Return the mutable post-DA state bucket for a domain."""
@@ -9399,16 +8987,16 @@ class PentestShell:
 
         return collect_attack_path_snapshot_counts(self, domain)
 
-    def _run_audit_post_da_bloodhound_refresh(
+    def _run_audit_post_da_graph_refresh(
         self,
         domain: str,
         username: str,
         password: str,
     ) -> None:
-        """Refresh BH and rerun path analysis after DA in audit mode."""
-        from adscan_internal.cli.post_da import run_audit_post_da_bloodhound_refresh
+        """Refresh the relationship graph and rerun path analysis after DA in audit mode."""
+        from adscan_internal.cli.post_da import run_audit_post_da_graph_refresh
 
-        run_audit_post_da_bloodhound_refresh(
+        run_audit_post_da_graph_refresh(
             self,
             domain=domain,
             username=username,
@@ -9867,6 +9455,9 @@ class PentestShell:
         def _executor(command: str, timeout: int) -> subprocess.CompletedProcess[str]:
             result = self.run_command(command, timeout=timeout)
             if result is None:
+                last_error = getattr(self, "_last_run_command_error", None)
+                if last_error and last_error[0] == "timeout":  # pylint: disable=unsubscriptable-object
+                    raise subprocess.TimeoutExpired(command, timeout)
                 raise RuntimeError("Command runner returned no result")
             return result
 
@@ -10408,10 +9999,6 @@ class PentestShell:
     current_domain_dir = None
     domain_path = None
     domains_data = CaseInsensitiveDict()  # Initialize as CaseInsensitiveDict
-    neo4j_host = "localhost"
-    neo4j_port = "7687"
-    neo4j_db_user = "neo4j"
-    neo4j_db_password = "neo4j"
     report_file = "technical_report.json"
     report = {}
     technical_report_file = "technical_report.json"
@@ -10419,69 +10006,44 @@ class PentestShell:
     scan_mode = None  # 'auth' | 'unauth' | None
     domain_validated_cred_counts = {}
     scan_start_time = None  # unix timestamp when a scan starts
+    environment_change_ledger = (
+        None  # EnvironmentChangeLedger instance for current workspace
+    )
+    _host_intel_cache = None  # services.host_intelligence.HostIntelligenceCache (workspace-scoped, lazy)
+    _host_intel_panels_shown: set = None  # session-tracked IPs we already announced
 
-    def run_neo4j(self, args: str, timeout=None):
-        """Run a neo4j CLI command with JAVA_HOME set to JDK11.
-
-        Wrapper method that delegates to the legacy Neo4j helper module.
-
-        Args:
-            args: Neo4j command arguments (e.g., "status", "start", "stop")
-            timeout: Command timeout in seconds
-
-        Returns:
-            subprocess.CompletedProcess or None
-        """
-        from adscan_internal.bloodhound_legacy import run_neo4j_command
-
-        return run_neo4j_command(args, timeout=timeout if timeout else 30)
-
-    def ensure_neo4j_running(
-        self, max_attempts: int = 5, poll_interval: int = 2
-    ) -> bool:
-        """Ensure Neo4j service is running; try to start it if not.
-
-        Wrapper method that calls the global ensure_neo4j_running function.
-
-        Args:
-            max_attempts: Maximum number of status check attempts after starting
-            poll_interval: Seconds to wait between status checks
-
-        Returns:
-            bool: True if Neo4j is running, False otherwise
-        """
-        return ensure_neo4j_running(
-            max_attempts=max_attempts, poll_interval=poll_interval
-        )
-
-    def ensure_neo4j_not_running(
-        self, max_attempts: int = 5, poll_interval: int = 2
-    ) -> bool:
-        """Ensure Neo4j service is NOT running; try to stop it if it is.
-
-        Wrapper method that calls the global ensure_neo4j_not_running function.
-
-        Args:
-            max_attempts: Maximum number of status check attempts after stopping
-            poll_interval: Seconds to wait between status checks
-
-        Returns:
-            bool: True if Neo4j is stopped, False otherwise
-        """
-        return ensure_neo4j_not_running(
-            max_attempts=max_attempts, poll_interval=poll_interval
-        )
-
-    def _is_bloodhound_running(self):
-        """Check if BloodHound GUI process is running via psutil."""
+    @property
+    def host_intel_cache(self):
+        """Workspace-scoped HostIntelligenceCache, lazily created."""
+        from adscan_internal.services.host_intelligence import HostIntelligenceCache
+        ws = getattr(self, 'current_workspace_dir', None)
+        if not ws:
+            return None
+        if self._host_intel_cache is None or getattr(self._host_intel_cache, '_ws_root', None) != ws:
+            cache = HostIntelligenceCache(ws)
+            cache._ws_root = ws  # type: ignore[attr-defined]
+            self._host_intel_cache = cache
+        # Bind the active domain so the cache emits the per-domain
+        # Defensive Posture inventory file alongside ``host_intel.json``.
         try:
-            for proc in psutil.process_iter(attrs=["cmdline"]):
-                cmdline = proc.info.get("cmdline") or []
-                if cmdline and self.bloodhound_gui_path in cmdline[0]:
-                    return True
-        except psutil.Error:
+            self._host_intel_cache.bind_domain(getattr(self, 'current_domain', None))
+        except Exception:
             pass
-        return False
+        return self._host_intel_cache
+
+    @property
+    def edr_intel(self):
+        """Workspace-scoped EdrIntelligence, lazily created."""
+        from adscan_internal.workspaces.edr_intelligence import EdrIntelligence
+        ws = getattr(self, 'current_workspace_dir', None)
+        if not ws:
+            return None
+        existing = getattr(self, '_edr_intel_obj', None)
+        if existing is None or getattr(existing, '_ws_root', None) != ws:
+            obj = EdrIntelligence(ws)
+            obj._ws_root = ws  # type: ignore[attr-defined]
+            self._edr_intel_obj = obj
+        return self._edr_intel_obj
 
     def _generate_user_permutations_interactive(self, domain):
         """Interactively build a username wordlist based on provided names."""
@@ -10597,6 +10159,15 @@ class PentestShell:
         self.preflight_check_fix_attempted: bool = False
         self.preflight_check_overridden: bool = False
         self.show_intro()
+        # First-run discovery hint — non-blocking, idempotent. Renders
+        # once when no workspaces exist and the first-scan flag is unset.
+        try:
+            from adscan_internal.cli.first_run_panel import (
+                maybe_show_first_run_panel,
+            )
+            maybe_show_first_run_panel()
+        except Exception:  # noqa: BLE001 — discovery hint must not break startup
+            pass
         self.ensure_workspaces_dir()
         # self.workspace_select() # This might be called before shell.run() in handle_start
         self.background_tasks = []  # List to keep track of active threads
@@ -10606,6 +10177,12 @@ class PentestShell:
         self.session_manager = SessionManager()
         self.current_session: Optional[RemoteSession] = None
 
+        # Cache of CredentialContext per (auth_domain, username) so each step
+        # in an exploit chain reuses the same instance (and its in-place
+        # ccache_path / issued_at_epoch updates).  See
+        # ``adscan_internal/cli/exploits.py:_build_executor_credential_context``.
+        self._credential_contexts: dict[tuple[str, str], object] = {}
+
         self.command_runner = command_runner or default_runner
         self.commands = {}
         self._register_commands()
@@ -10613,7 +10190,6 @@ class PentestShell:
         # Initialize paths for external tools
         # These paths are resolved once when the shell starts.
         self.netexec_path = get_tool_executable_path("netexec")
-        self.bloodhound_ce_py_path = get_tool_executable_path("bloodhound-ce-py")
         self.certipy_path = get_tool_executable_path("certipy")
         self.bloodyad_path = get_tool_executable_path(
             "bloodyad"
@@ -10621,16 +10197,20 @@ class PentestShell:
         self.enum_trusts_path = get_tool_executable_path("enum-trusts")
         self.manspider_path = get_tool_executable_path("manspider")
         self.credsweeper_path = get_tool_executable_path("credsweeper")
+        if not self.credsweeper_path:
+            try:
+                from adscan_internal.services.credsweeper_service import (
+                    CredSweeperService,
+                )
+
+                if CredSweeperService.is_library_available():
+                    self.credsweeper_path = "__credsweeper_library__"
+            except Exception:  # noqa: BLE001
+                self.credsweeper_path = None
         self.pypykatz_path = get_tool_executable_path("pypykatz")
         self.lsassy_path = get_tool_executable_path("lsassy")
         self.kerbrute_path = get_external_tool_executable("kerbrute")
-        self.medusa_path = shutil.which("medusa")
-        self.bloodhound_gui_path = os.path.join(
-            TOOLS_INSTALL_DIR,
-            "bloodhound_gui",
-            "BloodHound-linux-x64",
-            "BloodHound",
-        )
+        self.medusa_path = None  # replaced by aardwolf native RDP stack
 
         # For Impacket scripts, store the venv bin directory path
         impacket_venv_bin_dir = os.path.join(
@@ -10647,7 +10227,6 @@ class PentestShell:
         self.firepwd_python = get_external_tool_python("firepwd")
         self.lsa_reaper_python = get_external_tool_python("LSA-Reaper")
         self.pkinittools_python = get_external_tool_python("PKINITtools")
-        self.responder_python = get_external_tool_python("responder")
         self.coercer_python = get_external_tool_python("coercer")
 
         # Add more tool paths here as needed, for example:
@@ -10682,8 +10261,12 @@ class PentestShell:
         self._enumeration_context_depth: int = 0
         self._ctf_post_compromise_actions: dict[str, set[str]] = {}
         self._ctf_post_compromise_context: dict[str, dict[str, str]] = {}
-        self._ctf_post_compromise_executed: set[str] = set()
         self._ctf_compromise_panel_shown: set[str] = set()
+        # Idempotency guard: domains whose CTF post-compromise actions have
+        # already been dispatched (flags captured, dcsync done). Prevents
+        # double-execution when _flush_ctf_post_compromise_queue is called
+        # from multiple places (inline from attack step + post-Phase flow).
+        self._ctf_post_compromise_dispatched: set[str] = set()
 
         # Session tracking for telemetry (Hormozi Give:Ask ratio monitoring)
         self._session_start_time = None  # Will be set when session_start is captured
@@ -10709,7 +10292,7 @@ class PentestShell:
         self._scan_compromise_time: Optional[float] = None  # For scan-level TTC
 
         # Service layer instances (lazy-loaded)
-        self._bloodhound_service: Optional[Any] = None
+        self._graph_service: Optional[Any] = None
         self._domain_service: Optional[Any] = None
         self._credential_service: Optional[Any] = None
         self._enumeration_service: Optional[Any] = None
@@ -10738,72 +10321,19 @@ class PentestShell:
             return LicenseMode.LITE
         return LicenseMode.PRO
 
-    def _get_bloodhound_service(self) -> "BloodHoundService":
-        """Get or create a cached BloodHoundService instance.
-
-        The service integrates the internal bloodhound-cli modules directly (no subprocess),
-        and it is used for fast user enumeration queries.
+    def _get_graph_service(self) -> object:
+        """Get or create the local attack-graph query service.
 
         Returns:
-            BloodHoundService: Initialized service instance.
-
-        Raises:
-            Exception: If the service cannot be created due to missing/invalid config.
+            object: Initialized LocalGraphService instance.
         """
-        from adscan_internal.services import BloodHoundService
+        from adscan_internal.services import LocalGraphService
 
-        edition = (get_bloodhound_mode() or "ce").lower()
-        debug = bool(getattr(self, "debug", False))
-        verbose = bool(getattr(self, "verbose", False))
-        license_mode = self._get_license_mode_enum()
-
-        existing = self._bloodhound_service
-        if existing is not None and getattr(existing, "edition", "").lower() == edition:
+        existing = self._graph_service
+        if existing is not None and getattr(existing, "edition", "") == "native":
             return existing
-
-        if edition == "legacy":
-            host = str(getattr(self, "neo4j_host", "localhost") or "localhost")
-            port = str(getattr(self, "neo4j_port", "7687") or "7687")
-            uri = (
-                host
-                if host.startswith(("bolt://", "neo4j://"))
-                else f"bolt://{host}:{port}"
-            )
-            service = BloodHoundService(
-                edition="legacy",
-                uri=uri,
-                neo4j_user=str(getattr(self, "neo4j_db_user", "neo4j") or "neo4j"),
-                neo4j_password=str(getattr(self, "neo4j_db_password", "") or ""),
-                license_mode=license_mode,
-                debug=debug,
-                verbose=verbose,
-            )
-        else:
-            service = BloodHoundService(
-                edition="ce",
-                license_mode=license_mode,
-                debug=debug,
-                verbose=verbose,
-            )
-
-        self._bloodhound_service = service
-
-        # Activate OpenGraph sync as soon as the BH service is available so
-        # any custom edge created afterwards (via upsert_edge) is automatically
-        # uploaded — regardless of which command triggered it (bh sync, spraying,
-        # LDAP enum, kerberoasting, etc.).
-        try:
-            from adscan_internal.services import bh_opengraph_sync
-
-            bh_opengraph_sync.setup(lambda: self._get_bloodhound_service())
-            # Sync mode is on by default (uploads block the calling thread so
-            # logs appear inline). Set ADSCAN_BH_OPENGRAPH_ASYNC=true to switch
-            # to background worker mode.
-            if os.getenv("ADSCAN_BH_OPENGRAPH_ASYNC", "").lower() in ("1", "true"):
-                bh_opengraph_sync.set_sync_mode(False)
-        except Exception:  # noqa: BLE001
-            pass
-
+        service = LocalGraphService(self)
+        self._graph_service = service
         return service
 
     def _get_dns_resolver_service(self) -> "DNSResolverService":
@@ -10896,6 +10426,7 @@ class PentestShell:
             add_credential_callback=self.add_credential,
             cpassword_callback=self._process_cpassword_text,
             keepass_artifact_callback=self._process_keepass_artifact,
+            office_artifact_callback=self._process_office_artifact,
             handle_found_credentials_callback=self.handle_found_credentials,
             credsweeper_path=getattr(self, "credsweeper_path", None),
             pypykatz_path=self.pypykatz_path,
@@ -11091,22 +10622,6 @@ class PentestShell:
                 print_error(
                     f"Error loading technical report cache: {self.technical_report_file}"
                 )
-        # Only load legacy Neo4j configuration when operating in legacy mode.
-        if get_bloodhound_mode() == "legacy":
-            legacy_cfg: LegacyNeo4jConfig | None = load_legacy_neo4j_config(
-                LEGACY_BLOODHOUND_CONFIG_PATH
-            )
-            if legacy_cfg:
-                self.neo4j_host = legacy_cfg.get("host", self.neo4j_host)
-                self.neo4j_port = legacy_cfg.get("port", self.neo4j_port)
-                self.neo4j_db_user = legacy_cfg.get("db_user", self.neo4j_db_user)
-                self.neo4j_db_password = legacy_cfg.get(
-                    "db_password", self.neo4j_db_password
-                )
-                print_success_verbose(
-                    f"Neo4j configuration updated: {self.neo4j_host}:{self.neo4j_port} (user: {self.neo4j_db_user})"
-                )
-
         self.type = None  # Initialize pentest type (ctf or audit)
         self.lab_provider = (
             None  # Lab provider for CTF workspaces (HTB, TryHackMe, etc.)
@@ -11909,7 +11424,7 @@ class PentestShell:
                 self.workspace_save()
             except Exception as e:
                 telemetry.capture_exception(e)
-                print_error("Error during auto-save: {str(e)}")
+                print_error(f"Error during auto-save: {str(e)}")
 
     # =========================================================================
     # Remote sessions (reverse shells, etc.)
@@ -13473,10 +12988,6 @@ class PentestShell:
             "password",
             "hash",
             "base_dn",
-            "neo4j_host",
-            "neo4j_port",
-            "neo4j_db_user",
-            "neo4j_db_password",
         ]
         # For 'auto', we might want to suggest True/False later if we enhance NestedCompleter capabilities
         # or use a custom completer for 'set auto'. For now, just the variable name.
@@ -13839,9 +13350,16 @@ class PentestShell:
                 marked_user_input = mark_sensitive(user_input.strip(), "text")
                 print_info_debug(f"[cli] Execute command: {marked_user_input}")
                 log_cli_command_context(self, command_name, args_list, source="cli")
+                # Re-join for do_* methods that expect a raw string.
+                # Re-quote any token that contains whitespace so that a
+                # downstream shlex.split() reconstructs the original tokens
+                # (e.g. --client 'My Client Name' must not be split on the
+                # spaces inside the value).
+                import shlex as _shlex
                 arg_string = " ".join(
-                    args_list
-                )  # For compatibility with do_* methods expecting a string
+                    _shlex.quote(a) if " " in a or not a else a
+                    for a in args_list
+                )
                 raw_arg_string = _extract_raw_args(user_input, parts[0])
 
                 # Send telemetry event for commands (excluding blacklist)
@@ -13976,10 +13494,14 @@ class PentestShell:
             f"  ·  [link={raw_li}]💼 LinkedIn[/link][/dim]"
             f"  [dim]·  © 2026 Yeray Martín[/dim]"
         )
-        self.console.print(
-            "  [dim]Quick start in this workspace: "
-            "[bold]start_unauth[/bold] or [bold]start_auth[/bold][/dim]"
-        )
+        # ── Tier-aware intro — branched dispatch (LITE vs PRO).
+        # Source of truth: adscan_core.welcome_host.render_intro.
+        try:
+            from adscan_core.welcome_host import render_intro
+            from rich.padding import Padding as _Padding
+            self.console.print(_Padding(render_intro(), (0, 2)))
+        except Exception:  # noqa: BLE001 — splash must never break
+            pass
         self.console.print()
 
     def do_set(self, args):
@@ -13994,7 +13516,6 @@ class PentestShell:
         - iface: network interface to use. Automatically adds the interface's IP to the myip variable
         - auto: enable or disable automatic mode. It will run the scan without prompting (automatic) or by prompting the user (semi-automatic)
         - type: set the pentest type. Must be 'ctf' for CTF scenarios or 'audit' for real audits. This setting is mandatory before starting scans.
-        - neo4j_host, neo4j_port, neo4j_db_user, neo4j_db_password: Neo4j connection details.
 
         Examples:
 
@@ -14002,10 +13523,6 @@ class PentestShell:
         set iface eth0
         set auto True
         set type ctf
-        set neo4j_host 127.0.0.1
-        set neo4j_port 7687
-        set neo4j_db_user neo4j
-        set neo4j_db_password neo4j
         set telemetry on
         """
         try:
@@ -14112,20 +13629,6 @@ class PentestShell:
                     f"Base DN for domain {input_domain} configured: {self.domains_data[input_domain]['base_dn']}"
                 )
 
-            elif variable.startswith("neo4j"):
-                updated_cfg = update_legacy_neo4j_config(
-                    LEGACY_BLOODHOUND_CONFIG_PATH, variable, value
-                )
-                if updated_cfg:
-                    self.neo4j_host = updated_cfg.get("host", self.neo4j_host)
-                    self.neo4j_port = updated_cfg.get("port", self.neo4j_port)
-                    self.neo4j_db_user = updated_cfg.get("db_user", self.neo4j_db_user)
-                    self.neo4j_db_password = updated_cfg.get(
-                        "db_password", self.neo4j_db_password
-                    )
-                    print_success_verbose(
-                        f"Neo4j configuration updated: {self.neo4j_host}:{self.neo4j_port} - User: {self.neo4j_db_user}"
-                    )  # Avoid printing password
             else:
                 print_error(f"Variable {variable} not recognized.")
         except ValueError as e:
@@ -14293,22 +13796,6 @@ class PentestShell:
         )
         content.append("Current Workspace: ", style=f"bold {BRAND_COLORS['info']}")
         content.append(str(snapshot.get("current_workspace")) + "\n", style="white")
-        content.append("BloodHound CE URL: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(
-            mark_sensitive(str(snapshot.get("bloodhound_ce_url")), "host") + "\n",
-            style="white",
-        )
-        content.append("BloodHound CE User: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(
-            mark_sensitive(str(snapshot.get("bloodhound_ce_user")), "user") + "\n",
-            style="white",
-        )
-        content.append("BloodHound CE Password: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(
-            mark_sensitive(str(snapshot.get("bloodhound_ce_password")), "password")
-            + "\n",
-            style="white",
-        )
         content.append("Telemetry: ", style=f"bold {BRAND_COLORS['info']}")
         enabled = bool(snapshot.get("telemetry_enabled"))
         suffix = f" ({snapshot.get('telemetry_source', 'persisted')})"
@@ -14333,6 +13820,18 @@ class PentestShell:
         from adscan_internal.workspaces import ensure_workspaces_dir
 
         ensure_workspaces_dir(self.workspaces_dir)
+
+    def do_posture(self, args):
+        """Inspect, refresh, or clear the security posture for a domain.
+
+        Subcommands:
+            posture show [<domain>]
+            posture probe [<domain>]
+            posture clear [<domain>]
+        """
+        from adscan_internal.cli.posture import handle_posture_command
+
+        handle_posture_command(self, args)
 
     def do_workspace(self, args):
         """
@@ -14913,40 +14412,19 @@ class PentestShell:
             )
             return None
 
-        change_auth_string = self.build_auth_nxc(
-            user,
-            current_password,
-            domain_name,
-            kerberos=False,
-        )
-        change_log_file_path = self._build_domain_log_file_path(
-            domain_name,
-            user,
-            prefix="change_password",
-        )
+        print_info_verbose("Executing password change for password-must-change account (native SAMR)")
 
-        print_info_verbose("Executing password change for password-must-change account")
-        print_info_debug(
-            f"{self.netexec_path} smb {pdc_fqdn} {change_auth_string} "
-            f"-M change-password -o NEWPASS={mark_sensitive(new_password, 'password')} "
-            f'--log "{change_log_file_path}"'
-        )
-
+        from adscan_internal.models.domain import resolve_dc_ip as _resolve_dc_ip
+        _domain_data = self.domains_data.get(domain_name, {}) or {}
+        pdc_ip = _resolve_dc_ip(_domain_data) or pdc_fqdn
         service = self._get_credential_service()
-        change_result = service.change_password_with_netexec(
+        change_result = service.change_password_with_samr(
             domain=domain_name,
             username=user,
-            pdc_fqdn=pdc_fqdn,
-            netexec_path=self.netexec_path,
-            auth_string=change_auth_string,
+            old_password=current_password,
             new_password=new_password,
-            log_file_path=change_log_file_path,
-            executor=lambda cmd, timeout: self._run_netexec(
-                cmd,
-                domain=domain_name,
-                timeout=timeout,
-                pre_sync=False,
-            ),
+            pdc_host=pdc_fqdn,
+            pdc_ip=pdc_ip,
         )
 
         if not change_result.success:
@@ -15045,6 +14523,7 @@ class PentestShell:
         mark_user_compromised: bool = True,
         credential_origin: str | None = None,
         local_account_rid: str | None = None,
+        metadata=None,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -15073,6 +14552,7 @@ class PentestShell:
             mark_user_compromised=mark_user_compromised,
             credential_origin=credential_origin,
             local_account_rid=local_account_rid,
+            metadata=metadata,
         )
 
     def add_credentials_batch(
@@ -15088,6 +14568,7 @@ class PentestShell:
         verify_credential: bool = True,
         ui_silent: bool = False,
         ensure_fresh_kerberos_ticket: bool = True,
+        metadata_by_user=None,
     ):
         """Add multiple domain credentials via the shared CLI batch helper."""
         from adscan_internal.cli.creds import add_credentials_batch
@@ -15104,6 +14585,7 @@ class PentestShell:
             verify_credential=verify_credential,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+            metadata_by_user=metadata_by_user,
         )
 
     def add_local_credentials_batch(
@@ -15214,71 +14696,56 @@ class PentestShell:
                 icon="✓",
             )
 
-        # Decide auth string (NTLM vs Kerberos) based on clock sync hint.
-        if not self.do_sync_clock_with_pdc(domain_name):
-            auth_string = self.build_auth_nxc(user, cred_value, domain_name)
-        else:
-            auth_string = self.build_auth_nxc(
-                user, cred_value, domain_name, kerberos=True
-            )
-
-        if self.current_workspace_dir:
-            log_dir = os.path.join(
-                self.current_workspace_dir, "domains", domain_name, "ldap"
-            )
-            try:
-                os.makedirs(log_dir, exist_ok=True)
-                log_file_path = os.path.join(log_dir, f"verify_{user}.log")
-            except OSError as e:
-                telemetry.capture_exception(e)
-                if not ui_silent:
-                    print_error(
-                        f"Failed to create log directory '{log_dir}': {e}. "
-                        "Verification cannot proceed with logging."
-                    )
-                    print_warning(
-                        "Logging to a relative path due to directory creation error."
-                    )
-                else:
-                    print_info_verbose(
-                        f"[ui_silent] Failed to create log directory '{log_dir}': {e}. Using relative log path."
-                    )
-                log_file_path = f"verify_{domain_name}_{user}.log"
-        else:
-            if not ui_silent:
-                print_warning(
-                    "Current workspace directory not set. Log file path for NetExec "
-                    "will be relative."
-                )
-            else:
-                print_info_verbose(
-                    "[ui_silent] Current workspace directory not set; using relative log path."
-                )
-            log_file_path = f"verify_{domain_name}_{user}.log"
+        # Sync clock with PDC before requesting a TGT. Kerberos rejects
+        # tickets when client and KDC drift more than 5 minutes
+        # (KRB_AP_ERR_SKEW); this preserves the existing behaviour without
+        # using the result for an auth-string branch (the NetExec LDAP
+        # fallback that consumed it was deleted).
+        self.do_sync_clock_with_pdc(domain_name)
 
         print_info_verbose("Executing credential verification")
-        print_info_debug(
-            f'{self.netexec_path} ldap {pdc_fqdn} {auth_string} --log "{log_file_path}"'
-        )
 
         service = self._get_credential_service()
 
         try:
-            result = service.verify_credentials(
+            # Native Kerberos path — single source of truth. Requesting a
+            # TGT IS the verification: success means valid creds and yields
+            # a usable ticket as a side-effect. The historic NetExec LDAP
+            # fallback was deleted because it silently disagreed with
+            # Kerberos's verdict; when port 88 is unreachable the result
+            # message now embeds a TCP-probed diagnosis (filtered/closed/
+            # reachable-but-failing) instead of switching protocols.
+            result = service._verify_via_kerberos_sync(
                 domain=domain_name,
+                kdc_ip=pdc_host,
                 username=user,
                 credential=cred_value,
-                pdc_fqdn=pdc_fqdn,
-                netexec_path=self.netexec_path,
-                auth_string=auth_string,
-                log_file_path=log_file_path,
-                executor=lambda cmd, timeout: self._run_netexec(
-                    cmd,
-                    domain=domain_name,
-                    timeout=timeout,
-                    pre_sync=False,
-                ),
+                credential_type="hash" if self.is_hash(cred_value) else "password",
             )
+
+            if result.status == CredentialStatus.VALID and isinstance(
+                result.raw_output, bytes
+            ):
+                # Persist the TGT we got as a side-effect of verification.
+                try:
+                    from adscan_internal.services.kerberos_ticket_service import (
+                        KerberosTicketService,
+                        _write_ccache_bytes,
+                    )
+
+                    if self.current_workspace_dir:
+                        ccache_dir = KerberosTicketService._build_ccache_dir(
+                            self.current_workspace_dir, domain_name
+                        )
+                        ccache_path = ccache_dir / f"{user}.ccache"
+                        _write_ccache_bytes(result.raw_output, ccache_path)
+                        print_info_verbose(
+                            f"[verify] Kerberos TGT persisted for {user}@{domain_name}"
+                        )
+                    result.raw_output = None
+                except Exception as exc_tgt:  # noqa: BLE001
+                    telemetry.capture_exception(exc_tgt)
+
         except Exception as e:
             telemetry.capture_exception(e)
             if not ui_silent:
@@ -15604,6 +15071,12 @@ class PentestShell:
 
         return is_hash(cred)
 
+    def ask_for_share_credential_hunt(self, domain):
+        """Phase 5: offer a credential scan on writable shares discovered during collection."""
+        from adscan_internal.cli.smb import run_ask_for_share_credential_hunt
+
+        return run_ask_for_share_credential_hunt(self, domain=domain)
+
     def ask_for_smb_scan(self, domain):
         """Prompt user to perform unauthenticated SMB service scan."""
         from adscan_internal.cli.smb import run_ask_for_smb_scan
@@ -15625,6 +15098,56 @@ class PentestShell:
         from adscan_internal.cli.smb import run_smb_scan
 
         run_smb_scan(self, domain=domain)
+
+    def do_smb_shares(self, args):
+        """
+        Premium native SMB share enumeration with attack-graph fusion.
+
+        Combines a live ``tree_connect``-based access probe (effective
+        permissions for the current credential) with the ACL view recorded
+        by the share collector in ``attack_graph.json``. Highlights any
+        share where the live access exceeds what the graph mapped — the
+        high-signal discovery this command exists to surface.
+
+        Usage:
+          smb_shares <domain> [--host <host>] [--mode <mode>] [--timeout SEC]
+
+        Modes:
+          fusion   live + graph + delta classification (default)
+          live     live probe only, no graph load
+          graph    graph only, no network access
+          delta    fusion filtered to shares where live > graph
+        """
+        import argparse
+        import shlex
+
+        from adscan_internal.cli.smb_shares_view import (
+            SharesViewMode,
+            run_native_shares_view,
+        )
+
+        parser = argparse.ArgumentParser(prog="smb_shares", add_help=False)
+        parser.add_argument("domain")
+        parser.add_argument("--host", default=None)
+        parser.add_argument(
+            "--mode",
+            default=SharesViewMode.FUSION.value,
+            choices=[m.value for m in SharesViewMode],
+        )
+        parser.add_argument("--timeout", type=int, default=30)
+        try:
+            ns = parser.parse_args(shlex.split(args or ""))
+        except SystemExit:
+            print_error(self.do_smb_shares.__doc__ or "Usage: smb_shares <domain>")
+            return
+
+        run_native_shares_view(
+            self,
+            domain=ns.domain,
+            host=ns.host,
+            mode=ns.mode,
+            timeout=ns.timeout,
+        )
 
     def ask_for_unauth_scan(self, domain):
         """Thin wrapper → adscan_internal.cli.scan.ask_for_unauth_scan"""
@@ -15861,9 +15384,8 @@ class PentestShell:
         """
         Performs an authenticated scan of the specified domain.
 
-        First, the clock is synchronized with the domain's PDC. Then, BloodHound is
-        executed and, once finished, the function `run_post_bloodhound` is called to
-        display a message to the user and conclude the process.
+        First, the clock is synchronized with the domain's PDC. Then, ADscan's local
+        graph collector runs and the phased enumeration continues from that graph.
         """
         from adscan_internal.cli.ldap import run_enum_domain_auth
 
@@ -15875,11 +15397,13 @@ class PentestShell:
 
         run_enum_domain_auth_phase1(self, domain)
 
-    def run_enumeration(self, domain, *, stop_after_phase: int | None = None):
-        domain_data = self.domains_data.get(domain, {})
-        username = domain_data.get("username", "N/A")
-        pdc = domain_data.get("pdc", "N/A")
-
+    def run_enumeration(
+        self,
+        domain,
+        *,
+        stop_after_phase: int | None = None,
+        start_from_phase: int | None = None,
+    ):
         def _is_audit_map_only() -> bool:
             """Return True when audit mode is post-compromise and should avoid active exploitation."""
             try:
@@ -15896,28 +15420,120 @@ class PentestShell:
             self._ctf_execute_post_compromise_actions(domain)
             return
 
-        # Professional post-BloodHound enumeration with phased workflow
-        from adscan_internal.rich_output import print_phase_header, print_step_status
+        # Run workspace migrations before Phase 1 starts (idempotent).
+        try:
+            from adscan_internal.services.workspace_migrations import (
+                run_workspace_migrations,
+            )
 
-        # Determine total phases based on scan type and username presence.
+            run_workspace_migrations(
+                workspace_cwd=self.current_workspace_dir or os.getcwd(),
+                domain=domain,
+                domains_dir=self.domains_dir,
+            )
+        except Exception as _migration_exc:  # noqa: BLE001
+            telemetry.capture_exception(_migration_exc)
+
+        # Professional post-collection enumeration with phased workflow.
+        from adscan_internal.rich_output import print_step_status
+
+        # Determine total phases based on scan type.
         #
         # Phase design goals:
-        # - Quick wins first (BloodHound-derived steps + low-noise credential discovery)
+        # - Quick wins first (graph-derived steps + low-noise credential discovery)
         # - After any new credential, we can immediately search for paths from owned users
-        # - Avoid repeating slow/legacy enumeration already covered by BloodHound CE queries
+        # - Avoid repeating slow enumeration already covered by the local graph collection
         #
         # Base phases:
-        #  1) BloodHound Analysis
+        #  1) Domain Intelligence
         #  2) Attack Paths Discovery (steps + offer execution from owned)
-        #  3) Quick Credential Wins (ADCS detect, LDAP descriptions, GPP)
-        #  4) Roasting & Cracking
-        #  5) Password Spraying
-        #  6) Audit-only Unauthenticated Attack Surface
-        #  7) Audit-only Extras (CVE scan + configs)
+        #  3) Quick Credential Wins (Timeroast, ADCS detect, LDAP descriptions, GPP)
+        #  4) Password Spraying
+        #  5) Audit-only Unauthenticated Attack Surface
+        #  6) Audit-only Extras (CVE scan + configs)
         #
-        # Plus User Privilege Assessment (+1) if username is present.
-        base_phases = 5 if self.type == "ctf" else 7
-        total_phases = base_phases + (1 if username else 0)
+        # Roasting and User Privilege Assessment are no longer dedicated phases:
+        # kerberoast/asreproast attack steps and privilege analysis of the bound
+        # user are materialized in Attack Paths Discovery via the collector
+        # pipeline, and the operator executes them through the attack-paths
+        # offer flow. Avoiding the redundant re-run keeps the workflow narrative
+        # tight and prevents duplicate enumeration.
+
+        # Inner-scan chapter list lives in adscan_internal.services.scan_phases
+        # (single source of truth shared with _run_enum_domain_auth and the
+        # trust-enumeration entry point). The local helper still exists so
+        # the rest of this method keeps the same call signature, but it
+        # delegates to the registry — adding a phase only means editing
+        # ``scan_phases.SCAN_PHASES`` once.
+        from adscan_internal.services.scan_phases import (
+            emit_chapter as _emit_chapter_global,
+            phases_for_scan_type as _phases_for_scan_type,
+        )
+
+        _scan_type = self.type or "default"
+        _scan_phase_titles: list[str] = [
+            phase.title for phase in _phases_for_scan_type(_scan_type)
+        ]
+
+        def _emit_scan_chapter(title: str) -> None:
+            """Emit an inner-scan chapter divider for ``title``.
+
+            Resolves ``title`` to a phase id by looking up the registry, then
+            delegates to the shared :func:`emit_chapter` helper so trust,
+            collection, and analysis phases all render with consistent
+            numbering and the same phase strip.
+            """
+            from adscan_internal.services.scan_phases import SCAN_PHASES
+
+            phase = next((p for p in SCAN_PHASES if p.title == title), None)
+            if phase is None:
+                return
+            _emit_chapter_global(phase.phase_id, scan_type=_scan_type)
+
+        # Single-slot tracker for the currently open timeline phase span.
+        # ``_enter_phase`` automatically closes the prior span before opening
+        # the next, so phase transitions stay symmetrical even when the
+        # caller forgets to close explicitly. ``_close_active_phase`` runs
+        # in the function-level finally to flush the last phase on exit.
+        from adscan_internal.services.scan_phases import (
+            SCAN_PHASES as _SCAN_PHASES_REG,
+        )
+        from adscan_internal.services.scan_timeline import (
+            phase_span as _phase_span,
+        )
+
+        _active_phase_cm: list[Any] = [None]
+
+        def _close_active_phase() -> None:
+            cm = _active_phase_cm[0]
+            if cm is None:
+                return
+            _active_phase_cm[0] = None
+            try:
+                cm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 — telemetry must never block
+                pass
+
+        def _enter_phase(title: str) -> None:
+            """Render the chapter for ``title`` and open a fresh timeline span."""
+            _close_active_phase()
+            _emit_scan_chapter(title)
+            phase = next(
+                (p for p in _SCAN_PHASES_REG if p.title == title), None
+            )
+            if phase is None:
+                return
+            try:
+                cm = _phase_span(
+                    self,
+                    domain,
+                    phase_id=phase.phase_id,
+                    phase_title=phase.title,
+                )
+                cm.__enter__()
+                _active_phase_cm[0] = cm
+            except Exception:  # noqa: BLE001
+                _active_phase_cm[0] = None
 
         def _run_step(
             step_name: str,
@@ -15989,6 +15605,8 @@ class PentestShell:
             )
             return os.path.exists(computers_file) and os.path.exists(users_file)
 
+        _skip_phase1 = bool(start_from_phase and start_from_phase > 1)
+
         phase1_marked_complete = bool(
             self.domains_data.get(domain, {}).get("phase1_complete")
         )
@@ -15996,61 +15614,35 @@ class PentestShell:
         phase1_already_done = phase1_marked_complete or phase1_outputs_exist
         rerun_phase1 = False
 
-        if phase1_already_done:
-            phase1_reason_parts: list[str] = []
-            if phase1_marked_complete:
-                phase1_reason_parts.append(
-                    "the domain state is already marked as complete"
-                )
-            if phase1_outputs_exist:
-                phase1_reason_parts.append(
-                    "Phase 1 output files already exist in the workspace"
-                )
+        # The workspace-resume panel in `_run_enum_domain_auth` is the single
+        # source of truth for the operator's intent (Resume/Refresh/Replay/
+        # Inspect). REPLAY and REFRESH both want the analysis pipeline to re-
+        # run, so we honour them even when the cached output files still exist
+        # on disk. RESUME keeps the legacy behaviour (skip when artefacts are
+        # there). When the panel was not shown (no prior results, CI mode with
+        # no override), workspace_action is None and this collapses to the
+        # original first-run flow.
+        workspace_action = self.domains_data.get(domain, {}).get("_workspace_action")
+        if workspace_action in {"refresh", "replay"}:
+            rerun_phase1 = True
+        if phase1_already_done and not _skip_phase1 and workspace_action == "resume":
+            print_info(
+                f"Reusing cached Phase 1 results for {mark_sensitive(domain, 'domain')}."
+            )
 
-            marked_domain = mark_sensitive(domain, "domain")
-            print_info(f"Phase 1 results already exist for {marked_domain}.")
-            if phase1_reason_parts:
-                print_info(
-                    "ADscan detected this because "
-                    + " and ".join(phase1_reason_parts)
-                    + "."
-                )
-
-            confirmer = getattr(self, "_questionary_confirm", None)
-            prompt = f"Do you want to re-run Phase 1 for {marked_domain} and refresh the existing results?"
-            if callable(confirmer):
-                rerun_phase1 = bool(confirmer(prompt, default=False))
-            else:
-                rerun_phase1 = bool(Confirm.ask(prompt, default=False))
-
-            if rerun_phase1:
-                print_info("Re-running Phase 1 and refreshing existing results.")
-                self.domains_data.setdefault(domain, {})["phase1_complete"] = False
-
-        # ========== PHASE 1: Domain Analysis ==========
+        # ========== PHASE 1: Domain Intelligence ==========
+        _enter_phase("Domain Intelligence")
         emit_phase("domain_analysis")
-        print_phase_header(
-            "Domain Analysis",
-            phase_number=1,
-            total_phases=total_phases,
-            details={
-                "Domain": domain,
-                "PDC": pdc,
-                "Scan Type": self.type.upper() if self.type else "N/A",
-            },
-            icon="🔍",
-        )
-
         if phase1_already_done and not rerun_phase1:
             print_step_status(
-                "BloodHound Computers Query",
+                "Host Inventory",
                 status="skipped",
                 step_number=1,
                 total_steps=3,
                 details="Using existing Phase 1 results",
             )
             print_step_status(
-                "BloodHound Users Query",
+                "Identity Inventory",
                 status="skipped",
                 step_number=2,
                 total_steps=3,
@@ -16065,8 +15657,8 @@ class PentestShell:
             )
         else:
             if _run_step(
-                "BloodHound Computers Query",
-                lambda: self.do_bloodhound_computers(domain),
+                "Host Inventory",
+                lambda: self.do_host_inventory(domain),
                 step_number=1,
                 total_steps=3,
             ):
@@ -16075,8 +15667,8 @@ class PentestShell:
             time.sleep(2)
 
             if _run_step(
-                "BloodHound Users Query",
-                lambda: self.do_bloodhound_users(domain),
+                "Identity Inventory",
+                lambda: self.do_identity_inventory(domain),
                 step_number=2,
                 total_steps=3,
             ):
@@ -16146,24 +15738,29 @@ class PentestShell:
             return
 
         # ========== PHASE 2: Attack Paths Discovery ==========
-        emit_phase("attack_paths_discovery")
-        print_phase_header(
-            "Attack Paths Discovery",
-            phase_number=2,
-            total_phases=total_phases,
-            details={
-                "Domain": domain,
-            },
-            icon="🧭",
+        # In CTF workspaces the objective is foothold → DA → flags.  Once the
+        # domain transitions to "pwned" there is nothing left to calculate —
+        # re-running attack paths would just produce a redundant "Owned →
+        # Domain" graph that the operator has already exploited.  In audit
+        # workspaces this phase still runs post-compromise because the client
+        # deliverable needs the full attack-path view including post-ex paths.
+        _domain_already_pwned = (
+            self.type == "ctf"
+            and str(
+                getattr(self, "domains_data", {}).get(domain, {}).get("auth") or ""
+            ).strip().lower() == "pwned"
         )
-
-        if _run_step(
-            "Attack Paths Discovery",
-            lambda: self.do_bloodhound_attack_paths(domain),
-            step_number=1,
-            total_steps=1,
-        ):
-            return
+        _skip_phase2 = bool(start_from_phase and start_from_phase > 2) or _domain_already_pwned
+        if not _skip_phase2:
+            _enter_phase("Attack Paths Discovery")
+            emit_phase("attack_paths_discovery")
+            if _run_step(
+                "Attack Paths Discovery",
+                lambda: self.do_attack_path_discovery(domain),
+                step_number=1,
+                total_steps=1,
+            ):
+                return
 
         if stop_after_phase == 2:
             return
@@ -16173,17 +15770,7 @@ class PentestShell:
         # case we want to re-introduce an early takeover-CVE scan later.
 
         # ========== PHASE 3: Quick Credential Wins ==========
-        print_phase_header(
-            "Quick Credential Wins",
-            phase_number=3,
-            total_phases=total_phases,
-            details={
-                "Domain": domain,
-                "Goal": "Low-noise credential discovery",
-            },
-            icon="⚡",
-        )
-
+        _enter_phase("Quick Credential Wins")
         step_num = 1
         total_quickwin_steps = 3 + (2 if self.type == "audit" else 0)
 
@@ -16236,133 +15823,18 @@ class PentestShell:
         if stop_after_phase == 3:
             return
 
-        # ========== PHASE 4: Roasting & Cracking ==========
-        emit_phase("roasting_&_cracking")
-        print_phase_header(
-            "Roasting & Cracking",
-            phase_number=4,
-            total_phases=total_phases,
-            details={
-                "Domain": domain,
-                "Username": username,
-            },
-            icon="🔥",
-        )
-
-        if _is_audit_map_only():
-            print_step_status(
-                "Roasting & Cracking",
-                status="skipped",
-                step_number=1,
-                total_steps=1,
-                details="Audit map-only mode (domain already compromised)",
-            )
-        else:
-            step_num = 1
-            total_roast_steps = 4
-
-            def _hashes_file_path(roast_type: str) -> str:
-                return os.path.join(
-                    self.domains_dir, domain, self.cracking_dir, f"hashes.{roast_type}"
-                )
-
-            def _hashes_file_ready(path: str) -> bool:
-                try:
-                    return os.path.exists(path) and os.path.getsize(path) > 1
-                except OSError:
-                    return False
-
-            if _run_step(
-                "AS-REP Roasting",
-                lambda: self.ask_for_asreproast(domain, auto_crack=False),
-                step_number=step_num,
-                total_steps=total_roast_steps,
-            ):
-                return
-            step_num += 1
-
-            asrep_hashes_file = _hashes_file_path("asreproast")
-            if self._is_ctf_domain_pwned(domain):
-                self._ctf_execute_post_compromise_actions(domain)
-                return
-            if _hashes_file_ready(asrep_hashes_file):
-                if _run_step(
-                    "AS-REP Hash Cracking",
-                    lambda: self.ask_for_cracking(
-                        "asreproast", domain, asrep_hashes_file
-                    ),
-                    step_number=step_num,
-                    total_steps=total_roast_steps,
-                ):
-                    return
-            else:
-                print_step_status(
-                    "AS-REP Hash Cracking",
-                    status="skipped",
-                    step_number=step_num,
-                    total_steps=total_roast_steps,
-                    details="No hashes found",
-                )
-            step_num += 1
-
-            kerberoast_prompted = False
-            if _run_step(
-                "Kerberoasting",
-                lambda: self.ask_for_kerberoast(domain, auto_crack=True),
-                step_number=step_num,
-                total_steps=total_roast_steps,
-            ):
-                return
-            kerberoast_prompted = True
-            step_num += 1
-
-            kerberoast_hashes_file = _hashes_file_path("kerberoast")
-            if self._is_ctf_domain_pwned(domain):
-                self._ctf_execute_post_compromise_actions(domain)
-                return
-            if kerberoast_prompted:
-                print_step_status(
-                    "Kerberoast Hash Cracking",
-                    status="skipped",
-                    step_number=step_num,
-                    total_steps=total_roast_steps,
-                    details="Handled during Kerberoasting step",
-                )
-            elif _hashes_file_ready(kerberoast_hashes_file):
-                if _run_step(
-                    "Kerberoast Hash Cracking",
-                    lambda: self.ask_for_cracking(
-                        "kerberoast", domain, kerberoast_hashes_file
-                    ),
-                    step_number=step_num,
-                    total_steps=total_roast_steps,
-                ):
-                    return
-            else:
-                print_step_status(
-                    "Kerberoast Hash Cracking",
-                    status="skipped",
-                    step_number=step_num,
-                    total_steps=total_roast_steps,
-                    details="No hashes found",
-                )
-            step_num += 1
-
-        if stop_after_phase == 4:
-            return
-
-        # ========== PHASE 5: Password Spraying ==========
-        print_phase_header(
-            "Password Spraying",
-            phase_number=5,
-            total_phases=total_phases,
-            details={
-                "Domain": domain,
-                "Auto Mode": "Enabled" if self.auto else "Interactive",
-            },
-            icon="💦",
-        )
-
+        # ========== PHASE 4: Password Spraying ==========
+        # Roasting & Cracking and User Privilege Assessment used to live here
+        # as dedicated phases. They were removed because the underlying work is
+        # now produced upstream: kerberoast/asreproast attack steps and the
+        # bound-user privilege analysis are materialized inside Attack Paths
+        # Discovery via the collector pipeline, and the operator executes them
+        # through the attack-paths offer flow. The dedicated phases re-ran the
+        # same work as visual ceremony, so they have been dropped to keep the
+        # workflow narrative tight. The ask_for_kerberoast / ask_for_asreproast
+        # / ask_for_user_privs methods themselves still exist and remain
+        # available for manual invocation and attack-path execution.
+        _enter_phase("Password Spraying")
         if _run_step(
             "Password Spraying",
             lambda: self.ask_for_spraying(domain),
@@ -16378,27 +15850,35 @@ class PentestShell:
             maybe_offer_ctf_pre2k_followup(
                 self,
                 domain,
-                reason="phase_5_completed",
+                reason="phase_4_completed",
             )
         except Exception as exc:  # pragma: no cover - best-effort UX hint
             telemetry.capture_exception(exc)
+
+        if stop_after_phase == 4:
+            return
+
+        # ========== PHASE 5: Share Credential Hunt ==========
+        # Runs for both CTF and audit. Reads share exposure data already built
+        # during Phase 1 collection (attack graph edges), displays the SMB
+        # resources panel, and offers a credential scan on writable shares.
+        # In non-interactive / CI mode it auto-selects all writable shares.
+        _enter_phase("Share Credential Hunt")
+        emit_phase("share_credential_hunt")
+        if _run_step(
+            "Share Credential Hunt",
+            lambda: self.ask_for_share_credential_hunt(domain),
+            step_number=1,
+            total_steps=1,
+        ):
+            return
 
         if stop_after_phase == 5:
             return
 
         # ========== PHASE 6: Audit-only Unauthenticated Attack Surface ==========
         if self.type == "audit":
-            print_phase_header(
-                "Unauthenticated Attack Surface",
-                phase_number=6,
-                total_phases=total_phases,
-                details={
-                    "Domain": domain,
-                    "PDC": pdc,
-                },
-                icon="🛰️",
-            )
-
+            _enter_phase("Unauthenticated Attack Surface")
             if _run_step(
                 "Unauthenticated Scan",
                 lambda: self.ask_for_unauth_scan(domain),
@@ -16412,17 +15892,7 @@ class PentestShell:
 
         # ========== PHASE 7: Audit-only Extras ==========
         if self.type == "audit":
-            print_phase_header(
-                "Audit-only Extras",
-                phase_number=7,
-                total_phases=total_phases,
-                details={
-                    "Domain": domain,
-                    "Checks": "CVE scan, configuration enumeration",
-                },
-                icon="📋",
-            )
-
+            _enter_phase("Audit-only Extras")
             # Keep the existing broader CVE scan UX here for audit.
             if _run_step(
                 "CVE Vulnerability Scan",
@@ -16437,42 +15907,6 @@ class PentestShell:
                 step_number=2,
                 total_steps=2,
             )
-
-        # ========== User Privilege Assessment ==========
-        # Conditional privilege enumeration (only if username is present)
-        # This runs last to assess privileges after all enumeration is complete
-        # Phase number: 6 in CTF mode, 8 in audit mode.
-        if username:
-            user_priv_phase_number = 8 if self.type == "audit" else 6
-            print_phase_header(
-                "User Privilege Assessment",
-                phase_number=user_priv_phase_number,
-                total_phases=total_phases,
-                details={
-                    "Domain": domain,
-                    "Username": username,
-                },
-                icon="👤",
-            )
-
-            if _is_audit_map_only():
-                print_step_status(
-                    "User Privilege Enumeration",
-                    status="skipped",
-                    step_number=1,
-                    total_steps=1,
-                    details="Audit map-only mode (domain already compromised)",
-                )
-            else:
-                password = domain_data.get("password")
-                if _run_step(
-                    "User Privilege Enumeration",
-                    lambda: self.ask_for_user_privs(domain, username, password),
-                    step_number=1,
-                    total_steps=1,
-                    details=f"User: {username}",
-                ):
-                    return
 
         # In audit post-compromise we want to map as much as possible, then let the
         # operator decide which remaining paths to validate/exploit.
@@ -16530,12 +15964,12 @@ class PentestShell:
         if _scan_attack_paths > 0 and should_show_victory_hint(
             "scan_complete_report", "subtle"
         ):
-            _reports_url = mark_passthrough("https://adscanpro.com/reports")
+            _pro_url = mark_passthrough("https://adscanpro.com/pro")
             self.console.print()
             print_info(
-                f"[dim]💡 Found {_scan_attack_paths} attack path(s) — PRO turns them into a "
-                f"board-ready report (exec summary, attack diagrams, remediation priorities) "
-                f"in minutes → {_reports_url}[/dim]"
+                f"💡 Found [bold]{_scan_attack_paths} attack path(s)[/bold] — PRO turns them into a "
+                f"client-ready PDF (exec summary, attack chains, compliance mapping) "
+                f"in 90 seconds → {_pro_url}"
             )
             mark_victory_hint_shown("scan_complete_report")
         elif _scan_attack_paths == 0 and _scan_mode == "unauth":
@@ -16561,6 +15995,11 @@ class PentestShell:
             maybe_offer_post_scan_lab_confirmation(self)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+
+        # Flush the final phase span so its timeline row + delta footer are
+        # emitted. Earlier phases are closed automatically by ``_enter_phase``
+        # transitions; only the last phase needs an explicit close.
+        _close_active_phase()
 
     def _capture_scan_complete(self, domain: str) -> None:
         """Capture scan_complete telemetry event with case study metrics."""
@@ -16672,65 +16111,65 @@ class PentestShell:
 
         return _do_enum_configs(self, domain)
 
-    def do_bloodhound_dc_access(self, domain):
-        """Wrapper for run_bloodhound_dc_access - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_dc_access
+    def do_dc_access(self, domain):
+        """Wrapper for run_dc_access - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_dc_access
 
-        run_bloodhound_dc_access(self, domain)
+        run_dc_access(self, domain)
 
-    def execute_bloodhound_dc_access(
+    def execute_dc_access(
         self, command, domain, paths: list[dict] | None = None
     ):
-        """Wrapper for execute_bloodhound_dc_access - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import execute_bloodhound_dc_access
+        """Wrapper for execute_dc_access - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import execute_dc_access
 
-        execute_bloodhound_dc_access(self, command, domain, paths=paths)
+        execute_dc_access(self, command, domain, paths=paths)
 
-    def do_bloodhound_krbtgt(self, domain):
-        """Wrapper for run_bloodhound_krbtgt - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_krbtgt
+    def do_krbtgt(self, domain):
+        """Wrapper for run_krbtgt - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_krbtgt
 
-        run_bloodhound_krbtgt(self, domain)
+        run_krbtgt(self, domain)
 
-    def execute_bloodhound_krbtgt(self, command, domain):
-        """Wrapper for execute_bloodhound_krbtgt - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import execute_bloodhound_krbtgt
+    def execute_krbtgt(self, command, domain):
+        """Wrapper for execute_krbtgt - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import execute_krbtgt
 
-        execute_bloodhound_krbtgt(self, command, domain)
+        execute_krbtgt(self, command, domain)
 
-    def do_bloodhound_pwdneverexpires(self, domain):
-        """Wrapper for run_bloodhound_pwdneverexpires - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_pwdneverexpires
+    def do_pwdneverexpires(self, domain):
+        """Wrapper for run_pwdneverexpires - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_pwdneverexpires
 
-        run_bloodhound_pwdneverexpires(self, domain)
+        run_pwdneverexpires(self, domain)
 
-    def do_bloodhound_passnotreq(self, domain):
-        """Wrapper for run_bloodhound_passnotreq - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_passnotreq
+    def do_passnotreq(self, domain):
+        """Wrapper for run_passnotreq - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_passnotreq
 
-        run_bloodhound_passnotreq(self, domain)
+        run_passnotreq(self, domain)
 
-    def do_bloodhound_stale_enabled_users(self, domain, *, stale_days: int = 180):
+    def do_stale_enabled_users(self, domain, *, stale_days: int = 180):
         """Wrapper for stale enabled user hygiene check."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_stale_enabled_users
+        from adscan_internal.cli.attack_graph_reports import run_stale_enabled_users
 
-        run_bloodhound_stale_enabled_users(self, domain, stale_days=stale_days)
+        run_stale_enabled_users(self, domain, stale_days=stale_days)
 
-    def do_bloodhound_tier0_highvalue_sprawl(self, domain):
+    def do_tier0_highvalue_sprawl(self, domain):
         """Wrapper for Tier-0/high-value identity concentration check."""
-        from adscan_internal.cli.bloodhound import (
-            run_bloodhound_tier0_highvalue_sprawl,
+        from adscan_internal.cli.attack_graph_reports import (
+            run_tier0_highvalue_sprawl,
         )
 
-        run_bloodhound_tier0_highvalue_sprawl(self, domain)
+        run_tier0_highvalue_sprawl(self, domain)
 
-    def execute_bloodhound_passnotreq(
+    def execute_passnotreq(
         self, command, domain, file, users: list[str] | None = None
     ):
-        """Wrapper for execute_bloodhound_passnotreq - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import execute_bloodhound_passnotreq
+        """Wrapper for execute_passnotreq - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import execute_passnotreq
 
-        execute_bloodhound_passnotreq(self, command, domain, file, users=users)
+        execute_passnotreq(self, command, domain, file, users=users)
 
     def do_generate_relay_list(self, domain):
         """
@@ -16755,24 +16194,32 @@ class PentestShell:
 
         return _execute_generate_relay_list(self, command, domain)
 
-    def ask_for_enum_delegations(self, domain):
-        """Prompt user to enumerate Kerberos delegation configurations."""
-        from adscan_internal.cli.delegations import do_enum_delegations
+    def _build_probe_credentials(self, domain):
+        """Return :class:`ProbeCredentials` from ``domains_data[domain]`` or None."""
+        from adscan_internal.services.posture_probe import ProbeCredentials
 
-        do_enum_delegations(self, domain)
-
-    def do_enum_delegations(self, domain):
-        """
-        Enumerates Kerberos delegations in the specified domain.
-
-        Usage: enum_delegations <domain>
-
-        Performs the enumeration of Kerberos delegations in the domain
-
-        """
-        from adscan_internal.cli.delegations import do_enum_delegations
-
-        do_enum_delegations(self, domain)
+        entry = self.domains_data.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        username = entry.get("username")
+        if not username:
+            return None
+        password = entry.get("password")
+        nt_hash = None
+        if isinstance(password, str) and self.is_hash(password):
+            nt_hash = password
+            password = None
+        ccache_path = entry.get("ccache_path") or entry.get("ccache")
+        aes_key = entry.get("aes_key")
+        if not (password or nt_hash or ccache_path or aes_key):
+            return None
+        return ProbeCredentials(
+            username=username,
+            password=password if isinstance(password, str) else None,
+            nt_hash=nt_hash,
+            aes_key=aes_key if isinstance(aes_key, str) else None,
+            ccache_path=ccache_path if isinstance(ccache_path, str) else None,
+        )
 
     def do_enum_authenticated(self, domain):
         """
@@ -16786,6 +16233,36 @@ class PentestShell:
         Args:
             domain (str): The name of the domain to enumerate.
         """
+        # Posture freshness guard — convergence point for both Scenario A
+        # (start_auth with explicit creds) and Scenario B (start_unauth
+        # discovered creds via add_credential). Idempotent: no-op when posture
+        # is already fresh in this session.
+        try:
+            import asyncio as _asyncio
+
+            from adscan_internal.services.posture_orchestration import (
+                ensure_posture_fresh,
+            )
+            from adscan_internal.services.posture_probe import ProbePhase
+
+            pdc_for_probe = self.domains_data.get(domain, {}).get("pdc")
+            if pdc_for_probe:
+                creds_for_probe = self._build_probe_credentials(domain)
+                if creds_for_probe is not None:
+                    _asyncio.run(
+                        ensure_posture_fresh(
+                            self,
+                            domain=domain,
+                            dc_ip=pdc_for_probe,
+                            creds=creds_for_probe,
+                            phase=ProbePhase.AUTH,
+                        )
+                    )
+        except Exception as _exc:  # noqa: BLE001
+            from adscan_core import telemetry as _t  # noqa: PLC0415
+
+            _t.capture_exception(_exc)
+
         # Professional authenticated enumeration header
 
         username = self.domains_data.get(domain, {}).get("username", "N/A")
@@ -16828,27 +16305,62 @@ class PentestShell:
 
         return _ask_for_enum_cve_takeover(self, target_domain)
 
-    def do_enum_cve_dcs(self, target_domain):
-        """
-        Enumerates CVEs on domain controllers for a specified domain.
+    def do_enum_cve_dcs(self, target_domain: str) -> None:
+        """Enumerate CVEs on domain controllers using the native async scanner.
 
         Args:
-            target_domain (str): The domain on which to enumerate CVEs.
+            target_domain: The domain whose domain controllers to scan.
         """
-        from adscan_internal.cli.cves import run_enum_cve_dcs
+        import os
+        from adscan_internal.cli.cves_native import dispatch as _dispatch_cves
+        from adscan_internal.workspaces.computers import domain_subpath
 
-        return run_enum_cve_dcs(self, target_domain=target_domain)
+        workspace_dir = getattr(self, "current_workspace_dir", None) or os.getcwd()
+        domains_dir = getattr(self, "domains_dir", "domains")
+        dcs_file = domain_subpath(workspace_dir, domains_dir, target_domain, "dcs.txt")
+        if not os.path.isfile(dcs_file):
+            pdc_ip = (self.domains_data.get(target_domain) or {}).get("pdc")
+            if pdc_ip:
+                os.makedirs(os.path.dirname(dcs_file), exist_ok=True)
+                with open(dcs_file, "w", encoding="utf-8") as _f:
+                    _f.write(f"{pdc_ip}\n")
+            else:
+                from adscan_core.rich_output import print_error
+                print_error(
+                    f"No DC targets file found for {target_domain} and no PDC IP configured."
+                )
+                return
+        _dispatch_cves(self, f"scan --targets {dcs_file}")
 
-    def do_enum_cve_all(self, target_domain):
-        """
-        Enumerates vulnerabilities on all hosts of a domain.
+    def do_enum_cve_all(self, target_domain: str) -> None:
+        """Enumerate CVEs on all domain hosts using the native async scanner.
 
         Args:
-            target_domain (str): The name of the domain on which to enumerate vulnerabilities.
+            target_domain: The domain whose enabled computers to scan.
         """
-        from adscan_internal.cli.cves import run_enum_cve_all
+        import os
+        from adscan_core.rich_output import print_error
+        from adscan_internal.cli.cves_native import dispatch as _dispatch_cves
+        from adscan_internal.workspaces.computers import (
+            resolve_domain_service_target_file,
+        )
 
-        return run_enum_cve_all(self, target_domain=target_domain)
+        workspace_dir = getattr(self, "current_workspace_dir", None) or os.getcwd()
+        domains_dir = getattr(self, "domains_dir", "domains")
+        domain_data = self.domains_data.get(target_domain) or {}
+        targets_file, _source = resolve_domain_service_target_file(
+            workspace_dir,
+            domains_dir,
+            target_domain,
+            service="smb",
+            domain_data=domain_data,
+        )
+        if not targets_file:
+            print_error(
+                f"No host targets available for domain {target_domain}. Run host discovery first."
+            )
+            return
+        _dispatch_cves(self, f"scan --targets {targets_file}")
 
     def drop_the_mic(self, target_domain):
         """
@@ -17330,6 +16842,15 @@ class PentestShell:
                 "No current-vantage inventory refresh completed successfully."
             )
 
+    def do_inventory_diff(self, args):
+        """View the inventory delta for a domain.
+
+        Usage: inventory_diff <domain> [--since 1d|2h|30m|HH:MM|<ISO>] [--vs <snapshot_id>] [--peek]
+        """
+        from adscan_internal.cli.inventory_diff import run_inventory_diff_command
+
+        return run_inventory_diff_command(self, args)
+
     def gpp_passwords(self, domain, username, password, share):
         from adscan_internal.cli.smb import run_gpp_passwords_share
 
@@ -17384,171 +16905,29 @@ class PentestShell:
             hosts=hosts,
         )
 
-    def do_responder(self, _args):
-        """Start Responder to capture network hashes and monitor the Responder database.
+    def do_poisoning(self, _args):
+        """Start the native LLMNR/mDNS/NBT-NS poisoning suite + SMB capture.
 
-        Use 'stop_responder' to stop the processes started.
+        Use 'stop_poisoning' to stop the listeners.
         """
-        start_responder(self)
-
-    def execute_responder(self, command, env):
-        """Executes Responder in the background."""
-        print_info_debug(
-            f"[DEBUG] execute_responder: Received command: {' '.join(command)}"
-        )
-        print_info_debug(
-            f"[DEBUG] execute_responder: Received environment with keys (sample): {list(env.keys())[:10]}..."
-        )
-        try:
-            # Launch responder in background with inherited stdio
-            self.responder_process = self.spawn_command(
-                command,
-                env=env,
-                shell=False,
-                stdout=None,
-                stderr=None,
-                preexec_fn=os.setsid,
-            )
-            print_info_debug(
-                f"[DEBUG] execute_responder: self.responder_process object: {self.responder_process}"
-            )
-            if self.responder_process and hasattr(self.responder_process, "pid"):
-                print_info_debug(
-                    f"[DEBUG] execute_responder: Responder process PID: {self.responder_process.pid}"
-                )
-            else:
-                print_info_debug(
-                    "[DEBUG] execute_responder: Responder process object is None or does not have a PID."
-                )
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_info_debug(
-                f"[DEBUG] execute_responder: Exception during responder launch: {str(e)}"
-            )
-            print_error("Error executing Responder.")
-            print_exception(show_locals=False, exception=e)
-
-    def extract_username_and_netbios(self, user):
-        """
-        Extracts the username and the NetBIOS domain name.
-        Returns a tuple (username, netbios_domain)
-        """
-        # If a backslash is present, split into NetBIOS domain and username
-        if "\\" in user:
-            netbios_domain, username = user.split("\\")
-            return username, netbios_domain
-        return user, None
-
-    def find_domain_by_netbios(self, netbios):
-        """
-        Searches for the full domain corresponding to a NetBIOS domain name.
-        """
-        if netbios:
-            for domain, data in self.domains_data.items():
-                if "netbios" in data and data["netbios"] == netbios:
-                    return domain
-        return None
+        start_poisoning(self)
 
     def save_ntlm_hash(self, domain, hash_version, user, hash_value):
         """
         Saves the hash in the cracking directory of the domain, avoiding duplicates per user.
         Returns True if the user is new, False if the user already exists.
-
-        Args:
-            domain: Domain name
-            hash_version: Hash version (e.g., 'v1', 'v2')
-            user: Username
-            hash_value: Hash value to save
         """
         from adscan_internal.cli.creds import save_ntlm_hash
 
         return save_ntlm_hash(self, domain, hash_version, user, hash_value)
 
-    def monitor_responder_db(self, _args):
-        """Monitorea la base de datos de Responder en busca de nuevos hashes."""
-        from adscan_internal.rich_output import mark_sensitive
+    def do_clear_poisoning(self, _arg):
+        """Reset the per-session capture dedup set so prompts trigger again."""
+        clear_poisoning_state(self)
 
-        db_path = os.path.join(TOOLS_INSTALL_DIR, "responder", "Responder.db")
-        processed_users = set()  # Almacena usuarios ya procesados
-
-        while True:
-            try:
-                if not os.path.exists(db_path):
-                    time.sleep(1)
-                    continue
-
-                conn = sqlite3.connect(db_path)
-                cursor = conn.cursor()
-
-                # Buscar hashes NTLMv1 y NTLMv2
-                for hash_ver in ["v1", "v2"]:
-                    query = f"SELECT user, fullhash FROM Responder WHERE type LIKE '%{hash_ver}%'"
-                    cursor.execute(query)
-                    results = cursor.fetchall()
-
-                    for raw_user, hash_value in results:
-                        clean_user, netbios_domain = self.extract_username_and_netbios(
-                            raw_user
-                        )
-
-                        # Encontrar el dominio completo basado en el NetBIOS
-                        domain = self.find_domain_by_netbios(netbios_domain)
-
-                        if not domain:
-                            print_warning(
-                                f"No domain found for NetBIOS: {netbios_domain}"
-                            )
-                            continue
-
-                        # Si el usuario no ha sido procesado
-                        if clean_user not in processed_users:
-                            processed_users.add(
-                                clean_user
-                            )  # Añadirlo inmediatamente a procesados
-                            # Intentar guardar el hash
-                            if self.save_ntlm_hash(
-                                domain, version, clean_user, hash_value
-                            ):
-                                from adscan_internal.rich_output import print_info
-
-                                print_success(f"New NTLM{version} hash captured:")
-                                print_info(f"User: {clean_user}", spacing="none")
-                                print_info(
-                                    f"NetBIOS Domain: {netbios_domain}", spacing="none"
-                                )
-                                marked_domain = mark_sensitive(domain, "domain")
-                                print_info(
-                                    f"Full Domain: {marked_domain}", spacing="none"
-                                )
-                                print_info(f"Hash: {hash_value}", spacing="none")
-                                hash = os.path.join(
-                                    self.domains_dir,
-                                    domain,
-                                    self.cracking_dir,
-                                    f"{clean_user}_hashes.NTLM{version}",
-                                )
-                                # Preguntar si se desea crackear solo si el hash es nuevo
-                                self.ask_for_cracking(
-                                    f"{clean_user}.NTLM{version}", domain, hash
-                                )
-
-                conn.close()
-                time.sleep(1)  # Esperar antes de la siguiente comprobación
-
-            except Exception as e:
-                telemetry.capture_exception(e)
-                print_error("Error monitoring database.")
-                print_exception(show_locals=False, exception=e)
-                time.sleep(1)
-
-    def do_clear_responder_db(self, _arg):
-        """Clear the Responder database."""
-        clear_responder_db(self)
-
-    def do_stop_responder(self, _arg):
-        """Stop the running Responder process."""
-        stop_responder(self)
+    def do_stop_poisoning(self, _arg):
+        """Stop the native poisoning suite."""
+        stop_poisoning(self)
 
     def do_check_dc_ntlm_auth_type(self, args):
         """Coerce the current domain PDC and classify NTLMv1 vs NTLMv2.
@@ -17646,10 +17025,10 @@ class PentestShell:
 
         return run_secretsdump_registries(self, domain=domain)
 
-    def ask_for_flags(self, domain, username, password):
+    def ask_for_flags(self, domain, username, password, *, secret_kind=None):
         from adscan_internal.cli.flags import ask_for_flags
 
-        ask_for_flags(self, domain, username, password)
+        ask_for_flags(self, domain, username, password, secret_kind=secret_kind)
 
     def get_flags(self, domain, username, password):
         from adscan_internal.cli.flags import get_flags
@@ -17671,14 +17050,16 @@ class PentestShell:
 
         do_get_flags(self, args)
 
-    def execute_get_flags(self, *, domain, host, auth, remote_command):
-        """Execute get_flags command with retry logic and execution method fallback.
+    def execute_get_flags(self, *, domain, host, username, password, secret_kind=None):
+        """Execute get_flags command via the native SMB byte-read path.
 
         Args:
-            domain: Domain name for logging and error handling.
-            host: Target host (PDC).
-            auth: NetExec auth string.
-            remote_command: Command to execute remotely.
+            domain: Target domain.
+            host: Target host (PDC FQDN or IP).
+            username: Authenticating principal.
+            password: Credential (password, NT hash, or ccache path).
+            secret_kind: Optional secret type hint (``"password"``, ``"nt_hash"``,
+                ``"aes_key"``, ``"ccache_path"``).  Inferred when ``None``.
         """
         from adscan_internal.cli.flags import execute_get_flags
 
@@ -17686,8 +17067,9 @@ class PentestShell:
             self,
             domain=domain,
             host=host,
-            auth=auth,
-            remote_command=remote_command,
+            username=username,
+            password=password,
+            secret_kind=secret_kind,
         )
 
     def ask_for_rdp_access(self, domain, host, username, password):
@@ -17809,6 +17191,7 @@ class PentestShell:
         password: str,
         local_path: str,
         remote_path: str,
+        kerberos_spn_host: str | None = None,
     ) -> bool:
         """Upload a local file to a remote host over WinRM."""
         from adscan_internal.cli.winrm import winrm_upload
@@ -17820,6 +17203,7 @@ class PentestShell:
             password=password,
             local_path=local_path,
             remote_path=remote_path,
+            kerberos_spn_host=kerberos_spn_host,
         )
 
     def extract_firefox_passwords(self, domain, host, firefox_dir):
@@ -18509,12 +17893,6 @@ class PentestShell:
 
         exploit_delegation_constrained(self, domain, username, password, delegation_to)
 
-    def execute_constrained(self, command, domain, target_host, target_user):
-        """Executes constrained delegation command."""
-        from adscan_internal.cli.delegations import execute_constrained
-
-        execute_constrained(self, command, domain, target_host, target_user)
-
     def execute_dump_lsa(self, command, domain, _host):
         """Delegate to dumps module for consistency."""
         from adscan_internal.cli.dumps import execute_dump_lsa
@@ -18691,11 +18069,22 @@ class PentestShell:
 
         do_kerberoast_preauth(self, args)
 
-    def dcsync(self, domain, username, password):
-        """Perform DCSync to extract NTLM hashes of domain users."""
+    def dcsync(self, domain, username, password, target_domain=None):
+        """Perform DCSync to extract NTLM hashes of domain users.
+
+        ``domain`` is the auth domain (where the credential lives).
+        ``target_domain`` is the domain to extract from; when omitted it
+        defaults to ``domain`` (single-realm DCSync).  Cross-realm DCSync
+        via trust passes a different ``target_domain``.
+
+        Returns the extraction summary dict (``krbtgt``/``tier0_count``/
+        ``total``) when the run reached the secrets stage, ``None`` if it
+        aborted earlier. Used by the attack-graph step executor to decide
+        whether the DCSync edge succeeded.
+        """
         from adscan_internal.cli.kerberos import run_dcsync
 
-        run_dcsync(self, domain, username, password)
+        return run_dcsync(self, domain, username, password, target_domain=target_domain)
 
     def do_dcsync(self, args):
         """
@@ -19416,26 +18805,6 @@ class PentestShell:
 
         return run_smb_descriptions(self, domain=domain)
 
-    def do_netexec_null_general(self, domain):
-        """
-        Executes a null SMB session command for the specified domain.
-
-        Constructs a command to retrieve password policies using a null session for the domain's
-        primary domain controller (PDC). The output is logged to a file and executed in a separate thread.
-
-        Args:
-            domain (str): The domain for which to execute the null session command.
-        """
-        from adscan_internal.cli.smb import run_null_general
-
-        return run_null_general(self, domain=domain)
-
-    def do_netexec_null_shares(self, domain):
-        """Enumerate SMB shares via a null session."""
-        from adscan_internal.cli.smb import run_null_shares
-
-        run_null_shares(self, domain=domain)
-
     def do_netexec_guest(self, domain):
         """
         Executes a guest SMB session command to enumerate shares for the specified domain.
@@ -19475,54 +18844,17 @@ class PentestShell:
 
         run_netexec_auth_shares_from_args(self, args)
 
-    def netexec_cve_dcs(self, cve, target_domain):
-        from adscan_internal.cli.cves import run_netexec_cve_dcs
+    def do_cves(self, args):
+        """Native CVE scanner.
 
-        return run_netexec_cve_dcs(self, cve=cve, target_domain=target_domain)
-
-    def do_netexec_cve_dcs(self, args):
+        Usage:
+            cves scan [--targets <file>] [--cve <id|aka> ...] [--listener <ip>] [--concurrency N]
+            cves list
+            cves report
         """
-        Executes a netexec command to enumerate vulnerabilities on domain controllers.
+        from adscan_internal.cli.cves_native import dispatch as _dispatch_cves
 
-        Usage: netexec_cve_dcs <CVE> <domain>
-
-        Args:
-            args (str): A string containing the CVE identifier and target domain separated by a space.
-                       Example: "zerologon example.com"
-
-        Available CVEs:
-            zerologon
-            nopac
-        """
-        from adscan_internal.cli.cves import run_netexec_cve_dcs_from_args
-
-        return run_netexec_cve_dcs_from_args(self, args=args)
-
-    def netexec_cve_all(self, cve, target_domain):
-        from adscan_internal.cli.cves import run_netexec_cve_all
-
-        return run_netexec_cve_all(self, cve=cve, target_domain=target_domain)
-
-    def do_netexec_cve_all(self, args):
-        """
-        Executes a netexec command to enumerate vulnerabilities on all hosts in the specified domain.
-
-        Usage: netexec_cve_all <CVE> <domain>
-
-        Args:
-            args (str): A string containing the CVE identifier and target domain separated by a space.
-                       Example: "webdav example.com"
-
-        Available CVEs:
-            printnightmare
-            webdav
-            spooler
-            ms17-010
-            coerce_plus
-        """
-        from adscan_internal.cli.cves import run_netexec_cve_all_from_args
-
-        return run_netexec_cve_all_from_args(self, args=args)
+        return _dispatch_cves(self, args)
 
     def netexec_extract_domains_ldap(self, arg):
         command = f"{shlex.quote(self.netexec_path)} smb ldap/ips.txt"
@@ -19593,11 +18925,6 @@ class PentestShell:
 
         run_guest_shares_local(self, domain=domain)
 
-    def netexec_null_general_local(self, domain):
-        from adscan_internal.cli.smb import run_null_general_local
-
-        run_null_general_local(self, domain=domain)
-
     def do_rid_cycling(self, domain):
         from adscan_internal.cli.smb import run_rid_cycling
 
@@ -19663,40 +18990,6 @@ class PentestShell:
         from adscan_internal.cli.kerberos import execute_roast
 
         return execute_roast(self, command, domain, type, auto_crack=auto_crack)
-
-    def execute_bloodhound(self, command, domain):
-        from adscan_internal.rich_output import mark_sensitive
-
-        try:
-            print_info_verbose(f"Executing BloodHound command: {command}")
-            completed_process = self.run_command(command, timeout=300)
-
-            # Check the process output
-            if completed_process.returncode == 0:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_success(
-                    f"BloodHound executed successfully on domain {marked_domain}."
-                )
-                # Optionally, print stdout if needed, e.g., for confirmation or summary
-                # if completed_process.stdout:
-                #     print_info(f"BloodHound output:\n{completed_process.stdout.strip()}")
-            else:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_error(
-                    f"Error executing BloodHound on domain {marked_domain}. Return code: {completed_process.returncode}"
-                )
-                if completed_process.stderr:
-                    print_error(f"Error details: {completed_process.stderr.strip()}")
-                elif (
-                    completed_process.stdout
-                ):  # Sometimes errors are sent to stdout with shell=True
-                    print_error(
-                        f"Output (possibly error): {completed_process.stdout.strip()}"
-                    )
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error executing bloodhound.")
-            print_exception(show_locals=False, exception=e)
 
     def _postprocess_user_list_file(
         self,
@@ -19998,7 +19291,7 @@ class PentestShell:
         print_info_debug(f"[domain_file] Wrote {len(cleaned)} line(s) to {marked_path}")
         return file_path
 
-    def _process_bloodhound_computers_list(
+    def _process_computers_list(
         self, domain: str, comp_file: str, computers: list[str]
     ) -> None:
         """Process and persist a BloodHound computers list without using bloodhound-cli."""
@@ -20089,13 +19382,13 @@ class PentestShell:
             verbose_mode=VERBOSE_MODE,
         )
 
-    def execute_bloodhound_laps(
+    def execute_laps(
         self, command, domain, comp_file, computers: list[str] | None = None
     ):
-        """Wrapper for execute_bloodhound_laps - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import execute_bloodhound_laps
+        """Wrapper for execute_laps - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import execute_laps
 
-        execute_bloodhound_laps(self, command, domain, comp_file, computers=computers)
+        execute_laps(self, command, domain, comp_file, computers=computers)
 
     def monitor_nmap_domain(self, proc, domain):
         """Monitor nmap process output for domain-specific port scanning.
@@ -20155,18 +19448,6 @@ class PentestShell:
         from adscan_internal.cli.rdp import execute_rdp_access
 
         return execute_rdp_access(self, command)
-
-    def execute_secretsdump_with_domain(self, command, domain):
-        """Delegate to secretsdump module for consistency."""
-        from adscan_internal.cli.secretsdump import execute_secretsdump_with_domain
-
-        return execute_secretsdump_with_domain(self, command, domain)
-
-    def execute_secretsdump(self, command: str, domain: str) -> None:
-        """Delegate to secretsdump module for consistency."""
-        from adscan_internal.cli.secretsdump import execute_secretsdump
-
-        return execute_secretsdump(self, command, domain)
 
     def execute_dcsync_zerologon(self, command, domain):
         from adscan_internal.integrations.impacket.runner import (
@@ -20424,634 +19705,6 @@ class PentestShell:
         if not hasattr(self, "_cve_findings"):
             return
         self._cve_findings.pop((target_domain, scope), None)
-
-    def _run_netexec_cve_with_timeout_recovery(
-        self,
-        *,
-        command: str,
-        target_domain: str,
-        cve: str,
-        target_scope: str,
-    ):
-        """Run one NetExec CVE command using the shared NetExec timeout UX."""
-        from adscan_internal.rich_output import mark_sensitive
-
-        target_count = self._infer_service_command_target_count(command)
-        timeout_seconds = resolve_netexec_cve_timeout_seconds(
-            cve=cve,
-            target_scope=target_scope,
-            target_count=target_count,
-        )
-        marked_cve = mark_sensitive(str(cve or "").strip(), "text")
-        print_info_debug(
-            "[cves] timeout policy: "
-            f"cve={marked_cve} target_scope={target_scope} "
-            f"target_count={target_count} global_timeout={timeout_seconds}"
-        )
-        return self._run_netexec(
-            command,
-            domain=target_domain,
-            timeout=timeout_seconds,
-            operation_kind=f"cve_module:{str(cve or '').strip().lower() or 'unknown'}",
-            service="smb",
-            target_count=target_count,
-        )
-
-    def execute_netexec_cve_all(self, command, target_domain, cve):
-        # We use sets to avoid duplicates
-        from adscan_internal.rich_output import mark_sensitive
-        from adscan_internal.services.attack_graph_service import upsert_cve_host_edge
-
-        vulnerable_ips_dc = set()  # Set for vulnerable DCs
-        vulnerable_ips_non_dc = set()  # Set for the rest of the vulnerable hosts
-        vulnerable_all = set()
-        recorded_ips = set()
-
-        cve_key = str(cve or "").strip().lower()
-        cve_labels = {
-            "spooler": ("Spooler", "info"),
-            "webdav": ("WebDAV", "low"),
-            "printnightmare": ("PrintNightmare", "critical"),
-            "smbghost": ("SMBGhost", "high"),
-            "ms17-010": ("MS17-010", "critical"),
-        }
-        display_label, severity = cve_labels.get(cve_key, (str(cve), "info"))
-        step_status = "blocked" if cve_key == "printnightmare" else "discovered"
-        record_steps = cve_key not in {"spooler", "smbghost", "webdav"}
-
-        try:
-            completed_process = self._run_netexec_cve_with_timeout_recovery(
-                command=command,
-                target_domain=target_domain,
-                cve=cve,
-                target_scope="all",
-            )
-            output = strip_ansi_codes(completed_process.stdout or "")
-            errors = strip_ansi_codes(completed_process.stderr or "")
-
-            if completed_process.returncode == 0:
-                output_str = output
-                # Iterate over each line of the output
-                for line in output_str.splitlines():
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    # For MS17-010, take the IP from position 3
-                    if cve.lower() == "ms17-010":
-                        ip = parts[2]
-                    else:
-                        ip = parts[1]
-                        hostname = parts[3] if len(parts) >= 4 else None
-                        host_label = hostname or ip
-                    hostname = None
-                    if cve.lower() == "ms17-010":
-                        if len(parts) >= 5:
-                            hostname = parts[4]
-                    elif len(parts) >= 4:
-                        hostname = parts[3]
-                    host_label = hostname or ip
-
-                    # Determine the message and execute actions according to the CVE
-                    if "Spooler" in line:
-                        marked_ip = mark_sensitive(ip, "ip")
-                        print_success_verbose(f"Spooler activated on {marked_ip}.")
-                    elif "ly4k" in line:
-                        marked_ip = mark_sensitive(ip, "ip")
-                        marked_target_domain = mark_sensitive(target_domain, "domain")
-                        print_success_verbose(
-                            f"Domain {marked_target_domain} host at {marked_ip} vulnerable to printnightmare."
-                        )
-                        # self.ask_for_printnightmare(target_domain)
-                    elif "CVE-2020-0796" in line:
-                        marked_ip = mark_sensitive(ip, "ip")
-                        marked_target_domain = mark_sensitive(target_domain, "domain")
-                        print_success_verbose(
-                            f"Domain {marked_target_domain} host at {marked_ip} vulnerable to SMBGhost."
-                        )
-                    elif "is likely VULNERABLE to MS17-010" in line:
-                        marked_ip = mark_sensitive(ip, "ip")
-                        marked_target_domain = mark_sensitive(target_domain, "domain")
-                        print_success_verbose(
-                            f"Domain {marked_target_domain} host at {marked_ip} vulnerable to EternalBlue."
-                        )
-                    elif "WebClient" in line:
-                        marked_ip = mark_sensitive(ip, "ip")
-                        print_success_verbose(
-                            f"WebClient service running on {marked_ip}."
-                        )
-                    else:
-                        # If the line does not match any of the patterns, skip it.
-                        continue
-
-                    # Classify the IP based on whether it is a DC or not
-                    is_dc = self.is_computer_dc(target_domain, ip)
-                    if is_dc:
-                        vulnerable_ips_dc.add(ip)
-                    else:
-                        vulnerable_ips_non_dc.add(ip)
-                    vulnerable_all.add(ip)
-                    self._record_cve_finding(
-                        target_domain=target_domain,
-                        scope="all",
-                        key=cve_key,
-                        label=display_label,
-                        severity=severity,
-                        ip=ip,
-                        host_label=host_label,
-                        is_dc=is_dc,
-                    )
-                    if record_steps and ip not in recorded_ips:
-                        upsert_cve_host_edge(
-                            self,
-                            target_domain,
-                            relation=display_label,
-                            target_ip=ip,
-                            target_hostname=hostname,
-                            status=step_status,
-                            notes={"module": str(cve or "")},
-                        )
-                        recorded_ips.add(ip)
-
-                if not vulnerable_all:
-                    marked_target_domain = mark_sensitive(target_domain, "domain")
-                    print_error(
-                        f"No vulnerable hosts found for {cve} on domain {marked_target_domain}."
-                    )
-
-            else:
-                print_error(f"Error enumerating CVEs for {cve}.")
-                print_error(errors.strip())
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error executing netexec for {cve}.")
-            print_exception(show_locals=False, exception=e)
-
-        # Save the list of vulnerable DCs only if there is at least one IP
-        if vulnerable_ips_dc:
-            output_file_dc = f"domains/{target_domain}/smb/{cve}_vulnerable_dc.txt"
-            os.makedirs(os.path.dirname(output_file_dc), exist_ok=True)
-            try:
-                with open(output_file_dc, "w", encoding="utf-8") as f:
-                    for ip in vulnerable_ips_dc:
-                        f.write(ip + "\n")
-                print_info_verbose(
-                    f"Vulnerable DCs list for {cve} saved in {output_file_dc}."
-                )
-            except Exception as e:
-                telemetry.capture_exception(e)
-                print_error(
-                    f"Error writing the vulnerable DCs file for {cve}: {str(e)}"
-                )
-        else:
-            print_info_verbose(f"No vulnerable DCs for CVE {cve}.")
-
-        # Save the list of vulnerable non-DC hosts only if there is at least one IP
-        if vulnerable_ips_non_dc:
-            output_file_non_dc = (
-                f"domains/{target_domain}/smb/{cve}_vulnerable_non_dc.txt"
-            )
-            os.makedirs(os.path.dirname(output_file_non_dc), exist_ok=True)
-            try:
-                with open(output_file_non_dc, "w", encoding="utf-8") as f:
-                    for ip in vulnerable_ips_non_dc:
-                        f.write(ip + "\n")
-                print_info_verbose(
-                    f"Vulnerable non-DC hosts list for {cve} saved in {output_file_non_dc}."
-                )
-            except Exception as e:
-                telemetry.capture_exception(e)
-                print_error(
-                    f"Error writing the vulnerable hosts file for {cve}: {str(e)}"
-                )
-        else:
-            print_info_verbose(f"No vulnerable non-DC hosts for CVE {cve}.")
-
-        value = {
-            "all_computers": list(vulnerable_all) if list(vulnerable_all) else None,
-            "dcs": list(vulnerable_ips_dc) if vulnerable_ips_dc else None,
-            "non_dcs": list(vulnerable_ips_non_dc) if vulnerable_ips_non_dc else None,
-        }
-        # The following line seems to overwrite the dictionary 'value' with a list or None.
-        # This might be a bug in the original code. I will refactor the print statements
-        # but leave this logic as is, as per the requirement not to change functionality.
-        value = list(vulnerable_ips_dc) if vulnerable_ips_dc else None
-
-        self.update_report_field(target_domain, cve, value)
-
-        # Message indicating the completion of the CVE execution
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        print_info_verbose(
-            f"Finished executing CVE {cve} on domain {marked_target_domain}."
-        )
-
-    def execute_netexec_cve_all_coerce(self, command, target_domain):
-        # Dictionary to store the vulnerable IPs for each CVE.
-        # Each key is the CVE name and the value is another dictionary with two sets: one for DC and one for non‑DC.
-        from adscan_internal.rich_output import mark_sensitive
-        from adscan_internal.services.attack_graph_service import upsert_cve_host_edge
-
-        vulnerabilities = {
-            "dfscoerce": {"dc": set(), "non_dc": set()},
-            "petitpotam": {"dc": set(), "non_dc": set()},
-            "printerbug": {"dc": set(), "non_dc": set()},
-            "mseven": {"dc": set(), "non_dc": set()},
-        }
-        cve_labels = {
-            "dfscoerce": ("DFSCoerce", "high"),
-            "petitpotam": ("PetitPotam", "high"),
-            "printerbug": ("PrinterBug", "high"),
-            "mseven": ("MSEven", "medium"),
-        }
-        recorded_ips_by_cve: dict[str, set[str]] = {
-            key: set() for key in vulnerabilities
-        }
-        record_steps_for_coerce = set()
-
-        try:
-            completed_process = self._run_netexec_cve_with_timeout_recovery(
-                command=command,
-                target_domain=target_domain,
-                cve="coerce_plus",
-                target_scope="all",
-            )
-
-            if completed_process.returncode == 0:
-                output_str = completed_process.stdout
-                if not output_str:
-                    marked_target_domain = mark_sensitive(target_domain, "domain")
-                    print_warning(
-                        f"Netexec CVE coercion command for domain {marked_target_domain} executed successfully but produced no output."
-                    )
-                else:
-                    # Process each line of the output
-                    for line in output_str.splitlines():
-                        parts = line.split()
-                        if len(parts) < 2:
-                            continue
-                        ip = parts[1]  # Assuming IP is consistently the second part
-                        hostname = parts[3] if len(parts) >= 4 else None
-                        host_label = hostname or ip
-
-                        # Detect which CVE is mentioned in the line
-                        cve_detected = None
-                        if "DFSCoerce" in line:
-                            cve_detected = "dfscoerce"
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} host at {marked_ip} vulnerable to DFSCoerce."
-                            )
-                        elif "PetitPotam" in line:
-                            cve_detected = "petitpotam"
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} host at {marked_ip} vulnerable to PetitPotam."
-                            )
-                        elif "VULNERABLE, PrinterBug" in line:
-                            cve_detected = "printerbug"
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} host at {marked_ip} vulnerable to PrinterBug."
-                            )
-                        elif "MSEven" in line:
-                            cve_detected = "mseven"
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} host at {marked_ip} vulnerable to MSEven."
-                            )
-
-                        if cve_detected:
-                            is_dc = self.is_computer_dc(target_domain, ip)
-                            if is_dc:
-                                vulnerabilities[cve_detected]["dc"].add(ip)
-                            else:
-                                vulnerabilities[cve_detected]["non_dc"].add(ip)
-                            label, severity = cve_labels.get(
-                                cve_detected, (cve_detected, "info")
-                            )
-                            self._record_cve_finding(
-                                target_domain=target_domain,
-                                scope="all",
-                                key=cve_detected,
-                                label=label,
-                                severity=severity,
-                                ip=ip,
-                                host_label=host_label,
-                                is_dc=is_dc,
-                            )
-                            if (
-                                cve_detected in record_steps_for_coerce
-                                and ip not in recorded_ips_by_cve[cve_detected]
-                            ):
-                                label, _severity = cve_labels.get(
-                                    cve_detected, (cve_detected, "info")
-                                )
-                                upsert_cve_host_edge(
-                                    self,
-                                    target_domain,
-                                    relation=label,
-                                    target_ip=ip,
-                                    target_hostname=hostname,
-                                    status="discovered",
-                                    notes={"module": "coerce_plus"},
-                                )
-                                recorded_ips_by_cve[cve_detected].add(ip)
-
-                # After processing all output, iterate through the populated vulnerabilities dictionary
-                for cve_name, cve_data in vulnerabilities.items():
-                    if cve_data["dc"]:
-                        output_file_dc = (
-                            f"domains/{target_domain}/smb/{cve_name}_vulnerable_dc.txt"
-                        )
-                        os.makedirs(os.path.dirname(output_file_dc), exist_ok=True)
-                        try:
-                            with open(output_file_dc, "w", encoding="utf-8") as f:
-                                for ip_addr in sorted(list(cve_data["dc"])):
-                                    f.write(ip_addr + "\n")
-                            print_info_verbose(
-                                f"Vulnerable DCs list for {cve_name} saved in {output_file_dc}."
-                            )
-                        except Exception as e_write_dc:
-                            telemetry.capture_exception(e_write_dc)
-                            print_error(
-                                f"Error writing vulnerable DCs file for {cve_name}: {str(e_write_dc)}"
-                            )
-                    # else: # Optional: too verbose to print 'no vulnerable DCs' for every cve
-                    # print_warning(f"No vulnerable DCs found for {cve_name} via coercion.")
-
-                    if cve_data["non_dc"]:
-                        output_file_non_dc = f"domains/{target_domain}/smb/{cve_name}_vulnerable_non_dc.txt"
-                        os.makedirs(os.path.dirname(output_file_non_dc), exist_ok=True)
-                        try:
-                            with open(output_file_non_dc, "w", encoding="utf-8") as f:
-                                for ip_addr in sorted(list(cve_data["non_dc"])):
-                                    f.write(ip_addr + "\n")
-                            print_info_verbose(
-                                f"Vulnerable non-DC hosts list for {cve_name} saved in {output_file_non_dc}."
-                            )
-                        except Exception as e_write_non_dc:
-                            telemetry.capture_exception(e_write_non_dc)
-                            print_error(
-                                f"Error writing vulnerable non-DC hosts file for {cve_name}: {str(e_write_non_dc)}"
-                            )
-                    # else: # Optional: too verbose
-                    # print_warning(f"No vulnerable non-DC hosts found for {cve_name} via coercion.")
-
-                    # Update the report for the current cve_name
-                    # Original logic for 'value' in execute_netexec_cve_all_coerce only stored dcs and non_dcs.
-                    report_dcs = (
-                        sorted(list(cve_data["dc"])) if cve_data["dc"] else None
-                    )
-                    report_non_dcs = (
-                        sorted(list(cve_data["non_dc"])) if cve_data["non_dc"] else None
-                    )
-
-                    if (
-                        report_dcs or report_non_dcs
-                    ):  # Only update if there's something to report
-                        value_to_store = {"dcs": report_dcs, "non_dcs": report_non_dcs}
-                        self.update_report_field(
-                            target_domain, cve_name, value_to_store
-                        )
-                    # else: # Optionally, explicitly store None or an empty dict if nothing found for this CVE
-                    # self.update_report_field(target_domain, cve_name, None)
-
-                marked_target_domain = mark_sensitive(target_domain, "domain")
-                print_info(
-                    f"Finished executing and processing netexec CVE coercion on domain {marked_target_domain}."
-                )
-
-            elif completed_process.returncode != 0:
-                marked_target_domain = mark_sensitive(target_domain, "domain")
-                print_error(
-                    f"Error executing netexec for CVE coercion on domain {marked_target_domain}. Return code: {completed_process.returncode}"
-                )
-                error_message = (
-                    completed_process.stderr.strip()
-                    if completed_process.stderr
-                    else completed_process.stdout.strip()
-                )
-                if error_message:
-                    print_error(f"Details: {error_message}")
-                else:
-                    print_error("No error output from netexec CVE coercion command.")
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            marked_target_domain = mark_sensitive(target_domain, "domain")
-            print_error(
-                f"Error executing netexec for CVE coercion on domain {marked_target_domain}: {str(e)}"
-            )
-
-            print_exception(exception=e)
-
-    def execute_netexec_cve_dcs(self, command, target_domain, cve):
-        # We use sets to avoid duplicates
-        from adscan_internal.rich_output import mark_sensitive
-        from adscan_internal.services.attack_graph_service import upsert_cve_host_edge
-
-        vulnerable_ips_dc = set()  # Set for vulnerable DCs
-        vulnerable_dc_labels = set()
-        detected_takeover_cves: set[str] = set()
-        recorded_ips = set()
-
-        cve_key = str(cve or "").strip().lower()
-        cve_labels = {
-            "nopac": ("NoPac", "critical"),
-            "zerologon": ("Zerologon", "critical"),
-            "printnightmare": ("PrintNightmare", "critical"),
-        }
-        display_label, severity = cve_labels.get(cve_key, (str(cve), "high"))
-        step_status = "blocked" if cve_key == "printnightmare" else "discovered"
-
-        try:
-            completed_process = self._run_netexec_cve_with_timeout_recovery(
-                command=command,
-                target_domain=target_domain,
-                cve=cve,
-                target_scope="dcs",
-            )
-
-            if completed_process.returncode == 0:
-                output_str = completed_process.stdout
-                if not output_str:
-                    marked_target_domain = mark_sensitive(target_domain, "domain")
-                    print_error(
-                        f"Netexec command for {cve} on domain {marked_target_domain} executed successfully but produced no output."
-                    )
-                else:
-                    # Iterate over each line of the output
-                    for line in output_str.splitlines():
-                        parts = line.split()
-                        if len(parts) < 2:
-                            continue
-                        ip = parts[1]
-                        hostname = parts[3] if len(parts) >= 4 else None
-                        host_label = hostname or ip
-
-                        # Determine the message and execute actions according to the CVE
-                        if "Ridter" in line:
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} DC at {marked_ip} vulnerable to noPac."
-                            )
-                            detected_takeover_cves.add("nopac")
-                            # self.ask_for_nopac(target_domain) # User interaction to be handled elsewhere if needed
-                        elif "dirkjanm" in line:
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} DC at {marked_ip} vulnerable to zerologon."
-                            )
-                            detected_takeover_cves.add("zerologon")
-                            # self.ask_for_zerologon(target_domain) # User interaction to be handled elsewhere if needed
-                        elif "ly4k" in line:
-                            marked_ip = mark_sensitive(ip, "ip")
-                            marked_target_domain = mark_sensitive(
-                                target_domain, "domain"
-                            )
-                            print_success_verbose(
-                                f"Domain {marked_target_domain} DC at {marked_ip} vulnerable to printnightmare."
-                            )
-                        else:
-                            # If the line does not match any of the patterns, skip it.
-                            continue
-                        vulnerable_ips_dc.add(ip)
-                        if host_label:
-                            vulnerable_dc_labels.add(str(host_label).strip())
-                        self._record_cve_finding(
-                            target_domain=target_domain,
-                            scope="dcs",
-                            key=cve_key,
-                            label=display_label,
-                            severity=severity,
-                            ip=ip,
-                            host_label=host_label,
-                            is_dc=True,
-                        )
-                        if ip not in recorded_ips:
-                            upsert_cve_host_edge(
-                                self,
-                                target_domain,
-                                relation=display_label,
-                                target_ip=ip,
-                                target_hostname=hostname,
-                                status=step_status,
-                                notes={"module": str(cve or "")},
-                            )
-                            recorded_ips.add(ip)
-                if not vulnerable_ips_dc:
-                    marked_target_domain = mark_sensitive(target_domain, "domain")
-                    print_info(
-                        f"No vulnerable DCs found for {cve} on domain {marked_target_domain}."
-                    )
-            else:
-                marked_target_domain = mark_sensitive(target_domain, "domain")
-                print_error(
-                    f"Error executing netexec for {cve} on domain {marked_target_domain}. Return code: {completed_process.returncode}"
-                )
-                error_message = (
-                    completed_process.stderr.strip()
-                    if completed_process.stderr
-                    else completed_process.stdout.strip()
-                )
-                if error_message:
-                    print_error(f"Details: {error_message}")
-                else:
-                    print_error(f"No error output from netexec command for {cve}.")
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            marked_target_domain = mark_sensitive(target_domain, "domain")
-            print_error(
-                f"An exception occurred while executing netexec for {cve} on domain {marked_target_domain}: {str(e)}"
-            )
-
-            print_exception(exception=e)
-            # Ensure vulnerable_ips_dc is in a defined state if an exception occurs before its processing
-            # However, file saving and report update should ideally be within the try if they depend on command success
-
-        # Save the list of vulnerable DCs only if there is at least one IP
-        # This part is outside the try-catch for the subprocess, as it processes results regardless of subprocess success,
-        # but it should only run if the command was at least attempted.
-        # If an exception occurred during subprocess.run itself, vulnerable_ips_dc might not be reliably populated.
-        # For robustness, consider moving file/report logic into the `if completed_process.returncode == 0` block,
-        # or ensure `vulnerable_ips_dc` is correctly handled in case of early exceptions.
-        # For now, maintaining original flow: process whatever is in vulnerable_ips_dc.
-
-        if vulnerable_ips_dc:
-            output_file_dc = f"domains/{target_domain}/smb/{cve}_vulnerable_dc.txt"
-            os.makedirs(os.path.dirname(output_file_dc), exist_ok=True)
-            try:
-                with open(output_file_dc, "w", encoding="utf-8") as f:
-                    for ip_addr in sorted(list(vulnerable_ips_dc)):
-                        f.write(ip_addr + "\n")
-                print_info_verbose(
-                    f"Vulnerable DCs list for {cve} saved in {output_file_dc}."
-                )
-            except Exception as e_write:
-                telemetry.capture_exception(e_write)
-                print_error(
-                    f"Error writing the vulnerable DCs file for {cve}: {str(e_write)}"
-                )
-        else:
-            # Only print warning if the command itself didn't fail, to avoid redundant messages.
-            # This check might need `completed_process` which is not in scope here if an early exception happened.
-            # A simple flag could track command success if needed here.
-            marked_target_domain = mark_sensitive(target_domain, "domain")
-            print_info_verbose(
-                f"No vulnerable DCs found or reported for {cve} on domain {marked_target_domain}."
-            )
-
-        # Update report field
-        value_to_report = sorted(list(vulnerable_ips_dc)) if vulnerable_ips_dc else None
-        self.update_report_field(target_domain, cve, value_to_report)
-
-        # Record takeover CVE edges as attack graph steps (best-effort).
-        if detected_takeover_cves:
-            try:
-                from adscan_internal.services.attack_graph_service import (
-                    upsert_cve_takeover_edge,
-                )
-
-                for takeover_cve in sorted(detected_takeover_cves):
-                    upsert_cve_takeover_edge(
-                        self,
-                        target_domain,
-                        cve=takeover_cve,
-                        status="discovered",
-                        vulnerable_dc_labels=sorted(list(vulnerable_dc_labels)),
-                        notes={
-                            "source": "netexec",
-                            "module": str(cve or ""),
-                            "vulnerable_dc_labels": sorted(list(vulnerable_dc_labels)),
-                            "vulnerable_dcs": sorted(list(vulnerable_ips_dc)),
-                        },
-                    )
-            except Exception as e:
-                telemetry.capture_exception(e)
-
-        # Message indicating the completion of the CVE execution
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        print_success_verbose(
-            f"Finished executing CVE {cve} on domain {marked_target_domain}."
-        )
 
     def execute_netexec_gpp(self, command, type, domain: str | None = None):
         try:
@@ -21652,6 +20305,85 @@ class PentestShell:
             auth_username=auth_username,
         )
         return len(result.entries)
+
+    def _process_office_artifact(
+        self,
+        domain: str,
+        source_path: str,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+    ) -> int:
+        """Crack one encrypted Office artifact with office2john + John."""
+        from adscan_internal.cli.cracking import resolve_cracking_wordlist
+        from adscan_internal.cli.office_artifact_renderer import (
+            render_office_vault_detected,
+            render_office_vault_failed,
+            render_office_vault_unlocked,
+        )
+        from adscan_internal.services.john_artifact_cracking_service import (
+            JohnArtifactCrackingService,
+        )
+        from adscan_internal.services.office_artifact_service import (
+            OfficeArtifactService,
+        )
+
+        marked_source = mark_sensitive(source_path, "path")
+        office2john_path = JohnArtifactCrackingService.resolve_converter_path("office2john")
+        if not office2john_path:
+            print_warning(
+                f"Encrypted Office artifact found at {marked_source}, "
+                "but office2john is not available."
+            )
+            return 0
+
+        workspace_cwd = self._get_workspace_cwd()
+        render_office_vault_detected(
+            file_path=source_path,
+            workspace_cwd=workspace_cwd,
+            office2john_available=True,
+        )
+
+        wordlist_path = resolve_cracking_wordlist(
+            shell=self,
+            hash_type="office",
+            domain=domain,
+            wordlists_dir=WORDLISTS_INSTALL_DIR,
+            failed=False,
+        )
+        report_dir = os.path.join("domains", domain, "smb", "office_artifacts")
+        svc = OfficeArtifactService()
+        result = svc.crack(
+            domain=domain,
+            source_path=source_path,
+            wordlist_path=wordlist_path,
+            office2john_path=office2john_path,
+            python_executable="python3",
+            report_dir=report_dir,
+        )
+
+        if result.cracked:
+            render_office_vault_unlocked(result=result, workspace_cwd=workspace_cwd)
+            # Feed the cracked password into the credential pipeline so it can
+            # be used for spraying and validation like any other found credential.
+            self.handle_found_credentials(
+                {
+                    "office_artifact": [
+                        (result.cracked_password, 1.0, source_path, None, source_path)
+                    ]
+                },
+                domain,
+                source_hosts=source_hosts or [],
+                source_shares=source_shares or [],
+                auth_username=auth_username or "",
+                source_artifact="encrypted Office document",
+                analysis_origin="deterministic",
+                ai_findings=[],
+            )
+            return 1
+        else:
+            render_office_vault_failed(result=result, workspace_cwd=workspace_cwd)
+            return 0
 
     @staticmethod
     def _looks_like_cpassword_value(value: str | None) -> bool:
@@ -22610,7 +21342,7 @@ class PentestShell:
                 print_info_verbose(
                     "Membership snapshot/LDAP group lookup failed or is unavailable. Falling back to BloodHound."
                 )
-                privileged_groups = self._check_privileged_groups_with_bloodhound(
+                privileged_groups = self._check_privileged_groups_with_graph(
                     domain, username
                 )
                 source = "bloodhound"
@@ -22679,7 +21411,6 @@ class PentestShell:
             resolve_privileged_followup_options,
         )
 
-        summary = None
         privileged_groups = {
             "domain_admin": bool(membership.get("domain_admin")),
             "backup_operators": bool(membership.get("backup_operators")),
@@ -22774,7 +21505,40 @@ class PentestShell:
             print_warning(
                 f"The user {marked_username} is a member of the Domain Admins group"
             )
-            self.domains_data[domain]["auth"] = "pwned"
+            try:
+                from adscan_internal.services.membership_snapshot import (
+                    add_runtime_user_group_membership,
+                )
+
+                add_runtime_user_group_membership(
+                    self,
+                    domain,
+                    username=username,
+                    group_name="Domain Admins",
+                    source="priv_group_enumeration",
+                    evidence={
+                        "detected_at": datetime.now(timezone.utc).isoformat(),
+                        "source": "privileged-group enumeration follow-up",
+                    },
+                    origin_kind="runtime_effective",
+                    origin_relation="MemberOf",
+                )
+            except Exception as _exc:  # noqa: BLE001
+                telemetry.capture_exception(_exc)
+
+            from adscan_internal.services.domain_compromise_promotion import (
+                CompromiseEvidence,
+                promote_to_pwned,
+            )
+
+            promote_to_pwned(
+                self,
+                domain=domain,
+                evidence=CompromiseEvidence.DOMAIN_ADMIN_MEMBERSHIP,
+                username=username,
+                credential=password,
+                ctf_actions={"flags", "dcsync"},
+            )
             try:
                 from adscan_internal.cli.backup_operators_escalation import (
                     handle_backup_ops_sysvol_cleanup,
@@ -22789,128 +21553,12 @@ class PentestShell:
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
                 print_info_debug(f"[backup-ops] cleanup helper failed: {exc}")
-            record_technical_event = load_optional_report_service_attr(
-                "record_technical_event",
-                action="Technical event sync",
-                debug_printer=print_info_debug,
-            )
-            if callable(record_technical_event):
-                try:
-                    record_technical_event(
-                        self,
-                        domain,
-                        event_type="domain_compromise",
-                        message="Domain Admin compromise via privileged group membership",
-                        details={
-                            "username": username,
-                            "domain": domain,
-                            "source": source,
-                        },
-                    )
-                except Exception as _e:  # pragma: no cover
-                    telemetry.capture_exception(_e)
-            try:
-                duration_seconds: float | None = None
-                duration_minutes: float | None = None
-                if getattr(self, "scan_start_time", None):
-                    duration_seconds = max(0.0, time.monotonic() - self.scan_start_time)
-                    if isinstance(duration_seconds, (int, float)):
-                        duration_minutes = round(duration_seconds / 60.0, 2)
-
-                properties = {
-                    "scan_mode": getattr(self, "scan_mode", None),
-                    "duration_minutes": duration_minutes,
-                    "type": self.type,
-                    "auto": self.auto,
-                }
-                properties.update(build_lab_event_fields(shell=self, include_slug=True))
-                telemetry.capture("domain_compromise", properties)
-
-                # Track scan-level TTC for scan_complete event
-                if (
-                    hasattr(self, "_scan_compromise_time")
-                    and self._scan_compromise_time is None
-                ):
-                    self._scan_compromise_time = time.monotonic()
-                mark_session_domain_compromised(self)
-
-                # Track victory for session summary (Hormozi: Give:Ask ratio)
-                if hasattr(self, "_session_victories"):
-                    self._session_victories.append("domain_compromise")
-
-                marked_domain = mark_sensitive(domain, "domain")
-                if duration_minutes is not None:
-                    summary = (
-                        f"Domain [bold]{marked_domain}[/bold] compromised in "
-                        f"[bold green]{duration_minutes:.2f} minute(s)[/bold green]."
-                    )
-                else:
-                    summary = (
-                        f"Domain [bold]{marked_domain}[/bold] has been compromised."
-                    )
-            except Exception as _e:
-                telemetry.capture_exception(_e)
-                summary = None
-
-            # Victory hint: DA compromise (Tier 3 - explicit panel)
-            if should_show_victory_hint("da_compromise", "explicit"):
-                show_victory_hint_explicit(
-                    victory_type="da_compromise",
-                    title="🎯 Major Win: Domain Admin Compromised!",
-                    message=(
-                        "[bold green]You've just proven full domain compromise.[/bold green]\n\n"
-                        "Domain Admin access confirmed. This is the finding your client is paying you to discover.\n\n"
-                        "[bold]Next step:[/bold] Document it before the engagement window closes.\n"
-                        "Generate a board-ready report → "
-                        "[link=https://adscanpro.com/reports?utm_source=cli&utm_medium=victory_da_compromise]"
-                        "adscanpro.com/reports[/link]"
-                    ),
-                )
-            # Star CTA at peak goodwill — domain compromise euphoria (Hormozi: give first, ask at max goodwill)
-            if should_show_victory_hint("github_star", "explicit"):
-                raw_url = "https://github.com/ADscanPro/adscan"
-                url = mark_passthrough(raw_url)
-                self.console.print()
-                print_info(
-                    f"[dim]Enjoying ADscan? A ⭐ on GitHub helps other pentesters discover it "
-                    f"→ [link={raw_url}]{url}[/link][/dim]"
-                )
-                mark_victory_hint_shown("github_star")
-                try:
-                    telemetry.capture(
-                        "star_cta_shown", {"trigger": "domain_compromise"}
-                    )
-                except Exception:
-                    pass
 
             if self.type == "ctf":
-                # CTF mode: run minimal post-compromise actions immediately (flags + DCSync).
-                self._ctf_queue_post_compromise_actions(
-                    domain,
-                    username,
-                    password,
-                    actions={"flags", "dcsync"},
-                    compromise_summary=summary,
-                )
-                self._ctf_execute_post_compromise_actions(domain)
                 return privileged_groups
-
-            # Non-CTF flows keep the extended post-compromise actions.
-            # For these flows, keep the immediate compromise panel display.
-            if summary:
-                from adscan_internal.rich_output import print_panel
-
-                print_panel(
-                    summary,
-                    title="[bold green]Domain Compromised[/bold green]",
-                    border_style="green",
-                    box=rich.box.ROUNDED,
-                    padding=(1, 2),
-                    expand=False,
-                )
             self.ask_for_dcsync(domain, username, password)
             if self.type == "audit":
-                self._run_audit_post_da_bloodhound_refresh(
+                self._run_audit_post_da_graph_refresh(
                     domain,
                     username,
                     password,
@@ -22923,8 +21571,11 @@ class PentestShell:
             print_warning(
                 f"The user {marked_username} is a member of the Administrators group"
             )
-            if self.type == "ctf":
-                self.ask_for_flags(domain, username, password)
+            # In CTF mode: run DCSync first so we get the Domain Admin / Administrator
+            # NT hash, then rely on the credential-add pipeline to trigger flag
+            # collection with reliable credentials.  Asking for flags here fires
+            # before DCSync and uses the current (possibly contaminated) Kerberos
+            # session, causing ACCESS_DENIED on SMB C$ probes.
             self.ask_for_dcsync(domain, username, password)
 
         if selected_key == "backup_operators":
@@ -23034,10 +21685,15 @@ class PentestShell:
 
         return privileged_groups
 
-    def _check_privileged_groups_with_bloodhound(self, domain, username):
+    def _check_privileged_groups_with_graph(self, domain, username):
         """Use BloodHoundService to resolve group membership. Returns dict or None on failure."""
+
+        # In native mode the membership snapshot already covers group resolution.
+        # If we reached this point both snapshot and LDAP lookups already failed,
+        # so returning None degrades gracefully — the caller handles None.
+        return None
         try:
-            service = self._get_bloodhound_service()
+            service = self._get_graph_service()
             groups = service.get_user_groups(
                 domain=domain, username=username, recursive=True
             )
@@ -23648,84 +22304,6 @@ class PentestShell:
             self, domain=domain, username=username, password=password
         )
 
-    def enum_delegations_user(self, domain, username, password):
-        from adscan_internal.rich_output import mark_sensitive
-
-        try:
-            # Build the base command
-            auth = self.build_auth_impacket_no_host(username, password, domain)
-            if not self.impacket_scripts_dir:
-                print_error(
-                    "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-                )
-                return
-            find_delegation_path = os.path.join(
-                self.impacket_scripts_dir, "findDelegation.py"
-            )
-            if not os.path.isfile(find_delegation_path) or not os.access(
-                find_delegation_path, os.X_OK
-            ):
-                print_error(
-                    f"findDelegation.py not found or not executable in {self.impacket_scripts_dir}. Please check Impacket installation."
-                )
-                return
-            command = (
-                f"{shlex.quote(find_delegation_path)} {auth} "
-                f"-target-domain {shlex.quote(domain)}"
-            )
-            marked_username = mark_sensitive(username, "user")
-            print_info_verbose(
-                f"Enumerating delegation details for user {marked_username}"
-            )
-
-            # First execution without -k
-            completed_process = self.run_command(command, timeout=300)
-            output = completed_process.stdout
-            error = completed_process.stderr
-            # If there is a credentials error, try with -k
-            if (
-                "invalidCredentials" in output
-                or "AcceptSecurityContext error" in output
-            ):
-                command += " -k"
-                print_success("Retrying with -k")
-                completed_process = self.run_command(command, timeout=300)
-                output = completed_process.stdout
-                error = completed_process.stderr
-            if completed_process.returncode == 0:
-                # Process the output line by line
-                lines = output.strip().split("\n")
-                for line in lines:
-                    if line.startswith("AccountName") or line.startswith("-"):
-                        continue
-
-                    # Use regular expression to split the line while preserving spaces in delegation types
-                    matches = re.findall(
-                        r"(\S+)\s+(\S+)\s+((?:Resource-Based\s+)?Constrained(?:\s+w/\s+Protocol\s+Transition)?)\s+(\S+)",
-                        line,
-                    )
-
-                    if matches:
-                        account_name, account_type, delegation_type, delegation_to = (
-                            matches[0]
-                        )
-                        if account_name == username:  # Only process the specific user
-                            # Directly proceed to ask for exploitation with the full delegation type
-                            self.ask_for_exploit_delegation(
-                                domain,
-                                username,
-                                password,
-                                delegation_type,
-                                delegation_to,
-                            )
-                            break  # Exit after finding the user
-            else:
-                print_error(f"Error enumerating delegations: {error}")
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error enumerating user delegations.")
-            print_exception(show_locals=False, exception=e)
-
     def ask_for_exploit_delegation(
         self, domain, username, password, delegation_type, delegation_to
     ):
@@ -23817,10 +22395,35 @@ class PentestShell:
             return None
 
     def check_maq(self, domain, username, password):
-        """Checks the MachineAccountQuota using netexec."""
+        """Checks the MachineAccountQuota using native LDAP."""
         from adscan_internal.cli.ldap import check_maq
 
         return check_maq(self, domain, username, password)
+
+    def assess_machine_account_capacity(self, domain, username, password):
+        """Assess whether one actor can create another machine account."""
+        from adscan_internal.services.ldap_transport_service import ADscanLDAPConfig
+        from adscan_internal.services.machine_account_provisioning_service import (
+            assess_machine_account_capacity,
+        )
+
+        domain_data = self.domains_data.get(domain) or {}
+        dc_ip = str(domain_data.get("pdc") or "").strip()
+        if not dc_ip:
+            return None
+        config = ADscanLDAPConfig(
+            domain=domain,
+            dc_ip=dc_ip,
+            use_ldaps=True,
+            use_kerberos=False,
+            username=username,
+            password=password,
+        )
+        return assess_machine_account_capacity(
+            ldap_config=config,
+            actor_username=username,
+            shell=self,
+        )
 
     def add_computer_to_domain(
         self, domain, computer_name, computer_pass, username, password
@@ -23943,42 +22546,30 @@ class PentestShell:
         Delegates to the LDAP CLI helper to keep argument parsing and UX outside
         of the main CLI monolith.
         """
-        from adscan_internal.cli.bloodhound import run_enumerate_user_aces
+        from adscan_internal.cli.attack_graph_reports import run_enumerate_user_aces
 
         run_enumerate_user_aces(self, args)
 
     def enable_user(self, domain, username, password, target_username):
-        """Enables a disabled user account using bloodyAD."""
+        """Enable a disabled user account via native LDAP (userAccountControl)."""
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.services.exploitation import ExploitationService
-        from adscan_internal.integrations.bloody import resolve_bloody_host
 
+        marked_target = mark_sensitive(target_username, "user")
         try:
-            marked_target_username = mark_sensitive(target_username, "user")
-            print_info_verbose(
-                f"Attempting to enable disabled user: {marked_target_username}"
-            )
             pdc_ip = self.domains_data[domain]["pdc"]
-            pdc_hostname = self.domains_data[domain].get("pdc_hostname")
+            pdc_hostname = self.domains_data[domain].get("pdc_hostname") or pdc_ip
+            # Prefer FQDN for Kerberos SPN matching; fall back to IP.
             pdc_host = (
-                resolve_bloody_host(
-                    pdc_ip=pdc_ip,
-                    pdc_hostname=pdc_hostname,
-                    domain=domain,
-                    kerberos=True,
-                )
-                or pdc_ip
-            )
-            marked_pdc_ip = mark_sensitive(pdc_host, "ip")
-            marked_target_username = mark_sensitive(target_username, "user")
+                f"{pdc_hostname}.{domain}" if pdc_hostname and "." not in pdc_hostname
+                else pdc_hostname
+            ) or pdc_ip
             print_info_verbose(
-                f"Using PDC {marked_pdc_ip} to enable user {marked_target_username}"
+                f"Enabling user {marked_target} via LDAP on {mark_sensitive(pdc_host, 'ip')}"
             )
-
             service = ExploitationService()
             success = service.acl.enable_user(
                 pdc_host=pdc_host,
-                bloody_path=self.bloodyad_path,
                 username=username,
                 password=password,
                 domain=domain,
@@ -23986,55 +22577,35 @@ class PentestShell:
                 kerberos=True,
                 timeout=120,
             )
-
             if success:
-                print_success(f"Successfully enabled user: {marked_target_username}")
+                print_success(f"Successfully enabled user: {marked_target}")
             else:
-                print_error(
-                    f"Failed to enable user {marked_target_username}. "
-                    "Check logs for BloodyAD output details."
-                )
+                print_error(f"Failed to enable user {marked_target}.")
             return success
-
         except Exception as e:
             telemetry.capture_exception(e)
-            marked_target_username = mark_sensitive(target_username, "user")
-            print_error(
-                f"An exception occurred while trying to enable user {marked_target_username}: {e}"
-            )
+            print_error(f"Error enabling user {marked_target}: {e}")
             return False
 
     def enable_computer(self, domain, username, password, target_computer):
-        """Enables a disabled computer account using BloodyAD."""
+        """Enable a disabled computer account via native LDAP (userAccountControl)."""
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.services.exploitation import ExploitationService
-        from adscan_internal.integrations.bloody import resolve_bloody_host
 
+        marked_target = mark_sensitive(target_computer, "hostname")
         try:
-            marked_target_computer = mark_sensitive(target_computer, "hostname")
-            print_info_verbose(
-                f"Attempting to enable disabled computer account: {marked_target_computer}"
-            )
             pdc_ip = self.domains_data[domain]["pdc"]
-            pdc_hostname = self.domains_data[domain].get("pdc_hostname")
+            pdc_hostname = self.domains_data[domain].get("pdc_hostname") or pdc_ip
             pdc_host = (
-                resolve_bloody_host(
-                    pdc_ip=pdc_ip,
-                    pdc_hostname=pdc_hostname,
-                    domain=domain,
-                    kerberos=True,
-                )
-                or pdc_ip
-            )
-            marked_pdc = mark_sensitive(pdc_host, "ip")
+                f"{pdc_hostname}.{domain}" if pdc_hostname and "." not in pdc_hostname
+                else pdc_hostname
+            ) or pdc_ip
             print_info_verbose(
-                f"Using PDC {marked_pdc} to enable computer {marked_target_computer}"
+                f"Enabling computer {marked_target} via LDAP on {mark_sensitive(pdc_host, 'ip')}"
             )
-
             service = ExploitationService()
             success = service.acl.enable_computer(
                 pdc_host=pdc_host,
-                bloody_path=self.bloodyad_path,
                 username=username,
                 password=password,
                 domain=domain,
@@ -24042,16 +22613,10 @@ class PentestShell:
                 kerberos=True,
                 timeout=120,
             )
-
             if success:
-                print_success(
-                    f"Successfully enabled computer account: {marked_target_computer}"
-                )
+                print_success(f"Successfully enabled computer account: {marked_target}")
             else:
-                print_error(
-                    f"Failed to enable computer account {marked_target_computer}. "
-                    "Check logs for BloodyAD output details."
-                )
+                print_error(f"Failed to enable computer account {marked_target}.")
             return success
 
         except Exception as e:
@@ -24069,9 +22634,9 @@ class PentestShell:
         """Enumerate critical ACEs via BloodHound and offer exploitation.
 
         This is a thin compatibility wrapper that delegates to the refactored
-        implementation in `adscan_internal.cli.bloodhound`.
+        implementation in `adscan_internal.cli.attack_graph_reports`.
         """
-        from adscan_internal.cli.bloodhound import (
+        from adscan_internal.cli.attack_graph_reports import (
             enumerate_user_aces as _enumerate_user_aces,
         )
 
@@ -24084,15 +22649,37 @@ class PentestShell:
             cross_domain=cross_domain,
         )
 
-    def parse_bloodhound_acls(self, output):
+    def parse_acls(self, output):
         """Parses the output of bloodhound-cli acl and returns a list of ACEs.
 
-        This method has been moved to `adscan_internal.cli.bloodhound.parse_bloodhound_acls`.
+        This method has been moved to `adscan_internal.cli.attack_graph_reports.parse_acls`.
         This is a compatibility wrapper that delegates to the new implementation.
         """
-        from adscan_internal.cli.bloodhound import parse_bloodhound_acls
+        from adscan_internal.cli.attack_graph_reports import parse_acls
 
-        return parse_bloodhound_acls(output)
+        return parse_acls(output)
+
+    def exploit_owns(
+        self,
+        domain: str,
+        username: str,
+        password: str,
+        target_principal: str,
+        target_domain: str,
+        target_kind: str,
+    ) -> bool:
+        """Exploit object ownership to write a FullControl ACE via dacledit."""
+        from adscan_internal.cli.exploits import run_exploit_owns
+
+        return run_exploit_owns(
+            self,
+            domain=domain,
+            username=username,
+            password=password,
+            target_principal=target_principal,
+            target_domain=target_domain,
+            target_kind=target_kind,
+        )
 
     def exploit_write_owner(
         self,
@@ -24143,6 +22730,27 @@ class PentestShell:
             type=type,
             followup_after=followup_after,
         )
+
+    def exploit_gpo_abuse(self) -> bool:
+        """Operator-driven GPO Immediate Scheduled Task abuse wizard."""
+        from adscan_internal.cli.gpo_abuse_handler import run_exploit_gpo_abuse
+        return run_exploit_gpo_abuse(self)
+
+    def do_exploit_gpo_abuse(self, _args):
+        """Run the GPO Immediate Scheduled Task abuse wizard."""
+        from adscan_internal.cli.gpo_abuse_handler import run_exploit_gpo_abuse
+        run_exploit_gpo_abuse(self)
+
+    def exploit_gpo_rollback(self, ledger_id: str | None = None) -> bool:
+        """Roll back a previously planted GPO Immediate Scheduled Task."""
+        from adscan_internal.cli.gpo_abuse_handler import run_exploit_gpo_rollback
+        return run_exploit_gpo_rollback(self, ledger_id)
+
+    def do_exploit_gpo_rollback(self, args):
+        """Rollback a pending GPO change (optionally pass a ledger id)."""
+        from adscan_internal.cli.gpo_abuse_handler import run_exploit_gpo_rollback
+        ledger_id = (args or '').strip() or None
+        run_exploit_gpo_rollback(self, ledger_id)
 
     def enum_adcs_privs(self, domain, username, password):
         """Wrapper for enum_adcs_privs operation."""
@@ -24259,7 +22867,7 @@ class PentestShell:
         """Wrapper for ADCS ESC1 exploitation."""
         from adscan_internal.cli.adcs_exploitation import adcs_esc1 as _adcs_esc1
 
-        _adcs_esc1(
+        return _adcs_esc1(
             shell=self,
             domain=domain,
             username=username,
@@ -24271,19 +22879,13 @@ class PentestShell:
         """Wrapper for ADCS ESC4 exploitation."""
         from adscan_internal.cli.adcs_exploitation import adcs_esc4 as _adcs_esc4
 
-        _adcs_esc4(
+        return _adcs_esc4(
             shell=self,
             domain=domain,
             username=username,
             password=password,
             template=template,
         )
-
-    def adcs_esc7(self, domain, username, password):
-        """Wrapper for ADCS ESC7 exploitation."""
-        from adscan_internal.cli.adcs_exploitation import adcs_esc7 as _adcs_esc7
-
-        _adcs_esc7(shell=self, domain=domain, username=username, password=password)
 
     def adcs_esc3(
         self,
@@ -24296,7 +22898,7 @@ class PentestShell:
         """Wrapper for ADCS ESC3 exploitation."""
         from adscan_internal.cli.adcs_exploitation import adcs_esc3 as _adcs_esc3
 
-        _adcs_esc3(
+        return _adcs_esc3(
             shell=self,
             domain=domain,
             username=username,
@@ -24309,7 +22911,7 @@ class PentestShell:
         """Wrapper for ADCS ESC13 exploitation."""
         from adscan_internal.cli.adcs_exploitation import adcs_esc13 as _adcs_esc13
 
-        _adcs_esc13(
+        return _adcs_esc13(
             shell=self,
             domain=domain,
             username=username,
@@ -24361,52 +22963,16 @@ class PentestShell:
             template=template,
         )
 
-    def add_officer(self, command, domain, username, password):
-        """Wrapper for adding officer."""
-        from adscan_internal.cli.adcs_exploitation import add_officer as _add_officer
-
-        _add_officer(
-            shell=self,
-            command=command,
-            domain=domain,
-            username=username,
-            password=password,
-        )
-
-    def enable_template(self, domain, username, password):
-        """Wrapper for enabling template."""
-        from adscan_internal.cli.adcs_exploitation import (
-            enable_template as _enable_template,
-        )
-
-        _enable_template(
-            shell=self, domain=domain, username=username, password=password
-        )
-
     def request_cert(self, domain, username, password, command=None):
         """Wrapper for requesting certificate."""
         from adscan_internal.cli.adcs_exploitation import request_cert as _request_cert
 
-        _request_cert(
+        return _request_cert(
             shell=self,
             domain=domain,
             username=username,
             password=password,
             command=command,
-        )
-
-    def issue_request(self, domain, username, password, request_id):
-        """Wrapper for issuing request."""
-        from adscan_internal.cli.adcs_exploitation import (
-            issue_request as _issue_request,
-        )
-
-        _issue_request(
-            shell=self,
-            domain=domain,
-            username=username,
-            password=password,
-            request_id=request_id,
         )
 
     def retrieve_cert(self, domain, username, password, request_id):
@@ -24432,6 +22998,7 @@ class PentestShell:
         target_domain,
         *,
         prompt_for_user_privs_after: bool = True,
+        group_domain: str | None = None,
     ) -> bool:
         """Wrapper for exploit_gmsa_account operation."""
         from adscan_internal.cli.exploits import run_exploit_gmsa_account
@@ -24444,6 +23011,7 @@ class PentestShell:
             target_account=target_account,
             target_domain=target_domain,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
+            group_domain=group_domain,
         )
 
     def exploit_laps_password(
@@ -24529,8 +23097,11 @@ class PentestShell:
             )
             return []
 
+
+        return self._get_users_from_ou_native(resolved_domain, ou_dn)
+
         try:
-            users = self._get_bloodhound_service().get_users_in_ou(
+            users = self._get_graph_service().get_users_in_ou(
                 domain=resolved_domain,
                 ou_distinguished_name=ou_dn,
             )
@@ -24546,7 +23117,64 @@ class PentestShell:
             return users
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_error("Error executing BloodHound OU lookup.")
+            print_error("Error executing graph OU lookup.")
+            print_exception(show_locals=False, exception=exc)
+            return []
+
+    def _get_users_from_ou_native(self, domain: str, ou_dn: str) -> list:
+        """Query enabled users under an OU via badldap (native stack, no BH CE)."""
+        from adscan_internal.services.ldap_transport_service import (
+            ADscanLDAPConfig,
+            ADscanLDAPConnection,
+        )
+
+        domain_data = self.domains_data.get(domain, {})
+        dc_ip = domain_data.get("pdc") or domain_data.get("dc_ip") or ""
+        if not dc_ip:
+            print_warning_debug(
+                f"[ou-lookup] No DC IP for {mark_sensitive(domain, 'domain')}; cannot perform OU LDAP query."
+            )
+            return []
+
+        username = domain_data.get("username") or None
+        password = domain_data.get("password") or None
+        use_kerberos = str(domain_data.get("auth") or "").lower() == "kerberos"
+
+        config = ADscanLDAPConfig(
+            domain=domain,
+            dc_ip=dc_ip,
+            use_ldaps=False,
+            use_kerberos=use_kerberos,
+            username=username,
+            password=password,
+        )
+        try:
+            users: list = []
+            with ADscanLDAPConnection(config) as conn:
+                conn.search(
+                    search_base=ou_dn,
+                    search_filter="(&(objectClass=user)(!(objectClass=computer))(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
+                    attributes=["sAMAccountName"],
+                    search_scope="SUBTREE",
+                )
+                for entry in conn.entries:
+                    sam = str(
+                        entry.entry_attributes_as_dict.get("sAMAccountName", [""])[0]
+                        or ""
+                    ).strip()
+                    if sam:
+                        users.append(sam)
+            if users:
+                print_success(f"Found {len(users)} users in the OU:")
+                for user in users:
+                    marked_user = mark_sensitive(user, "user")
+                    self.console.print(f" - {marked_user}")
+            else:
+                print_warning("No users found in the OU")
+            return users
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_error("Error querying OU via LDAP.")
             print_exception(show_locals=False, exception=exc)
             return []
 
@@ -24648,27 +23276,23 @@ class PentestShell:
     def add_shadow_credentials(
         self, domain, username, password, target_user, target_domain
     ):
-        """Adds shadow credentials using bloodyAD."""
+        """Add shadow credentials (msDS-KeyCredentialLink) via native LDAP."""
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.services.exploitation import ExploitationService
-        from adscan_internal.integrations.bloody import resolve_bloody_host
+        from adscan_internal.services.smb_transport import resolve_pdc_host
 
         try:
             pdc_ip = self.domains_data[target_domain]["pdc"]
             pdc_hostname = self.domains_data[target_domain].get("pdc_hostname")
-            pdc_host = (
-                resolve_bloody_host(
-                    pdc_ip=pdc_ip,
-                    pdc_hostname=pdc_hostname,
-                    domain=target_domain,
-                    kerberos=True,
-                )
-                or pdc_ip
-            )
+            pdc_host = resolve_pdc_host(
+                pdc_ip=pdc_ip,
+                pdc_hostname=pdc_hostname,
+                domain=target_domain,
+                kerberos=True,
+            ) or pdc_ip
             service = ExploitationService()
             result = service.acl.add_shadow_credentials(
                 pdc_host=pdc_host,
-                bloody_path=self.bloodyad_path,
                 domain=domain,
                 username=username,
                 password=password,
@@ -24678,6 +23302,58 @@ class PentestShell:
             )
 
             if result.success and result.nt_hash:
+                ledger = getattr(self, "environment_change_ledger", None)
+                if ledger is not None:
+                    try:
+                        change_id = ledger.register_change(
+                            kind="shadow_credentials_added",
+                            domain=domain,
+                            target=target_user,
+                            detail={
+                                "target_domain": target_domain,
+                                "target_object": target_user,
+                                "target_user": target_user,
+                                "exec_username": username,
+                                "executor_username": username,
+                                "executor_auth_domain": domain,
+                                "credential_lookup_domain": domain,
+                                "added_key_credential_value": getattr(
+                                    result, "added_key_credential_value", None
+                                ),
+                                "cleanup_success": getattr(
+                                    result, "cleanup_success", None
+                                ),
+                                "cleanup_raw_output": getattr(
+                                    result, "cleanup_raw_output", None
+                                ),
+                            },
+                            method="Shadow Credentials (msDS-KeyCredentialLink)",
+                        )
+                        if getattr(result, "cleanup_success", None) is True:
+                            ledger.mark_reverted(change_id)
+                        elif isinstance(
+                            getattr(self, "acl_cleanup_actions", None), list
+                        ):
+                            self.acl_cleanup_actions.append(
+                                {
+                                    "kind": "shadow_credentials_added",
+                                    "domain": domain,
+                                    "target_domain": target_domain,
+                                    "target": target_user,
+                                    "exec_username": username,
+                                    "added_key_credential_value": getattr(
+                                        result, "added_key_credential_value", None
+                                    ),
+                                    "_ledger_change_id": change_id,
+                                }
+                            )
+                    except Exception as exc:
+                        telemetry.capture_exception(exc)
+                if getattr(result, "cleanup_success", None) is False:
+                    print_warning(
+                        "Shadow Credentials cleanup did not complete automatically. "
+                        f"Manually review msDS-KeyCredentialLink on {mark_sensitive(target_user, 'user')}."
+                    )
                 marked_nt_hash = mark_sensitive(result.nt_hash, "password")
                 marked_target_user = mark_sensitive(target_user, "user")
                 print_warning(
@@ -24695,7 +23371,7 @@ class PentestShell:
                 return True
 
             print_error(
-                "Could not obtain NT hash via BloodyAD. Check logs for details."
+                "Could not obtain NT hash via shadow credentials. Check logs for details."
             )
             return False
 
@@ -24778,15 +23454,18 @@ class PentestShell:
         username=None,
         *,
         step_context: dict[str, object] | None = None,
-        preserve_certipy_ticket: bool = False,
+        store_credential: bool = True,
     ):
-        """Perform Pass-the-Certificate using Certipy and display the result."""
+        """Perform Pass-the-Certificate using native PKINIT and display the result."""
         from adscan_internal.rich_output import mark_sensitive
-        from adscan_internal.services.certipy_service import CertipyService
         from adscan_internal.services.attack_graph_service import (
             update_edge_status_by_labels,
         )
-        from rich.prompt import Prompt
+        from adscan_internal.services.adcs import (
+            PassTheCertificateResult,
+            native_ptc_enabled,
+            pass_the_certificate_native,
+        )
 
         try:
             pdc_ip = self.domains_data[domain]["pdc"]
@@ -24795,64 +23474,49 @@ class PentestShell:
                 workspace_cwd, self.domains_dir, domain, self.kerberos_dir
             )
             os.makedirs(kerberos_dir, exist_ok=True)
-            service = CertipyService()
-            result = service.pass_the_certificate(
-                certipy_path=self.certipy_path,
-                domain=domain,
-                pdc_ip=pdc_ip,
-                pfx_file=pfx_file,
-                pfx_password=pfx_password,
-                username=username,
-                shell=self,
-                cwd=kerberos_dir,
-            )
 
-            if not result.success or not result.nt_hash or not result.username:
-                if (
-                    not username
-                    and result.error_message
-                    and "identity" in result.error_message.lower()
-                ):
-                    inferred_user = os.path.splitext(os.path.basename(pfx_file))[0]
-                    if inferred_user and inferred_user != pfx_file:
+            result: PassTheCertificateResult | None = None
+            if native_ptc_enabled():
+                try:
+                    print_info_debug(
+                        "[ptc] Trying native PKINIT + UnPAC-the-hash "
+                        f"(pfx={mark_sensitive(str(pfx_file), 'path')})"
+                    )
+                    native_result = pass_the_certificate_native(
+                        domain=domain,
+                        pdc_ip=pdc_ip,
+                        pfx_file=pfx_file,
+                        pfx_password=pfx_password,
+                        username=username,
+                        cwd=kerberos_dir,
+                    )
+                    if native_result.success and native_result.nt_hash:
+                        result = native_result
+                    else:
                         print_info_debug(
-                            "[certipy] Retrying auth with inferred username "
-                            f"{mark_sensitive(inferred_user, 'user')}"
+                            "[ptc] Native PTC did not deliver an NT hash "
+                            f"({native_result.error_message or 'no hash'})."
                         )
-                        result = service.pass_the_certificate(
-                            certipy_path=self.certipy_path,
-                            domain=domain,
-                            pdc_ip=pdc_ip,
-                            pfx_file=pfx_file,
-                            pfx_password=pfx_password,
-                            username=inferred_user,
-                            shell=self,
-                        )
-                    if (
-                        not result.success or not result.nt_hash or not result.username
-                    ) and hasattr(self, "_questionary_select"):
-                        print_info_debug(
-                            "[certipy] Identity missing; prompting for target username"
-                        )
-                        prompt_text = (
-                            "Certipy could not resolve the certificate identity. "
-                            "Enter the target username (e.g., administrator):"
-                        )
-                        user_input = Prompt.ask(prompt_text, default="").strip()
-                        if user_input:
-                            print_info_debug(
-                                "[certipy] Retrying auth with user-provided username "
-                                f"{mark_sensitive(user_input, 'user')}"
-                            )
-                            result = service.pass_the_certificate(
-                                certipy_path=self.certipy_path,
-                                domain=domain,
-                                pdc_ip=pdc_ip,
-                                pfx_file=pfx_file,
-                                pfx_password=pfx_password,
-                                username=user_input,
-                                shell=self,
-                            )
+                        result = native_result
+                except Exception as exc_native:  # noqa: BLE001
+                    telemetry.capture_exception(exc_native)
+                    print_info_debug(
+                        f"[ptc] Native PTC raised "
+                        f"{type(exc_native).__name__}: {exc_native}."
+                    )
+
+            if result is None:
+                result = PassTheCertificateResult(
+                    domain=domain,
+                    principal=None,
+                    username=None,
+                    resolved_domain=None,
+                    nt_hash=None,
+                    ticket_path=None,
+                    raw_output="",
+                    success=False,
+                    error_message="Native PKINIT did not deliver an NT hash.",
+                )
 
             if not result.success or not result.nt_hash or not result.username:
                 print_error(
@@ -24977,23 +23641,14 @@ class PentestShell:
                     f"ticket={mark_sensitive(result.ticket_path, 'path')}"
                 )
 
-            # Persist credential in domains_data.  ESC13 must preserve the certificate
-            # ccache because a password-derived TGT does not carry the issuance-policy
-            # group authorization.
-            if preserve_certipy_ticket:
-                self.add_credential(
-                    resolved_domain,
-                    result.username,
-                    result.nt_hash,
-                    verify_credential=False,
-                    prompt_for_user_privs_after=False,
-                    skip_user_privs_enumeration=True,
-                    ensure_fresh_kerberos_ticket=False,
-                    mark_user_compromised=False,
-                    credential_origin="adcs_esc13_ptc",
-                )
-            else:
+            if store_credential:
                 self.add_credential(resolved_domain, result.username, result.nt_hash)
+            else:
+                print_info_debug(
+                    "[certipy] Skipping add_credential for PTC result by caller request: "
+                    f"user={mark_sensitive(result.username, 'user')} "
+                    f"domain={mark_sensitive(resolved_domain, 'domain')}"
+                )
 
             # Mark the attack-graph step as success only if it achieved the expected user
             # (typically: DA) for this attack path.
@@ -25674,59 +24329,245 @@ class PentestShell:
 
         return run_ldap_active_users(self, target_domain)
 
-    def ask_for_bloodhound_users(self, target_domain):
-        """Wrapper for ask_for_bloodhound_users - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import ask_for_bloodhound_users
+    def do_identity_inventory(self, target_domain):
+        """Populate enabled identity inventory from the local attack graph."""
+        from adscan_internal.cli.intelligence import run_identity_inventory
 
-        ask_for_bloodhound_users(self, target_domain)
+        run_identity_inventory(self, target_domain)
 
-    def do_bloodhound_users(self, target_domain):
-        """Wrapper for run_bloodhound_users - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_users
+    def ask_for_users(self, target_domain):
+        """Wrapper for ask_for_users - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import ask_for_users
 
-        run_bloodhound_users(self, target_domain)
+        ask_for_users(self, target_domain)
 
-    def do_bloodhound_all_users(self, target_domain):
-        """Wrapper for run_bloodhound_all_users - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_all_users
+    def do_users(self, target_domain):
+        """Wrapper for run_users - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_users
 
-        run_bloodhound_all_users(self, target_domain)
+        run_users(self, target_domain)
 
-    def do_bloodhound_admin_users(self, target_domain):
+    def do_all_users(self, target_domain):
+        """Wrapper for run_all_users - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_all_users
+
+        run_all_users(self, target_domain)
+
+    def do_admin_users(self, target_domain):
         """Persist the ADscan control-exposure inventory for one domain."""
-        from adscan_internal.cli.bloodhound import (
-            run_bloodhound_control_exposure_identities,
+        from adscan_internal.cli.attack_graph_reports import (
+            run_control_exposure_identities,
         )
 
-        run_bloodhound_control_exposure_identities(self, target_domain)
+        run_control_exposure_identities(self, target_domain)
 
-    def do_bloodhound_privileged_users(self, target_domain):
+    def do_privileged_users(self, target_domain):
         """Persist the ADscan domain-compromise-enabler inventory for one domain."""
-        from adscan_internal.cli.bloodhound import (
-            run_bloodhound_domain_compromise_enablers,
+        from adscan_internal.cli.attack_graph_reports import (
+            run_domain_compromise_enablers,
         )
 
-        run_bloodhound_domain_compromise_enablers(self, target_domain)
+        run_domain_compromise_enablers(self, target_domain)
 
-    def do_bloodhound_attack_paths(self, args):
-        """Enumerate low-priv BloodHound attack paths to high-value targets."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_attack_paths
+    def do_paths_inspect(self, args):
+        """Inspect one attack path and list its applicable post-exploitation techniques.
+
+        Phase 5 surface for the post-exploitation catalog. Renders the path
+        summary, the catalog techniques applicable to its foothold (ranked by
+        likelihood-of-domain-compromise minus a detection penalty), and a
+        per-technique plan with MITRE IDs. Execution from this menu is Phase 6.
+
+        Usage:
+            paths_inspect <domain> <index>          # 1-based index in the attack_paths table
+            paths_inspect <index>                   # uses the active workspace domain
+
+        Examples:
+            paths_inspect north.sevenkingdoms.local 1
+            paths_inspect 1
+        """
+        from adscan_internal.cli.attack_graph_reports import (
+            _resolve_attack_paths_compute_cap,  # noqa: PLC0415
+        )
+        from adscan_internal.cli.post_ex_inspect import render_paths_inspect  # noqa: PLC0415
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            ATTACK_PATHS_MAX_DEPTH_USER,
+            get_attack_path_summaries,
+        )
+
+        parts = (args or "").split()
+        if not parts:
+            print_instruction("Usage: paths_inspect <domain> <index>  |  paths_inspect <index>")
+            return
+
+        domain: str
+        index_str: str
+        if len(parts) == 1:
+            domain = self.domain or ""
+            index_str = parts[0]
+        else:
+            domain = parts[0]
+            index_str = parts[1]
+
+        if not domain:
+            print_instruction("Usage: paths_inspect <domain> <index>  (no active domain)")
+            return
+
+        try:
+            index = int(index_str)
+        except ValueError:
+            print_instruction(f"Index must be an integer, got: {index_str!r}")
+            return
+
+        if domain not in self.domains:
+            print_error(
+                f"Domain '{mark_sensitive(domain, 'domain')}' is not configured."
+            )
+            return
+
+        try:
+            paths = get_attack_path_summaries(
+                self,
+                domain,
+                scope="domain",
+                max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
+                max_paths=_resolve_attack_paths_compute_cap(50),
+                target="highvalue",
+                target_mode="tier0",
+                no_cache=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry sink
+            telemetry.capture_exception(exc)
+            print_error(f"Failed to load attack paths: {exc}")
+            return
+
+        from pathlib import Path as _Path  # noqa: PLC0415
+        ws_dir = getattr(self, 'current_workspace_dir', None)
+        ws_path = _Path(ws_dir) if ws_dir else None
+        render_paths_inspect(
+            console=self.console,
+            domain=domain,
+            paths=list(paths or []),
+            index=index,
+            workspace_path=ws_path,
+        )
+
+    def do_paths_execute(self, args):
+        """Execute one post-exploitation technique against an attack path.
+
+        Sister command to ``paths_inspect``. ``paths_inspect`` is read-only;
+        ``paths_execute`` is the explicit mutate. The orchestrator resolves
+        the foothold credential from the workspace, runs the technique,
+        inserts any derived edges into ``attack_graph.json``, persists the
+        execution record on the per-domain sidecar, and prints a summary.
+
+        Usage:
+            paths_execute <domain> <path-index> <technique-index>
+            paths_execute <path-index> <technique-index>     (uses active workspace domain)
+
+        Example:
+            paths_execute north.sevenkingdoms.local 1 2
+        """
+        import asyncio  # noqa: PLC0415
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_internal.cli.attack_graph_reports import (  # noqa: PLC0415
+            _resolve_attack_paths_compute_cap,
+        )
+        from adscan_internal.cli.post_ex_execute import render_paths_execute  # noqa: PLC0415
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            ATTACK_PATHS_MAX_DEPTH_USER,
+            get_attack_path_summaries,
+        )
+
+        parts = (args or "").split()
+        if len(parts) not in (2, 3):
+            print_instruction(
+                "Usage: paths_execute <domain> <path-index> <technique-index>"
+            )
+            return
+
+        if len(parts) == 2:
+            domain = self.domain or ""
+            path_index_str, technique_index_str = parts
+        else:
+            domain, path_index_str, technique_index_str = parts
+
+        if not domain:
+            print_instruction(
+                "Usage: paths_execute <domain> <path-index> <technique-index> "
+                "(no active domain)"
+            )
+            return
+
+        try:
+            path_index = int(path_index_str)
+            technique_index = int(technique_index_str)
+        except ValueError:
+            print_instruction(
+                "path-index and technique-index must be integers"
+            )
+            return
+
+        if domain not in self.domains:
+            print_error(
+                f"Domain '{mark_sensitive(domain, 'domain')}' is not configured."
+            )
+            return
+
+        try:
+            paths = get_attack_path_summaries(
+                self,
+                domain,
+                scope="domain",
+                max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
+                max_paths=_resolve_attack_paths_compute_cap(50),
+                target="highvalue",
+                target_mode="tier0",
+                no_cache=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry sink
+            telemetry.capture_exception(exc)
+            print_error(f"Failed to load attack paths: {exc}")
+            return
+
+        try:
+            asyncio.run(
+                render_paths_execute(
+                    shell=self,
+                    console=self.console,
+                    domain=domain,
+                    paths=list(paths or []),
+                    path_index=path_index,
+                    technique_index=technique_index,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry sink
+            telemetry.capture_exception(exc)
+            print_error(f"paths_execute failed: {exc}")
+
+    def do_attack_path_discovery(self, args):
+        """Build and display attack paths from the local attack graph."""
+        from adscan_internal.cli.intelligence import run_attack_path_discovery
 
         parts = args.split()
         domain = parts[0] if parts else (self.domain or "")
         if not domain:
-            print_instruction("Usage: bloodhound_attack_paths <domain> [max_depth]")
+            print_instruction("Usage: attack_path_discovery <domain> [max_depth]")
             return
 
+        # Depth budget counts only actionable edges. Structural relations
+        # (MemberOf, Contains, GpLink, TrustedBy, HasSIDHistory) flow freely
+        # — see ``_count_actionable_edges`` in attack_graph_core. So 4 here
+        # means up to 4 attack actions, which fits every real kill chain.
         max_depth = 4
         if len(parts) >= 2:
             try:
                 max_depth = int(parts[1])
             except ValueError:
-                print_instruction("Usage: bloodhound_attack_paths <domain> [max_depth]")
+                print_instruction("Usage: attack_path_discovery <domain> [max_depth]")
                 return
 
-        run_bloodhound_attack_paths(self, domain, max_depth=max_depth)
+        run_attack_path_discovery(self, domain, max_depth=max_depth)
 
     def do_attack_paths(self, args):
         """List attack paths computed from the domain attack graph.
@@ -25771,7 +24612,7 @@ class PentestShell:
             attack_paths north.sevenkingdoms.local owned
             attack_paths north.sevenkingdoms.local 2
         """
-        from adscan_internal.cli.bloodhound import run_show_attack_paths
+        from adscan_internal.cli.attack_graph_reports import run_show_attack_paths
         from adscan_internal.services.attack_graph_service import (
             ATTACK_PATHS_MAX_DEPTH_USER,
         )
@@ -25792,7 +24633,7 @@ class PentestShell:
         max_path_steps: int | None = None
         include_all = False
         lowpriv = False
-        target_mode = "tier0"
+        target_mode = "object"
         no_cache = False
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
@@ -25935,7 +24776,7 @@ class PentestShell:
             attack_steps north.sevenkingdoms.local --relation LocalCredToDomainReuse
             attack_steps north.sevenkingdoms.local jon.snow --relation AllowedToDelegate
         """
-        from adscan_internal.cli.bloodhound import run_show_attack_steps
+        from adscan_internal.cli.attack_graph_reports import run_show_attack_steps
 
         parts = args.split()
         domain = parts[0] if parts else (self.domain or "")
@@ -26021,9 +24862,9 @@ class PentestShell:
             )
         except ImportError:
             print_info(
-                "Attack graph report validation is available with ADscan Report License."
+                "Attack graph report validation is available with ADscan PRO."
             )
-            print_info("Learn more: https://www.adscanpro.com/reports")
+            print_info("Get beta access: https://www.adscanpro.com/pro")
             return
 
         errors = validate_attack_graph_findings(self, target_domain)
@@ -26039,15 +24880,57 @@ class PentestShell:
         for error in errors:
             print_warning(f"- {error}")
 
-    def ask_for_bloodhound(self, target_domain, callback=None) -> list[str]:
-        collector_results = self.do_bloodhound_collector(target_domain)
+    def do_show_timeline(self, args):
+        """Render the workspace scan timeline (one row per phase).
 
-        # Always call the callback if it exists, regardless of whether BloodHound ran or not (mimicking original logic for user 'no' choice)
+        Reads ``domains/<domain>/timeline.jsonl`` and renders the most recent
+        scan run as a rich table — phase title, status, elapsed time, and a
+        delta chip per phase (``+208 nodes``, ``+12 paths``, ...). Use ``--all``
+        to render every run in the file, or ``--diff`` to compare the two
+        most recent runs side-by-side (regression detection across re-scans).
+
+        Usage:
+            show_timeline [<domain>] [--all] [--diff]
+
+        Args:
+            domain: Optional target domain. Falls back to the active shell
+                domain when omitted.
+
+        Flags:
+            --all: Render every run found, oldest to newest.
+            --diff: Compare the two most recent runs phase-by-phase.
+
+        Examples:
+            show_timeline
+            show_timeline ais.local
+            show_timeline ais.local --all
+            show_timeline ais.local --diff
+        """
+        from adscan_internal.cli.timeline_command import run_show_timeline
+
+        parts = args.split() if args else []
+        domain: str | None = None
+        show_all = False
+        diff = False
+        for token in parts:
+            if token == "--all":
+                show_all = True
+            elif token == "--diff":
+                diff = True
+            elif not token.startswith("-") and domain is None:
+                domain = token
+
+        run_show_timeline(self, domain=domain, show_all=show_all, diff=diff)
+
+    def ask_for_graph_collection(self, target_domain, callback=None) -> list[str]:
+        collector_results = self.do_graph_collection(target_domain)
+
+        # Preserve the original orchestration contract: collection callbacks always continue.
         if callback:
             callback()
         return collector_results
 
-    def do_bloodhound_collector(
+    def do_graph_collection(
         self,
         target_domain,
         *,
@@ -26055,664 +24938,16 @@ class PentestShell:
         auth_password: str | None = None,
         auth_domain: str | None = None,
     ) -> list[str]:
-        """Delegate BloodHound collection to the CLI orchestration layer."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_collector
+        """Collect ADscan graph data using the native async collector."""
+        from adscan_internal.cli.intelligence import run_native_collection
 
-        return run_bloodhound_collector(
+        return run_native_collection(
             self,
             target_domain,
             auth_username=auth_username,
             auth_password=auth_password,
             auth_domain=auth_domain,
         )
-
-    def execute_bloodhound_collector(
-        self,
-        command: str,
-        domain: str,
-        *,
-        tool_name: str = "rusthound-ce",
-        ldaps_flag: str = "--ldaps",
-        bh_dir: str | None = None,
-        sync_domain: str | None = None,
-        fallback_username: str | None = None,
-        fallback_password: str | None = None,
-        fallback_auth_domain: str | None = None,
-        dc_fqdn: str | None = None,
-        dns_ip: str | None = None,
-        allow_password_fallback: bool = False,
-        zip_filename: str | None = None,
-        password_fallback_command: str | None = None,
-        password_fallback_display: str | None = None,
-    ) -> None:
-        from adscan_internal.rich_output import mark_sensitive
-        from adscan_internal.cli.bloodhound import (
-            get_bloodhound_collector_timeout_seconds,
-        )
-
-        collector_timeout = get_bloodhound_collector_timeout_seconds(tool_name)
-        try:
-
-            def _detect_kerberos_time_error_reason(
-                stdout: str | None, stderr: str | None
-            ) -> str | None:
-                combined = f"{stdout or ''}\n{stderr or ''}".lower()
-                if ("ticket not yet valid" in combined) or (
-                    "krb_ap_err_tkt_nyv" in combined
-                ):
-                    return "ticket_not_yet_valid"
-                if ("clock skew too great" in combined) or (
-                    "krb_ap_err_skew" in combined
-                ):
-                    return "clock_skew"
-                return None
-
-            def _detect_ldaps_error(stdout: str | None, stderr: str | None) -> bool:
-                combined = f"{stdout or ''}\n{stderr or ''}".lower()
-                if ldaps_flag not in current_command:
-                    return False
-                if "timeout" in combined or "elapsed" in combined:
-                    return True
-                if any(
-                    token in combined
-                    for token in (
-                        "invalidcertificate",
-                        "badsignature",
-                        "x509",
-                        "certificate",
-                        "ssl",
-                        "tls",
-                        "handshake",
-                    )
-                ):
-                    return True
-                # Heuristics: LDAPS/TLS/connectivity issues. Keep conservative.
-                if "code: 104" in combined:
-                    return True
-                if "ldaps" in combined or ":636" in combined:
-                    return any(
-                        token in combined
-                        for token in (
-                            "timeout",
-                            "timed out",
-                            "connection refused",
-                            "connect",
-                            "tls",
-                            "ssl",
-                            "handshake",
-                            "certificate",
-                            "x509",
-                            "starttls",
-                        )
-                    )
-                return False
-
-            def _sanitize_collector_command_for_logging(cmd: str) -> str:
-                """Redact passwords from collector command strings."""
-                try:
-                    # Match: -p PASS | -p 'PASS' | -p "PASS"
-                    return re.sub(
-                        r"(\s-p\s+)(?:'[^']*'|\"[^\"]*\"|\S+)",
-                        r"\1[REDACTED]",
-                        cmd,
-                    )
-                except Exception:
-                    return cmd
-
-            from adscan_internal.workspaces import domain_subpath
-
-            workspace_cwd = self.current_workspace_dir or os.getcwd()
-            from adscan_internal.workspaces import DEFAULT_DOMAIN_LAYOUT
-
-            bh_dir = domain_subpath(
-                workspace_cwd,
-                self.domains_dir,
-                domain,
-                DEFAULT_DOMAIN_LAYOUT.bloodhound,
-            )
-            os.makedirs(bh_dir, exist_ok=True)
-
-            def _list_zip_files_in_bh_dir() -> list[str]:
-                """Return absolute paths to ZIP files currently present in bh_dir."""
-                try:
-                    zip_files = [
-                        os.path.join(bh_dir, f)
-                        for f in os.listdir(bh_dir)
-                        if f.endswith(".zip")
-                        and os.path.isfile(os.path.join(bh_dir, f))
-                    ]
-                except OSError as exc:
-                    telemetry.capture_exception(exc)
-                    print_info_debug(
-                        f"[BloodHound] Failed to list ZIP files in BH dir: {type(exc).__name__}: {exc}"
-                    )
-                    return []
-                zip_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                return zip_files
-
-            def _mark_paths(paths: list[str]) -> str:
-                """Render a comma-separated list of sensitive-marked paths for debug logs."""
-                if not paths:
-                    return "(none)"
-                return ", ".join(mark_sensitive(path, "path") for path in paths)
-
-            def _infer_collector_zip_token() -> str | None:
-                """Infer collector token used to identify ZIP artifacts."""
-                value = f"{tool_name} {zip_filename or ''}".lower()
-                if "rusthound-ce" in value:
-                    return "rusthound-ce"
-                if "bloodhound-ce-python" in value:
-                    return "bloodhound-ce-python"
-                if "certihound" in value:
-                    return "certihound"
-                return None
-
-            def _pick_zip_source_for_success(
-                *,
-                pre_zip_paths: list[str],
-                command_started_at: float,
-                target_dest_path: str,
-            ) -> str | None:
-                """Select the best ZIP source path produced by the successful collector run."""
-                post_zip_paths = _list_zip_files_in_bh_dir()
-                pre_set = set(pre_zip_paths)
-                new_zip_paths = [p for p in post_zip_paths if p not in pre_set]
-
-                # Some collectors may rewrite an existing filename in place. Capture
-                # files touched during this attempt as a second-level fallback.
-                recent_zip_paths: list[str] = []
-                for path in post_zip_paths:
-                    try:
-                        if os.path.getmtime(path) >= (command_started_at - 1.5):
-                            recent_zip_paths.append(path)
-                    except OSError as exc:
-                        telemetry.capture_exception(exc)
-                        print_info_debug(
-                            f"[BloodHound] Could not read mtime for {mark_sensitive(path, 'path')}: {exc}"
-                        )
-
-                collector_token = _infer_collector_zip_token()
-                token_new = (
-                    [p for p in new_zip_paths if collector_token in os.path.basename(p)]
-                    if collector_token
-                    else []
-                )
-                token_recent = (
-                    [
-                        p
-                        for p in recent_zip_paths
-                        if collector_token in os.path.basename(p)
-                    ]
-                    if collector_token
-                    else []
-                )
-
-                print_info_debug(
-                    "[BloodHound] ZIP selection snapshot: "
-                    f"pre={_mark_paths(pre_zip_paths)} | "
-                    f"post={_mark_paths(post_zip_paths)} | "
-                    f"new={_mark_paths(new_zip_paths)} | "
-                    f"recent={_mark_paths(recent_zip_paths)} | "
-                    f"token={collector_token or 'none'} | "
-                    f"token_new={_mark_paths(token_new)} | "
-                    f"token_recent={_mark_paths(token_recent)}"
-                )
-
-                # Highest confidence: expected final name already exists.
-                if os.path.exists(target_dest_path):
-                    return target_dest_path
-
-                for candidates in (
-                    token_new,
-                    token_recent,
-                    new_zip_paths,
-                    recent_zip_paths,
-                ):
-                    if candidates:
-                        return candidates[0]
-
-                # Final conservative fallback: if only one ZIP exists, use it.
-                if len(post_zip_paths) == 1:
-                    return post_zip_paths[0]
-
-                return None
-
-            def _finalize_success(
-                *,
-                pre_zip_paths: list[str],
-                command_started_at: float,
-            ) -> None:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_success(
-                    f"BloodHound collector executed successfully on the domain {marked_domain}."
-                )
-
-                new_filename = zip_filename or f"{domain}_bloodhound-collector.zip"
-                dest_path = os.path.join(bh_dir, new_filename)
-                source_path = _pick_zip_source_for_success(
-                    pre_zip_paths=pre_zip_paths,
-                    command_started_at=command_started_at,
-                    target_dest_path=dest_path,
-                )
-                if not source_path:
-                    print_error(
-                        "BloodHound ZIP file not found after successful collector execution."
-                    )
-                    print_info_debug(
-                        "[BloodHound] Could not resolve ZIP source after success: "
-                        f"expected_dest={mark_sensitive(dest_path, 'path')}"
-                    )
-                    return
-
-                if os.path.abspath(source_path) != os.path.abspath(dest_path):
-                    try:
-                        if os.path.exists(dest_path):
-                            os.remove(dest_path)
-                        shutil.move(source_path, dest_path)
-                        print_info_debug(
-                            "[BloodHound] ZIP artifact normalized: "
-                            f"source={mark_sensitive(source_path, 'path')} -> "
-                            f"dest={mark_sensitive(dest_path, 'path')}"
-                        )
-                    except OSError as exc:
-                        telemetry.capture_exception(exc)
-                        print_error("Failed to normalize BloodHound ZIP artifact path.")
-                        print_info_debug(
-                            "[BloodHound] ZIP normalization failure: "
-                            f"source={mark_sensitive(source_path, 'path')}, "
-                            f"dest={mark_sensitive(dest_path, 'path')}, "
-                            f"error={type(exc).__name__}: {exc}"
-                        )
-                        return
-                else:
-                    print_info_debug(
-                        "[BloodHound] ZIP artifact already in expected path: "
-                        f"{mark_sensitive(dest_path, 'path')}"
-                    )
-
-                bh_mode = get_bloodhound_mode()
-                if bh_mode == "ce":
-                    launch_bloodhound_ce_suite(dest_path)
-                else:
-                    self.launch_bloodhound_suite(dest_path)
-
-            current_command = command
-            used_ldap_fallback = False
-            last_time_error: str | None = None
-            last_unknown_error = False
-
-            for attempt in range(1, 4):
-                sanitized_cmd = _sanitize_collector_command_for_logging(current_command)
-                print_info_debug(
-                    f"[BloodHound] Executing (attempt {attempt}/3): {sanitized_cmd}"
-                )
-                pre_zip_paths = _list_zip_files_in_bh_dir()
-                command_started_at = time.time()
-                completed_process = self.run_command(
-                    current_command,
-                    timeout=collector_timeout,
-                    cwd=bh_dir,
-                )
-                if completed_process is None:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    last_error = getattr(self, "_last_run_command_error", None)
-                    error_kind = ""
-                    if isinstance(last_error, tuple) and len(last_error) == 2:
-                        error_kind = str(next(iter(last_error), "")).strip().lower()
-                    if error_kind == "timeout":
-                        print_error(
-                            f"BloodHound collector timed out after {collector_timeout} seconds for {marked_domain}."
-                        )
-                        print_instruction(
-                            "Large domains can require a longer collector window. "
-                            "Retry with ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT set to a higher value, "
-                            "for example `ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT=3600 adscan ...`."
-                        )
-                    else:
-                        print_error(
-                            f"BloodHound collector failed to start for {marked_domain}."
-                        )
-                    return
-                stdout = completed_process.stdout
-                stderr = completed_process.stderr
-
-                if completed_process.returncode == 0:
-                    print_info_debug(
-                        f"[BloodHound] Execution successful. "
-                        f"Stdout len: {len(stdout or '')}, Stderr len: {len(stderr or '')}"
-                    )
-                    _finalize_success(
-                        pre_zip_paths=pre_zip_paths,
-                        command_started_at=command_started_at,
-                    )
-                    return
-
-                time_error = None
-                if _detect_kerberos_time_error(stdout, stderr):
-                    time_error = (
-                        _detect_kerberos_time_error_reason(stdout, stderr)
-                        or "clock_skew"
-                    )
-                if time_error:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    last_time_error = time_error
-
-                    if time_error == "ticket_not_yet_valid":
-                        print_warning(
-                            f"Ticket not yet valid detected while collecting BloodHound data for {marked_domain}. "
-                            f"Attempting clock synchronization and retrying ({attempt}/3)..."
-                        )
-                    else:
-                        print_warning(
-                            f"Clock skew too great detected while collecting BloodHound data for {marked_domain}. "
-                            f"Attempting clock synchronization and retrying ({attempt}/3)..."
-                        )
-
-                    domains_to_sync: list[str] = []
-                    if time_error == "ticket_not_yet_valid":
-                        domains_to_sync.append(domain)
-                        if sync_domain and sync_domain != domain:
-                            domains_to_sync.append(sync_domain)
-                    else:
-                        if sync_domain:
-                            domains_to_sync.append(sync_domain)
-                        if domain not in domains_to_sync:
-                            domains_to_sync.append(domain)
-
-                    seen: set[str] = set()
-                    unique_domains_to_sync = [
-                        d for d in domains_to_sync if not (d in seen or seen.add(d))
-                    ]
-
-                    sync_ok = False
-                    for domain_to_sync in unique_domains_to_sync:
-                        marked_sync_domain = mark_sensitive(domain_to_sync, "domain")
-                        if sync_domain and sync_domain != domain:
-                            print_info_debug(
-                                f"[BloodHound] Clock sync candidate: {marked_sync_domain} "
-                                f"(target_domain={marked_domain}, issue={time_error})"
-                            )
-                        ok = self.do_sync_clock_with_pdc(domain_to_sync, verbose=True)
-                        print_info_debug(
-                            f"[BloodHound] Clock sync attempt result: domain={marked_sync_domain}, ok={ok}"
-                        )
-                        if ok:
-                            sync_ok = True
-                            break
-
-                    if not sync_ok:
-                        print_error(
-                            f"Clock synchronization failed; cannot retry BloodHound collection for {marked_domain}."
-                        )
-                        return
-
-                    continue
-
-                if _detect_ldaps_error(stdout, stderr) and not used_ldap_fallback:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    combined = f"{stdout or ''}\n{stderr or ''}".lower()
-                    if "timeout" in combined or "elapsed" in combined:
-                        print_warning(
-                            f"LDAPS timeout detected on domain {marked_domain}. Retrying with LDAP..."
-                        )
-                    else:
-                        print_warning(
-                            f"Could not establish LDAPS connection on domain {marked_domain}. Retrying with LDAP..."
-                        )
-                    current_command = current_command.replace(
-                        f" {ldaps_flag}", ""
-                    ).replace(ldaps_flag, "")
-                    used_ldap_fallback = True
-                    print_info_debug(
-                        f"[BloodHound] Retrying {tool_name} without {ldaps_flag}"
-                    )
-                    continue
-
-                if (ldaps_flag in current_command) and not used_ldap_fallback:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_warning(
-                        f"LDAPS was used for {marked_domain} but the collector failed. "
-                        "Retrying with LDAP before other fallbacks."
-                    )
-                    current_command = current_command.replace(
-                        f" {ldaps_flag}", ""
-                    ).replace(ldaps_flag, "")
-                    used_ldap_fallback = True
-                    print_info_debug(
-                        f"[BloodHound] Retrying {tool_name} without {ldaps_flag}"
-                    )
-                    continue
-
-                # Unknown/non-time failure. If Kerberos was attempted and a cleartext
-                # password is available, fall back to password auth (NTLM) rather than
-                # failing outright. This is especially important in multi-domain
-                # workspaces where DNS/KDC selection can drift between runs.
-                if allow_password_fallback and " -k" in f" {current_command} ":
-                    last_unknown_error = True
-                    break
-
-                marked_domain = mark_sensitive(domain, "domain")
-                print_error(
-                    f"Error executing bloodhound collector on the domain {marked_domain}."
-                )
-                # Avoid printing potentially sensitive tool output in non-secret mode.
-                print_info_debug(
-                    f"[BloodHound] {tool_name} failure: rc={completed_process.returncode}, "
-                    f"stderr_len={len(stderr or '')}, stdout_len={len(stdout or '')}"
-                )
-                return
-
-            marked_domain = mark_sensitive(domain, "domain")
-
-            if (last_time_error or last_unknown_error) and allow_password_fallback:
-                if not fallback_password or not fallback_username:
-                    print_error(
-                        f"BloodHound Kerberos collection failed for {marked_domain}, "
-                        "and password fallback is not possible (missing cleartext password)."
-                    )
-                    return
-
-                if not dc_fqdn or not dns_ip:
-                    print_error(
-                        f"BloodHound Kerberos collection failed for {marked_domain}, "
-                        "and password fallback is missing DC/DNS details."
-                    )
-                    return
-
-                if password_fallback_command and password_fallback_display:
-                    print_warning(
-                        f"Kerberos collection failed for {marked_domain}. Falling back to password authentication."
-                    )
-                    password_command = password_fallback_command
-                    password_display = password_fallback_display
-                else:
-                    fallback_domain = fallback_auth_domain or domain
-
-                    def _format_upn(user_value: str, domain_value: str) -> str:
-                        if "@" in user_value:
-                            return user_value
-                        if "\\" in user_value:
-                            user_value = user_value.split("\\", 1)[1]
-                        return f"{user_value}@{domain_value}"
-
-                    upn = _format_upn(fallback_username, fallback_domain)
-
-                    marked_upn = mark_sensitive(upn, "user")
-                    marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
-                    marked_dns_ip = mark_sensitive(dns_ip, "ip")
-
-                    print_warning(
-                        f"Kerberos collection failed for {marked_domain}. Falling back to password authentication: "
-                        f"-u {marked_upn} -p [REDACTED] -f {marked_dc_fqdn} -n {marked_dns_ip}"
-                    )
-
-                    password_command = (
-                        "rusthound-ce "
-                        f"-d {shlex.quote(domain)} "
-                        f"-u {shlex.quote(upn)} -p {shlex.quote(fallback_password)} "
-                        f"-f {shlex.quote(dc_fqdn)} -n {shlex.quote(dns_ip)} "
-                        "-c All --zip --ldaps"
-                    )
-                    password_display = (
-                        f"rusthound-ce -d {marked_domain} -u {marked_upn} -p [REDACTED] "
-                        f"-f {marked_dc_fqdn} -n {marked_dns_ip} -c All --zip --ldaps"
-                    )
-                print_info_debug(
-                    f"[BloodHound] Password fallback command: {password_display}"
-                )
-
-                current_command = password_command
-                used_ldap_fallback = False
-                for attempt in range(1, 3):
-                    pre_zip_paths = _list_zip_files_in_bh_dir()
-                    command_started_at = time.time()
-                    completed_process = self.run_command(
-                        current_command,
-                        timeout=collector_timeout,
-                        cwd=bh_dir,
-                    )
-                    if completed_process is None:
-                        marked_domain = mark_sensitive(domain, "domain")
-                        last_error = getattr(self, "_last_run_command_error", None)
-                        error_kind = ""
-                        if isinstance(last_error, tuple) and len(last_error) == 2:
-                            error_kind = str(next(iter(last_error), "")).strip().lower()
-                        if error_kind == "timeout":
-                            print_error(
-                                f"BloodHound collector timed out after {collector_timeout} seconds for {marked_domain}."
-                            )
-                            print_instruction(
-                                "Large domains can require a longer collector window. "
-                                "Retry with ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT set to a higher value, "
-                                "for example `ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT=3600 adscan ...`."
-                            )
-                        else:
-                            print_error(
-                                f"BloodHound collector failed to start for {marked_domain}."
-                            )
-                        return
-                    stdout = completed_process.stdout
-                    stderr = completed_process.stderr
-                    if completed_process.returncode == 0:
-                        _finalize_success(
-                            pre_zip_paths=pre_zip_paths,
-                            command_started_at=command_started_at,
-                        )
-                        return
-                    if (
-                        _detect_ldaps_error(stdout, stderr)
-                        and ldaps_flag in current_command
-                        and not used_ldap_fallback
-                    ):
-                        print_warning(
-                            f"LDAPS failed for {marked_domain} in password fallback. Retrying with LDAP..."
-                        )
-                        current_command = current_command.replace(
-                            f" {ldaps_flag}", ""
-                        ).replace(ldaps_flag, "")
-                        used_ldap_fallback = True
-                        print_info_debug(
-                            f"[BloodHound] Password fallback retrying {tool_name} without {ldaps_flag}"
-                        )
-                        continue
-                    if (ldaps_flag in current_command) and not used_ldap_fallback:
-                        print_warning(
-                            f"LDAPS was used for {marked_domain} in password fallback but the collector failed. "
-                            "Retrying with LDAP before stopping."
-                        )
-                        current_command = current_command.replace(
-                            f" {ldaps_flag}", ""
-                        ).replace(ldaps_flag, "")
-                        used_ldap_fallback = True
-                        print_info_debug(
-                            f"[BloodHound] Password fallback retrying {tool_name} without {ldaps_flag}"
-                        )
-                        continue
-                    print_info_debug(
-                        f"[BloodHound] Password fallback attempt failed: rc={completed_process.returncode}"
-                    )
-                    break
-
-                print_error(
-                    f"BloodHound collection failed for {marked_domain} after Kerberos retries and password fallback."
-                )
-                return
-
-            if last_time_error == "ticket_not_yet_valid":
-                print_error(
-                    f"BloodHound collection failed for {marked_domain} after multiple ticket-not-yet-valid retries."
-                )
-                return
-            print_error(
-                f"BloodHound collection failed for {marked_domain} after multiple clock-skew retries."
-            )
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error executing bloodhound collector.")
-            print_exception(show_locals=False, exception=e)
-
-    def launch_bloodhound_suite(self, zip_path):
-        try:
-            # Ensure Neo4j is running
-            neo4j_running = self.ensure_neo4j_running()
-
-            proc = self.run_command("java -version", timeout=10)
-            print_info_debug(
-                f"JAVA env under ADscan → stdout={proc.stdout}, stderr={proc.stderr}"
-            )
-
-            if not neo4j_running:
-                return
-
-            # Check if BloodHound is already running
-            bloodhound_running = self._is_bloodhound_running()
-
-            if bloodhound_running:
-                print_info_verbose("BloodHound is already running")
-            else:
-                # Start BloodHound sequentially. This will block until the GUI is closed.
-                if self.bloodhound_gui_path is None:
-                    print_error("BloodHound GUI path not found.")
-                    return
-                print_info("Launching BloodHound GUI. Please wait 5 seconds...")
-                marked_zip_path_1 = mark_sensitive(zip_path, "path")
-                print_instruction(
-                    f"You must manually import the ZIP file from: {marked_zip_path_1} to the BloodHound GUI."
-                )
-                time.sleep(5)
-                try:
-                    subprocess.Popen(
-                        [self.bloodhound_gui_path, "--no-sandbox"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        stdin=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                    print_success_verbose(
-                        "BloodHound GUI launched as a detached process."
-                    )
-                except Exception as e:
-                    print_error("Failed to launch BloodHound GUI.")
-                    print_exception(show_locals=False, exception=e)
-                # time.sleep(5) # May not be needed if 'run' blocks until GUI is closed, or could be for post-launch readiness if it daemonizes unexpectedly.
-                # For now, let's assume 'run' blocks as expected for a GUI app.
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error launching applications.")
-            print_exception(show_locals=False, exception=e)
-            self.run_command("neo4j stop", timeout=300)
-
-    def _ensure_bloodhound_ce_running(self) -> bool:
-        """Ensure BloodHound CE is running, launching it if needed.
-
-        Reuses the same check-and-launch logic as the collector upload flow
-        so all BH CE callers (upload, attack paths, etc.) behave consistently.
-
-        Returns:
-            True if BloodHound CE is ready, False otherwise.
-        """
-        return launch_bloodhound_ce_suite(None)
 
     def ask_for_ldap_computers(self, target_domain):
         """Delegates LDAP computers prompt to CLI ldap module (backwards-compatible)."""
@@ -26736,54 +24971,54 @@ class PentestShell:
 
         return run_ldap_computers(self, target_domain)
 
-    def ask_for_bloodhound_computers(self, target_domain):
+    def do_host_inventory(self, target_domain):
+        """Populate enabled host inventory from the local attack graph."""
+        from adscan_internal.cli.intelligence import run_host_inventory
+
+        run_host_inventory(self, target_domain)
+
+    def ask_for_computers(self, target_domain):
         if self.auto:
-            self.do_bloodhound_computers(target_domain)
+            self.do_host_inventory(target_domain)
         else:
             marked_target_domain = mark_sensitive(target_domain, "domain")
             answer = Confirm.ask(
-                f"Do you want to enumerate BloodHound computers for the domain {marked_target_domain}?"
+                f"Do you want to enumerate host inventory for the domain {marked_target_domain}?"
             )
             if answer:  # Prompt.ask for (y/n) returns boolean
-                self.do_bloodhound_computers(target_domain)
+                self.do_host_inventory(target_domain)
 
-    def do_bloodhound_computers(self, target_domain):
-        """Wrapper for run_bloodhound_computers - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_computers
+    def do_sessions(self, target_domain):
+        """Wrapper for run_sessions - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_sessions
 
-        run_bloodhound_computers(self, target_domain)
+        run_sessions(self, target_domain)
 
-    def do_bloodhound_sessions(self, target_domain):
-        """Wrapper for run_bloodhound_sessions - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_sessions
-
-        run_bloodhound_sessions(self, target_domain)
-
-    def execute_bh_sessions(
+    def execute_sessions(
         self, command, domain, comp_file, sessions: list[dict] | None = None
     ):
-        """Wrapper for execute_bh_sessions - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import execute_bh_sessions
+        """Wrapper for execute_sessions - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import execute_sessions
 
-        execute_bh_sessions(self, command, domain, comp_file, sessions=sessions)
+        execute_sessions(self, command, domain, comp_file, sessions=sessions)
 
-    def do_bloodhound_computers_all(self, target_domain):
-        """Wrapper for run_bloodhound_computers_all - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_computers_all
+    def do_computers_all(self, target_domain):
+        """Wrapper for run_computers_all - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_computers_all
 
-        run_bloodhound_computers_all(self, target_domain)
+        run_computers_all(self, target_domain)
 
-    def do_bloodhound_computers_with_laps(self, target_domain):
-        """Wrapper for run_bloodhound_computers_with_laps - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_computers_with_laps
+    def do_computers_with_laps(self, target_domain):
+        """Wrapper for run_computers_with_laps - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_computers_with_laps
 
-        run_bloodhound_computers_with_laps(self, target_domain)
+        run_computers_with_laps(self, target_domain)
 
-    def do_bloodhound_computers_without_laps(self, target_domain):
-        """Wrapper for run_bloodhound_computers_without_laps - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_computers_without_laps
+    def do_computers_without_laps(self, target_domain):
+        """Wrapper for run_computers_without_laps - maintains compatibility."""
+        from adscan_internal.cli.attack_graph_reports import run_computers_without_laps
 
-        run_bloodhound_computers_without_laps(self, target_domain)
+        run_computers_without_laps(self, target_domain)
 
     def do_netexec_smb_null_enum_users(self, domain):
         """
@@ -27205,6 +25440,26 @@ class PentestShell:
 
         return auto_generate_kerberos_ticket(self, username, credential, domain, dc_ip)
 
+    def _auto_generate_kerberos_ticket_result(
+        self, username, credential, domain, dc_ip=None
+    ):
+        """Return full KerberosTGTResult (not just path) for callers that need error_kind.
+
+        Args:
+            username (str): Username for authentication
+            credential (str): Password or NTLM hash
+            domain (str): Domain name
+            dc_ip (str, optional): Domain Controller IP address
+
+        Returns:
+            KerberosTGTResult with success status and error_kind, or None on unexpected error.
+        """
+        from adscan_internal.cli.kerberos import auto_generate_kerberos_ticket_result
+
+        return auto_generate_kerberos_ticket_result(
+            self, username, credential, domain, dc_ip
+        )
+
     def _ensure_kerberos_environment_for_command(
         self, domain, user_domain, username=None, command_name="kerberos command"
     ):
@@ -27239,7 +25494,7 @@ class PentestShell:
             initialize_report(self)
         except ImportError:
             print_info("Report initialization is available with ADscan Report License.")
-            print_info("Learn more: https://www.adscanpro.com/reports")
+            print_info("Get beta access: https://www.adscanpro.com/pro")
 
     @staticmethod
     def _is_optional_report_service_import_error(exc: Exception) -> bool:
@@ -27374,6 +25629,20 @@ class PentestShell:
                                 "generate_report technical"
                                 "generate_report technical ens,iso27001,dora"
         """
+        # PRO gate — runs BEFORE any interactive prompts so a LITE operator
+        # never invests 30 seconds answering questionary checkboxes (frameworks,
+        # theme, display name) only to be blocked at the end. The canonical
+        # PRO upsell panel surfaces immediately — same panel rendered by the
+        # host launcher and the REPL ``deliver`` flow — so the operator sees
+        # the value-stack and the upgrade URL at the moment of highest intent
+        # (they just tried to render the deliverable).
+        from adscan_core import tier as _tier
+        if not _tier.is_pro():
+            from adscan_core.pro_upsell import print_pro_upsell
+
+            print_pro_upsell("generate_report", "direct_invocation")
+            return None
+
         from adscan_internal.cli.ci import run_generate_report
 
         args_parts = args.strip().split() if args and args.strip() else []
@@ -27464,6 +25733,25 @@ class PentestShell:
             else "corporate_light"
         )
 
+        # ── Display name ────────────────────────────────────────────────────
+        # The display name appears on the report cover. We prefer a commercial
+        # client name over the raw AD domain — auditors and execs read the
+        # cover before anything else. Empty answer falls back to the current
+        # domain (existing report-side behaviour) so this prompt is strictly
+        # additive: pressing Enter preserves the legacy output.
+        display_name_arg = ""
+        try:
+            from rich.prompt import Prompt as _Prompt
+            default_display = (getattr(self, "current_domain", "") or "").strip()
+            display_name_arg = _Prompt.ask(
+                "Display name (client/engagement, blank = use domain)",
+                default=default_display or None,
+                show_default=bool(default_display),
+            ) or ""
+            display_name_arg = display_name_arg.strip()
+        except Exception:
+            display_name_arg = ""
+
         # Delegate to CLI helper
         return run_generate_report(
             self,
@@ -27475,6 +25763,7 @@ class PentestShell:
             renderer=renderer_arg,
             template=template_arg,
             theme=theme_arg,
+            display_name=display_name_arg,
         )
 
     def do_extract_netbios(self, domain):
@@ -27487,16 +25776,6 @@ class PentestShell:
         from adscan_internal.cli.dns import extract_netbios_name
 
         return extract_netbios_name(self, domain)
-
-    def execute_netexec_null(self, command, domain):
-        """Execute NetExec null session command and handle results.
-
-        This wrapper delegates to the service layer while maintaining
-        compatibility with existing CLI code.
-        """
-        from adscan_internal.cli.smb import execute_netexec_null
-
-        execute_netexec_null(self, command=command, domain=domain)
 
     def monitor_smb(self, proc, domain):
         while True:
@@ -28368,72 +26647,6 @@ class PentestShell:
         return self._get_dns_resolver_service().ensure_dhcpcd_enter_hook_enforces_resolv_conf(
             resolv_lines
         )
-
-    def _handle_dcsync_privilege_rollback(self, command: str, domain: str) -> bool:
-        """
-        Reapply ACE-based privileges and retry DCSync when a lab resets ACLs.
-
-        Returns:
-            bool: True if a retry was triggered, False otherwise.
-        """
-        raw_context = getattr(self, "_current_dcsync_context", None)
-        if isinstance(raw_context, dict):
-            context: Dict[str, Any] = dict(raw_context)
-            self._current_dcsync_context = context
-        else:
-            print_info_verbose(
-                "Cannot attempt automatic ACE reapplication: DCSync context is missing."
-            )
-            return False
-        if context.get("retry_attempted"):
-            print_info_verbose(
-                "Automatic ACE reapplication already attempted for this DCSync run."
-            )
-            return False
-
-        username = context.get("username")
-        password = context.get("password")
-        if not username or not password:
-            print_warning(
-                "Cannot automatically reapply ACEs because the original credentials are unavailable."
-            )
-            context["retry_attempted"] = True
-            return False
-
-        print_warning(
-            "The requested user no longer has DCSync privileges (ACLs were probably reset)."
-        )
-        prompt_message = (
-            "DCSync failed because the assigned ACEs were likely reverted. "
-            "Re-enumerate and exploit ACEs again automatically?"
-        )
-        if not Confirm.ask(prompt_message, default=True):
-            print_warning(
-                "Skipping automatic ACE re-enumeration; DCSync will not be retried."
-            )
-            context["retry_attempted"] = True
-            return False
-
-        from adscan_internal.rich_output import mark_sensitive
-
-        marked_username = mark_sensitive(username, "user")
-        marked_domain = mark_sensitive(domain, "domain")
-        print_info(
-            f"Re-enumerating ACEs for {marked_username} in domain {marked_domain} to restore DCSync privileges..."
-        )
-        context["retry_attempted"] = True
-        try:
-            self.enumerate_user_aces(domain, username, password)
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_error(
-                f"Failed to re-enumerate ACEs automatically before retrying DCSync: {exc}"
-            )
-            return False
-
-        print_info("Retrying DCSync after reapplying ACEs...")
-        self.execute_secretsdump(command, domain)
-        return True
 
     def _clean_domain_entries(self, domain):
         """Remove ADscan resolver entries for a domain from Unbound and /etc/hosts."""
@@ -29308,6 +27521,16 @@ class PentestShell:
             print_warning("Shutdown already in progress. Please wait...")
             return exit_requested
         self._shutdown_in_progress = True
+        # ACL/attribute-level environment change cleanup
+        try:
+            from adscan_internal.services.acl_change_cleanup_service import (
+                execute_acl_cleanup,
+            )
+
+            execute_acl_cleanup(self)
+        except Exception as exc:  # pragma: no cover - best-effort shutdown
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[acl-cleanup] shutdown cleanup failed: {exc}")
         try:
             from adscan_internal.services.ligolo_artifact_cleanup_service import (
                 cleanup_workspace_ligolo_artifacts,
@@ -29317,10 +27540,43 @@ class PentestShell:
         except Exception as exc:  # pragma: no cover - best-effort shutdown
             telemetry.capture_exception(exc)
             print_info_debug(f"[ligolo-cleanup] shutdown cleanup failed: {exc}")
+        # Render environment change cleanup summary and finalise ledger
+        try:
+            if getattr(self, "environment_change_ledger", None) is not None:
+                from adscan_internal.services.cleanup_ux import (
+                    render_cleanup_exit_panel,
+                )
+
+                render_cleanup_exit_panel(self.environment_change_ledger)
+                self.environment_change_ledger.finalize()
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[ledger] exit panel failed: {exc}")
         # Use telemetry console for session recording export. This console
         # records a superset of what the user sees in the terminal and is
         # only used for sanitized session uploads.
         self.workspace_save()
+        # Attach environment change ledger data for Appendix F
+        try:
+            if getattr(self, "environment_change_ledger", None) is not None:
+                import json as _json
+                import os as _os
+
+                _ledger_path = _os.path.join(
+                    self.current_workspace_dir or "", "technical_report.json"
+                )
+                if _os.path.isfile(_ledger_path):
+                    with open(_ledger_path, "r", encoding="utf-8") as _f:
+                        _report = _json.load(_f)
+                    _report["environment_changes"] = {
+                        "summary": self.environment_change_ledger.get_summary(),
+                        "changes": self.environment_change_ledger.get_changes(),
+                    }
+                    with open(_ledger_path, "w", encoding="utf-8") as _f:
+                        _json.dump(_report, _f, indent=2)
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[ledger] failed to attach to technical_report: {exc}")
         print_info("Workspace saved.")
         # Context-aware exit: attribution (once-ever) → summary → CTAs
         _maybe_ask_attribution(self)
@@ -29473,17 +27729,16 @@ class PentestShell:
             ],
             "Trusts": ["enum_trusts", "raise_child", "enum_cross_domain_acl"],
             "ADCS": ["search_adcs", "show_adcs_cache", "enum_adcs_privs"],
-            "Delegations": ["enum_delegations"],
             "CVE": [
                 "enum_cve_dcs",
                 "enum_cve_all",
                 "netexec_cve_all",
                 "netexec_cve_dcs",
             ],
-            "Responder": [
-                "responder",
-                "clear_responder_db",
-                "stop_responder",
+            "Poisoning": [
+                "poisoning",
+                "clear_poisoning",
+                "stop_poisoning",
                 "check_dc_ntlm_auth_type",
             ],
             "Flags": ["get_flags"],
@@ -29566,7 +27821,7 @@ class PentestShell:
             "ADCS": "Operations and privileges over ADCS.",
             "Delegations": "Delegation management and exploitation.",
             "CVE": "Search and exploitation of vulnerabilities (CVE).",
-            "Responder": "Responder usage plus NTLM capture/coercion probes.",
+            "Poisoning": "Native LLMNR/mDNS/NBT-NS poisoning and NTLM capture/coercion probes.",
             "Flags": "Retrieval of domain flags.",
             "MSSQL": "Exploitation and management of MSSQL.",
             "Credential Harvesting": "Dumping credentials and sensitive data.",
@@ -29584,6 +27839,27 @@ class PentestShell:
             "WinRM": "Enumeration and exploitation with WinRM",
             "Other Enum": "Other types of enumeration",
         }
+
+        # ── Registry-driven categories (Deliverables, etc.) ──────────────
+        # Pull verbs from the shell-command registry so future top-level
+        # commands surface in help with zero touches here.
+        try:
+            from adscan_internal.cli.shell_commands import (
+                REGISTRY as _SHELL_CMD_REGISTRY,
+            )
+            for _spec in _SHELL_CMD_REGISTRY:
+                if _spec.is_dev_only:
+                    continue
+                help_tree.setdefault(_spec.category, [])
+                if _spec.verb not in help_tree[_spec.category]:
+                    help_tree[_spec.category].append(_spec.verb)
+            category_descriptions.setdefault(
+                "Deliverables",
+                "Client deliverables — the deliver kit, cheatsheet, "
+                "and the demo / TUI surfaces.",
+            )
+        except Exception:  # noqa: BLE001 — never break help on registry import
+            pass
 
         # If no argument is provided, display the categories and their descriptions.
         if not arg:
@@ -29654,6 +27930,20 @@ class PentestShell:
                         track_docs_link_shown("help_not_found", docs_url)
 
 
+# ── Registry-driven shell-command binding ────────────────────────────────
+# Inject do_<verb> for every entry in adscan_internal.cli.shell_commands.REGISTRY.
+# Future top-level commands plug in via the registry — never via a new do_ method.
+try:
+    from adscan_internal.cli.shell_commands import bind_registered_shell_commands
+    bind_registered_shell_commands(PentestShell)
+except Exception as _shell_cmd_bind_exc:  # noqa: BLE001 — non-fatal
+    try:
+        from adscan_core import telemetry as _shell_cmd_bind_telemetry
+        _shell_cmd_bind_telemetry.capture_exception(_shell_cmd_bind_exc)
+    except Exception:
+        pass
+
+
 # --- Helper function to get tool executable paths ---
 def get_tool_executable_path(tool_key):
     """Gets the full path to an executable for a tool defined in PipToolsConfig."""
@@ -29675,7 +27965,7 @@ def get_tool_executable_path(tool_key):
 def get_external_tool_python(tool_name):
     """Gets the Python executable path for an external tool with isolated venv.
 
-    External tools with requirements.txt (firepwd, LSA-Reaper, PKINITtools, responder)
+    External tools with requirements.txt (firepwd, LSA-Reaper, PKINITtools)
     are installed in isolated venvs at TOOL_VENVS_BASE_DIR/tool_name/venv/
 
     Args:
@@ -29711,28 +28001,6 @@ def get_external_tool_executable(tool_name: str) -> str | None:
         return executable_path
 
     return None
-
-
-def get_bloodhound_cli_executable_path() -> str | None:
-    """Return the preferred bloodhound-cli executable path.
-
-    We avoid relying on PATH order to prevent conflicts with globally installed
-    bloodhound-cli binaries. Preference order:
-      1) Isolated venv tool install: ~/.adscan/tool_venvs/bloodhound-cli/venv/bin/bloodhound-cli
-      2) BloodHound CE bundled CLI (when present): TOOLS_INSTALL_DIR/bloodhound_ce/bloodhound-ce-cli
-      3) Global PATH (last resort)
-    """
-    preferred = os.path.join(
-        TOOL_VENVS_BASE_DIR, "bloodhound-cli", "venv", "bin", "bloodhound-cli"
-    )
-    if os.path.exists(preferred) and os.access(preferred, os.X_OK):
-        return preferred
-
-    ce_cli_path = os.path.join(BLOODHOUND_CE_DIR, "bloodhound-ce-cli")
-    if os.path.exists(ce_cli_path) and os.access(ce_cli_path, os.X_OK):
-        return ce_cli_path
-
-    return shutil.which("bloodhound-cli")
 
 
 def _build_venv_exec_env(venv_path: str, python_executable: str) -> dict[str, str]:
@@ -30163,7 +28431,6 @@ def _build_check_context(handle_check_fn):
     from adscan_internal.cli.check import (
         AdscanCheckContext,
         check_core_dependencies,
-        check_docker_compose,
         check_dns_resolver,
         check_external_binary_tools,
         check_external_tools,
@@ -30185,7 +28452,6 @@ def _build_check_context(handle_check_fn):
         wordlists_install_dir=WORDLISTS_INSTALL_DIR,
         tool_venvs_base_dir=TOOL_VENVS_BASE_DIR,
         venv_path=VENV_PATH,
-        bloodhound_ce_dir=BLOODHOUND_CE_DIR,
         core_requirements=CORE_REQUIREMENTS,
         pip_tools_config=PipToolsConfig,
         external_tools_config=EXTERNAL_TOOLS_CONFIG,
@@ -30193,7 +28459,6 @@ def _build_check_context(handle_check_fn):
         python_version="3.12.3",
         is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
         determine_session_environment=_determine_session_environment,
-        get_bloodhound_mode=get_bloodhound_mode,
         ensure_dir_writable=_ensure_dir_writable,
         check_virtual_environment_fn=check_virtual_environment,
         check_core_dependencies_fn=check_core_dependencies,
@@ -30201,7 +28466,6 @@ def _build_check_context(handle_check_fn):
         check_system_packages_fn=check_system_packages,
         check_dns_resolver_fn=check_dns_resolver,
         check_external_binary_tools_fn=check_external_binary_tools,
-        check_docker_compose_fn=check_docker_compose,
         check_rust_tools_fn=check_rust_tools,
         check_go_toolchain_fn=check_go_toolchain,
         check_pyenv_status_fn=check_pyenv_status,
@@ -30239,9 +28503,6 @@ def _build_check_context(handle_check_fn):
         setup_external_tool=_setup_external_tool,
         is_docker_official_installed=_is_docker_official_installed,
         is_docker_compose_plugin_available=_is_docker_compose_plugin_available,
-        check_bloodhound_ce_running=_check_bloodhound_ce_running,
-        start_bloodhound_ce=_start_bloodhound_ce,
-        get_bloodhound_cli_executable_path=get_bloodhound_cli_executable_path,
         is_docker_env=is_docker_env,
         is_rustup_available=_is_rustup_available,
         get_rusthound_verification_status=_get_rusthound_verification_status,
@@ -30308,107 +28569,6 @@ def handle_uninstall():
         ),
     )
 
-
-def _handle_report_command(args) -> int:
-    """Handle `adscan report` — generate a report from an existing workspace."""
-    import os as _os
-    from pathlib import Path as _Path
-    from adscan_internal.cli.ci import run_generate_report
-
-    workspace = str(getattr(args, "workspace", "") or "")
-    report_json = getattr(args, "report_json", None)
-
-    # Auto-detect technical_report.json if not provided
-    if not report_json:
-        workspace_base = _Path(_os.path.expanduser("~/.adscan/workspaces"))
-        candidate = workspace_base / workspace / "technical_report.json"
-        if candidate.exists():
-            report_json = str(candidate)
-        else:
-            # Look for newest .run_* sub-workspace
-            run_dirs = sorted(
-                [d for d in workspace_base.glob(f".run_{workspace}_*") if d.is_dir()],
-                key=lambda d: d.stat().st_mtime,
-                reverse=True,
-            )
-            for d in run_dirs:
-                c = d / "technical_report.json"
-                if c.exists():
-                    report_json = str(c)
-                    print_info(f"Using report data from execution workspace: {d.name}")
-                    break
-
-    if not report_json:
-        print_error(f"No technical_report.json found for workspace '{workspace}'.")
-        print_info("Run a scan first or specify --json <path>.")
-        return 1
-
-    # Public report generation is PDF-only. DOCX generation remains internal
-    # for future reactivation, but it is intentionally not exposed in CLI UX.
-    fmt = "pdf"
-
-    profile = getattr(args, "profile", None) or "full"
-
-    frameworks_raw = getattr(args, "frameworks", None)
-    if frameworks_raw:
-        frameworks = [f.strip() for f in frameworks_raw.split(",") if f.strip()]
-    else:
-        from questionary import checkbox
-
-        _FW_MAP = {
-            "ENS Alto + NIS2 (Spain)": "ens",
-            "ISO 27001:2022": "iso27001",
-            "DORA (EU financial)": "dora",
-            "PCI DSS v4.0": "pci_dss",
-        }
-        selected = checkbox(
-            "Select compliance frameworks:", choices=list(_FW_MAP.keys())
-        ).ask()
-        frameworks = [_FW_MAP[s] for s in (selected or [])] or ["ens"]
-
-    engine = getattr(args, "engine", None) or ""
-    renderer = getattr(args, "renderer", None) or ""
-    template = getattr(args, "template", None) or ""
-    theme = getattr(args, "theme", None) or ""
-
-    if fmt == "pdf" and not engine:
-        # Guided prompts for PDF stack
-        _THEME_MAP = {
-            "Corporate Light — white/navy, print-safe (recommended)": "corporate_light",
-            "Premium Dark — navy/cyan, screen-first": "premium_dark",
-            "No theme — template is self-contained": "",
-        }
-
-        def _sel(prompt, mapping):
-            keys = list(mapping.keys())
-            from questionary import select
-
-            chosen = select(prompt, choices=keys).ask()
-            return mapping.get(chosen or keys[0], mapping[keys[0]])
-
-        engine = "chromium"
-        renderer = "cytoscape"
-        template = "premium"
-        theme = _sel("Report theme:", _THEME_MAP)
-
-    display_name = str(getattr(args, "display_name", "") or "").strip()
-    result = run_generate_report(
-        None,  # no shell needed — report-only command
-        report_json,
-        fmt,
-        profile,
-        frameworks=frameworks,
-        engine=engine,
-        renderer=renderer,
-        template=template,
-        theme=theme,
-        display_name=display_name,
-    )
-    if result:
-        print_success(f"Report generated: {result}")
-        return 0
-    print_error("Report generation failed.")
-    return 1
 
 
 def _questionary_select_standalone(title: str, options: list, default_idx: int = 0):
@@ -30483,12 +28643,30 @@ if __name__ == "__main__":
         action="store_true",
         help="Show ADscan version and exit.",
     )
+    # Global --output mode — propagates to adscan_core.output via
+    # ADSCAN_OUTPUT_MODE so structured consumers (adscan_web, agents)
+    # parse the canonical JSON envelope from docs/cli_style.md §2.
+    parser.add_argument(
+        "--output",
+        choices=["human", "json", "quiet"],
+        default=None,
+        help=(
+            "Output mode. 'human' (default) renders Rich panels/tables; "
+            "'json' emits one JSON envelope per operation to stdout; "
+            "'quiet' suppresses everything except the final JSON envelope."
+        ),
+    )
     # subparsers = parser.add_subparsers(dest="command", help="Available commands. If no command is given, 'start' is assumed if the environment is set up.", required=False)
+    # ``metavar="command"`` keeps the usage synopsis to ``adscan ... command``
+    # (follows the convention used by `git`, `gh`, `docker`) so subcommands
+    # we want to hide (e.g. the work-in-progress ``tui``) don't leak into
+    # the curly-brace choices list at the top of ``--help``.
     subparsers = parser.add_subparsers(
         dest="command",
         title="commands",
         description="Run 'adscan <command> -h' for more information on a specific command.",
         help="Available subcommands",
+        metavar="command",
     )
 
     install_parser = subparsers.add_parser(
@@ -30509,19 +28687,6 @@ if __name__ == "__main__":
         "--allow-low-disk",
         action="store_true",
         help="Continue installation even if free disk space is below 10GB (not recommended).",
-    )
-    install_parser.add_argument(
-        "--bh-admin-password",
-        dest="bh_admin_password",
-        default="Adscan4thewin!",
-        type=_parse_bh_admin_password_arg,
-        help="BloodHound CE admin password to set during Docker installation.",
-    )
-    install_parser.add_argument(
-        "--no-open-browser",
-        dest="no_open_browser",
-        action="store_true",
-        help="Do not open the BloodHound CE login page automatically during installation.",
     )
     install_parser.add_argument(
         "--pull-timeout",
@@ -30569,6 +28734,17 @@ if __name__ == "__main__":
         "--tui",
         action="store_true",
         help="Launch the Textual-based TUI instead of the default prompt_toolkit shell.",
+    )
+    start_parser.add_argument(
+        "--show-structural",
+        action="store_true",
+        dest="show_structural",
+        help=(
+            "Show the STRUCTURAL band in the Tactical Findings panel "
+            "(INFO-severity edges that are part of the expected AD "
+            "hierarchy — Domain Admins, Enterprise Admins, DCs, SYSTEM). "
+            "Hidden by default to keep the panel focused on choke points."
+        ),
     )
     # Non-interactive CI scan for automated testing
     ci_parser = subparsers.add_parser(
@@ -30623,6 +28799,15 @@ if __name__ == "__main__":
         help="Keep the workspace after scan completion (do not delete auto-created workspace)",
     )
     ci_parser.add_argument(
+        "--show-structural",
+        action="store_true",
+        dest="show_structural",
+        help=(
+            "Show the STRUCTURAL band in the Tactical Findings panel "
+            "(hidden by default)."
+        ),
+    )
+    ci_parser.add_argument(
         "--generate-report",
         action="store_true",
         help="Generate report after successful scan with flags captured (requires Report License)",
@@ -30673,67 +28858,99 @@ if __name__ == "__main__":
         help="Client-facing name shown on the report cover (e.g. the web workspace name).",
     )
 
-    report_parser = subparsers.add_parser(
-        "report",
-        help="Generate a report from an existing workspace without re-scanning.",
+
+
+    # ── adscan demo ───────────────────────────────────────────────────────
+    # Lead-magnet command: deterministic 60-second demo against a baked-in
+    # fake AD environment, producing a real PDF report. Implementation lives
+    # in adscan_internal.cli.demo so the launcher can re-use the parser shape.
+    from adscan_internal.cli.demo import add_demo_subparser as _add_demo_subparser
+    _add_demo_subparser(subparsers)
+
+    # ── adscan cheatsheet (LITE operator desk reference) ──────────────
+    # The PRO bonus PDFs (playbook / checklist / coverage-matrix) are now
+    # generated exclusively via ``adscan deliver --only <slug>``. Only the
+    # LITE-tier operator cheat sheet keeps a standalone subcommand.
+    from adscan_internal.cli.bonuses import add_cheatsheet_subparser as _add_cheatsheet_subparser
+    _add_cheatsheet_subparser(subparsers)
+
+    # ── adscan deliver (PRO Client Deliverable Kit) ───────────────────
+    # Renders the four PRO PDFs in parallel and packages them into a
+    # single ZIP under <workspace>/deliverables/. PRO only — LITE
+    # invocation is intercepted at runtime via the canonical upsell.
+    if "deliver" not in subparsers.choices:
+        try:
+            from adscan_internal.cli.deliver import (
+                add_deliver_subparser as _add_deliver_subparser,
+            )
+        except ModuleNotFoundError:
+            # LITE images strip ``adscan_internal/cli/deliver.py``. We still
+            # need argparse to ACCEPT the verb so the exit-42 PRO gate below
+            # (line ~29062) can fire and the host launcher renders the
+            # canonical upsell panel — otherwise argparse errors with
+            # "invalid choice" before any LITE/PRO awareness kicks in, and
+            # the user sees a confusing usage message instead of the upsell.
+            #
+            # The stub uses ``argparse.REMAINDER`` to swallow every flag and
+            # value the operator typed (``--workspace X``, ``--client Y``,
+            # ``--frameworks ens``, …) so the gate never trips on unknown
+            # arguments. The remainder is intentionally never read.
+            _deliver_stub = subparsers.add_parser(
+                "deliver",
+                help=argparse.SUPPRESS,
+                add_help=False,
+            )
+            _deliver_stub.add_argument(
+                "_deliver_lite_stub_args",
+                nargs=argparse.REMAINDER,
+                help=argparse.SUPPRESS,
+            )
+        else:
+            _add_deliver_subparser(subparsers)
+
+    # ── adscan mitre-navigator ────────────────────────────────────────────
+    # MITRE ATT&CK Navigator layer export (LITE + PRO). LITE writes a
+    # community-watermarked JSON snapshot; PRO adds an interactive HTML
+    # bundle, posture diff vs previous scan, and history snapshots.
+    if "mitre-navigator" not in subparsers.choices:
+        from adscan_internal.cli.mitre_navigator import (
+            add_mitre_navigator_subparser as _add_mitre_navigator_subparser,
+        )
+        _add_mitre_navigator_subparser(subparsers)
+
+    # ── adscan tui ────────────────────────────────────────────────────────
+    # Top-level launcher for the Textual workbench. Equivalent to
+    # 'adscan start --tui' but discoverable as a first-class command and
+    # supports --demo for previewing the workbench without running a scan.
+    #
+    # Help is intentionally suppressed while the workbench is under active
+    # development. The verb stays routable (so internal/manual invocation
+    # still works) but is not advertised on any user-facing surface
+    # (welcome cards, --help listing) until production-ready. Mirrors the
+    # launcher-side SUPPRESS in adscan_launcher/cli.py.
+    tui_parser = subparsers.add_parser(
+        "tui",
+        help=argparse.SUPPRESS,
     )
-    report_parser.add_argument(
-        "--workspace",
-        required=True,
-        help="Workspace name (logical or .run_* execution workspace).",
+    # Note: the ``tui`` and ``host-helper`` entries are dropped from the
+    # help-formatter listing at the end of this builder (Python <3.12
+    # renders ``argparse.SUPPRESS`` on a subparser literally rather than
+    # hiding it — bpo-44793). Mirrors the launcher's behaviour so the
+    # container ``--help`` matches what users see from the host.
+    tui_parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose mode for detailed informational output.",
     )
-    report_parser.add_argument(
-        "--json",
-        dest="report_json",
-        default=None,
-        help="Path to technical_report.json (auto-detected from workspace if omitted).",
+    tui_parser.add_argument(
+        "-d", "--debug", action="store_true",
+        help="Enable debug mode.",
     )
-    report_parser.add_argument(
-        "--format",
-        choices=["pdf"],
-        default="pdf",
-        help="Output format: pdf.",
+    tui_parser.add_argument(
+        "--demo", action="store_true",
+        help="Boot the workbench on top of the deterministic demo workspace.",
     )
-    report_parser.add_argument(
-        "--profile",
-        choices=["full", "technical", "executive"],
-        default=None,
-        help="Report profile (default: full).",
-    )
-    report_parser.add_argument(
-        "--frameworks",
-        default=None,
-        help="Comma-separated compliance frameworks: ens,iso27001,dora,pci_dss.",
-    )
-    report_parser.add_argument(
-        "--engine",
-        choices=["chromium"],
-        default=None,
-        help="PDF engine (chromium).",
-    )
-    report_parser.add_argument(
-        "--renderer",
-        choices=["cytoscape"],
-        default=None,
-        help="Attack-path renderer (cytoscape).",
-    )
-    report_parser.add_argument(
-        "--template",
-        choices=["premium"],
-        default=None,
-        help="Report template (only premium supported).",
-    )
-    report_parser.add_argument(
-        "--theme",
-        choices=["premium_dark", "corporate_light"],
-        default=None,
-        help="Report theme.",
-    )
-    report_parser.add_argument(
-        "--display-name",
-        dest="display_name",
-        default=None,
-        help="Client-facing name shown on the report cover (overrides workspace dir name).",
+    tui_parser.add_argument(
+        "--dev", action="store_true", help=argparse.SUPPRESS,
     )
 
     check_parser = subparsers.add_parser(
@@ -30790,6 +29007,17 @@ if __name__ == "__main__":
     )
     version_parser = subparsers.add_parser("version", help="Show ADscan version.")
 
+    welcome_parser = subparsers.add_parser(
+        "welcome",
+        help="Show the editorial welcome screen (default when no command is given).",
+    )
+    welcome_parser.add_argument(
+        "-v", "--verbose", action="store_true", help=argparse.SUPPRESS,
+    )
+    welcome_parser.add_argument(
+        "-d", "--debug", action="store_true", help=argparse.SUPPRESS,
+    )
+
     # Internal-only: privileged host helper used by Docker runtime to execute
     # a very small set of safe host operations (e.g., clock sync) via sudo.
     helper_parser = subparsers.add_parser(
@@ -30802,18 +29030,79 @@ if __name__ == "__main__":
         help=argparse.SUPPRESS,
     )
 
+    # Strip subparser entries whose ``help`` is ``argparse.SUPPRESS`` from
+    # the help-formatter's choices listing. Python <3.12 renders the
+    # literal "==SUPPRESS==" sentinel for these entries instead of hiding
+    # them (bpo-44793). The dispatch path is untouched — only the help
+    # formatter's side-table is mutated. Applies to ``tui`` (in-development
+    # workbench) and ``host-helper`` (internal-only).
+    _hidden_subparser_dests = {"tui", "host-helper"}
+    _choices_actions = getattr(subparsers, "_choices_actions", None)
+    if _choices_actions:
+        for _action in list(_choices_actions):
+            if getattr(_action, "dest", None) in _hidden_subparser_dests:
+                _choices_actions.remove(_action)
+
     # Add any arguments specific to 'start' if needed, e.g., --workspace
     # start_parser.add_argument("-w", "--workspace", help="Specify a workspace to load on start.")
 
-    # If adscan.py is run without any arguments
+    # If adscan.py is run without any arguments, show the editorial welcome.
     if len(sys.argv) == 1:
         _SESSION_CAPTURE_FINALIZED = True
-        parser.print_help()
+        try:
+            from adscan_internal.cli.welcome import (
+                load_latest_posture,
+                print_welcome,
+            )
+            posture, ws_name, age_days = load_latest_posture()
+            print_welcome(
+                latest_posture=posture,
+                workspace_name=ws_name,
+                last_scan_age_days=age_days,
+                license_mode=str(globals().get("LICENSE_MODE", "LITE") or "LITE"),
+            )
+        except Exception as _exc:
+            from adscan_core import telemetry as _tm
+            _tm.capture_exception(_exc)
+            parser.print_help()
         sys.exit(0)
 
     args = parser.parse_args()
     SESSION_COMMAND_TYPE = args.command
+    # Propagate --output to adscan_core.output (and ADSCAN_OUTPUT_MODE
+    # so subprocesses inherit the mode without re-threading the flag).
+    if getattr(args, "output", None):
+        try:
+            from adscan_core.output import set_output_mode as _set_output_mode
+
+            _set_output_mode(args.output)
+        except Exception:  # noqa: BLE001 — never block dispatch on UX wiring
+            pass
+    # Propagate --show-structural as ADSCAN_SHOW_STRUCTURAL so the
+    # Tactical Findings renderer in adscan_core can read it without
+    # threading the flag through every subcommand layer. Mirrors the
+    # existing pattern used by SECRET_MODE / DEBUG_MODE toggles.
+    if getattr(args, "show_structural", False):
+        os.environ["ADSCAN_SHOW_STRUCTURAL"] = "1"
     _SESSION_CAPTURE_FINALIZED = not _is_session_capture_allowed(SESSION_COMMAND_TYPE)
+
+    # ── PRO-only command gate (Pass C exit-42 protocol) ────────────────────
+    # When LITE container receives a PRO-only verb (deliver, playbook,
+    # checklist, coverage-matrix), exit with code 42 and a single JSON line
+    # so the host launcher can render the canonical PRO upsell panel
+    # instead of bubbling up a confusing import error.
+    try:
+        from adscan_core.cli_catalog import is_pro_only as _is_pro_only
+        from adscan_core.tier import is_pro as _is_pro
+        if args.command and _is_pro_only(str(args.command)) and not _is_pro():
+            import json as _json
+            print(_json.dumps({"error": "pro_required", "feature": str(args.command)}))
+            sys.stdout.flush()
+            sys.exit(42)
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001 — gate must never crash dispatch
+        pass
 
     if args.command == "host-helper":
         from adscan_internal.host_privileged_helper import run_host_helper_server
@@ -30903,12 +29192,6 @@ if __name__ == "__main__":
                     },
                 )
                 install_success = _handle_install_docker_mode(
-                    bloodhound_admin_password=getattr(
-                        args, "bh_admin_password", "Adscan4thewin!"
-                    ),
-                    suppress_bloodhound_browser=bool(
-                        getattr(args, "no_open_browser", False)
-                    ),
                     pull_timeout_seconds=getattr(args, "pull_timeout", None),
                 )
             else:
@@ -31029,9 +29312,41 @@ if __name__ == "__main__":
                 extra={"mode": "container", "ci_mode": str(getattr(args, "mode", ""))},
             )
         sys.exit(exit_code)
-    elif args.command == "report":
-        exit_code = _handle_report_command(args)
-        sys.exit(exit_code)
+    elif args.command == "demo":
+        from adscan_internal.cli.demo import run_demo as _run_demo
+        sys.exit(_run_demo(args))
+    elif args.command == "cheatsheet":
+        from adscan_internal.cli.bonuses import run_cheatsheet as _run_cheatsheet
+        sys.exit(_run_cheatsheet(args))
+    elif args.command == "deliver":
+        from adscan_internal.cli.deliver import run_deliver_sync as _run_deliver_sync
+        sys.exit(_run_deliver_sync(args))
+    elif args.command == "mitre-navigator":
+        from adscan_internal.cli.mitre_navigator import (
+            run_mitre_navigator_sync as _run_mitre_navigator_sync,
+        )
+        sys.exit(_run_mitre_navigator_sync(args))
+    elif args.command == "tui":
+        from adscan_internal.cli.tui import run_tui as _run_tui
+        sys.exit(_run_tui(args, handle_start=handle_start))
+    elif args.command == "welcome":
+        from adscan_internal.cli.welcome import (
+            load_latest_posture,
+            print_welcome,
+        )
+        try:
+            posture, ws_name, age_days = load_latest_posture()
+            print_welcome(
+                latest_posture=posture,
+                workspace_name=ws_name,
+                last_scan_age_days=age_days,
+                license_mode=str(globals().get("LICENSE_MODE", "LITE") or "LITE"),
+            )
+            sys.exit(0)
+        except Exception as _exc:
+            from adscan_core import telemetry as _tm
+            _tm.capture_exception(_exc)
+            sys.exit(1)
     # If a command was given but not matched (shouldn't happen if 'required=True' for subparsers,
     # but good for safety if 'required=False' or for the initial no-command case)
     elif args.command is None:

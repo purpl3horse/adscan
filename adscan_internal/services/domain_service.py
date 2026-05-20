@@ -7,19 +7,33 @@ and domain authentication operations.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
-import re
 import subprocess
+import time
 from typing import Any, Dict, List, Optional
 
+from adscan_core import telemetry
+from adscan_core.rich_output import (
+    print_info_debug,
+    print_warning,
+)
+
 from adscan_internal.services.base_service import BaseService
-from adscan_internal.integrations.netexec.helpers import build_auth_nxc
+from adscan_internal.services.ldap_transport_service import (
+    ADscanLDAPConfig,
+    ADscanLDAPConnection,
+)
+from adscan_internal.services.domain_posture import DomainPosture
+from adscan_internal.services.posture_sink import PostureSink
+from adscan_internal.services.enumeration.trust_query import (
+    TrustedDomainEntry,
+    query_trusted_domains,
+)
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
 
 
 logger = logging.getLogger(__name__)
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 @dataclass
@@ -27,11 +41,14 @@ class TrustRelationship:
     """Represents a domain trust relationship.
 
     Attributes:
-        source_domain: Source domain name
-        target_domain: Target domain name
-        trust_type: Type of trust (Parent, Child, External, Forest, etc.)
-        trust_direction: Direction (Inbound, Outbound, Bidirectional)
-        target_pdc: Target domain's PDC (if available)
+        source_domain: Source domain name.
+        target_domain: Target domain name.
+        trust_type: Human label (Forest, External, Parent-Child, …).
+        trust_direction: Direction (Inbound, Outbound, Bidirectional, Disabled).
+        target_pdc: Target domain's PDC IP (if known).
+        trust_attributes: Raw ``trustAttributes`` bitmask.
+        attribute_flags: Decoded ``trustAttributes`` bit names.
+        partner_sid: Partner domain SID when available.
     """
 
     source_domain: str
@@ -39,15 +56,20 @@ class TrustRelationship:
     trust_type: str = "Unknown"
     trust_direction: str = "Unknown"
     target_pdc: Optional[str] = None
+    trust_attributes: int = 0
+    attribute_flags: List[str] = field(default_factory=list)
+    partner_sid: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "source_domain": self.source_domain,
             "target_domain": self.target_domain,
             "trust_type": self.trust_type,
             "trust_direction": self.trust_direction,
             "target_pdc": self.target_pdc,
+            "trust_attributes": self.trust_attributes,
+            "attribute_flags": list(self.attribute_flags),
+            "partner_sid": self.partner_sid,
         }
 
 
@@ -59,17 +81,12 @@ class TrustEnumerationResult:
     discovered_domains: List[str]
     domain_controllers: Dict[str, str]
     domain_connectivity: Dict[str, Dict[str, Any]]
+    failed_domains: Dict[str, str] = field(default_factory=dict)
+    per_domain_durations: Dict[str, float] = field(default_factory=dict)
 
 
 class DomainService(BaseService):
-    """Service for domain operations.
-
-    This service encapsulates domain-related operations including:
-    - Trust enumeration
-    - Domain authentication
-    - Domain configuration retrieval
-    - ADCS detection
-    """
+    """Service for domain operations."""
 
     def enumerate_trusts(
         self,
@@ -77,45 +94,77 @@ class DomainService(BaseService):
         pdc: str,
         username: str,
         password: str,
-        netexec_path: str,
-        executor: Callable[[str, int], subprocess.CompletedProcess[str] | None],
-        resolve_pdc_ip: Callable[[str, str], str | None] | None = None,
-        check_domain_reachability: Callable[[str, str, str], Dict[str, Any]] | None = None,
+        *,
+        auth_domain: Optional[str] = None,
+        auth_kdc: Optional[str] = None,
+        use_kerberos: bool = True,
+        nt_hash: Optional[str] = None,
+        aes_key: Optional[str] = None,
+        dc_hostname: Optional[str] = None,
+        resolve_dc_hostname: Optional[Callable[[str, str], Optional[str]]] = None,
+        resolve_pdc_ip: Optional[Callable[[str, str], Optional[str]]] = None,
+        check_domain_reachability: Optional[
+            Callable[[str, str, str], Dict[str, Any]]
+        ] = None,
         scan_id: Optional[str] = None,
-        timeout: int = 300,
+        timeout: int = 60,
+        progress_cb: Optional[Callable[[Any], None]] = None,
+        posture_sink: Optional[PostureSink] = None,
+        posture_snapshot: Optional[DomainPosture] = None,
     ) -> TrustEnumerationResult:
-        """Enumerate domain trusts recursively using NetExec LDAP.
+        """Enumerate trusts recursively over native badldap.
+
+        BFS expands across all reachable partner domains, opening a fresh
+        LDAP connection per domain (with built-in LDAPS→LDAP fallback).
 
         Args:
-            domain: Domain name to enumerate
-            pdc: Primary domain controller IP/FQDN for the starting domain
-            username: Authentication username
-            password: Authentication password
-            netexec_path: Path to the NetExec executable
-            executor: Command executor routed through ADscan's NetExec runner
-            resolve_pdc_ip: Optional callback to resolve a trusted domain's PDC
-            check_domain_reachability: Optional callback to validate that a
-                newly discovered trusted domain controller is reachable before
-                recursing into it
-            scan_id: Optional scan ID for progress tracking
-            timeout: Command timeout in seconds
+            domain: Source domain to enumerate.
+            pdc: Source domain's PDC address.
+            username: Authenticating user (lives in ``auth_domain``).
+            password: Plaintext password (or NT hash if ``nt_hash`` is empty).
+            auth_domain: Domain the credential belongs to. Defaults to ``domain``.
+            auth_kdc: KDC for ``auth_domain``. Defaults to ``pdc``.
+            use_kerberos: Bind with Kerberos when True.
+            nt_hash: 32-hex NT hash (passed in lieu of password when set).
+            aes_key: AES Kerberos key (32 or 64 hex chars).
+            resolve_pdc_ip: Optional callback ``(partner, resolver_ip) -> ip``.
+            check_domain_reachability: Optional reachability probe callback.
+            scan_id: Optional scan id for progress events.
+            timeout: Per-domain LDAP timeout (seconds). Reserved.
+            progress_cb: Optional ``TrustEnumProgressEvent`` consumer.
 
         Returns:
-            Structured trust enumeration result.
+            ``TrustEnumerationResult``.
         """
-        normalized_domain = domain.strip().lower()
-        auth_string = build_auth_nxc(
-            username,
-            password,
-            normalized_domain,
-            kerberos=True,
+        from adscan_internal.cli.widgets.trust_enum_live import (
+            TrustEnumProgressEvent,
         )
+
+        normalized_domain = domain.strip().lower()
+        effective_auth_domain = (auth_domain or normalized_domain).strip().lower()
+        effective_auth_kdc = (auth_kdc or pdc).strip()
+
         pending_domains: list[str] = [normalized_domain]
         seen_domains: set[str] = set()
         discovered_domains: list[str] = [normalized_domain]
         domain_controllers: Dict[str, str] = {normalized_domain: pdc}
+        domain_hostnames: Dict[str, str] = {}
+        if dc_hostname:
+            domain_hostnames[normalized_domain] = dc_hostname.strip()
         domain_connectivity: Dict[str, Dict[str, Any]] = {}
         trusts: List[TrustRelationship] = []
+        failed_domains: Dict[str, str] = {}
+        per_domain_durations: Dict[str, float] = {}
+
+        def _emit(event: TrustEnumProgressEvent) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(event)
+                except Exception as cb_exc:  # noqa: BLE001
+                    telemetry.capture_exception(cb_exc)
+
+        # Pick the credential value badldap will receive.
+        secret = nt_hash or password
 
         self._emit_progress(
             scan_id=scan_id,
@@ -128,14 +177,18 @@ class DomainService(BaseService):
             current_domain = pending_domains.pop(0)
             if current_domain in seen_domains:
                 continue
-
             current_pdc = domain_controllers.get(current_domain)
             if not current_pdc:
-                self.logger.warning(
-                    "Skipping trust enumeration for %s: missing PDC", current_domain
-                )
                 seen_domains.add(current_domain)
                 continue
+
+            _emit(
+                TrustEnumProgressEvent(
+                    phase="connect",
+                    current_domain=current_domain,
+                    pdc=current_pdc,
+                )
+            )
 
             self._emit_progress(
                 scan_id=scan_id,
@@ -143,65 +196,118 @@ class DomainService(BaseService):
                 progress=0.3,
                 message=f"Enumerating trusts for {current_domain}",
             )
-            command = f"{netexec_path} ldap {current_pdc} {auth_string} --dc-list"
-            self.logger.info(
-                "Executing recursive trust enumeration for domain: %s", current_domain
-            )
 
-            result = executor(command, timeout)
-            if result is None:
-                self.logger.warning(
-                    "NetExec runner returned no result for trust enumeration of %s",
-                    current_domain,
+            entries: list[TrustedDomainEntry] = []
+            t_start = time.monotonic()
+            try:
+                target_hostname = domain_hostnames.get(current_domain)
+                ldap_cfg = ADscanLDAPConfig(
+                    domain=current_domain,
+                    dc_ip=current_pdc,
+                    use_ldaps=True,
+                    use_kerberos=use_kerberos,
+                    username=username,
+                    password=secret,
+                    auth_domain=effective_auth_domain,
+                    auth_kdc=effective_auth_kdc,
+                    aes_key=aes_key,
+                    kerberos_target_hostname=target_hostname,
+                    posture_sink=posture_sink,
+                    posture_snapshot=posture_snapshot,
                 )
+                _emit(
+                    TrustEnumProgressEvent(
+                        phase="querying",
+                        current_domain=current_domain,
+                        pdc=current_pdc,
+                    )
+                )
+                with ADscanLDAPConnection(ldap_cfg) as conn:
+                    entries = query_trusted_domains(conn, ldap_cfg.domain_dn)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                err_text = self._summarize_ldap_error(exc)
+                failed_domains[current_domain] = err_text
+                duration_ms = (time.monotonic() - t_start) * 1000.0
+                per_domain_durations[current_domain] = duration_ms
                 seen_domains.add(current_domain)
+                _emit(
+                    TrustEnumProgressEvent(
+                        phase="failed",
+                        current_domain=current_domain,
+                        pdc=current_pdc,
+                        error=err_text,
+                        duration_ms=duration_ms,
+                    )
+                )
                 continue
 
-            output = self._combine_process_output(result)
-            parsed_trusts = self._parse_netexec_trust_output(output)
+            duration_ms = (time.monotonic() - t_start) * 1000.0
+            per_domain_durations[current_domain] = duration_ms
             seen_domains.add(current_domain)
 
-            if result.returncode != 0 and not parsed_trusts:
-                self.logger.warning(
-                    "Trust enumeration command for %s failed with rc=%s",
-                    current_domain,
-                    result.returncode,
-                )
-                continue
-
-            for parsed_trust in parsed_trusts:
-                partner = parsed_trust["partner"]
+            for entry in entries:
+                partner = entry.partner
                 if not partner:
                     continue
 
                 partner_pdc = domain_controllers.get(partner)
                 if not partner_pdc and resolve_pdc_ip is not None:
-                    partner_pdc = resolve_pdc_ip(partner, current_pdc)
+                    try:
+                        partner_pdc = resolve_pdc_ip(partner, current_pdc)
+                    except Exception as rexc:  # noqa: BLE001
+                        telemetry.capture_exception(rexc)
+                        partner_pdc = None
                     if partner_pdc:
                         domain_controllers[partner] = partner_pdc
+
+                if partner not in domain_hostnames and resolve_dc_hostname is not None:
+                    try:
+                        partner_host = resolve_dc_hostname(partner, current_pdc)
+                    except Exception as hexc:  # noqa: BLE001
+                        telemetry.capture_exception(hexc)
+                        partner_host = None
+                    if partner_host:
+                        domain_hostnames[partner] = partner_host.strip()
 
                 trusts.append(
                     TrustRelationship(
                         source_domain=current_domain,
                         target_domain=partner,
-                        trust_type=parsed_trust["type"],
-                        trust_direction=parsed_trust["direction"],
+                        trust_type=entry.trust_type,
+                        trust_direction=entry.direction,
                         target_pdc=partner_pdc,
+                        trust_attributes=entry.trust_attributes,
+                        attribute_flags=list(entry.attribute_flags),
+                        partner_sid=entry.sid,
                     )
                 )
 
                 if partner not in discovered_domains:
                     discovered_domains.append(partner)
+
+                _emit(
+                    TrustEnumProgressEvent(
+                        phase="partner_resolved",
+                        current_domain=current_domain,
+                        pdc=current_pdc,
+                        partner=partner,
+                    )
+                )
+
                 should_enqueue = True
                 if partner_pdc and check_domain_reachability is not None:
-                    connectivity = check_domain_reachability(
-                        partner,
-                        partner_pdc,
-                        current_domain,
-                    )
+                    try:
+                        connectivity = check_domain_reachability(
+                            partner, partner_pdc, current_domain
+                        )
+                    except Exception as cexc:  # noqa: BLE001
+                        telemetry.capture_exception(cexc)
+                        connectivity = {}
                     if connectivity:
                         domain_connectivity[partner] = connectivity
                         should_enqueue = bool(connectivity.get("reachable"))
+
                 if (
                     should_enqueue
                     and partner not in seen_domains
@@ -209,67 +315,59 @@ class DomainService(BaseService):
                 ):
                     pending_domains.append(partner)
 
+            _emit(
+                TrustEnumProgressEvent(
+                    phase="done",
+                    current_domain=current_domain,
+                    pdc=current_pdc,
+                    duration_ms=duration_ms,
+                    trust_count=len(entries),
+                )
+            )
+
         self._emit_progress(
             scan_id=scan_id,
             phase="trust_enumeration",
             progress=1.0,
             message=f"Trust enumeration completed: {len(trusts)} trust(s) found",
         )
-        self.logger.info(
-            "Trust enumeration completed for %s: %s trust(s), %s domain(s)",
-            normalized_domain,
-            len(trusts),
-            len(discovered_domains),
-        )
         return TrustEnumerationResult(
             trusts=trusts,
             discovered_domains=discovered_domains,
             domain_controllers=domain_controllers,
             domain_connectivity=domain_connectivity,
+            failed_domains=failed_domains,
+            per_domain_durations=per_domain_durations,
         )
 
-    def _parse_netexec_trust_output(self, output: str) -> List[Dict[str, str]]:
-        """Parse NetExec trust lines from ``--dc-list`` output."""
-        trusts: List[Dict[str, str]] = []
-        for raw_line in output.splitlines():
-            parsed = self._parse_trust_line(raw_line)
-            if parsed:
-                trusts.append(parsed)
-        return trusts
-
-    def _parse_trust_line(self, line: str) -> Dict[str, str] | None:
-        """Extract trust metadata from one NetExec output line."""
-        normalized_line = _ANSI_ESCAPE_RE.sub("", line or "").strip()
-        if "->" not in normalized_line:
-            return None
-
-        parts = [part.strip() for part in normalized_line.split("->")]
-        if len(parts) < 3:
-            return None
-
-        left_tokens = parts[0].split()
-        if not left_tokens:
-            return None
-
-        partner = left_tokens[-1].rstrip(":").lower()
-        if "." not in partner:
-            return None
-
-        direction = parts[1].strip() or "Unknown"
-        trust_type = parts[2].strip() or "Unknown"
-        return {
-            "partner": partner,
-            "direction": direction,
-            "type": trust_type,
-        }
-
-    def _combine_process_output(self, result: subprocess.CompletedProcess[str]) -> str:
-        """Return stdout and stderr combined for best-effort parsing."""
-        return "\n".join(
-            part
-            for part in [(result.stdout or "").strip(), (result.stderr or "").strip()]
-            if part
-        )
+    @staticmethod
+    def _summarize_ldap_error(exc: BaseException) -> str:
+        """Compress an LDAP/Kerberos exception chain into one user line."""
+        text = str(exc or "")
+        lower = text.lower()
+        if "signing" in lower or "strongerauth" in lower:
+            return "LDAP signing required"
+        if "channel binding" in lower:
+            return "LDAP channel binding required"
+        if (
+            "preauth" in lower
+            or "client not found" in lower
+            or "decrypt integrity" in lower
+        ):
+            return "bind failed (credential rejected)"
+        if "timeout" in lower or "timed out" in lower:
+            return "timeout"
+        if (
+            "no route" in lower
+            or "unreachable" in lower
+            or "connection refused" in lower
+        ):
+            return "DC unreachable"
+        if "kerberos" in lower or "krb_ap_err" in lower or "gssapi" in lower:
+            return f"Kerberos error: {type(exc).__name__}"
+        # Compact fallback
+        compact = text.strip().splitlines()[0] if text.strip() else type(exc).__name__
+        return compact[:160]
 
     def verify_domain_connectivity(
         self,
@@ -277,24 +375,13 @@ class DomainService(BaseService):
         pdc: str,
         scan_id: Optional[str] = None,
     ) -> bool:
-        """Verify basic connectivity to domain.
-
-        Args:
-            domain: Domain name
-            pdc: PDC hostname/IP
-            scan_id: Optional scan ID
-
-        Returns:
-            True if domain is reachable, False otherwise
-        """
+        """Verify basic connectivity to domain via ICMP."""
         self._emit_progress(
             scan_id=scan_id,
             phase="domain_connectivity",
             progress=0.0,
             message=f"Checking connectivity to {domain}",
         )
-
-        # Simple ping check (can be enhanced)
         try:
             clean_env = get_clean_env_for_compilation()
             result = subprocess.run(
@@ -305,23 +392,22 @@ class DomainService(BaseService):
                 env=clean_env,
             )
             is_reachable = result.returncode == 0
-
             self._emit_progress(
                 scan_id=scan_id,
                 phase="domain_connectivity",
                 progress=1.0,
                 message=f"Domain {'reachable' if is_reachable else 'unreachable'}",
             )
-
             return is_reachable
-        except (subprocess.TimeoutExpired, Exception) as e:
-            self.logger.error(f"Connectivity check failed: {e}")
+        except (subprocess.TimeoutExpired, Exception) as e:  # noqa: BLE001
+            telemetry.capture_exception(e)
             self._emit_progress(
                 scan_id=scan_id,
                 phase="domain_connectivity",
                 progress=1.0,
                 message="Connectivity check failed",
             )
+            print_warning(f"Connectivity check failed: {e}")
             return False
 
     def get_domain_info(
@@ -333,19 +419,7 @@ class DomainService(BaseService):
         netexec_path: str,
         scan_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get domain information using NetExec.
-
-        Args:
-            domain: Domain name
-            pdc: PDC hostname/IP
-            username: Authentication username
-            password: Authentication password
-            netexec_path: Path to NetExec executable
-            scan_id: Optional scan ID
-
-        Returns:
-            Dictionary with domain information
-        """
+        """Get domain information using NetExec (legacy)."""
         self._emit_progress(
             scan_id=scan_id,
             phase="domain_info",
@@ -360,8 +434,6 @@ class DomainService(BaseService):
             "dc_count": 0,
         }
 
-        # Build argv-style command to avoid shell quoting issues.
-        # Detect NT hash: 32 hexadecimal characters.
         is_hash = len(password) == 32 and all(
             c in "0123456789abcdef" for c in password.lower()
         )
@@ -381,18 +453,11 @@ class DomainService(BaseService):
                 check=False,
                 env=clean_env,
             )
-
-            if result.returncode == 0:
-                # Parse output (simplified - real implementation more complex)
-                domain_info["retrieved"] = True
-                self.logger.info(f"Domain info retrieved for {domain}")
-            else:
-                domain_info["retrieved"] = False
-                self.logger.warning(f"Failed to retrieve domain info for {domain}")
-
-        except subprocess.TimeoutExpired:
+            domain_info["retrieved"] = result.returncode == 0
+        except subprocess.TimeoutExpired as exc:
+            telemetry.capture_exception(exc)
             domain_info["retrieved"] = False
-            self.logger.error(f"Domain info retrieval timed out for {domain}")
+            print_info_debug(f"Domain info retrieval timed out for {domain}")
 
         self._emit_progress(
             scan_id=scan_id,
@@ -400,5 +465,4 @@ class DomainService(BaseService):
             progress=1.0,
             message="Domain information retrieval completed",
         )
-
         return domain_info

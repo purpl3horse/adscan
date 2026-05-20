@@ -2,6 +2,96 @@ from __future__ import annotations
 
 from typing import Any
 
+from adscan_core.rich_output import print_info_verbose
+
+
+# ---------------------------------------------------------------------------
+# Legacy state migration
+# ---------------------------------------------------------------------------
+
+# Legacy workspace-state keys that referenced the now-removed managed Neo4j /
+# BloodHound CE stack. They held connection details for a service ADscan no
+# longer ships, so they are dropped on read instead of being remapped.
+_LEGACY_NEO4J_STATE_KEYS: tuple[str, ...] = (
+    "neo4j_host",
+    "neo4j_port",
+    "neo4j_db_user",
+    "neo4j_db_password",
+)
+
+# Legacy edge_type / source provenance literal that BloodHound-CE-derived
+# graph data was tagged with. Renamed to a transport-neutral name now that
+# graph collection is performed natively.
+_LEGACY_BLOODHOUND_EDGE_TYPE = "bloodhound_ce"
+_CURRENT_GRAPH_EDGE_TYPE = "graph_collection"
+
+
+def migrate_legacy_workspace_state(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Strip legacy BloodHound/Neo4j keys from a persisted workspace state dict.
+
+    The workspace ``variables.json`` schema previously carried ``neo4j_*``
+    connection settings for the managed Neo4j container. That stack has been
+    removed, so any persisted keys are stale and must be dropped on load to
+    keep the in-memory shape consistent with the current writer.
+
+    The migration is idempotent: a subsequent call returns ``changed=False``.
+
+    Args:
+        state: Parsed ``variables.json`` payload (may be mutated in place).
+
+    Returns:
+        A tuple ``(state, changed)`` where ``changed`` indicates whether any
+        legacy key was removed.
+    """
+    if not isinstance(state, dict):
+        return state, False
+    changed = False
+    for key in _LEGACY_NEO4J_STATE_KEYS:
+        if key in state:
+            state.pop(key, None)
+            changed = True
+    return state, changed
+
+
+def migrate_legacy_attack_graph(graph: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Rewrite legacy ``bloodhound_ce`` edge_type tags in an attack graph dict.
+
+    Edges and nodes persisted before the BloodHound-CE removal carry an
+    ``edge_type == "bloodhound_ce"`` provenance tag. The literal has been
+    renamed to ``graph_collection`` so the on-disk graph is normalised on
+    first load.
+
+    Idempotent: subsequent calls find no legacy literal and return
+    ``changed=False``.
+    """
+    if not isinstance(graph, dict):
+        return graph, False
+    changed = False
+    edges = graph.get("edges")
+    if isinstance(edges, list):
+        for edge in edges:
+            if (
+                isinstance(edge, dict)
+                and edge.get("edge_type") == _LEGACY_BLOODHOUND_EDGE_TYPE
+            ):
+                edge["edge_type"] = _CURRENT_GRAPH_EDGE_TYPE
+                changed = True
+    nodes = graph.get("nodes")
+    if isinstance(nodes, dict):
+        node_iter: Any = nodes.values()
+    elif isinstance(nodes, list):
+        node_iter = nodes
+    else:
+        node_iter = ()
+    for node in node_iter:
+        if (
+            isinstance(node, dict)
+            and node.get("edge_type") == _LEGACY_BLOODHOUND_EDGE_TYPE
+        ):
+            node["edge_type"] = _CURRENT_GRAPH_EDGE_TYPE
+            changed = True
+    return graph, changed
+
 
 def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
     """Collect workspace-level variables from the CLI shell instance."""
@@ -24,10 +114,6 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         "current_domain_dir": getattr(shell, "current_domain_dir", None),
         "domains_data": getattr(shell, "domains_data", {}),
         "domain_connectivity": getattr(shell, "domain_connectivity", {}),
-        "neo4j_host": getattr(shell, "neo4j_host", "localhost"),
-        "neo4j_port": getattr(shell, "neo4j_port", 7687),
-        "neo4j_db_user": getattr(shell, "neo4j_db_user", "neo4j"),
-        "neo4j_db_password": getattr(shell, "neo4j_db_password", "neo4j"),
         "auto": getattr(shell, "auto", False),
         "telemetry": getattr(shell, "telemetry", True),
         "type": getattr(shell, "type", None),
@@ -48,6 +134,13 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
             if isinstance(domain_data, dict):
                 domain_data = dict(domain_data)
                 domain_data.pop("credential_previews", None)
+                # Drop transient in-memory keys that contain non-JSON types
+                # (e.g. ``set``) or that should never leak across sessions.
+                # Prefix convention: keys starting with "_" are runtime-only.
+                for _transient_key in [
+                    k for k in domain_data.keys() if str(k).startswith("_")
+                ]:
+                    domain_data.pop(_transient_key, None)
             sanitized[domain_key] = domain_data
         workspace_vars["domains_data"] = sanitized
 
@@ -83,7 +176,18 @@ def collect_domain_variables_from_shell(shell: Any) -> dict[str, Any]:
 
 
 def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) -> None:
-    """Apply loaded workspace variables to the CLI shell instance."""
+    """Apply loaded workspace variables to the CLI shell instance.
+
+    Legacy BloodHound/Neo4j keys are stripped before application so older
+    workspaces load cleanly against the current shell schema.
+    """
+    if isinstance(variables, dict):
+        variables, migrated = migrate_legacy_workspace_state(variables)
+        if migrated:
+            workspace_label = variables.get("current_workspace") or "workspace"
+            print_info_verbose(
+                f"Migrated legacy BloodHound/Neo4j state keys for {workspace_label}"
+            )
     defaults: dict[str, Any] = {
         "hosts": None,
         "myip": None,
@@ -104,10 +208,6 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
         "current_domain_dir": None,
         "domains_data": {},
         "domain_connectivity": {},
-        "neo4j_host": "localhost",
-        "neo4j_port": 7687,
-        "neo4j_db_user": "neo4j",
-        "neo4j_db_password": "neo4j",
         "auto": False,
         "telemetry": True,
         "type": None,
@@ -138,4 +238,6 @@ __all__ = [
     "apply_workspace_variables_to_shell",
     "collect_domain_variables_from_shell",
     "collect_workspace_variables_from_shell",
+    "migrate_legacy_attack_graph",
+    "migrate_legacy_workspace_state",
 ]

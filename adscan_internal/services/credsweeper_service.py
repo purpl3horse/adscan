@@ -3,8 +3,8 @@
 This module centralizes:
 
 - Resolution of CredSweeper rules files (``config.yaml`` and ``custom_config.yaml``)
-- Execution of the external ``credsweeper`` CLI with proper environment handling
-- Parsing and normalization of JSON output into a Python-friendly structure
+- Execution of the installed CredSweeper Python library
+- Normalization of CredSweeper candidates into a Python-friendly structure
 
 The goal is to decouple CredSweeper-specific logic from the monolithic
 ``adscan.py`` file and make it easier to test and reuse from different
@@ -19,11 +19,9 @@ from importlib import metadata as importlib_metadata
 from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -34,7 +32,6 @@ from rich.markup import escape as rich_escape
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.path_utils import get_adscan_home
-from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.services.smb_sensitive_file_policy import (
     resolve_effective_sensitive_extension,
 )
@@ -552,11 +549,11 @@ class CredSweeperFinding:
 
 
 class CredSweeperService(BaseService):
-    """Service wrapper around the CredSweeper CLI.
+    """Service wrapper around the installed CredSweeper Python library.
 
-    This service is intentionally CLI-oriented and uses a pluggable command
-    executor so that it can run through ADscan's ``run_command`` helper in
-    production and a stub executor in tests.
+    ``credsweeper_path`` parameters remain on public methods for backward
+    compatibility with older callers. They are no longer used for execution;
+    availability is determined by importing the ``credsweeper`` package.
     """
 
     def __init__(
@@ -571,6 +568,29 @@ class CredSweeperService(BaseService):
         """
         super().__init__()
         self._command_executor = command_executor
+
+    @staticmethod
+    def is_library_available() -> bool:
+        """Return whether CredSweeper can be imported in the active interpreter."""
+        try:
+            CredSweeperService._load_credsweeper_library()
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    @staticmethod
+    def _get_vendored_credsweeper_root() -> Path:
+        """Return the local CredSweeper reference tree used only as dev fallback."""
+        project_root = Path(__file__).resolve().parents[2]
+        return project_root / "external_tools" / "CredSweeper"
+
+    @staticmethod
+    def _load_credsweeper_library() -> tuple[Any, Any]:
+        """Load CredSweeper classes from the package installed from PyPI."""
+        from credsweeper import CredSweeper  # type: ignore  # pylint: disable=import-error
+        from credsweeper.file_handler.files_provider import FilesProvider  # type: ignore  # pylint: disable=import-error
+
+        return CredSweeper, FilesProvider
 
     # Public API ---------------------------------------------------------------
 
@@ -649,6 +669,142 @@ class CredSweeperService(BaseService):
                 )
             remapped[rule_name] = remapped_entries
         return remapped
+
+    @staticmethod
+    def _normalize_candidates(
+        candidates: list[Any],
+        *,
+        drop_ml_none: bool,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Normalize CredSweeper Candidate objects into grouped ADscan findings."""
+        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        seen_credentials: set[Tuple[str, str, int, str]] = set()
+
+        for candidate in candidates:
+            rule_name = str(getattr(candidate, "rule_name", "") or "")
+            ml_probability = getattr(candidate, "ml_probability", None)
+            if drop_ml_none and ml_probability is None:
+                continue
+            try:
+                if ml_probability is not None:
+                    ml_probability = float(ml_probability)
+            except (TypeError, ValueError):
+                ml_probability = None
+
+            findings.setdefault(rule_name, [])
+            for line_data in list(getattr(candidate, "line_data_list", []) or []):
+                value = str(getattr(line_data, "value", "") or "")
+                context_line = str(getattr(line_data, "line", "") or "")
+                file_path = str(getattr(line_data, "path", "") or "")
+                try:
+                    line_num = int(getattr(line_data, "line_num", 0) or 0)
+                except (TypeError, ValueError):
+                    line_num = 0
+                if not value or len(value) < 3:
+                    continue
+                dedup_key = (rule_name, value, line_num, file_path)
+                if dedup_key in seen_credentials:
+                    continue
+                seen_credentials.add(dedup_key)
+                findings[rule_name].append(
+                    (value, ml_probability, context_line, line_num, file_path)
+                )
+        return findings
+
+    def _run_library_ruleset(
+        self,
+        *,
+        path_to_scan: str,
+        rules_path: str,
+        drop_ml_none: bool,
+        ml_threshold: str,
+        doc: bool,
+        depth: bool,
+        no_filters: bool,
+        find_by_ext: bool,
+        jobs: int | None,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Run one CredSweeper ruleset against a filesystem path via library API."""
+        CredSweeper, FilesProvider = self._load_credsweeper_library()
+        analyzer = CredSweeper(
+            rule_path=rules_path,
+            stdout=False,
+            use_filters=not no_filters,
+            pool_count=max(1, int(jobs or 1)),
+            ml_threshold=float(ml_threshold),
+            find_by_ext=find_by_ext,
+            depth=1 if depth else 0,
+            doc=doc,
+            thrifty=False,
+        )
+        analyzer.run(FilesProvider([path_to_scan]))
+        return self._normalize_candidates(
+            list(analyzer.credential_manager.get_credentials()),
+            drop_ml_none=drop_ml_none,
+        )
+
+    def _run_library_path_scan(
+        self,
+        *,
+        path_to_scan: str,
+        rules_path: Optional[str],
+        include_custom_rules: bool,
+        rules_profile: str,
+        drop_ml_none: bool | None,
+        ml_threshold: str,
+        custom_ml_threshold: str | None = None,
+        doc: bool = False,
+        depth: bool = False,
+        no_filters: bool = False,
+        find_by_ext: bool = False,
+        jobs: int | None = None,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Run all selected CredSweeper rulesets against a filesystem path."""
+        primary_rules, custom_rules = get_credsweeper_rules_paths(profile=rules_profile)
+        selected_primary = rules_path or primary_rules
+        rulesets: list[tuple[str, str, str]] = []
+        if selected_primary:
+            rulesets.append(("primary", selected_primary, str(ml_threshold)))
+        if include_custom_rules and custom_rules:
+            rulesets.append(("custom", custom_rules, str(custom_ml_threshold or "0.0")))
+
+        if not rulesets:
+            print_info_verbose("No CredSweeper rules available. Skipping CredSweeper analysis.")
+            return {}
+
+        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        for label, selected_rules, effective_ml_threshold in rulesets:
+            started_at = time.perf_counter()
+            try:
+                ruleset_findings = self._run_library_ruleset(
+                    path_to_scan=path_to_scan,
+                    rules_path=selected_rules,
+                    drop_ml_none=resolve_credsweeper_drop_ml_none_for_ruleset(
+                        ruleset_label=label,
+                        drop_ml_none=drop_ml_none,
+                    ),
+                    ml_threshold=effective_ml_threshold,
+                    doc=doc,
+                    depth=depth,
+                    no_filters=no_filters,
+                    find_by_ext=find_by_ext,
+                    jobs=jobs,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_warning(f"Credential analysis failed for path ({label} rules).")
+                print_warning_debug(
+                    f"[credsweeper] Library analysis failed ({label}): {type(exc).__name__}: {exc}"
+                )
+                logger.exception("CredSweeper library analysis failed")
+                continue
+            findings = self._merge_grouped_findings(findings, ruleset_findings)
+            print_info_debug(
+                "[credsweeper] Ruleset completed: "
+                f"label={label} path={path_to_scan} duration_seconds={time.perf_counter() - started_at:.2f} "
+                f"accumulated_results={self._count_total_grouped_findings(findings)}"
+            )
+        return findings
 
     @staticmethod
     def _needs_xml_sanitized_analysis(file_path: str) -> bool:
@@ -776,274 +932,14 @@ class CredSweeperService(BaseService):
             Dictionary of findings grouped by rule name.
         """
 
-        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
-
-        if not credsweeper_path:
-            print_info_verbose(
-                "Credential extraction tool not available. Skipping CredSweeper analysis."
-            )
-            return findings
-
-        if not os.path.exists(file_path):
-            print_warning(f"File not found for CredSweeper analysis: {file_path}")
-            return findings
-
-        analysis_target = str(file_path)
-        path_aliases: dict[str, str] = {}
-        cleanup_dir: str | None = None
-        if self._needs_xml_sanitized_analysis(str(file_path)):
-            try:
-                temp_root = create_analysis_temp_root(
-                    prefix=".adscan_xml_file_",
-                    preferred_parent=Path(file_path).resolve().parent,
-                )
-                cleanup_dir = str(temp_root)
-                text = Path(file_path).read_text(encoding="utf-8", errors="replace")
-                sanitized_path = build_sanitized_xml_analysis_copy(
-                    source_path=str(file_path),
-                    text=text,
-                    temp_root=temp_root,
-                )
-                analysis_target = str(sanitized_path)
-                path_aliases[str(sanitized_path)] = str(file_path)
-                print_info_debug(
-                    "[credsweeper] Using sanitized XML analysis copy: "
-                    f"source={file_path} analysis_target={analysis_target}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_warning_debug(
-                    f"[credsweeper] Failed to prepare sanitized XML copy for {file_path}: {type(exc).__name__}"
-                )
-
-        try:
-            # Run CredSweeper twice with two rulesets:
-            # - Primary rules (config.yaml): drop entries with ml_probability=None
-            # - Custom rules (custom_config.yaml): keep entries even if ml_probability=None
-            all_results: List[Dict[str, Any]] = []
-
-            primary_rules, custom_rules = get_credsweeper_rules_paths()
-            if primary_rules:
-                print_info_debug(
-                    f"[credsweeper] Using primary rules for file: {primary_rules}"
-                )
-            else:
-                print_info_debug(
-                    "[credsweeper] No primary rules (config.yaml) found for file."
-                )
-
-            if custom_rules:
-                print_info_debug(
-                    f"[credsweeper] Using custom rules for file: {custom_rules}"
-                )
-            else:
-                print_info_debug(
-                    "[credsweeper] No custom rules (custom_config.yaml) found for file."
-                )
-
-            def _run_ruleset(
-                rules_path: Optional[str],
-                json_suffix: str,
-                label: str,
-                drop_ml_none: bool,
-                ml_threshold: str,
-            ) -> None:
-                if not rules_path:
-                    return
-
-                json_output = self._resolve_json_output_path(
-                    file_path=analysis_target,
-                    output_basename=json_suffix,
-                    json_output_dir=json_output_dir,
-                )
-                cmd_parts = [
-                    shlex.quote(credsweeper_path),
-                    "--path",
-                    shlex.quote(analysis_target),
-                    "--save-json",
-                    shlex.quote(json_output),
-                    "--ml_threshold",
-                    ml_threshold,
-                    "--rules",
-                    shlex.quote(rules_path),
-                ]
-                command = " ".join(cmd_parts)
-
-                print_info_verbose(
-                    f"Analyzing file for credentials with CredSweeper ({label} rules)..."
-                )
-                print_info_debug(f"[credsweeper] Command ({label}): {command}")
-
-                ruleset_started_at = time.perf_counter()
-                completed_process = self._command_executor(
-                    command, timeout=timeout, use_clean_env=True
-                )
-                ruleset_duration_seconds = time.perf_counter() - ruleset_started_at
-
-                if not completed_process or completed_process.returncode != 0:
-                    stdout_text = strip_ansi_codes(
-                        (completed_process.stdout or "").strip()
-                        if completed_process
-                        else ""
-                    )
-                    stderr_text = strip_ansi_codes(
-                        (completed_process.stderr or "").strip()
-                        if completed_process
-                        else ""
-                    )
-                    print_warning(
-                        f"Credential analysis failed for file ({label} rules)."
-                    )
-                    print_warning_debug(
-                        f"[credsweeper] Analysis failed ({label}). "
-                        f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
-                        f"Stdout: {stdout_text or 'No stdout'}\n"
-                        f"Stderr: {stderr_text or 'No stderr'}\n"
-                        f"Duration: {ruleset_duration_seconds:.2f}s"
-                    )
-                    return
-
-                if not os.path.exists(json_output):
-                    print_info_verbose(
-                        f"[credsweeper] No JSON output generated for file ({label} rules)."
-                    )
-                    return
-
-                try:
-                    with open(json_output, "r", encoding="utf-8") as f:
-                        results = json.load(f)
-                except (json.JSONDecodeError, Exception) as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_warning(
-                        f"Error parsing CredSweeper JSON ({label} rules): {exc}"
-                    )
-                    return
-                finally:
-                    try:
-                        os.remove(json_output)
-                    except Exception:  # noqa: BLE001
-                        # Best-effort cleanup; safe to ignore failures here
-                        pass
-
-                if not isinstance(results, list):
-                    print_warning_debug(
-                        f"[credsweeper] Unexpected JSON structure for file ({label} rules)."
-                    )
-                    return
-
-                for result in results:
-                    ml_probability = result.get("ml_probability")
-                    if drop_ml_none and ml_probability is None:
-                        continue
-                    all_results.append(result)
-                print_info_debug(
-                    "[credsweeper] Ruleset completed: "
-                        f"label={label} path={analysis_target} duration_seconds={ruleset_duration_seconds:.2f} "
-                    f"raw_results={len(results)} accumulated_results={len(all_results)}"
-                )
-
-            # Primary rules: drop ml_probability=None
-            _run_ruleset(
-                primary_rules,
-                json_suffix="_config",
-                label="primary",
-                drop_ml_none=True,
-                ml_threshold="0.1",
-            )
-
-            # Custom rules: keep ml_probability=None
-            _run_ruleset(
-                custom_rules,
-                json_suffix="_custom",
-                label="custom",
-                drop_ml_none=False,
-                ml_threshold="0.0",
-            )
-
-            if not all_results:
-                print_info_verbose("No credentials detected by CredSweeper.")
-                return findings
-
-            # Extract all credential types from CredSweeper results
-            # Use a set to track seen credentials for deduplication
-            seen_credentials: set[Tuple[str, str, int]] = set()
-
-            for result in all_results:
-                rule_name = result.get("rule", "") or ""
-                ml_probability = result.get("ml_probability")
-
-                # Ensure ml_probability is either float or None
-                try:
-                    if ml_probability is not None:
-                        ml_probability = float(ml_probability)
-                except (ValueError, TypeError):
-                    ml_probability = None
-
-                line_data_list = result.get("line_data_list", []) or []
-
-                # Initialize category if not exists
-                if rule_name not in findings:
-                    findings[rule_name] = []
-
-                for line_data in line_data_list:
-                    value = line_data.get("value", "")
-                    context_line = line_data.get("line", "") or ""
-                    line_num = line_data.get("line_num", 0)
-
-                    # Normalize line number
-                    if line_num is None:
-                        line_num = 0
-                    try:
-                        line_num = int(line_num)
-                    except (ValueError, TypeError):
-                        line_num = 0
-
-                    file_path_entry = line_data.get("path", analysis_target)
-                    if file_path_entry is None:
-                        file_path_entry = analysis_target
-                    if not isinstance(file_path_entry, str):
-                        file_path_entry = str(file_path_entry) or analysis_target
-                    file_path_entry = path_aliases.get(file_path_entry, file_path_entry)
-
-                    # Ensure value is a string and not None
-                    if value is None:
-                        value = ""
-                    if not isinstance(value, str):
-                        value = str(value) if value else ""
-
-                    if value and len(value) >= 3:
-                        # Create a unique key for deduplication: (rule_name, value, line_num)
-                        dedup_key = (rule_name, value, line_num)
-
-                        if dedup_key not in seen_credentials:
-                            seen_credentials.add(dedup_key)
-                            findings[rule_name].append(
-                                (
-                                    value,
-                                    ml_probability,
-                                    context_line,
-                                    line_num,
-                                    file_path_entry,
-                                )
-                            )
-
-        except json.JSONDecodeError as exc:
-            telemetry.capture_exception(exc)
-            print_warning(f"Error parsing CredSweeper JSON output: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_warning("Error analyzing file for credentials with CredSweeper.")
-            logger.exception("Error in CredSweeperService.analyze_file: %s", exc)
-        finally:
-            if cleanup_dir:
-                shutil.rmtree(cleanup_dir, ignore_errors=True)
-
-        print_info_debug(
-            "[credsweeper] Analysis summary: "
-            f"target={file_path} grouped_rules={len(findings)} "
-            f"total_findings={self._count_total_grouped_findings(findings)}"
+        _ = credsweeper_path
+        return self.analyze_file_with_options(
+            file_path,
+            credsweeper_path=None,
+            json_output_dir=json_output_dir,
+            include_custom_rules=True,
+            timeout=timeout,
         )
-        return findings
 
     def analyze_file_with_options(
         self,
@@ -1096,11 +992,7 @@ class CredSweeperService(BaseService):
             Findings grouped by rule name.
         """
         findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
-        if not credsweeper_path:
-            print_info_verbose(
-                "Credential extraction tool not available. Skipping CredSweeper analysis."
-            )
-            return findings
+        _ = (credsweeper_path, json_output_dir, timeout)
         if not os.path.exists(file_path):
             print_warning(f"File not found for CredSweeper analysis: {file_path}")
             return findings
@@ -1133,150 +1025,19 @@ class CredSweeperService(BaseService):
                     f"[credsweeper] Failed to prepare sanitized XML copy for {file_path}: {type(exc).__name__}"
                 )
 
-        primary_rules, custom_rules = get_credsweeper_rules_paths(profile=rules_profile)
-        selected_primary = rules_path or primary_rules
-        rulesets: list[tuple[str, str]] = []
-        if selected_primary:
-            rulesets.append(("primary", selected_primary))
-        if include_custom_rules and custom_rules:
-            rulesets.append(("custom", custom_rules))
-
-        if not rulesets:
-            print_info_verbose(
-                "No CredSweeper rules available. Skipping CredSweeper analysis."
-            )
-            return findings
-
-        all_results: List[Dict[str, Any]] = []
         analysis_started_at = time.perf_counter()
-
-        for label, rules in rulesets:
-            json_output = self._resolve_json_output_path(
-                file_path=analysis_target,
-                output_basename=label,
-                json_output_dir=json_output_dir,
-            )
-            cmd_parts = [
-                shlex.quote(credsweeper_path),
-                "--path",
-                shlex.quote(analysis_target),
-                "--save-json",
-                shlex.quote(json_output),
-                "--ml_threshold",
-                str(ml_threshold),
-                "--rules",
-                shlex.quote(rules),
-            ]
-            if doc:
-                cmd_parts.append("--doc")
-            if depth:
-                cmd_parts.append("--depth")
-            if no_filters:
-                cmd_parts.append("--no-filters")
-            command = " ".join(cmd_parts)
-
-            ruleset_started_at = time.perf_counter()
-            completed_process = self._command_executor(
-                command, timeout=timeout, use_clean_env=True
-            )
-            ruleset_duration_seconds = time.perf_counter() - ruleset_started_at
-
-            if not completed_process or completed_process.returncode != 0:
-                stdout_text = strip_ansi_codes(
-                    (completed_process.stdout or "").strip()
-                    if completed_process
-                    else ""
-                )
-                stderr_text = strip_ansi_codes(
-                    (completed_process.stderr or "").strip()
-                    if completed_process
-                    else ""
-                )
-                print_warning(f"Credential analysis failed for file ({label} rules).")
-                print_warning_debug(
-                    f"[credsweeper] Analysis failed ({label}). "
-                    f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
-                    f"Stdout: {stdout_text or 'No stdout'}\n"
-                    f"Stderr: {stderr_text or 'No stderr'}\n"
-                    f"Duration: {ruleset_duration_seconds:.2f}s"
-                )
-                continue
-
-            if not os.path.exists(json_output):
-                continue
-
-            try:
-                with open(json_output, "r", encoding="utf-8") as handle:
-                    results = json.load(handle)
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_warning(f"Error parsing CredSweeper JSON ({label} rules): {exc}")
-                continue
-            finally:
-                try:
-                    os.remove(json_output)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            if not isinstance(results, list):
-                print_warning_debug(
-                    f"[credsweeper] Unexpected JSON structure for file ({label} rules)."
-                )
-                continue
-
-            for result in results:
-                ml_probability = result.get("ml_probability")
-                if resolve_credsweeper_drop_ml_none_for_ruleset(
-                    ruleset_label=label,
-                    drop_ml_none=drop_ml_none,
-                ) and ml_probability is None:
-                    continue
-                all_results.append(result)
-        if not all_results:
-            return findings
-
-        seen_credentials: set[Tuple[str, str, int]] = set()
-        for result in all_results:
-            rule_name = result.get("rule", "") or ""
-            ml_probability = result.get("ml_probability")
-            try:
-                if ml_probability is not None:
-                    ml_probability = float(ml_probability)
-            except (ValueError, TypeError):
-                ml_probability = None
-
-            line_data_list = result.get("line_data_list", []) or []
-            findings.setdefault(rule_name, [])
-
-            for line_data in line_data_list:
-                value = line_data.get("value", "")
-                context_line = line_data.get("line", "") or ""
-                line_num = line_data.get("line_num", 0)
-                try:
-                    line_num = int(line_num or 0)
-                except (ValueError, TypeError):
-                    line_num = 0
-
-                file_path_entry = line_data.get("path", analysis_target) or analysis_target
-                if not isinstance(file_path_entry, str):
-                    file_path_entry = str(file_path_entry) or analysis_target
-                file_path_entry = path_aliases.get(file_path_entry, file_path_entry)
-
-                if value is None:
-                    value = ""
-                if not isinstance(value, str):
-                    value = str(value) if value else ""
-
-                if not value or len(value) < 3:
-                    continue
-
-                dedup_key = (rule_name, value, line_num)
-                if dedup_key in seen_credentials:
-                    continue
-                seen_credentials.add(dedup_key)
-                findings[rule_name].append(
-                    (value, ml_probability, context_line, line_num, file_path_entry)
-                )
+        findings = self._run_library_path_scan(
+            path_to_scan=analysis_target,
+            rules_path=rules_path,
+            include_custom_rules=include_custom_rules,
+            rules_profile=rules_profile,
+            drop_ml_none=drop_ml_none,
+            ml_threshold=str(ml_threshold),
+            doc=doc,
+            depth=depth,
+            no_filters=no_filters,
+        )
+        findings = self._remap_grouped_finding_paths(findings, path_aliases)
 
         try:
             print_info_debug(
@@ -1341,193 +1102,34 @@ class CredSweeperService(BaseService):
             Findings grouped by rule name.
         """
         findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
-        if not credsweeper_path:
-            print_info_verbose(
-                "Credential extraction tool not available. Skipping CredSweeper analysis."
-            )
-            return findings
+        _ = (credsweeper_path, json_output_dir, timeout)
         if not os.path.exists(path_to_scan):
             print_warning(
                 f"File or directory not found for CredSweeper analysis: {path_to_scan}"
             )
             return findings
-
-        primary_rules, custom_rules = get_credsweeper_rules_paths(profile=rules_profile)
-        selected_primary = rules_path or primary_rules
-        rulesets: list[tuple[str, str]] = []
-        if selected_primary:
-            rulesets.append(("primary", selected_primary))
-        if include_custom_rules and custom_rules:
-            rulesets.append(("custom", custom_rules))
-
-        if not rulesets:
-            print_info_verbose(
-                "No CredSweeper rules available. Skipping CredSweeper analysis."
-            )
-            return findings
-
-        all_results: List[Dict[str, Any]] = []
         analysis_started_at = time.perf_counter()
         target_is_directory = os.path.isdir(path_to_scan)
-
-        for label, rules in rulesets:
-            json_output = self._resolve_json_output_path(
-                file_path=path_to_scan,
-                output_basename=label,
-                json_output_dir=json_output_dir,
+        if target_is_directory:
+            print_info_verbose(f"Analyzing path for credentials with CredSweeper: {path_to_scan}")
+            print_info_debug(
+                "[credsweeper] Library execution budget: "
+                f"doc={doc} depth={depth} timeout_seconds={int(timeout)}"
             )
-            effective_ml_threshold = str(ml_threshold)
-            if (
-                label == "custom"
-                and include_custom_rules
-                and custom_ml_threshold is not None
-            ):
-                effective_ml_threshold = str(custom_ml_threshold)
-
-            cmd_parts = [
-                shlex.quote(credsweeper_path),
-                "--path",
-                shlex.quote(path_to_scan),
-                "--save-json",
-                shlex.quote(json_output),
-                "--ml_threshold",
-                effective_ml_threshold,
-                "--rules",
-                shlex.quote(rules),
-            ]
-            if doc:
-                cmd_parts.append("--doc")
-            if no_filters:
-                cmd_parts.append("--no-filters")
-            if find_by_ext:
-                cmd_parts.append("--find-by-ext")
-            if depth:
-                cmd_parts.append("--depth")
-            if jobs is not None and int(jobs) > 0:
-                cmd_parts.extend(["--jobs", str(int(jobs))])
-            command = " ".join(cmd_parts)
-
-            if target_is_directory:
-                print_info_verbose(
-                    "Analyzing path for credentials with CredSweeper "
-                    f"({label} rules): {path_to_scan}"
-                )
-                print_info_debug(f"[credsweeper] Command ({label}): {command}")
-                print_info_debug(
-                    "[credsweeper] Execution budget: "
-                    f"label={label} doc={doc} depth={depth} timeout_seconds={int(timeout)}"
-                )
-
-            ruleset_started_at = time.perf_counter()
-            completed_process = self._command_executor(
-                command, timeout=timeout, use_clean_env=True
-            )
-            ruleset_duration_seconds = time.perf_counter() - ruleset_started_at
-
-            if not completed_process or completed_process.returncode != 0:
-                stdout_text = strip_ansi_codes(
-                    (completed_process.stdout or "").strip()
-                    if completed_process
-                    else ""
-                )
-                stderr_text = strip_ansi_codes(
-                    (completed_process.stderr or "").strip()
-                    if completed_process
-                    else ""
-                )
-                print_warning(f"Credential analysis failed for path ({label} rules).")
-                print_warning_debug(
-                    f"[credsweeper] Analysis failed ({label}). "
-                    f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
-                    f"Stdout: {stdout_text or 'No stdout'}\n"
-                    f"Stderr: {stderr_text or 'No stderr'}\n"
-                    f"Duration: {ruleset_duration_seconds:.2f}s"
-                )
-                continue
-
-            if not os.path.exists(json_output):
-                if target_is_directory:
-                    print_info_verbose(
-                        f"[credsweeper] No JSON output generated for path ({label} rules)."
-                    )
-                continue
-
-            try:
-                with open(json_output, "r", encoding="utf-8") as handle:
-                    results = json.load(handle)
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_warning(f"Error parsing CredSweeper JSON ({label} rules): {exc}")
-                continue
-            finally:
-                try:
-                    os.remove(json_output)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            if not isinstance(results, list):
-                print_warning_debug(
-                    f"[credsweeper] Unexpected JSON structure for path ({label} rules)."
-                )
-                continue
-
-            for result in results:
-                ml_probability = result.get("ml_probability")
-                if resolve_credsweeper_drop_ml_none_for_ruleset(
-                    ruleset_label=label,
-                    drop_ml_none=drop_ml_none,
-                ) and ml_probability is None:
-                    continue
-                all_results.append(result)
-            if target_is_directory:
-                print_info_debug(
-                    "[credsweeper] Ruleset completed: "
-                    f"label={label} path={path_to_scan} duration_seconds={ruleset_duration_seconds:.2f} "
-                    f"raw_results={len(results)} accumulated_results={len(all_results)}"
-                )
-
-        if all_results:
-            seen_credentials: set[Tuple[str, str, int]] = set()
-            for result in all_results:
-                rule_name = result.get("rule", "") or ""
-                ml_probability = result.get("ml_probability")
-                try:
-                    if ml_probability is not None:
-                        ml_probability = float(ml_probability)
-                except (ValueError, TypeError):
-                    ml_probability = None
-
-                line_data_list = result.get("line_data_list", []) or []
-                findings.setdefault(rule_name, [])
-
-                for line_data in line_data_list:
-                    value = line_data.get("value", "")
-                    context_line = line_data.get("line", "") or ""
-                    line_num = line_data.get("line_num", 0)
-                    try:
-                        line_num = int(line_num or 0)
-                    except (ValueError, TypeError):
-                        line_num = 0
-
-                    file_path_entry = line_data.get("path", path_to_scan) or path_to_scan
-                    if not isinstance(file_path_entry, str):
-                        file_path_entry = str(file_path_entry) or path_to_scan
-
-                    if value is None:
-                        value = ""
-                    if not isinstance(value, str):
-                        value = str(value) if value else ""
-
-                    if not value or len(value) < 3:
-                        continue
-
-                    dedup_key = (rule_name, value, line_num)
-                    if dedup_key in seen_credentials:
-                        continue
-                    seen_credentials.add(dedup_key)
-                    findings[rule_name].append(
-                        (value, ml_probability, context_line, line_num, file_path_entry)
-                    )
+        findings = self._run_library_path_scan(
+            path_to_scan=path_to_scan,
+            rules_path=rules_path,
+            include_custom_rules=include_custom_rules,
+            rules_profile=rules_profile,
+            drop_ml_none=drop_ml_none,
+            ml_threshold=str(ml_threshold),
+            custom_ml_threshold=custom_ml_threshold,
+            doc=doc,
+            depth=depth,
+            no_filters=no_filters,
+            find_by_ext=find_by_ext,
+            jobs=jobs,
+        )
 
         if _enable_xml_sanitization_pass and os.path.isdir(path_to_scan) and not doc:
             supplemental_findings = self._analyze_sanitized_xml_overlay(

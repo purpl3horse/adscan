@@ -8,6 +8,7 @@ caller explicitly requests it for one operation.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 from typing import Final
@@ -58,13 +59,25 @@ class WinRMLogonBypassService:
         """Delegate one PSRP file fetch to the underlying backend."""
         return self._psrp_service.fetch_file(remote_path, save_path)
 
+    async def async_fetch_file(self, remote_path: str, save_path: str) -> str:
+        """Delegate one async PSRP file fetch to the underlying backend."""
+        return await self._psrp_service.async_fetch_file(remote_path, save_path)
+
     def fetch_files(self, paths, download_dir: str):
         """Delegate multi-file PSRP downloads to the underlying backend."""
         return self._psrp_service.fetch_files(paths, download_dir)
 
+    async def async_fetch_files(self, paths, download_dir: str):
+        """Delegate async multi-file PSRP downloads to the underlying backend."""
+        return await self._psrp_service.async_fetch_files(paths, download_dir)
+
     def upload_file(self, local_path: str, remote_path: str) -> bool:
         """Delegate one PSRP upload to the underlying backend."""
         return self._psrp_service.upload_file(local_path, remote_path)
+
+    async def async_upload_file(self, local_path: str, remote_path: str) -> bool:
+        """Delegate one async PSRP upload to the underlying backend."""
+        return await self._psrp_service.async_upload_file(local_path, remote_path)
 
     def execute_powershell(
         self,
@@ -85,9 +98,13 @@ class WinRMLogonBypassService:
         Returns:
             Structured PSRP execution result.
         """
-        normalized_operation = str(operation_name or "winrm_powershell").strip() or "winrm_powershell"
+        normalized_operation = (
+            str(operation_name or "winrm_powershell").strip() or "winrm_powershell"
+        )
         if not require_logon_bypass:
-            return self._psrp_service.execute_powershell(script, operation_name=normalized_operation)
+            return self._psrp_service.execute_powershell(
+                script, operation_name=normalized_operation
+            )
 
         bypass_reason = self._get_bypass_unavailability_reason()
         if bypass_reason:
@@ -96,7 +113,9 @@ class WinRMLogonBypassService:
                 f"operation={mark_sensitive(normalized_operation, 'text')} "
                 f"reason={mark_sensitive(bypass_reason, 'text')}"
             )
-            return self._psrp_service.execute_powershell(script, operation_name=normalized_operation)
+            return self._psrp_service.execute_powershell(
+                script, operation_name=normalized_operation
+            )
 
         try:
             remote_runascs_path = self._ensure_runascs_uploaded()
@@ -107,7 +126,9 @@ class WinRMLogonBypassService:
                 f"operation={mark_sensitive(normalized_operation, 'text')} "
                 f"error={mark_sensitive(str(exc), 'text')}"
             )
-            return self._psrp_service.execute_powershell(script, operation_name=normalized_operation)
+            return self._psrp_service.execute_powershell(
+                script, operation_name=normalized_operation
+            )
 
         print_info_debug(
             "WinRM logon bypass active: "
@@ -122,6 +143,29 @@ class WinRMLogonBypassService:
         return self._psrp_service.execute_powershell(
             bypass_script,
             operation_name=f"{normalized_operation}:runascs",
+        )
+
+    async def async_execute_powershell(
+        self,
+        script: str,
+        *,
+        operation_name: str | None = None,
+        require_logon_bypass: bool = False,
+    ) -> WinRMPSRPExecutionResult:
+        """Execute PowerShell without blocking the caller's event loop."""
+        if not require_logon_bypass:
+            normalized_operation = (
+                str(operation_name or "winrm_powershell").strip() or "winrm_powershell"
+            )
+            return await self._psrp_service.async_execute_powershell(
+                script,
+                operation_name=normalized_operation,
+            )
+        return await asyncio.to_thread(
+            self.execute_powershell,
+            script,
+            operation_name=operation_name,
+            require_logon_bypass=require_logon_bypass,
         )
 
     def _get_bypass_unavailability_reason(self) -> str | None:
@@ -150,7 +194,9 @@ class WinRMLogonBypassService:
 
         runascs_path = get_runascs_local_path(target_os="windows", arch="amd64")
         if runascs_path is None:
-            raise WinRMPSRPError("RunasCs binary is not available on the operator host.")
+            raise WinRMPSRPError(
+                "RunasCs binary is not available on the operator host."
+            )
         self._psrp_service.upload_file(str(runascs_path), self._remote_runascs_path)
         self._runascs_uploaded = True
         return self._remote_runascs_path
@@ -160,9 +206,13 @@ class WinRMLogonBypassService:
         """Escape one string for safe use in a PowerShell single-quoted literal."""
         return str(value or "").replace("'", "''")
 
-    def _build_runascs_wrapper_script(self, *, script: str, remote_runascs_path: str) -> str:
+    def _build_runascs_wrapper_script(
+        self, *, script: str, remote_runascs_path: str
+    ) -> str:
         """Return a PSRP wrapper script that re-launches PowerShell through RunasCs."""
-        encoded_command = base64.b64encode((script or "").encode("utf-16-le")).decode("ascii")
+        encoded_command = base64.b64encode((script or "").encode("utf-16-le")).decode(
+            "ascii"
+        )
         command_line = (
             "powershell.exe -NoLogo -NoProfile -NonInteractive "
             "-ExecutionPolicy Bypass -EncodedCommand "

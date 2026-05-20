@@ -68,6 +68,7 @@ COMPROMISE_EFFORT_PRIORITY: dict[str, int] = {
 }
 TARGET_OUTCOME_LABELS: dict[str, str] = {
     "direct_compromise": "Direct Domain Control",
+    "tier0_foothold": "Tier 0 Foothold (post-ex pending)",
     "followup_terminal": "Domain Compromise Enabler",
     "graph_extension": "High-Impact Privilege",
     "future_followup": "Future Follow-up",
@@ -76,12 +77,14 @@ TARGET_OUTCOME_LABELS: dict[str, str] = {
 }
 TARGET_OUTCOME_SECTION_ORDER: tuple[str, ...] = (
     "direct_compromise",
+    "tier0_foothold",
     "followup_terminal",
     "graph_extension",
     "pivot",
 )
 TARGET_OUTCOME_SECTION_STYLES: dict[str, tuple[str, str, str]] = {
     "direct_compromise": ("Direct Domain Control", "🔥", "error"),
+    "tier0_foothold": ("Tier 0 Footholds", "🔓", "warning"),
     "followup_terminal": ("Domain Compromise Enablers", "🎯", "warning"),
     "graph_extension": ("High-Impact Privileges", "⚠", "info"),
     "pivot": ("Pivot Opportunities", "➜", "info"),
@@ -177,7 +180,7 @@ def describe_path_compromise_effort(relations: Iterable[str]) -> str:
 
 def build_path_priority_key(
     record: dict[str, object],
-) -> tuple[int, int, int, int, int, int, int, int, int, str, str]:
+) -> tuple[int, int, int, int, int, int, int, int, int, int, str, str]:
     """Return a semantics-aware sort key for attack-path display ordering.
 
     Ordering is deterministic and target-aware:
@@ -229,9 +232,10 @@ def build_path_priority_key(
     ).strip().lower()
     terminal_class_order = {
         "direct_compromise": 0,
-        "followup_terminal": 1,
-        "graph_extension": 2,
-        "pivot": 3,
+        "tier0_foothold": 1,
+        "followup_terminal": 2,
+        "graph_extension": 3,
+        "pivot": 4,
     }
     target_followup_status = str(
         record.get("target_followup_status") or ""
@@ -239,6 +243,7 @@ def build_path_priority_key(
     if not target_followup_status:
         target_followup_status = {
             "direct_compromise": "actionable",
+            "tier0_foothold": "theoretical",
             "followup_terminal": "theoretical",
             "graph_extension": "theoretical",
             "future_followup": "unsupported",
@@ -257,11 +262,28 @@ def build_path_priority_key(
         target_priority_rank = int(record.get("target_priority_rank", 100))
     except (TypeError, ValueError):
         target_priority_rank = 100
+    # Target reachability deboost — when the annotation phase has determined
+    # that the path's terminal host is not reachable from the current vantage,
+    # demote the path within its (priority_class, terminal_class, followup,
+    # priority_rank) bucket so reachable paths surface first.  ``meta`` is
+    # populated by ``_annotate_execution_readiness``; absent it (pre-annotation
+    # ordering), every path scores 0 and the ranking is unchanged.
+    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    viability_status = str(
+        (meta or {}).get("execution_target_viability_status") or ""
+    ).strip().lower()
+    _UNREACHABLE_VIABILITY_STATES = {
+        "resolved_but_unreachable",
+        "enabled_but_unresolved",
+        "not_in_enabled_inventory",
+    }
+    target_viability_rank = 1 if viability_status in _UNREACHABLE_VIABILITY_STATES else 0
     return (
         priority_class_order.get(target_priority_class, 2),
         terminal_class_order.get(target_terminal_class, 3),
         target_followup_status_order.get(target_followup_status, 3),
         target_priority_rank,
+        target_viability_rank,
         status_order.get(str(record.get("status") or "").strip().lower(), 3),
         aggregate_effort_score,
         COMPROMISE_SEMANTICS_PRIORITY.get(terminal_semantics, 2),
@@ -273,10 +295,29 @@ def build_path_priority_key(
 
 
 def get_path_target_outcome_class(record: dict[str, object]) -> str:
-    """Return the normalized ADscan outcome class for one path."""
+    """Return the normalized ADscan outcome class for one path.
+
+    Phase 3 — when the materializer has stamped a canonical
+    ``outcome_class`` on the record (via the path-based classifier in
+    :mod:`adscan_internal.services.compromise_class`), that value is
+    authoritative. The legacy heuristics below remain only for
+    backward compatibility with cached records produced before Phase 3.
+    """
+    explicit = str(record.get("outcome_class") or "").strip().lower()
+    if explicit in {
+        "direct_compromise",
+        "tier0_foothold",
+        "followup_terminal",
+        "graph_extension",
+        "future_followup",
+        "dependency_only",
+        "pivot",
+    }:
+        return explicit
     terminal_class = str(record.get("target_terminal_class") or "").strip().lower()
     if terminal_class in {
         "direct_compromise",
+        "tier0_foothold",
         "followup_terminal",
         "graph_extension",
         "future_followup",
@@ -313,14 +354,14 @@ def describe_search_mode_label(mode: str | None) -> str:
 
 def build_path_execution_priority_key(
     record: dict[str, object],
-) -> tuple[int, int, int, int, int, int, int, int, int, str, str]:
+) -> tuple[int, int, int, int, int, int, int, int, int, int, str, str]:
     """Return the canonical execution-priority key for one path."""
     return build_path_priority_key(record)
 
 
 def build_path_remediation_priority_key(
     record: dict[str, object],
-) -> tuple[int, int, int, int, int, int, int, int, int, str, str]:
+) -> tuple[int, int, int, int, int, int, int, int, int, int, str, str]:
     """Return a remediation-oriented priority key for one path.
 
     Remediation favors blast-radius/choke-point value while still preserving
@@ -339,16 +380,18 @@ def build_path_remediation_priority_key(
             candidate = details.get("blast_radius")
             if isinstance(candidate, int) and candidate > blast_radius:
                 blast_radius = candidate
+    # The viability_rank field is at base[4]; every later index shifted +1.
     return (
         base[0],
         base[1],
         -blast_radius,
         base[2],
         base[3],
-        base[4],
-        base[5],
-        base[6],
-        base[7],
-        base[9],
-        base[10],
+        base[4],   # target_viability_rank
+        base[5],   # status_order (was base[4])
+        base[6],   # agg_effort_score (was base[5])
+        base[7],   # terminal_semantics (was base[6])
+        base[8],   # terminal_effort (was base[7])
+        base[10],  # source (was base[9])
+        base[11],  # target (was base[10])
     )

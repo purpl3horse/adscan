@@ -218,7 +218,7 @@ def resolve_bloodhound_pwdlastset_year(
     """Resolve one user's ``pwdLastSet`` year from BloodHound.
 
     Args:
-        shell: Active shell exposing ``_get_bloodhound_service``.
+        shell: Active shell exposing graph service access.
         domain: Target domain.
         username: SAM account name.
 
@@ -226,12 +226,19 @@ def resolve_bloodhound_pwdlastset_year(
         Password-last-set year, or ``None`` when unavailable.
     """
     try:
-        service = shell._get_bloodhound_service()
+        service_getter = getattr(shell, "_get_graph_service", None) or getattr(
+            shell,
+            "_get_graph_service",
+            None,
+        )
+        if not callable(service_getter):
+            return None
+        service = service_getter()
         records = service.get_password_last_change(domain, user=username)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_info_debug(
-            "[password-year-variant] BloodHound pwdLastSet lookup failed for "
+            "[password-year-variant] Graph pwdLastSet lookup failed for "
             f"{mark_sensitive(username, 'user')}@{mark_sensitive(domain, 'domain')}: {exc}"
         )
         return None

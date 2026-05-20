@@ -39,9 +39,101 @@ from adscan_internal.services.privileged_group_classifier import (
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
-from adscan_internal.workspaces import read_json_file
+from adscan_internal.services.attack_step_catalog import (
+    edges_chain_compatible,
+    get_attack_step_catalog,
+)
+from adscan_internal.services.smb_exclusion_policy import is_globally_excluded_smb_share
+from adscan_internal.workspaces import read_json_file, write_json_file
+from adscan_internal.workspaces.state import migrate_legacy_attack_graph
 
 _LOCAL_REUSE_RELATION_KEY = "localadminpassreuse"
+_SHARE_ACCESS_RELATION_KEYS = {"readshare", "writeshare", "fullcontrolshare"}
+
+# ── Target-mode normalization ─────────────────────────────────────────────────
+# Canonical target modes for path computation.  Any value outside this set
+# is normalised to the ``"domain"`` fallback so callers never see an unknown
+# mode reach the DFS.  Adding a new mode is a one-line change here; every
+# consumer that calls ``normalize_target_mode`` picks it up automatically.
+_VALID_TARGET_MODES: frozenset[str] = frozenset({"tier0", "impact", "object", "domain"})
+
+
+def normalize_target_mode(value: str | None) -> str:
+    """Return a canonical, lower-cased target_mode string.
+
+    Recognises four modes:
+
+    ``"tier0"``
+        DFS terminates at any Tier-0 / ``direct_compromise`` node (Domain
+        Admins, Domain Controllers, BUILTIN\\\\Administrators, …).
+
+    ``"impact"``
+        DFS terminates at high-impact nodes (superset of tier0).
+
+    ``"object"``
+        DFS terminates **only** at Domain-kind nodes (e.g. ``ESSOS.LOCAL``).
+        This allows paths to extend past Tier-0 groups through kill-chain edges
+        like DCSync, producing complete kill chains to the domain object.
+        Use this for explicit object-targeted queries and for the default
+        authenticated-scan display (``target_mode="object"`` in the CLI).
+
+    ``"domain"``
+        Legacy alias. DFS behaves identically to ``"tier0"`` but post-
+        processing uses ``keep_longest`` path collapse (holistic domain view).
+
+    Any other value normalises to ``"domain"``.
+    """
+    mode = str(value or "domain").strip().lower()
+    return mode if mode in _VALID_TARGET_MODES else "domain"
+
+
+# ── Lookup dicts for the credential-context DFS guard ─────────────────────────
+# Built once at module load; any entry missing from the catalog falls back to
+# "other" semantics (provides "none") and "user_credentials" requirement —
+# both of which are the safest defaults for unknown relations.
+_RELATION_SEMANTICS: dict[str, str] = {
+    e.relation: e.compromise_semantics for e in get_attack_step_catalog()
+}
+_RELATION_REQUIRES: dict[str, str] = {
+    e.relation: e.source_context_requirement for e in get_attack_step_catalog()
+}
+_MEMBEROF_KEY = "memberof"
+_LOCAL_REUSE_KEY = "localadminpassreuse"
+# Relations that are transparent to credential context — they change the
+# principal identity (or lateral-pivot the attacker to a new host) but do NOT
+# change which credentials the attacker holds.  Any edge that follows one of
+# these is evaluated against the context of the *previous* non-transparent edge
+# (or the implicit start-of-path user_credentials when the path is empty).
+_CONTEXT_TRANSPARENT_KEYS: frozenset[str] = frozenset({_MEMBEROF_KEY, _LOCAL_REUSE_KEY})
+
+
+def _edges_chain_ok(
+    path_relations: list[str],
+    candidate_relation: str,
+) -> bool:
+    """Return True when ``candidate_relation`` may extend the current path.
+
+    Walks back through ``path_relations`` skipping transparent-context edges
+    (MemberOf, LocalAdminPassReuse) which change principal identity but not
+    what credentials the attacker holds. Returns True for an empty path
+    (start of traversal) because the initial principal always has their own
+    ``user_credentials``.
+    """
+    cand_rel = str(candidate_relation or "").strip().lower()
+    if cand_rel in _CONTEXT_TRANSPARENT_KEYS:
+        return True  # transparent edges are never blocked
+
+    requires = _RELATION_REQUIRES.get(cand_rel, "user_credentials")
+
+    # Find most recent non-transparent edge in path.
+    prev_semantics: str | None = None
+    for rel in reversed(path_relations):
+        if rel not in _CONTEXT_TRANSPARENT_KEYS:
+            prev_semantics = _RELATION_SEMANTICS.get(rel, "other")
+            break
+    # prev_semantics=None means empty path → implicit user_credentials at start.
+
+    return edges_chain_compatible(prev_semantics, requires)
 
 
 @dataclass(frozen=True)
@@ -64,7 +156,9 @@ class AttackPath:
         return len(self.steps)
 
 
-def display_record_signature(record: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def display_record_signature(
+    record: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return a case-insensitive deduplication signature for one display record.
 
     Attack-path records can occasionally differ only by label casing when
@@ -78,11 +172,245 @@ def display_record_signature(record: dict[str, Any]) -> tuple[tuple[str, ...], t
     Returns:
         Tuple ``(nodes, relations)`` normalized for case-insensitive matching.
     """
-    nodes = tuple(str(node or "").strip().lower() for node in (record.get("nodes") or []))
-    relations = tuple(
-        str(relation or "").strip().lower() for relation in (record.get("relations") or [])
+    nodes = tuple(
+        str(node or "").strip().lower() for node in (record.get("nodes") or [])
     )
+    relations = tuple(_display_relation_identity_values(record, normalize=True))
     return nodes, relations
+
+
+def _extract_share_access_name_from_notes(notes: dict[str, Any] | None) -> str:
+    """Return the SMB share name persisted on a share-access edge."""
+    if not isinstance(notes, dict):
+        return ""
+    share_name = str(notes.get("share_name") or notes.get("share") or "").strip()
+    if share_name:
+        return share_name
+    collector_method = str(notes.get("collector_method") or "").strip()
+    if collector_method.lower().startswith("share_acl:"):
+        return collector_method.split(":", 1)[1].strip()
+    return ""
+
+
+def share_access_step_signature_component(
+    relation: str,
+    notes: dict[str, Any] | None,
+) -> str:
+    """Return the share-specific identity component for path deduplication."""
+    relation_key = str(relation or "").strip().lower()
+    if relation_key not in _SHARE_ACCESS_RELATION_KEYS:
+        return ""
+    return _extract_share_access_name_from_notes(notes).casefold()
+
+
+def attack_path_step_signature(step: AttackPathStep) -> tuple[str, str, str, str]:
+    """Return a path-step identity that keeps distinct SMB shares separate."""
+    return (
+        step.from_id,
+        step.relation,
+        step.to_id,
+        share_access_step_signature_component(step.relation, step.notes),
+    )
+
+
+def _display_relation_identity_values(
+    record: dict[str, Any],
+    *,
+    normalize: bool,
+) -> tuple[str, ...]:
+    relations = record.get("relations") or []
+    details = record.get("steps") or []
+    values: list[str] = []
+    for index, relation in enumerate(relations):
+        rel_text = str(relation or "").strip()
+        rel_key = rel_text.lower()
+        identity = rel_key if normalize else rel_text
+        if rel_key in _SHARE_ACCESS_RELATION_KEYS:
+            step_details = details[index] if index < len(details) else {}
+            step_notes = (
+                step_details.get("details")
+                if isinstance(step_details, dict)
+                and isinstance(step_details.get("details"), dict)
+                else {}
+            )
+            share_name = _extract_share_access_name_from_notes(step_notes)
+            if share_name:
+                share_identity = share_name.casefold() if normalize else share_name
+                identity = f"{identity}:{share_identity}"
+        values.append(identity)
+    return tuple(values)
+
+
+def _is_excluded_share_access_edge(edge: dict[str, Any]) -> bool:
+    """Return True for share-access edges that should not enter the DFS adjacency.
+
+    All ReadShare / WriteShare / FullControlShare edges are excluded from
+    attack-path computation. Share access is an exposure finding (resource
+    inventory) — not a host-compromise edge — and is enumerated separately
+    via :func:`collect_share_exposures_from_graph`.
+
+    Excluding these edges at adjacency-building time avoids wasting DFS
+    cycles on paths that would be filtered out at render time anyway, and
+    keeps the attack-paths cost bounded by the count of true compromise
+    edges (control / auth / derived / escalation) rather than by the
+    cardinality of share principals × shares.
+    """
+    relation_key = str(edge.get("relation") or "").strip().lower()
+    return relation_key in _SHARE_ACCESS_RELATION_KEYS
+
+
+# ── Well-known SIDs that expand to the low-priv authenticated population ─────
+
+_WELL_KNOWN_LABELS: dict[str, str] = {
+    "S-1-1-0": "Everyone",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-32-545": "Users",
+    "S-1-5-32-544": "Administrators",
+}
+_SHARE_ACCESS_RANK: dict[str, int] = {
+    "readshare": 1,
+    "writeshare": 2,
+    "fullcontrolshare": 3,
+}
+_SHARE_ACCESS_LABEL: dict[str, str] = {
+    "readshare": "Read",
+    "writeshare": "Write",
+    "fullcontrolshare": "Full Control",
+}
+
+
+def _share_node_is_tier0(node: dict[str, Any]) -> bool:
+    """Lightweight Tier-0 check suitable for graph-level share enumeration."""
+    if bool(node.get("isTierZero")):
+        return True
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    if bool(props.get("isTierZero")):
+        return True
+    tags = node.get("system_tags") or props.get("system_tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    return any(str(t).lower() == "admin_tier_0" for t in tags)
+
+
+def collect_share_exposures_from_graph(
+    graph: dict[str, Any],
+    *,
+    domain_sid: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Build a share exposure inventory directly from the attack graph.
+
+    Unlike ``_collect_share_exposure_rows`` (which derives data from path search
+    results and inherits attack-path DFS rules like max_depth, target_mode, and
+    max_paths cap), this function reads share-access edges directly from the raw
+    graph. It applies no depth limit, no target filter, and no path cap — the
+    result is an exhaustive inventory of every ReadShare / WriteShare /
+    FullControlShare edge that exists in the graph at the time of the call.
+
+    Args:
+        graph: Raw attack graph dict (``nodes`` + ``edges``).
+        domain_sid: Optional domain SID (``S-1-5-21-...``). When supplied,
+            ``<domain_sid>-513`` is recognised as ``Domain Users``.
+        limit: Maximum number of rows to return (ranked by risk).
+
+    Returns:
+        List of share exposure dicts compatible with
+        ``_render_share_resources_panel``.  Each dict contains: ``host``,
+        ``share``, ``access`` (set), ``principals`` (set), ``choke`` (bool),
+        ``impact_rank`` (int 0-3), ``admin_share`` (bool).
+    """
+    nodes_map: dict[str, Any] = graph.get("nodes") or {}
+    edges: list[Any] = graph.get("edges") or []
+
+    # Domain Users SID: S-1-5-21-<domain>-513
+    domain_users_sid = (
+        f"{domain_sid.rstrip('-')}-513".upper() if domain_sid else None
+    )
+    well_known = dict(_WELL_KNOWN_LABELS)
+    if domain_users_sid:
+        well_known[domain_users_sid] = "Domain Users"
+
+    def _principal_label(node_id: str) -> str:
+        sid_upper = str(node_id or "").strip().upper()
+        if sid_upper in well_known:
+            return well_known[sid_upper]
+        node = nodes_map.get(node_id) or {}
+        label = str(node.get("label") or node.get("name") or node_id).strip()
+        return label
+
+    exposures: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        rel_key = str(edge.get("relation") or "").strip().lower()
+        if rel_key not in _SHARE_ACCESS_RELATION_KEYS:
+            continue
+
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        share_name = _extract_share_access_name_from_notes(notes)
+        if not share_name:
+            continue
+        if is_globally_excluded_smb_share(share_name):
+            continue
+
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if not from_id or not to_id:
+            continue
+
+        target_node = nodes_map.get(to_id) or {}
+        host_label = str(
+            target_node.get("label") or target_node.get("name") or to_id
+        ).strip()
+
+        key = (host_label.lower(), share_name.lower())
+        row = exposures.setdefault(
+            key,
+            {
+                "host": host_label,
+                "share": share_name,
+                "access": set(),
+                "principals": set(),
+                "choke": False,
+                "impact_rank": 0,
+                "admin_share": False,
+            },
+        )
+
+        access_label = _SHARE_ACCESS_LABEL[rel_key]
+        row["access"].add(access_label)  # type: ignore[union-attr]
+        row["principals"].add(_principal_label(from_id))  # type: ignore[union-attr]
+
+        if bool(notes.get("is_choke_point")):
+            row["choke"] = True
+
+        is_t0 = _share_node_is_tier0(target_node)
+        if is_t0:
+            row["impact_rank"] = max(int(row.get("impact_rank") or 0), 3)
+        elif bool(row.get("choke")):
+            row["impact_rank"] = max(int(row.get("impact_rank") or 0), 2)
+        else:
+            row["impact_rank"] = max(int(row.get("impact_rank") or 0), 1)
+
+    ranked = sorted(
+        exposures.values(),
+        key=lambda r: (
+            int(r.get("impact_rank") or 0),
+            _SHARE_ACCESS_RANK.get(
+                max(
+                    (a.lower().replace(" ", "") for a in (r.get("access") or set())),
+                    key=lambda k: _SHARE_ACCESS_RANK.get(k, 0),
+                    default="readshare",
+                ),
+                0,
+            ),
+            str(r.get("host") or "").lower(),
+            str(r.get("share") or "").lower(),
+        ),
+        reverse=True,
+    )
+    return ranked[:max(0, limit)]
 
 
 def _display_record_exact_signature(
@@ -106,12 +434,20 @@ def _display_record_exact_signature(
     if not isinstance(nodes, list) or not isinstance(rels, list):
         return None
     nodes_sig = tuple(nodes)
-    rels_sig = tuple(rels)
+    rels_sig = _display_relation_identity_values(record, normalize=False)
     return nodes_sig, rels_sig
 
 
 def load_attack_graph(path: Path) -> dict[str, Any] | None:
     """Load an attack graph from an `attack_graph.json` file path.
+
+    Phase 2 (schema 1.2): every edge carries a top-level ``kind`` field
+    set from :class:`adscan_internal.services.edge_kind.EdgeKind`. Older
+    workspaces (schema 1.1) load transparently — this function backfills
+    ``kind`` in memory from the edge ``relation`` so downstream
+    classifiers always see a populated value. The JSON on disk is NOT
+    rewritten by this function alone; the next ``save_attack_graph``
+    call will persist the upgraded schema.
 
     Args:
         path: Path to `attack_graph.json`.
@@ -132,7 +468,36 @@ def load_attack_graph(path: Path) -> dict[str, Any] | None:
     edges = data.get("edges")
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return None
+    data, migrated = migrate_legacy_attack_graph(data)
+    if migrated:
+        try:
+            write_json_file(str(path), data)
+        except OSError:
+            # Best-effort normalisation; in-memory data is already correct.
+            pass
+    _backfill_edge_kinds(data)
     return data
+
+
+def _backfill_edge_kinds(graph: dict[str, Any]) -> None:
+    """In-memory backfill of EdgeKind for legacy schema 1.1 graphs.
+
+    No-op for edges that already carry a ``kind`` field. Imported lazily
+    to avoid a hard import cycle with services that ultimately import
+    this module.
+    """
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return
+    from adscan_internal.services.edge_kind import classify_edge_kind
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if edge.get("kind"):
+            continue
+        relation = str(edge.get("relation") or "")
+        edge["kind"] = classify_edge_kind(relation).value
 
 
 def get_owned_node_ids(
@@ -198,7 +563,7 @@ def compute_display_paths_for_domain_unfiltered(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     start_node_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain (graph-only, unfiltered).
@@ -206,9 +571,7 @@ def compute_display_paths_for_domain_unfiltered(
     This is the graph-only equivalent of the CLI `attack_paths <domain>` logic.
     Callers can optionally post-process with `filter_contained_paths_for_domain_listing`.
     """
-    mode = (target_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = normalize_target_mode(target_mode)
 
     high_value_reachable_node_ids: set[str] | None = None
     effective_start_node_ids = (
@@ -286,6 +649,12 @@ def compute_display_paths_for_domain_unfiltered(
         )
         record["is_tier_zero"] = priority_class == "tierzero"
         record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
+        # Phase 3 — path-based compromise-class classifier (overrides terminal_class).
+        from adscan_internal.services.compromise_class import (
+            apply_path_based_classification as _apply_pbc,
+        )
+
+        _apply_pbc(record, target_node if isinstance(target_node, dict) else None)
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
@@ -395,7 +764,9 @@ def filter_contained_paths_for_domain_listing(
         #
         # preserve_prefix_paths=False: any sub-sequence match suffices — O(L²).
         if is_hv_terminal is not None:
-            normalized.sort(key=lambda item: (not is_hv_terminal(item[2]), len(item[1])))
+            normalized.sort(
+                key=lambda item: (not is_hv_terminal(item[2]), len(item[1]))
+            )
         else:
             normalized.sort(key=lambda item: len(item[1]))
         kept_sigs: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
@@ -440,7 +811,7 @@ def filter_contained_paths_for_domain_listing(
         # a longer non-HV path (e.g. "A→HV" survives when "A→HV→X" also exists).
         covered_prefixes: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
         for nodes_t, rels_t, _rec in kept_entries:
-            for end in range(1, len(rels_t)):   # strict prefix: end < full length
+            for end in range(1, len(rels_t)):  # strict prefix: end < full length
                 covered_prefixes.add((nodes_t[: end + 1], rels_t[:end]))
 
         pass2_kept: list[dict[str, Any]] = []
@@ -455,6 +826,195 @@ def filter_contained_paths_for_domain_listing(
         return pass2_kept, removed_multi + pass2_removed
 
 
+# Outcome-class priority ranking — higher value = more severe / more complete.
+# Paths with lower-rank classes are dropped when a higher-rank super-path covers them.
+_OUTCOME_CLASS_RANK: dict[str, int] = {
+    "direct_compromise": 100,
+    "domain_breaker": 100,      # alias used in some callers
+    "tier0_foothold": 80,
+    "privileged_escalator": 60,
+    "compromise_enabler": 50,
+    "graph_extension": 50,      # runtime alias for compromise_enabler
+    "pivot": 20,
+    "followup_terminal": 20,
+}
+
+
+def _outcome_class_rank(record: dict[str, Any]) -> int:
+    cls = str(
+        record.get("outcome_class") or record.get("compromise_class") or ""
+    ).strip().lower()
+    return _OUTCOME_CLASS_RANK.get(cls, 10)
+
+
+def filter_prefix_paths_dominated_by_super_path(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove paths that are strict contiguous prefixes of a higher/equal-class super-path.
+
+    Rule: if path A is a strict contiguous prefix of path B (same source, A's
+    node/rel sequence appears at the start of B's), AND rank(B) >= rank(A),
+    eliminate A — the super-path already communicates everything A does, plus more.
+
+    Exception: if rank(B) < rank(A) (B goes *beyond* A to a less valuable target),
+    A is kept — it terminates at a more important node.
+
+    This is applied *after* the within-target contained-path filter so that it only
+    deals with cross-target prefix relationships (different terminal nodes).
+    """
+    if len(records) <= 1:
+        return records, 0
+
+    normalized: list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]] = []
+    for record in records:
+        # Use nodes/relations directly — the cached _exact_signature may reflect
+        # a longer path variant picked by an earlier deduplication stage and would
+        # give a signature inconsistent with what this record currently displays.
+        nodes = record.get("nodes")
+        rels = record.get("relations")
+        if not isinstance(nodes, list) or not isinstance(rels, list) or not nodes or not rels:
+            normalized.append(((), (), record))
+            continue
+        nodes_t = tuple(str(n) for n in nodes)
+        rels_t = tuple(str(r) for r in rels)
+        normalized.append((nodes_t, rels_t, record))
+
+    # Build a set of (nodes_prefix, rels_prefix, max_rank) from all records so
+    # we can check whether a shorter path's full signature appears as a prefix of
+    # some longer, higher/equal-ranked path.
+    prefix_max_rank: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+    for nodes_t, rels_t, record in normalized:
+        rank = _outcome_class_rank(record)
+        rel_len = len(rels_t)
+        if rel_len < 2:
+            continue
+        # Register every strict prefix (length 1..rel_len-1) of this path.
+        for end in range(1, rel_len):
+            key = (nodes_t[: end + 1], rels_t[:end])
+            existing = prefix_max_rank.get(key, -1)
+            if rank > existing:
+                prefix_max_rank[key] = rank
+
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for nodes_t, rels_t, record in normalized:
+        if not rels_t:
+            kept.append(record)
+            continue
+        sig = (nodes_t, rels_t)
+        super_rank = prefix_max_rank.get(sig, -1)
+        own_rank = _outcome_class_rank(record)
+        if super_rank >= own_rank:
+            # A higher/equal-class super-path covers this record — drop it.
+            removed += 1
+        else:
+            kept.append(record)
+
+    return kept, removed
+
+
+def _attack_core_signature(
+    nodes_t: tuple[str, ...],
+    rels_t: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return (nodes, rels) with trailing contextual edges stripped.
+
+    Contextual relations (MemberOf, Contains, etc.) at the end of a path are
+    structural annotations — they do not represent an attack action.  Two paths
+    whose only difference is which contextual group they terminate in represent
+    the same attack and should be deduplicated.
+
+    Example:
+      Kerberoasting → ADMINISTRATOR → MemberOf → Domain Admins
+      Kerberoasting → ADMINISTRATOR → MemberOf → GPCO
+    Both reduce to core: Kerberoasting → ADMINISTRATOR
+    """
+    if not rels_t:
+        return nodes_t, rels_t
+    # Strip trailing contextual relations from the right.
+    end = len(rels_t)
+    while end > 0 and rels_t[end - 1].lower() in _STRUCTURAL_RELATIONS_LOWER:
+        end -= 1
+    return nodes_t[: end + 1], rels_t[:end]
+
+
+def deduplicate_trailing_contextual_suffix_paths(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Deduplicate paths that share the same attack core but differ only in trailing contextual edges.
+
+    Paths like:
+        A → GenericAll → B → MemberOf → Group1   [graph_extension]
+        A → GenericAll → B → MemberOf → Group2   [graph_extension]
+    share attack core ``A → GenericAll → B``.  Within each core group, keep
+    only the **best representative**:
+
+    Priority (descending):
+        1. Highest outcome-class rank  (direct_compromise > graph_extension…)
+        2. Highest target_priority_rank  (already set by Stage 7; tierzero wins)
+        3. Longest path  (more context is better when all else is equal)
+
+    This runs BEFORE Stage 7 so target_priority_rank may not yet be set; fall
+    back to 0 when the field is missing.  Stage 7 will re-tag the survivors.
+    """
+    if len(records) <= 1:
+        return records, 0
+
+    # Group records by their attack core.
+    # Key: (core_nodes, core_rels)
+    groups: dict[
+        tuple[tuple[str, ...], tuple[str, ...]],
+        list[dict[str, Any]],
+    ] = {}
+    ungroupable: list[dict[str, Any]] = []
+
+    for record in records:
+        sig = _display_record_exact_signature(record)
+        if sig is None:
+            ungroupable.append(record)
+            continue
+        nodes_t, rels_t = sig
+        core = _attack_core_signature(nodes_t, rels_t)
+        groups.setdefault(core, []).append(record)
+
+    kept: list[dict[str, Any]] = []
+    removed = 0
+
+    for core, group in groups.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+
+        # Check whether any member of the group actually has trailing contextual
+        # edges.  If all members share the same full signature (no difference),
+        # they're exact duplicates — keep one (first, already handled by
+        # dedupe_exact_display_paths).  If they have different full signatures
+        # but the same core, the difference IS the trailing contextual suffix.
+        full_sigs = {_display_record_exact_signature(r) for r in group}
+        if len(full_sigs) == 1:
+            # All identical — just keep one; exact-dupe filter handles this.
+            kept.extend(group)
+            continue
+
+        # Multiple paths with the same attack core but different trailing context:
+        # pick the single best representative.
+        def _sort_key(rec: dict[str, Any]) -> tuple[int, int, int]:
+            sig = _display_record_exact_signature(rec)
+            length = len(sig[1]) if sig else 0
+            return (
+                -_outcome_class_rank(rec),                          # higher class first
+                -(rec.get("target_priority_rank") or 0),            # higher priority first
+                -length,                                            # longer path first
+            )
+
+        group_sorted = sorted(group, key=_sort_key)
+        kept.append(group_sorted[0])
+        removed += len(group) - 1
+
+    kept.extend(ungroupable)
+    return kept, removed
+
+
 def compute_display_paths_for_start_node(
     graph: dict[str, Any],
     *,
@@ -462,12 +1022,10 @@ def compute_display_paths_for_start_node(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths starting from a specific node id."""
-    mode = (target_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = normalize_target_mode(target_mode)
 
     high_value_reachable_node_ids: set[str] | None = None
     if target == "highvalue":
@@ -533,6 +1091,12 @@ def compute_display_paths_for_start_node(
         )
         record["is_tier_zero"] = priority_class == "tierzero"
         record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
+        # Phase 3 — path-based compromise-class classifier (overrides terminal_class).
+        from adscan_internal.services.compromise_class import (
+            apply_path_based_classification as _apply_pbc,
+        )
+
+        _apply_pbc(record, target_node if isinstance(target_node, dict) else None)
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
@@ -616,7 +1180,9 @@ def _build_local_reuse_virtual_state(
         node_ids_set = cluster.get("node_ids")
         if not isinstance(node_ids_set, set):
             continue
-        node_ids = tuple(sorted({str(node_id) for node_id in node_ids_set}, key=str.lower))
+        node_ids = tuple(
+            sorted({str(node_id) for node_id in node_ids_set}, key=str.lower)
+        )
         if len(node_ids) < 2:
             continue
         cluster["node_ids"] = node_ids
@@ -664,6 +1230,86 @@ def _build_local_reuse_useful_node_ids(
     return useful
 
 
+
+# Relations that confer LOCAL ADMIN on the target Computer.  Only these
+# justify injecting a virtual DumpLSA self-loop: DumpLSA reads
+# HKLM\SECURITY\Policy\Secrets\$MACHINE.ACC, which requires local-admin
+# privileges on the host (MITRE T1003.004).
+#
+# NOT included here: CanPSRemote, CanRDP — those give a user-level WinRM /
+# RDP session, not local-admin.  An attacker arriving via CanPSRemote cannot
+# dump LSA secrets without first escalating, so a speculative DumpLSA bridge
+# for those edges would produce false-positive paths.
+_LOCAL_ADMIN_ACCESS_RELATIONS: frozenset[str] = frozenset(
+    {
+        "adminto",           # SMB local-admin shell — deterministic local admin
+        "readlapspassword",  # recovers the local admin password — AdminTo-equivalent
+        # NOT included:
+        #   canpsremote / canrdp — user-level sessions, no admin guarantee
+        #   executedcom         — COM execution context; SYSTEM not guaranteed
+        #   sqladmin            — SQL sysadmin; SYSTEM requires SeImpersonatePrivilege
+        #                         (modelled separately via MssqlSeImpersonateEscalation)
+    }
+)
+
+
+def _build_implicit_dumplsa_overlay(
+    graph: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build virtual DumpLSA self-loop edges for local-admin Computer targets.
+
+    For every Computer node reachable via a LOCAL-ADMIN access edge
+    (AdminTo, ReadLAPSPassword, ExecuteDCOM, SQLAdmin), injects a synthetic
+    self-loop ``DumpLSA`` edge that bridges local_admin_session to
+    credential_recovered (machine account hash via T1003.004 — LSA secrets).
+
+    DumpLSA is deterministic: HKLM\\SECURITY\\Policy\\Secrets\\$MACHINE.ACC
+    always contains the machine account hash when the caller has local admin.
+
+    Edges excluded from the bridge:
+    - CanPSRemote — WinRM session as the source *user*, not as local admin.
+    - CanRDP      — RDP session as the source *user*, not as local admin.
+    Either can escalate inside the session, but that escalation is not
+    guaranteed and is out of scope for a speculative bridge injection.
+
+    The overlay is computed once per DFS call and never persisted to disk.
+    """
+    nodes_map: dict[str, Any] = graph.get("nodes") or {}
+    overlay: dict[str, list[dict[str, Any]]] = {}
+    seen_computer_targets: set[str] = set()
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        rel_lower = str(edge.get("relation") or "").strip().lower()
+        if rel_lower not in _LOCAL_ADMIN_ACCESS_RELATIONS:
+            continue
+        to_id = str(edge.get("to") or "").strip()
+        if not to_id or to_id in seen_computer_targets:
+            continue
+        target_node = nodes_map.get(to_id)
+        if not isinstance(target_node, dict):
+            continue
+        if str(target_node.get("kind") or "").strip().lower() != "computer":
+            continue
+        seen_computer_targets.add(to_id)
+        overlay.setdefault(to_id, []).append(
+            {
+                "from": to_id,
+                "to": to_id,
+                "relation": "DumpLSA",
+                "kind": "derived",
+                "notes": {
+                    "virtual": True,
+                    "theoretical": True,
+                    "synthesized_from": "implicit_dumplsa_bridge",
+                },
+            }
+        )
+
+    return overlay
+
+
 def _iter_outgoing_edges_with_virtual_local_reuse(
     current: str,
     *,
@@ -672,6 +1318,7 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
     local_reuse_by_node: dict[str, list[dict[str, Any]]],
     local_reuse_existing_pairs: set[tuple[str, str]],
     local_reuse_useful_nodes: set[str],
+    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return real + virtual outgoing edges for traversal.
 
@@ -690,12 +1337,14 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
         next_edges.append(edge)
     clusters = local_reuse_by_node.get(current) or []
     if not clusters:
+        # Virtual implicit DumpLSA self-loops — append even when there are no
+        # local-reuse clusters so the early-return path does not skip them.
+        for edge in (implicit_dumplsa_overlay or {}).get(current, []):
+            next_edges.append(edge)
         return next_edges
 
     last_step = acc_steps[-1] if acc_steps else None
-    last_relation = (
-        str(last_step.relation or "").strip().lower() if last_step else ""
-    )
+    last_relation = str(last_step.relation or "").strip().lower() if last_step else ""
     last_cluster_id = (
         str((last_step.notes or {}).get("reuse_cluster_id") or "").strip()
         if last_step
@@ -733,12 +1382,17 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
                         "source": "local_reuse_virtual_expansion",
                         "virtual_expansion": True,
                         "reuse_cluster_id": cluster_id,
-                        "local_admin_username": cluster.get(
-                            "local_admin_username"
-                        ),
+                        "local_admin_username": cluster.get("local_admin_username"),
                     },
                 }
             )
+
+    # Virtual implicit DumpLSA self-loops — append last so they have lowest
+    # traversal priority. The DFS context guard will only allow them to chain
+    # when the previous edge produced local_admin_session.
+    for edge in (implicit_dumplsa_overlay or {}).get(current, []):
+        next_edges.append(edge)
+
     return next_edges
 
 
@@ -866,8 +1520,8 @@ def _build_high_value_reachable_node_ids(
             continue
         adjacency.setdefault(from_id, []).append(edge)
 
-    local_reuse_by_node, local_reuse_existing_pairs = (
-        _build_local_reuse_virtual_state(nodes_map, edges)
+    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
+        nodes_map, edges
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
     target_node_ids = _build_high_value_terminal_candidate_ids(
@@ -921,6 +1575,7 @@ def _is_same_local_reuse_cluster_chain(
 # so only the per-batch source list is pickled on every task dispatch.
 # ---------------------------------------------------------------------------
 
+
 def _read_attack_path_workers() -> int:
     try:
         return int(os.getenv("ADSCAN_ATTACK_PATH_WORKERS", "0").strip())
@@ -936,6 +1591,7 @@ _W_LOCAL_REUSE_BY_NODE: dict[str, list[dict[str, Any]]] = {}
 _W_LOCAL_REUSE_EXISTING_PAIRS: set[tuple[str, str]] = set()
 _W_LOCAL_REUSE_USEFUL_NODES: set[str] = set()
 _W_TERMINAL_SET: set[str] = set()
+_W_IMPLICIT_DUMPLSA_OVERLAY: dict[str, list[dict[str, Any]]] = {}
 
 
 def _dfs_worker_init(
@@ -944,15 +1600,18 @@ def _dfs_worker_init(
     local_reuse_existing_pairs: set[tuple[str, str]],
     local_reuse_useful_nodes: set[str],
     terminal_set: set[str],
+    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]],
 ) -> None:
     """Populate per-worker globals. Called once per worker process by the pool initializer."""
     global _W_ADJACENCY, _W_LOCAL_REUSE_BY_NODE  # noqa: PLW0603
     global _W_LOCAL_REUSE_EXISTING_PAIRS, _W_LOCAL_REUSE_USEFUL_NODES, _W_TERMINAL_SET  # noqa: PLW0603
+    global _W_IMPLICIT_DUMPLSA_OVERLAY  # noqa: PLW0603
     _W_ADJACENCY = adjacency
     _W_LOCAL_REUSE_BY_NODE = local_reuse_by_node
     _W_LOCAL_REUSE_EXISTING_PAIRS = local_reuse_existing_pairs
     _W_LOCAL_REUSE_USEFUL_NODES = local_reuse_useful_nodes
     _W_TERMINAL_SET = terminal_set
+    _W_IMPLICIT_DUMPLSA_OVERLAY = implicit_dumplsa_overlay
 
 
 def _dfs_sources_batch_worker(
@@ -973,9 +1632,10 @@ def _dfs_sources_batch_worker(
     local_reuse_existing_pairs = _W_LOCAL_REUSE_EXISTING_PAIRS
     local_reuse_useful_nodes = _W_LOCAL_REUSE_USEFUL_NODES
     terminal_set = _W_TERMINAL_SET
+    implicit_dumplsa_overlay = _W_IMPLICIT_DUMPLSA_OVERLAY
 
     paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -986,7 +1646,7 @@ def _dfs_sources_batch_worker(
             return
         if target == "lowpriv" and acc_steps[-1].to_id in terminal_set:
             return
-        signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
+        signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
             return
         seen_signatures.add(signature)
@@ -1001,8 +1661,13 @@ def _dfs_sources_batch_worker(
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        depth = len(acc_steps)
-        if depth >= max_depth or (depth > 0 and current in terminal_set):
+        actionable_depth = _count_actionable_edges(acc_steps)
+        structural_depth = len(acc_steps) - actionable_depth
+        if (
+            actionable_depth >= max_depth
+            or structural_depth >= _MAX_STRUCTURAL_HOPS
+            or (acc_steps and current in terminal_set)
+        ):
             emit(acc_steps)
             return
         next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
@@ -1012,17 +1677,38 @@ def _dfs_sources_batch_worker(
             local_reuse_by_node=local_reuse_by_node,
             local_reuse_existing_pairs=local_reuse_existing_pairs,
             local_reuse_useful_nodes=local_reuse_useful_nodes,
+            implicit_dumplsa_overlay=implicit_dumplsa_overlay,
         )
         if not next_edges:
             emit(acc_steps)
             return
         extended = False
+        _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
             last_step = acc_steps[-1] if acc_steps else None
             if _is_same_local_reuse_cluster_chain(last_step, edge):
                 continue
+
+            # ── Credential-context guard ────────────────────────────────────
+            # Pruning incompatible chains at the DFS level (rather than at
+            # render time) avoids generating paths like
+            # AdminTo → AllowedToDelegate that look valid syntactically but
+            # require an unstated post-exploitation step.
+            _cand_rel = str(edge.get("relation") or "").strip().lower()
+            if not _edges_chain_ok(_path_rels, _cand_rel):
+                continue
+            # ── End guard ────────────────────────────────────────────────────
+
             to_id = str(edge.get("to") or "")
-            if not to_id or to_id in visited:
+            if not to_id:
+                continue
+            # Self-loop edges (to_id == current) are context-upgrading derived
+            # steps (e.g. DumpLSASS on the same node).  They don't advance the
+            # DFS to a new node, so the visited-set check does not apply —
+            # current is already in visited as expected.  Append the step and
+            # recurse from the same node without re-adding to visited.
+            is_self_loop = to_id == current
+            if not is_self_loop and to_id in visited:
                 continue
             step = AttackPathStep(
                 from_id=current,
@@ -1031,11 +1717,13 @@ def _dfs_sources_batch_worker(
                 status=str(edge.get("status") or "discovered"),
                 notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
             )
-            visited.add(to_id)
+            if not is_self_loop:
+                visited.add(to_id)
             acc_steps.append(step)
             dfs(to_id, visited, acc_steps)
             acc_steps.pop()
-            visited.remove(to_id)
+            if not is_self_loop:
+                visited.remove(to_id)
             extended = True
         if not extended:
             emit(acc_steps)
@@ -1078,6 +1766,7 @@ def _run_parallel_domain_dfs(
     max_depth: int,
     max_paths_cap: int | None,
     n_workers: int,
+    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[AttackPath]:
     """Distribute the DFS over *n_workers* spawn-context processes.
 
@@ -1110,10 +1799,13 @@ def _run_parallel_domain_dfs(
                 local_reuse_existing_pairs,
                 local_reuse_useful_nodes,
                 terminal_set,
+                implicit_dumplsa_overlay or {},
             ),
         ) as pool:
             futures = [
-                pool.submit(_dfs_sources_batch_worker, batch, target, max_depth, max_paths_cap)
+                pool.submit(
+                    _dfs_sources_batch_worker, batch, target, max_depth, max_paths_cap
+                )
                 for batch in batches
             ]
             for future in concurrent.futures.as_completed(futures):
@@ -1122,7 +1814,10 @@ def _run_parallel_domain_dfs(
                     if sig not in seen_sigs:
                         seen_sigs.add(sig)
                         all_paths.append(path)
-                        if max_paths_cap is not None and len(all_paths) >= max_paths_cap:
+                        if (
+                            max_paths_cap is not None
+                            and len(all_paths) >= max_paths_cap
+                        ):
                             # Cancel remaining futures (best-effort).
                             for f in futures:
                                 f.cancel()
@@ -1135,13 +1830,147 @@ def _run_parallel_domain_dfs(
     return all_paths
 
 
+# ---------------------------------------------------------------------------
+# Path-depth budget — count only actionable edges
+# ---------------------------------------------------------------------------
+# Operators specify ``--max-depth N`` expecting "N attack steps". The DFS used
+# to count every edge including structural ones (MemberOf, Contains, GpLink,
+# TrustedBy, HasSIDHistory), forcing operators to mentally pad the value by
+# the depth of the AD group hierarchy. That made depth=4 work for one lab and
+# fail for another despite both having 2 actionable steps.
+#
+# Structural relations only express AD topology — they grant no privilege,
+# they're not executable attack steps. The displayed ``Len`` column already
+# excludes them. The DFS budget should align with operator intuition: depth=4
+# means up to 4 actionable transitions, structural edges flow freely.
+#
+# The set below MUST align with ``EdgeKind.MEMBERSHIP`` ∪ ``EdgeKind.TRUST``
+# in :mod:`adscan_internal.services.edge_kind`. Sync when adding new edges.
+_STRUCTURAL_RELATIONS_LOWER: frozenset[str] = frozenset(
+    {
+        "memberof",
+        "contains",
+        "gplink",
+        "trustedby",
+        "hassidhistory",
+    }
+)
+
+# Defensive cap on structural-edge depth. AD group hierarchies are 3–7 levels
+# deep in normal environments, ≤15 in the most pathological. Anything beyond
+# that is either a cycle (already pruned by the visited set) or a graph
+# anomaly. Cap protects against runaway expansion without affecting any real
+# kill chain.
+_MAX_STRUCTURAL_HOPS: int = 12
+
+
+def _count_actionable_edges(acc_steps: list[AttackPathStep]) -> int:
+    """Return the number of attack-step edges in the accumulated path.
+
+    Excludes structural relations (``MemberOf``, ``Contains``, ``GpLink``,
+    ``TrustedBy``, ``HasSIDHistory``) — those don't grant privilege and
+    should not consume the depth budget specified by the operator.
+    """
+    return sum(
+        1
+        for step in acc_steps
+        if str(step.relation or "").strip().lower() not in _STRUCTURAL_RELATIONS_LOWER
+    )
+
+
+# ---------------------------------------------------------------------------
+# Direct-compromise group priority — collapse redundant membership expansion
+# ---------------------------------------------------------------------------
+# When a principal is member of >1 ``direct_compromise`` groups (the
+# domain-takeover sinks: Domain Admins, Enterprise Admins, BUILTIN
+# Administrators, etc.), the DFS expands ``MemberOf`` through every one,
+# producing one near-identical path per group. The kill chain is the same
+# story: ``... → Administrator → MemberOf → <DA|EA|Administrators> → ...``.
+# Only the group label changes.
+#
+# Rule: when a principal has multiple ``MemberOf`` outgoing edges to
+# direct-compromise groups, follow ONLY the highest-priority group. The
+# membership info for other groups stays in the persisted graph (and in
+# memberships.json) for choke-point analysis, reporting, and BloodHound
+# parity — the suppression is purely path-traversal-time.
+#
+# Priority order (lower rank = higher priority, picked first):
+#   1. Domain Admins (RID 512) — canonical "I'm DA" phrasing in every report
+#   2. Enterprise Admins (RID 519) — forest-wide takeover
+#   3. BUILTIN Administrators (RID 544 / S-1-5-32-544) — equivalent at scale
+#   4. Schema Admins (RID 518)
+#   5. Domain Controllers (RID 516)
+#   6. Enterprise Read-Only Domain Controllers (RID 498)
+#   7. Read-Only Domain Controllers (RID 521)
+_DIRECT_COMPROMISE_GROUP_PRIORITY: dict[int, int] = {
+    512: 0,
+    519: 1,
+    544: 2,
+    518: 3,
+    516: 4,
+    498: 5,
+    521: 6,
+}
+
+
+def _direct_compromise_group_priority_rank(node: dict[str, Any]) -> int | None:
+    """Return priority rank for direct-compromise group nodes, else None."""
+    if str(node.get("kind") or "") != "Group":
+        return None
+    _, rid = _extract_node_sid_and_rid(node)
+    if rid is None:
+        return None
+    return _DIRECT_COMPROMISE_GROUP_PRIORITY.get(rid)
+
+
+def _build_priority_memberof_suppression(
+    edges: list[dict[str, Any]],
+    nodes_map: dict[str, Any],
+) -> set[tuple[str, str]]:
+    """Return ``{(from_id, to_id)}`` MemberOf edges to suppress in the DFS.
+
+    For each principal with MemberOf edges into >1 direct-compromise groups,
+    keeps only the edge to the highest-priority one. All other actionable
+    edges are untouched — only redundant ``MemberOf`` expansion is collapsed.
+    """
+    if not isinstance(edges, list) or not isinstance(nodes_map, dict):
+        return set()
+
+    source_to_candidates: dict[str, list[tuple[int, str]]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip().lower() != "memberof":
+            continue
+        from_id = str(edge.get("from") or "")
+        to_id = str(edge.get("to") or "")
+        if not from_id or not to_id:
+            continue
+        target_node = nodes_map.get(to_id)
+        if not isinstance(target_node, dict):
+            continue
+        rank = _direct_compromise_group_priority_rank(target_node)
+        if rank is None:
+            continue
+        source_to_candidates.setdefault(from_id, []).append((rank, to_id))
+
+    suppressed: set[tuple[str, str]] = set()
+    for from_id, candidates in source_to_candidates.items():
+        if len(candidates) <= 1:
+            continue
+        candidates.sort(key=lambda pair: (pair[0], pair[1]))
+        for _, to_id in candidates[1:]:
+            suppressed.add((from_id, to_id))
+    return suppressed
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    terminal_mode: str = "tier0",
+    terminal_mode: str = "domain",
     start_node_ids: set[str] | None = None,
     reachable_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
@@ -1161,16 +1990,22 @@ def compute_maximal_attack_paths(
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return []
 
+    suppressed_memberof = _build_priority_memberof_suppression(edges, nodes_map)
+
     adjacency: dict[str, list[dict[str, Any]]] = {}
     incoming: dict[str, int] = {}
     outgoing: dict[str, int] = {}
     for edge in edges:
         if not isinstance(edge, dict):
             continue
+        if _is_excluded_share_access_edge(edge):
+            continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
         rel = str(edge.get("relation") or "")
         if not from_id or not to_id or not rel:
+            continue
+        if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
             continue
         adjacency.setdefault(from_id, []).append(edge)
         outgoing[from_id] = outgoing.get(from_id, 0) + 1
@@ -1180,19 +2015,20 @@ def compute_maximal_attack_paths(
             incoming[to_id] = incoming.get(to_id, 0) + 1
         incoming.setdefault(from_id, incoming.get(from_id, 0))
         outgoing.setdefault(to_id, outgoing.get(to_id, 0))
-    local_reuse_by_node, local_reuse_existing_pairs = (
-        _build_local_reuse_virtual_state(nodes_map, edges)
+    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
+        nodes_map, edges
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    implicit_dumplsa_overlay = _build_implicit_dumplsa_overlay(graph)
 
-    mode = (terminal_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = normalize_target_mode(terminal_mode)
 
     def is_terminal(node_id: str) -> bool:
         node = nodes_map.get(node_id)
         if not isinstance(node, dict):
             return False
+        if mode in {"object"}:
+            return _node_is_domain(node)
         if mode == "impact":
             return _node_is_terminal_target(node, mode=mode)
         return _node_is_terminal_target(node, mode=mode)
@@ -1232,6 +2068,7 @@ def compute_maximal_attack_paths(
     n_workers = _effective_domain_dfs_workers(len(sources))
     if n_workers >= 2:
         from adscan_internal.rich_output import print_info_debug  # noqa: PLC0415
+
         print_info_debug(
             f"[domain-dfs] parallel: {n_workers} workers / {len(sources)} sources"
         )
@@ -1251,25 +2088,31 @@ def compute_maximal_attack_paths(
             max_depth,
             max_paths_cap,
             n_workers,
+            implicit_dumplsa_overlay,
         )
         if parallel_paths or not sources:
             return parallel_paths
         # Fall through to sequential if parallel returned nothing unexpectedly.
         from adscan_internal.rich_output import print_info_debug  # noqa: PLC0415
-        print_info_debug("[domain-dfs] parallel returned empty, falling back to sequential")
+
+        print_info_debug(
+            "[domain-dfs] parallel returned empty, falling back to sequential"
+        )
     # --- Sequential DFS (default / fallback) ---------------------------------
 
     paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
+            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
+        ):
             return
-        signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
+        signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
             return
         seen_signatures.add(signature)
@@ -1284,8 +2127,13 @@ def compute_maximal_attack_paths(
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        depth = len(acc_steps)
-        if depth >= max_depth or (depth > 0 and is_terminal(current)):
+        actionable_depth = _count_actionable_edges(acc_steps)
+        structural_depth = len(acc_steps) - actionable_depth
+        if (
+            actionable_depth >= max_depth
+            or structural_depth >= _MAX_STRUCTURAL_HOPS
+            or (acc_steps and is_terminal(current))
+        ):
             emit(acc_steps)
             return
 
@@ -1296,18 +2144,39 @@ def compute_maximal_attack_paths(
             local_reuse_by_node=local_reuse_by_node,
             local_reuse_existing_pairs=local_reuse_existing_pairs,
             local_reuse_useful_nodes=local_reuse_useful_nodes,
+            implicit_dumplsa_overlay=implicit_dumplsa_overlay,
         )
         if not next_edges:
             emit(acc_steps)
             return
 
         extended = False
+        _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
             last_step = acc_steps[-1] if acc_steps else None
             if _is_same_local_reuse_cluster_chain(last_step, edge):
                 continue
+
+            # ── Credential-context guard ────────────────────────────────────
+            # Pruning incompatible chains at the DFS level (rather than at
+            # render time) avoids generating paths like
+            # AdminTo → AllowedToDelegate that look valid syntactically but
+            # require an unstated post-exploitation step.
+            _cand_rel = str(edge.get("relation") or "").strip().lower()
+            if not _edges_chain_ok(_path_rels, _cand_rel):
+                continue
+            # ── End guard ────────────────────────────────────────────────────
+
             to_id = str(edge.get("to") or "")
-            if not to_id or to_id in visited:
+            if not to_id:
+                continue
+            # Self-loop edges (to_id == current) are context-upgrading derived
+            # steps (e.g. DumpLSASS on the same node).  They don't advance the
+            # DFS to a new node, so the visited-set check does not apply —
+            # current is already in visited as expected.  Append the step and
+            # recurse from the same node without re-adding to visited.
+            is_self_loop = to_id == current
+            if not is_self_loop and to_id in visited:
                 continue
             if allowed_reachable_ids and to_id not in allowed_reachable_ids:
                 continue
@@ -1318,11 +2187,13 @@ def compute_maximal_attack_paths(
                 status=str(edge.get("status") or "discovered"),
                 notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
             )
-            visited.add(to_id)
+            if not is_self_loop:
+                visited.add(to_id)
             acc_steps.append(step)
             dfs(to_id, visited, acc_steps)
             acc_steps.pop()
-            visited.remove(to_id)
+            if not is_self_loop:
+                visited.remove(to_id)
             extended = True
 
         if not extended:
@@ -1343,7 +2214,7 @@ def compute_maximal_attack_paths_from_start(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
-    terminal_mode: str = "tier0",
+    terminal_mode: str = "domain",
     reachable_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal paths starting from a specific node."""
@@ -1362,20 +2233,27 @@ def compute_maximal_attack_paths_from_start(
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return []
 
+    suppressed_memberof = _build_priority_memberof_suppression(edges, nodes_map)
+
     adjacency: dict[str, list[dict[str, Any]]] = {}
     for edge in edges:
         if not isinstance(edge, dict):
+            continue
+        if _is_excluded_share_access_edge(edge):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
         rel = str(edge.get("relation") or "")
         if not from_id or not to_id or not rel:
             continue
+        if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
+            continue
         adjacency.setdefault(from_id, []).append(edge)
-    local_reuse_by_node, local_reuse_existing_pairs = (
-        _build_local_reuse_virtual_state(nodes_map, edges)
+    local_reuse_by_node, local_reuse_existing_pairs = _build_local_reuse_virtual_state(
+        nodes_map, edges
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    implicit_dumplsa_overlay = _build_implicit_dumplsa_overlay(graph)
     allowed_reachable_ids: set[str] = (
         {str(node_id) for node_id in reachable_node_ids if str(node_id).strip()}
         if reachable_node_ids
@@ -1384,29 +2262,31 @@ def compute_maximal_attack_paths_from_start(
     if allowed_reachable_ids and start_node_id not in allowed_reachable_ids:
         return []
 
-    mode = (terminal_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = normalize_target_mode(terminal_mode)
 
     def is_terminal(node_id: str) -> bool:
         node = nodes_map.get(node_id)
         if not isinstance(node, dict):
             return False
+        if mode in {"object"}:
+            return _node_is_domain(node)
         if mode == "impact":
             return _node_is_terminal_target(node, mode=mode)
         return _node_is_terminal_target(node, mode=mode)
 
     paths: list[AttackPath] = []
-    seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
+    seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
+            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
+        ):
             return
-        signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
+        signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
             return
         seen_signatures.add(signature)
@@ -1421,8 +2301,13 @@ def compute_maximal_attack_paths_from_start(
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        depth = len(acc_steps)
-        if depth >= max_depth or (depth > 0 and is_terminal(current)):
+        actionable_depth = _count_actionable_edges(acc_steps)
+        structural_depth = len(acc_steps) - actionable_depth
+        if (
+            actionable_depth >= max_depth
+            or structural_depth >= _MAX_STRUCTURAL_HOPS
+            or (acc_steps and is_terminal(current))
+        ):
             emit(acc_steps)
             return
 
@@ -1433,18 +2318,39 @@ def compute_maximal_attack_paths_from_start(
             local_reuse_by_node=local_reuse_by_node,
             local_reuse_existing_pairs=local_reuse_existing_pairs,
             local_reuse_useful_nodes=local_reuse_useful_nodes,
+            implicit_dumplsa_overlay=implicit_dumplsa_overlay,
         )
         if not next_edges:
             emit(acc_steps)
             return
 
         extended = False
+        _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
             last_step = acc_steps[-1] if acc_steps else None
             if _is_same_local_reuse_cluster_chain(last_step, edge):
                 continue
+
+            # ── Credential-context guard ────────────────────────────────────
+            # Pruning incompatible chains at the DFS level (rather than at
+            # render time) avoids generating paths like
+            # AdminTo → AllowedToDelegate that look valid syntactically but
+            # require an unstated post-exploitation step.
+            _cand_rel = str(edge.get("relation") or "").strip().lower()
+            if not _edges_chain_ok(_path_rels, _cand_rel):
+                continue
+            # ── End guard ────────────────────────────────────────────────────
+
             to_id = str(edge.get("to") or "")
-            if not to_id or to_id in visited:
+            if not to_id:
+                continue
+            # Self-loop edges (to_id == current) are context-upgrading derived
+            # steps (e.g. DumpLSASS on the same node).  They don't advance the
+            # DFS to a new node, so the visited-set check does not apply —
+            # current is already in visited as expected.  Append the step and
+            # recurse from the same node without re-adding to visited.
+            is_self_loop = to_id == current
+            if not is_self_loop and to_id in visited:
                 continue
             if allowed_reachable_ids and to_id not in allowed_reachable_ids:
                 continue
@@ -1455,11 +2361,13 @@ def compute_maximal_attack_paths_from_start(
                 status=str(edge.get("status") or "discovered"),
                 notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
             )
-            visited.add(to_id)
+            if not is_self_loop:
+                visited.add(to_id)
             acc_steps.append(step)
             dfs(to_id, visited, acc_steps)
             acc_steps.pop()
-            visited.remove(to_id)
+            if not is_self_loop:
+                visited.remove(to_id)
             extended = True
 
         if not extended:
@@ -1474,7 +2382,7 @@ def collect_source_step_signatures_on_high_value_paths(
     *,
     start_node_id: str,
     max_depth: int,
-    target_mode: str = "tier0",
+    target_mode: str = "object",
 ) -> set[tuple[str, str, str]]:
     """Return source-edge signatures that participate in HV/tier-zero paths.
 
@@ -1495,9 +2403,7 @@ def collect_source_step_signatures_on_high_value_paths(
         high-value / tier-zero target under the same promotion semantics used by
         display-path generation.
     """
-    mode = (target_mode or "tier0").strip().lower()
-    if mode not in {"tier0", "impact"}:
-        mode = "tier0"
+    mode = normalize_target_mode(target_mode)
 
     required_rank = 1 if mode == "impact" else 3
     results: set[tuple[str, str, str]] = set()
@@ -1552,7 +2458,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     ) -> dict[str, Any] | None:
         if not isinstance(target_node, dict):
             return None
-        target_kind = target_node.get("kind") or target_node.get("labels") or target_node.get("type")
+        target_kind = (
+            target_node.get("kind")
+            or target_node.get("labels")
+            or target_node.get("type")
+        )
         if isinstance(target_kind, list):
             target_kind = str(target_kind[0] if target_kind else "")
         if str(target_kind or "") != "Group":
@@ -1680,7 +2590,16 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     return {
         "nodes": nodes,
         "relations": relations,
-        "_exact_signature": (tuple(nodes), tuple(relations)),
+        "_exact_signature": (
+            tuple(nodes),
+            _display_relation_identity_values(
+                {
+                    "relations": relations,
+                    "steps": steps_for_ui,
+                },
+                normalize=False,
+            ),
+        ),
         "length": sum(
             1
             for rel in relations
@@ -1727,9 +2646,45 @@ def _path_target_is_high_value(
     node = nodes_map.get(str(target_id or "")) if isinstance(nodes_map, dict) else None
     if not isinstance(node, dict):
         return False
+    if mode == "domain":
+        return _node_is_domain(node)
     if mode == "impact":
         return _node_is_impact_high_value(node)
     return _node_is_tier0(node)
+
+
+def _node_is_domain(node: dict[str, Any]) -> bool:
+    """Return True when the node represents the AD Domain object."""
+    return str(node.get("kind") or "").strip().lower() == "domain"
+
+
+def resolve_domain_node_labels(graph: dict[str, Any]) -> tuple[str, ...]:
+    """Return the labels of all Domain-kind nodes in the attack graph.
+
+    A small but load-bearing helper for the unified ``target_mode="object"``
+    pipeline: callers that previously relied on ``target_mode="domain"`` to
+    "find paths terminating at any domain object" can now resolve the
+    concrete domain-node label(s) here and pass them as ``target_labels`` —
+    making the target object explicit rather than implied.
+
+    In single-domain workspaces this returns one label; in cross-domain /
+    forest-merged graphs it can return several (one per domain node present).
+    Returns an empty tuple when no domain node is materialised in the graph.
+    """
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, dict):
+        return ()
+    labels: list[str] = []
+    seen: set[str] = set()
+    for node in nodes.values():
+        if not isinstance(node, dict) or not _node_is_domain(node):
+            continue
+        label = str(node.get("label") or node.get("name") or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return tuple(labels)
 
 
 def _extract_node_sid_and_rid(node: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -1864,7 +2819,11 @@ def _node_target_priority_rank(node: dict[str, Any]) -> int:
             name=group_name,
             distinguished_name=distinguished_name,
         ):
-            if rid == 548 and isinstance(sid_upper, str) and sid_upper.startswith("S-1-5-32-"):
+            if (
+                rid == 548
+                and isinstance(sid_upper, str)
+                and sid_upper.startswith("S-1-5-32-")
+            ):
                 return 10
             return 15
         return 19
@@ -1873,7 +2832,11 @@ def _node_target_priority_rank(node: dict[str, Any]) -> int:
         if node_is_rodc_computer(node):
             return RODC_TARGET_PRIORITY_RANK
         if is_followup_terminal_group(sid=sid_upper, name=group_name):
-            if rid == 551 and isinstance(sid_upper, str) and sid_upper.startswith("S-1-5-32-"):
+            if (
+                rid == 551
+                and isinstance(sid_upper, str)
+                and sid_upper.startswith("S-1-5-32-")
+            ):
                 return 20
             if rid == 1101:
                 return 30
@@ -1926,6 +2889,19 @@ def _node_target_terminal_class(node: dict[str, Any]) -> str:
     distinguished_name = str(props.get("distinguishedname") or "")
     sid_upper, rid = _extract_node_sid_and_rid(node)
     priority_class = _node_target_priority_class(node)
+    inherited_terminal_class = str(
+        props.get("target_terminal_class") or node.get("target_terminal_class") or ""
+    ).strip()
+    if bool(
+        props.get("tier0_inherited") or node.get("tier0_inherited")
+    ) and inherited_terminal_class in {
+        "direct_compromise",
+        "followup_terminal",
+        "graph_extension",
+        "future_followup",
+        "dependency_only",
+    }:
+        return inherited_terminal_class
 
     if node_is_rodc_computer(node):
         return "followup_terminal"

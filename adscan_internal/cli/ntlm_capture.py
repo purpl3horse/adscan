@@ -9,7 +9,6 @@ from typing import Any, Protocol
 
 from adscan_internal import telemetry
 from adscan_internal.interaction import is_non_interactive
-from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import (
     confirm_operation,
     mark_sensitive,
@@ -18,13 +17,15 @@ from adscan_internal.rich_output import (
     print_info,
     print_info_debug,
     print_instruction,
+    print_panel,
     print_success,
     print_warning,
 )
-from adscan_internal.integrations.coercer import CoercerRunner, looks_like_ntlm_hash
 from adscan_internal.services.ntlm_capture_workflow import (
+    NativeCoercionTrigger,
+    NativeListenerCapture,
     NtlmCaptureProbeResult,
-    ResponderListener,
+    looks_like_ntlm_hash,
     run_ntlm_capture_probe,
 )
 from adscan_internal.services.current_vantage_reachability_service import (
@@ -40,8 +41,6 @@ class NtlmCaptureShell(Protocol):
 
     myip: str | None
     interface: str | None
-    responder_python: str | None
-    coercer_python: str | None
     domains_data: dict[str, dict[str, Any]]
     domains_dir: str
     current_workspace_dir: str | None
@@ -61,9 +60,7 @@ class NtlmCaptureShell(Protocol):
         """Spawn a command in the background."""
         ...
 
-    def run_command(
-        self, command: Any, *, timeout: int | None = None, **kwargs
-    ) -> Any:
+    def run_command(self, command: Any, *, timeout: int | None = None, **kwargs) -> Any:
         """Run a blocking command."""
         ...
 
@@ -80,9 +77,30 @@ class PreparedNtlmProbe(Protocol):
     pdc_hostname: str
     username: str
     secret: str
-    responder_script: str
-    responder_db_path: str
-    coercer_script: str
+
+
+def _probe_coercion_target_reachable(
+    targets: list[str],
+    *,
+    port: int = 445,
+    timeout: float = 3.0,
+) -> bool | None:
+    """Return True if any target accepts a TCP connection on *port*, False if all fail, None if empty."""
+    from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
+    from adscan_internal.services.network_probe_service import tcp_probe_multi  # noqa: PLC0415
+
+    if not targets:
+        return None
+    for host in targets:
+        if not str(host or "").strip():
+            continue
+        try:
+            result = run_async_sync(tcp_probe_multi(host, [port], timeout=timeout))
+            if result.status == "open":
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
 
 
 def _parse_probe_args(args: str) -> tuple[str | None, int, int, str | None]:
@@ -128,29 +146,6 @@ def _parse_probe_args(args: str) -> tuple[str | None, int, int, str | None]:
     return domain, capture_timeout, trigger_timeout, method_filter
 
 
-def _build_coercer_script_path() -> str:
-    """Return the expected local Coercer script path."""
-
-    tools_dir = os.environ.get("ADSCAN_TOOLS_INSTALL_DIR")
-    if tools_dir:
-        return os.path.join(tools_dir, "coercer", "Coercer.py")
-    return os.path.join(str(get_adscan_home()), "tools", "coercer", "Coercer.py")
-
-
-def _build_responder_paths() -> tuple[str, str]:
-    """Return the expected Responder script and SQLite DB paths."""
-
-    tools_dir = os.environ.get("ADSCAN_TOOLS_INSTALL_DIR")
-    if tools_dir:
-        base_dir = tools_dir
-    else:
-        base_dir = os.path.join(str(get_adscan_home()), "tools")
-    responder_dir = os.path.join(base_dir, "responder")
-    return (
-        os.path.join(responder_dir, "Responder.py"),
-        os.path.join(responder_dir, "Responder.db"),
-    )
-
 
 def _summarize_output(text: str, *, max_lines: int = 12) -> str:
     """Return a compact single-string summary of command output for debug logs."""
@@ -166,27 +161,22 @@ def _summarize_output(text: str, *, max_lines: int = 12) -> str:
     return "\n".join(summary_lines)
 
 
-def _prepare_ntlm_probe(shell: NtlmCaptureShell, domain: str) -> PreparedNtlmProbe | None:
+def _prepare_ntlm_probe(
+    shell: NtlmCaptureShell, domain: str
+) -> PreparedNtlmProbe | None:
     """Validate domain/tool prerequisites and return normalized probe inputs."""
 
     domain_data = shell.domains_data.get(domain)
     if not isinstance(domain_data, dict):
-        print_error(f"Domain not found in current context: {mark_sensitive(domain, 'domain')}")
-        return None
-
-    if not shell.interface or not shell.myip:
         print_error(
-            "This probe requires an interface and listener IP. Configure them first with "
-            "'set interface <iface>' and ensure 'myip' is available."
+            f"Domain not found in current context: {mark_sensitive(domain, 'domain')}"
         )
         return None
 
-    if not shell.responder_python:
-        print_error("Responder Python venv not found. Run 'install' or 'check --fix'.")
-        return None
-
-    if not shell.coercer_python:
-        print_error("Coercer Python venv not found. Run 'install' or 'check --fix'.")
+    if not shell.myip:
+        print_error(
+            "This probe requires a listener IP. Ensure 'myip' is available."
+        )
         return None
 
     pdc_ip = str(domain_data.get("pdc") or "").strip()
@@ -219,7 +209,8 @@ def _prepare_ntlm_probe(shell: NtlmCaptureShell, domain: str) -> PreparedNtlmPro
             (
                 item
                 for item in reachability.assessments
-                if item.requested_target in {pdc_ip, pdc_hostname, f"{pdc_hostname}.{domain}"}
+                if item.requested_target
+                in {pdc_ip, pdc_hostname, f"{pdc_hostname}.{domain}"}
                 and item.matched
             ),
             None,
@@ -259,19 +250,30 @@ def _prepare_ntlm_probe(shell: NtlmCaptureShell, domain: str) -> PreparedNtlmPro
                 "[ntlm-capture] current-vantage reachability report did not contain an exact match for "
                 f"{mark_sensitive(pdc_ip, 'ip')}; proceeding without a hard block."
             )
-
-    responder_script, responder_db_path = _build_responder_paths()
-    coercer_script = _build_coercer_script_path()
-    if not os.path.exists(responder_script):
-        print_error(
-            f"Responder script not found at {mark_sensitive(responder_script, 'path')}."
+    else:
+        # No persisted report, do a live TCP probe on the PDC so we don't
+        # send coercion traffic to a host that is not reachable from here.
+        probe_targets = [t for t in [pdc_ip, f"{pdc_hostname}.{domain}", pdc_hostname] if t]
+        live_reachable = _probe_coercion_target_reachable(probe_targets)
+        marked_target = mark_sensitive(pdc_ip, "ip")
+        if live_reachable is False:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning(
+                f"Skipping coercion precheck in {marked_domain}: live TCP probe confirms the target {marked_target} is not reachable from the current vantage."
+            )
+            print_info_debug(
+                "[ntlm-capture] live probe blocked coercion: "
+                f"target={marked_target} targets={probe_targets}"
+            )
+            return None
+        print_info_debug(
+            "[ntlm-capture] no reachability report; "
+            + (
+                f"live TCP probe confirmed {marked_target} is reachable."
+                if live_reachable
+                else f"live TCP probe returned no result for {marked_target}; proceeding."
+            )
         )
-        return None
-    if not os.path.exists(coercer_script):
-        print_error(
-            f"Coercer script not found at {mark_sensitive(coercer_script, 'path')}."
-        )
-        return None
 
     class _Prepared:
         pass
@@ -282,38 +284,96 @@ def _prepare_ntlm_probe(shell: NtlmCaptureShell, domain: str) -> PreparedNtlmPro
     prepared.pdc_hostname = pdc_hostname
     prepared.username = username
     prepared.secret = secret
-    prepared.responder_script = responder_script
-    prepared.responder_db_path = responder_db_path
-    prepared.coercer_script = coercer_script
     return prepared
+
+
+def _render_captured_hash_jackpot(
+    result: NtlmCaptureProbeResult, *, domain: str
+) -> None:
+    """Render the verdict-first capture panel when an NTLM authentication is observed."""
+
+    observation = result.observation
+    auth_type = result.auth_type or "NTLM"
+    if observation is None:
+        return
+
+    raw_user = str(observation.raw_user or "").strip()
+    if "\\" in raw_user:
+        captured_domain, captured_sam = raw_user.split("\\", 1)
+    elif "@" in raw_user:
+        captured_sam, captured_domain = raw_user.split("@", 1)
+    else:
+        captured_sam, captured_domain = raw_user, domain
+
+    marked_user = mark_sensitive(captured_sam or raw_user, "user")
+    marked_domain = mark_sensitive(captured_domain or domain, "domain")
+    marked_auth = mark_sensitive(auth_type, "text")
+
+    lines: list[str] = [
+        f"[bold]Verdict[/bold]   [green][+][/green] {marked_auth} authentication captured from coerced PDC",
+        f"[bold]Principal[/bold] {marked_user}@{marked_domain}",
+    ]
+    if auth_type == "NTLMv1":
+        lines.append(
+            "[bold]Posture[/bold]   [red][!][/red] NTLMv1 is downgrade-attack ready (crack.sh, hashcat -m 5500)"
+        )
+    elif auth_type == "NTLMv2":
+        lines.append(
+            "[bold]Posture[/bold]   [yellow][~][/yellow] NTLMv2 in use (hashcat -m 5600, offline only)"
+        )
+
+    next_lines: list[str] = ["", "[bold]Next:[/bold]"]
+    if auth_type == "NTLMv1":
+        next_lines.append(
+            "  [cyan]>[/cyan] Submit to crack.sh for guaranteed recovery, or run [bold]hashcat -m 5500 hash.txt rockyou.txt[/bold]"
+        )
+    else:
+        next_lines.append(
+            "  [cyan]>[/cyan] Crack offline with [bold]hashcat -m 5600 hash.txt wordlist.txt -r rules/best64.rule[/bold]"
+        )
+    next_lines.append(
+        "  [cyan]>[/cyan] If SMB signing is unenforced on other hosts, relay this auth with [bold]ntlmrelayx[/bold] instead of cracking"
+    )
+    next_lines.append(
+        "  [cyan]>[/cyan] Inspect the full captured hash in the SMB listener log inside the workspace"
+    )
+
+    print_panel(
+        "\n".join(lines + next_lines),
+        title="[bold]NTLM Capture[/bold] [green]captured[/green]",
+        title_align="left",
+        border_style="green",
+    )
 
 
 def _render_failed_ntlm_capture_probe(result: NtlmCaptureProbeResult) -> None:
     """Render a precise user-facing explanation for a failed NTLM capture probe."""
 
-    trigger_output = f"{result.trigger_stdout or ''}\n{result.trigger_stderr or ''}".lower()
+    trigger_output = (
+        f"{result.trigger_stdout or ''}\n{result.trigger_stderr or ''}".lower()
+    )
 
     if result.reason == "listener_exited_during_capture":
         print_warning(
-            "Responder stopped before the capture window completed, so the NTLM probe "
+            "[!] The SMB listener stopped before the capture window completed, so the NTLM probe "
             "result is inconclusive."
         )
         return
 
     if result.trigger_returncode not in (None, 0):
         print_warning(
-            f"Coercer returned code {result.trigger_returncode} and no capture was observed."
+            f"[!] Native coercion returned code {result.trigger_returncode} and no capture was observed."
         )
         if "status_not_supported" in trigger_output:
             print_instruction(
-                "The Coercer trigger reported STATUS_NOT_SUPPORTED. Treat this as a "
+                "The native coercion trigger reported STATUS_NOT_SUPPORTED. Treat this as a "
                 "strong sign that NTLM/SMB auth is disabled or restricted on the target."
             )
         return
 
-    print_warning("No NTLM authentication capture was observed from the PDC.")
+    print_warning("[-] No NTLM authentication capture was observed from the PDC.")
     print_instruction(
-        "If other hosts authenticated to Responder during this window, do not attribute "
+        "If other hosts authenticated to the listener during this window, do not attribute "
         "those captures to the PDC unless the captured username matches the PDC computer account."
     )
 
@@ -321,20 +381,23 @@ def _render_failed_ntlm_capture_probe(result: NtlmCaptureProbeResult) -> None:
 def _render_no_capture_next_steps(result: NtlmCaptureProbeResult) -> None:
     """Render actionable next steps for no-capture outcomes."""
 
-    trigger_output = f"{result.trigger_stdout or ''}\n{result.trigger_stderr or ''}".lower()
+    trigger_output = (
+        f"{result.trigger_stdout or ''}\n{result.trigger_stderr or ''}".lower()
+    )
 
     if result.reason != "capture_not_observed":
         return
 
     if "status_not_supported" in trigger_output:
         print_instruction(
-            "This environment likely blocks NTLM/SMB auth for the trigger path."
+            "Next: this environment likely blocks NTLM/SMB auth for the trigger path. "
+            "Pivot to LDAP-based or HTTP-based coercion if available."
         )
         return
 
     print_instruction(
-        "Try again after confirming LLMNR/NBT-NS/SMB reachability to the listener, or filter "
-        "Coercer to a known-working method with --method=<name>."
+        "Next: confirm LLMNR/NBT-NS/SMB reachability to the listener, then retry. "
+        "To narrow the trigger surface, pass --method=<name> with a known-working coercion vector."
     )
 
 
@@ -367,7 +430,9 @@ def _persist_ntlm_probe_result(
         "listener_expected_stop": result.listener_expected_stop if result else None,
         "trigger_returncode": result.trigger_returncode if result else None,
         "trigger_auth_mode": result.trigger_auth_mode if result else None,
-        "attempted_trigger_auth_modes": list(result.attempted_trigger_auth_modes) if result else [],
+        "attempted_trigger_auth_modes": list(result.attempted_trigger_auth_modes)
+        if result
+        else [],
         "trigger_error_kind": result.trigger_error_kind if result else None,
         "trigger_error_detail": result.trigger_error_detail if result else None,
         "reachable_ip_count": reachable_ip_count,
@@ -452,25 +517,14 @@ def _execute_ntlm_capture_probe(
     marked_pdc = mark_sensitive(f"{prepared.pdc_hostname}.{domain}", "hostname")
     marked_listener = mark_sensitive(shell.myip, "ip")
     print_info(
-        f"Checking NTLM auth type for PDC {marked_pdc} in domain {marked_domain} "
+        f"[*] Checking NTLM auth type for PDC {marked_pdc} in domain {marked_domain} "
         f"via coerced authentication to listener {marked_listener}"
     )
     if method_filter:
-        print_info(f"Filtering Coercer method: {method_filter}", spacing="none")
+        print_info(f"    Filtering native coercion method: {method_filter}", spacing="none")
 
-    listener = ResponderListener(
-        responder_python=shell.responder_python,
-        responder_script=prepared.responder_script,
-        responder_db_path=prepared.responder_db_path,
-        interface=shell.interface,
-        shell=shell,
-    )
-    trigger = CoercerRunner(
-        coercer_python=shell.coercer_python,
-        coercer_script=prepared.coercer_script,
-        run_command=shell.run_command,
-        get_last_error=lambda: getattr(shell, "_last_run_command_error", None),
-    )
+    listener = NativeListenerCapture(listen_host=shell.myip)
+    trigger = NativeCoercionTrigger()
 
     expected_user = f"{prepared.pdc_hostname}$"
     try:
@@ -533,20 +587,22 @@ def _execute_ntlm_capture_probe(
         f"(attempted={','.join(result.attempted_trigger_auth_modes) or 'none'})"
     )
     print_info_debug(
-        f"[ntlm-capture] coercer returncode: {result.trigger_returncode!r}"
+        f"[ntlm-capture] native coercion returncode: {result.trigger_returncode!r}"
     )
     if result.trigger_error_kind:
         print_info_debug(
-            "[ntlm-capture] coercer error kind: "
+            "[ntlm-capture] native coercion error kind: "
             f"{result.trigger_error_kind} ({result.trigger_error_detail or 'n/a'})"
         )
     if result.listener_returncode is not None:
         print_info_debug(
-            "[ntlm-capture] responder listener exited with return code "
+            "[ntlm-capture] listener exited with return code "
             f"{result.listener_returncode!r} (expected_stop={result.listener_expected_stop})"
         )
     if method_filter:
-        print_info_debug(f"[ntlm-capture] coercer method filter: {method_filter}")
+        print_info_debug(
+            f"[ntlm-capture] native coercion method filter: {method_filter}"
+        )
     should_log_trigger_output = (
         not result.success
         or bool(result.trigger_error_kind)
@@ -555,13 +611,13 @@ def _execute_ntlm_capture_probe(
     if should_log_trigger_output and result.trigger_stdout.strip():
         stdout_summary = _summarize_output(result.trigger_stdout)
         print_info_debug(
-            "[ntlm-capture] coercer stdout:\n"
+            "[ntlm-capture] native coercion stdout:\n"
             + str(mark_sensitive(stdout_summary, "text"))
         )
     if should_log_trigger_output and result.trigger_stderr.strip():
         stderr_summary = _summarize_output(result.trigger_stderr)
         print_info_debug(
-            "[ntlm-capture] coercer stderr:\n"
+            "[ntlm-capture] native coercion stderr:\n"
             + str(mark_sensitive(stderr_summary, "text"))
         )
 
@@ -593,7 +649,7 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
     if workspace_type == "ctf" and reachable_ip_count < 2:
         marked_domain = mark_sensitive(target_domain, "domain")
         print_info(
-            f"Skipping DC NTLM auth-type check in {marked_domain}: fewer than 2 enabled computer IPs are available for this domain."
+            f"[~] Skipping DC NTLM auth-type check in {marked_domain}: fewer than 2 enabled computer IPs are available for this domain."
         )
         print_info_debug(
             "[ntlm-capture] CTF quick win skipped because enabled computer IP count "
@@ -611,7 +667,7 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
 
     should_execute = True
     if bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell):
-        print_info("Auto mode detected. Proceeding with DC NTLM auth-type check.")
+        print_info("[*] Auto mode detected. Proceeding with DC NTLM auth-type check.")
     else:
         pdc = (
             str(shell.domains_data.get(target_domain, {}).get("pdc") or "").strip()
@@ -640,13 +696,14 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
                 "PDC Hostname": pdc_hostname,
                 "Username": username,
                 "Listener": listener_ip,
-                "Trigger": "Coercer -> Responder",
+                "Trigger": "Native coercion to SMB listener",
+                "OPSEC": "Coercion to a listener may be flagged by Defender for Identity, MDI, or SOC NDR",
             },
             default=True,
             icon="🔐",
         )
     if not should_execute:
-        print_info("DC NTLM auth-type check skipped by user.")
+        print_info("[~] DC NTLM auth-type check skipped by user.")
         _persist_ntlm_probe_result(
             shell,
             domain=target_domain,
@@ -671,11 +728,9 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
     if result.success and result.observation:
         marked_user = mark_sensitive(result.observation.raw_user, "user")
         print_success(
-            f"Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
+            f"[+] Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
         )
-        print_instruction(
-            f"Result: the Domain Controller is authenticating back using {result.auth_type}."
-        )
+        _render_captured_hash_jackpot(result, domain=target_domain)
         return True
 
     _render_failed_ntlm_capture_probe(result)
@@ -707,11 +762,9 @@ def run_check_dc_ntlm_auth_type(shell: NtlmCaptureShell, args: str) -> None:
     if result.success and result.observation:
         marked_user = mark_sensitive(result.observation.raw_user, "user")
         print_success(
-            f"Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
+            f"[+] Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
         )
-        print_instruction(
-            f"Result: the Domain Controller is authenticating back using {result.auth_type}."
-        )
+        _render_captured_hash_jackpot(result, domain=domain)
         return
 
     _render_failed_ntlm_capture_probe(result)

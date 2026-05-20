@@ -1,15 +1,20 @@
 """Refresh and assess current-vantage inventory freshness.
 
 This service keeps "current-vantage" reachability artifacts honest even when no
-pivot was involved. In real audits, reachable hosts and exposed ports can drift
-over time or change after operators receive access to additional VLANs/subnets.
+pivot was involved. In real audits, reachable hosts and exposed ports drift
+over time and change after operators receive access to additional VLANs.
 
-The service provides:
+Design contract (post-2026-05 redesign):
 
-- stale/missing report assessment per domain
-- a manual refresh primitive that reuses ``convert_hostnames_to_ips_and_scan``
-- an optional workspace-load UX that offers refreshing only the current-vantage
-  inventory without rerunning full Phase 1
+- The 24h staleness threshold and 12h prompt cooldown are no longer used to
+  gate user-facing behavior. The workspace-load flow ALWAYS renders the
+  inventory status banner and ALWAYS prompts (default ``No``) when in audit
+  mode. The two constants remain exported for backward compat.
+- Diff history (added/removed hosts, opened/closed ports) is owned by
+  :mod:`adscan_internal.services.inventory_timeline_service`. After every
+  successful refresh we record a snapshot there. Workspace-load always shows
+  the cumulative diff against the operator's ``inventory_last_seen`` marker
+  before asking whether to refresh.
 """
 
 from __future__ import annotations
@@ -29,12 +34,21 @@ from adscan_internal.rich_output import (
     print_info,
     print_info_debug,
     print_instruction,
-    print_panel,
     print_success,
     print_warning,
 )
 from adscan_internal.services.domain_connectivity_service import (
     reconcile_domain_connectivity_from_current_vantage_report,
+)
+from adscan_internal.services.inventory_timeline_service import (
+    TRIGGER_MANUAL_REFRESH_INVENTORY,
+    TRIGGER_WORKSPACE_LOAD_REFRESH,
+    diff_against_last_seen,
+    is_timeline_enabled,
+    mark_diff_seen,
+    record_inventory_snapshot,
+    render_inventory_diff,
+    render_inventory_status_banner,
 )
 from adscan_internal.services.post_pivot_followup_service import (
     maybe_offer_trust_followup_for_newly_reachable_domains,
@@ -63,20 +77,16 @@ class CurrentVantageInventoryStatus:
 
 
 def _workspace_dir(shell: Any) -> str:
-    """Return the current workspace root for the active shell."""
-
     return str(getattr(shell, "current_workspace_dir", "") or "").strip()
 
 
 def _domains_dir(shell: Any) -> str:
-    """Return the domains directory name used inside the workspace."""
-
-    return str(getattr(shell, "domains_dir", "domains") or "domains").strip() or "domains"
+    return (
+        str(getattr(shell, "domains_dir", "domains") or "domains").strip() or "domains"
+    )
 
 
 def _report_path(shell: Any, *, domain: str) -> str:
-    """Return the persisted current-vantage reachability report path."""
-
     return os.path.join(
         _workspace_dir(shell),
         _domains_dir(shell),
@@ -86,20 +96,14 @@ def _report_path(shell: Any, *, domain: str) -> str:
 
 
 def _enabled_computers_path(shell: Any) -> str:
-    """Return the enabled computers inventory path for the workspace."""
-
     return os.path.join(_workspace_dir(shell), "enabled_computers.txt")
 
 
 def _nmap_dir(shell: Any, *, domain: str) -> str:
-    """Return the per-domain Nmap artifact directory."""
-
     return os.path.join(_workspace_dir(shell), _domains_dir(shell), domain, "nmap")
 
 
 def _parse_iso8601_timestamp(value: str) -> datetime | None:
-    """Parse one ISO-8601 timestamp into an aware ``datetime`` when possible."""
-
     text = str(value or "").strip()
     if not text:
         return None
@@ -114,11 +118,7 @@ def _parse_iso8601_timestamp(value: str) -> datetime | None:
 
 
 def _resolve_report_generated_at(report_path: str) -> tuple[str | None, float | None]:
-    """Return report ``generated_at`` and age in seconds.
-
-    Newer workspaces persist ``generated_at`` in the JSON payload. Older ones do
-    not, so we fall back to the report file's mtime to avoid a migration step.
-    """
+    """Return ``generated_at`` and age in seconds for one persisted report."""
 
     if not report_path or not os.path.exists(report_path):
         return None, None
@@ -151,8 +151,6 @@ def _resolve_report_generated_at(report_path: str) -> tuple[str | None, float | 
 
 
 def _load_report_summary(report_path: str) -> dict[str, object]:
-    """Return the persisted reachability report summary when available."""
-
     if not report_path or not os.path.exists(report_path):
         return {}
     try:
@@ -166,26 +164,8 @@ def _load_report_summary(report_path: str) -> dict[str, object]:
     return summary if isinstance(summary, dict) else {}
 
 
-def _format_age(age_seconds: float | None) -> str:
-    """Return a concise age string for operator-facing summaries."""
-
-    if age_seconds is None:
-        return "unknown"
-    total_seconds = int(max(age_seconds, 0.0))
-    if total_seconds < 60:
-        return f"{total_seconds}s"
-    total_minutes, seconds = divmod(total_seconds, 60)
-    if total_minutes < 60:
-        return f"{total_minutes}m {seconds}s"
-    total_hours, minutes = divmod(total_minutes, 60)
-    if total_hours < 24:
-        return f"{total_hours}h {minutes}m"
-    total_days, hours = divmod(total_hours, 24)
-    return f"{total_days}d {hours}h"
-
-
 def _domain_inventory_freshness_state(shell: Any, *, domain: str) -> dict[str, Any]:
-    """Return mutable per-domain prompt state for current-vantage freshness UX."""
+    """Return mutable per-domain bookkeeping dict (kept for backwards compat)."""
 
     domains_data = getattr(shell, "domains_data", {})
     if not isinstance(domains_data, dict):
@@ -197,83 +177,28 @@ def _domain_inventory_freshness_state(shell: Any, *, domain: str) -> dict[str, A
     return freshness_state if isinstance(freshness_state, dict) else {}
 
 
-def _age_seconds_from_iso8601(value: str | None) -> float | None:
-    """Return elapsed seconds from one persisted ISO-8601 timestamp."""
-
-    parsed = _parse_iso8601_timestamp(str(value or "").strip())
-    if parsed is None:
-        return None
-    return max((datetime.now(timezone.utc) - parsed).total_seconds(), 0.0)
-
-
-def _record_prompt_decision(shell: Any, *, domain: str, decision: str) -> None:
-    """Persist the latest workspace-load prompt decision for one domain."""
+def _record_refresh_metadata(shell: Any, *, domain: str, reason: str) -> None:
+    """Persist the most recent refresh event for one domain (informational)."""
 
     freshness_state = _domain_inventory_freshness_state(shell, domain=domain)
-    freshness_state["last_prompted_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    freshness_state["last_prompt_decision"] = decision
+    freshness_state["last_refreshed_at"] = (
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    )
+    freshness_state["last_refresh_reason"] = reason
     saver = getattr(shell, "save_workspace_data", None)
     if callable(saver):
         try:
             saver()
         except Exception as exc:  # noqa: BLE001
             print_info_debug(
-                "[current-vantage-refresh] failed to persist prompt decision for "
+                "[current-vantage-refresh] failed to persist refresh metadata for "
                 f"{mark_sensitive(domain, 'domain')}: {exc}"
             )
 
 
-def _should_prompt_for_domain(shell: Any, *, status: CurrentVantageInventoryStatus) -> bool:
-    """Return whether audit-mode workspace load should prompt for this domain now."""
-
-    freshness_state = _domain_inventory_freshness_state(shell, domain=status.domain)
-    last_prompted_at = str(freshness_state.get("last_prompted_at") or "").strip()
-    last_prompt_decision = str(freshness_state.get("last_prompt_decision") or "").strip().lower()
-    prompt_age = _age_seconds_from_iso8601(last_prompted_at)
-    if prompt_age is None:
-        return True
-    if last_prompt_decision != "skip":
-        return True
-    return prompt_age >= CURRENT_VANTAGE_INVENTORY_PROMPT_COOLDOWN_SECONDS
-
-
-def _render_stale_inventory_banner(statuses: list[CurrentVantageInventoryStatus]) -> None:
-    """Render a compact stale inventory banner for workspace load UX."""
-
-    if not statuses:
-        return
-    lines: list[str] = []
-    for status in statuses:
-        if status.reason == "missing_reachability_report":
-            detail = "missing report"
-        else:
-            parts = [f"last refresh {mark_sensitive(_format_age(status.age_seconds), 'detail')} ago"]
-            if status.reachable_ip_count is not None:
-                parts.append(f"reachable={mark_sensitive(str(status.reachable_ip_count), 'detail')}")
-            if status.no_response_ip_count is not None:
-                parts.append(f"no-response={mark_sensitive(str(status.no_response_ip_count), 'detail')}")
-            if status.total_ip_count is not None:
-                parts.append(f"total={mark_sensitive(str(status.total_ip_count), 'detail')}")
-            detail = " | ".join(parts)
-        lines.append(f"{mark_sensitive(status.domain, 'domain')}: {detail}")
-
-    print_panel(
-        "\n".join(
-            [
-                "Current-vantage inventory may be stale for the domains below:",
-                "",
-                *lines,
-                "",
-                "Use `refresh_inventory <domain>` or `refresh_inventory all` to revalidate reachability and service target files.",
-            ]
-        ),
-        title="Current-Vantage Inventory Status",
-        border_style="yellow",
-        expand=False,
-    )
-
-
-def list_current_vantage_inventory_statuses(shell: Any) -> list[CurrentVantageInventoryStatus]:
+def list_current_vantage_inventory_statuses(
+    shell: Any,
+) -> list[CurrentVantageInventoryStatus]:
     """Return freshness status for every domain that can be refreshed."""
 
     workspace_dir = _workspace_dir(shell)
@@ -286,7 +211,9 @@ def list_current_vantage_inventory_statuses(shell: Any) -> list[CurrentVantageIn
     domains: list[str] = []
     domains_data = getattr(shell, "domains_data", {})
     if isinstance(domains_data, dict):
-        domains.extend(str(domain).strip() for domain in domains_data.keys() if str(domain).strip())
+        domains.extend(
+            str(domain).strip() for domain in domains_data.keys() if str(domain).strip()
+        )
     current_domain = str(getattr(shell, "current_domain", "") or "").strip()
     if current_domain and current_domain not in domains:
         domains.append(current_domain)
@@ -316,7 +243,8 @@ def list_current_vantage_inventory_statuses(shell: Any) -> list[CurrentVantageIn
         generated_at, age_seconds = _resolve_report_generated_at(report_path)
         summary = _load_report_summary(report_path)
         is_stale = (
-            age_seconds is None or age_seconds >= CURRENT_VANTAGE_INVENTORY_STALE_AFTER_SECONDS
+            age_seconds is None
+            or age_seconds >= CURRENT_VANTAGE_INVENTORY_STALE_AFTER_SECONDS
         )
         statuses.append(
             CurrentVantageInventoryStatus(
@@ -327,7 +255,9 @@ def list_current_vantage_inventory_statuses(shell: Any) -> list[CurrentVantageIn
                 generated_at=generated_at,
                 age_seconds=age_seconds,
                 stale=is_stale,
-                reason="stale_reachability_report" if is_stale else "fresh_reachability_report",
+                reason="stale_reachability_report"
+                if is_stale
+                else "fresh_reachability_report",
                 reachable_ip_count=(
                     int(summary["responsive_ips"])
                     if isinstance(summary.get("responsive_ips"), int)
@@ -353,6 +283,15 @@ def list_current_vantage_inventory_statuses(shell: Any) -> list[CurrentVantageIn
     return statuses
 
 
+def _trigger_for_reason(reason: str) -> str:
+    """Map a refresh reason to a timeline trigger constant."""
+
+    text = str(reason or "").strip().lower()
+    if "manual" in text or "command" in text:
+        return TRIGGER_MANUAL_REFRESH_INVENTORY
+    return TRIGGER_WORKSPACE_LOAD_REFRESH
+
+
 def refresh_current_vantage_inventory(
     shell: Any,
     *,
@@ -371,7 +310,9 @@ def refresh_current_vantage_inventory(
 
     domain = str(domain or "").strip()
     if not domain:
-        print_warning("Skipping current-vantage inventory refresh because no domain was provided.")
+        print_warning(
+            "Skipping current-vantage inventory refresh because no domain was provided."
+        )
         return False
 
     computers_file = _enabled_computers_path(shell)
@@ -383,8 +324,14 @@ def refresh_current_vantage_inventory(
 
     try:
         domains_data = getattr(shell, "domains_data", {})
-        domain_data = domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
-        pdc_ip = str(domain_data.get("pdc") or "").strip() if isinstance(domain_data, dict) else ""
+        domain_data = (
+            domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+        )
+        pdc_ip = (
+            str(domain_data.get("pdc") or "").strip()
+            if isinstance(domain_data, dict)
+            else ""
+        )
         dns_checker = getattr(shell, "do_check_dns", None)
         dns_updater = getattr(shell, "do_update_resolv_conf", None)
         if pdc_ip and callable(dns_checker) and not bool(dns_checker(domain, pdc_ip)):
@@ -415,14 +362,33 @@ def refresh_current_vantage_inventory(
         print_warning(
             f"The current-vantage inventory refresh for {marked_domain} failed."
         )
-        print_info_debug(f"[current-vantage-refresh] exception for {marked_domain}: {exc}")
+        print_info_debug(
+            f"[current-vantage-refresh] exception for {marked_domain}: {exc}"
+        )
         return False
 
     refreshed_report = _report_path(shell, domain=domain)
     if os.path.exists(refreshed_report):
-        newly_reachable_domains = reconcile_domain_connectivity_from_current_vantage_report(
-            shell,
-            source_domain=domain,
+        try:
+            record_inventory_snapshot(
+                shell,
+                domain=domain,
+                trigger=_trigger_for_reason(reason),
+                trigger_detail=reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[current-vantage-refresh] failed to record inventory snapshot for {marked_domain}: {exc}"
+            )
+
+        _record_refresh_metadata(shell, domain=domain, reason=reason)
+
+        newly_reachable_domains = (
+            reconcile_domain_connectivity_from_current_vantage_report(
+                shell,
+                source_domain=domain,
+            )
         )
         if newly_reachable_domains:
             print_info_debug(
@@ -430,7 +396,9 @@ def refresh_current_vantage_inventory(
                 f"domain={mark_sensitive(domain, 'domain')} "
                 f"updated={len(newly_reachable_domains)}"
             )
-            if not is_non_interactive(shell=shell) and not bool(getattr(shell, "auto", False)):
+            if not is_non_interactive(shell=shell) and not bool(
+                getattr(shell, "auto", False)
+            ):
                 maybe_offer_trust_followup_for_newly_reachable_domains(
                     shell,
                     source_domain=domain,
@@ -460,12 +428,58 @@ def maybe_offer_workspace_current_vantage_refresh(
     *,
     trigger: str,
 ) -> list[str]:
-    """Offer a premium prompt to refresh stale current-vantage inventories."""
+    """Render banner + cumulative diffs and prompt the operator to refresh now.
 
-    statuses = [status for status in list_current_vantage_inventory_statuses(shell) if status.stale]
+    The audit-mode contract is now: always render banner, always render any
+    pending diffs against the last viewed snapshot, then ask once with default
+    ``No``. There is no skip cooldown — the operator gets fresh context every
+    workspace load.
+    """
+
+    statuses = list_current_vantage_inventory_statuses(shell)
     if not statuses:
         return []
-    _render_stale_inventory_banner(statuses)
+
+    pending_diffs: dict[str, Any] = {}
+    if is_timeline_enabled(shell):
+        for status in statuses:
+            try:
+                diff = diff_against_last_seen(shell, domain=status.domain)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[current-vantage-refresh] failed to compute pending diff for "
+                    f"{mark_sensitive(status.domain, 'domain')}: {exc}"
+                )
+                diff = None
+            if diff is not None:
+                pending_diffs[status.domain] = diff
+
+    render_inventory_status_banner(
+        shell,
+        statuses=statuses,
+        pending_diffs=pending_diffs,
+    )
+
+    # Render the per-domain diffs before prompting so the operator has full
+    # context when deciding whether to refresh now.
+    for status in statuses:
+        diff = pending_diffs.get(status.domain)
+        if diff is None or diff.is_empty:
+            continue
+        try:
+            render_inventory_diff(
+                shell,
+                diff=diff,
+                title=f"What changed in {status.domain} since you last opened this workspace",
+            )
+            mark_diff_seen(shell, domain=status.domain, snapshot_id=diff.after_id)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                "[current-vantage-refresh] failed to render diff for "
+                f"{mark_sensitive(status.domain, 'domain')}: {exc}"
+            )
 
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     if workspace_type and workspace_type != "audit":
@@ -481,75 +495,28 @@ def maybe_offer_workspace_current_vantage_refresh(
         )
         return []
 
-    promptable_statuses = [status for status in statuses if _should_prompt_for_domain(shell, status=status)]
-    if not promptable_statuses:
-        print_info_debug(
-            "[current-vantage-refresh] skipping workspace-load prompt because all stale domains are within the prompt cooldown window."
-        )
-        return []
-
-    threshold_hours = CURRENT_VANTAGE_INVENTORY_STALE_AFTER_SECONDS // 3600
-    lines: list[str] = []
-    for status in promptable_statuses:
-        if status.reason == "missing_reachability_report":
-            detail = "missing report"
-        else:
-            parts = [f"last refresh {mark_sensitive(_format_age(status.age_seconds), 'detail')} ago"]
-            if status.reachable_ip_count is not None:
-                parts.append(f"reachable={mark_sensitive(str(status.reachable_ip_count), 'detail')}")
-            if status.no_response_ip_count is not None:
-                parts.append(f"no-response={mark_sensitive(str(status.no_response_ip_count), 'detail')}")
-            if status.total_ip_count is not None:
-                parts.append(f"total={mark_sensitive(str(status.total_ip_count), 'detail')}")
-            if status.important_port_scan_performed is not None:
-                parts.append(
-                    "service-scan="
-                    + mark_sensitive(
-                        "yes" if status.important_port_scan_performed else "discovery-only",
-                        "detail",
-                    )
-                )
-            detail = " | ".join(parts)
-        lines.append(f"{mark_sensitive(status.domain, 'domain')}: {detail}")
-    print_panel(
-        "\n".join(
-            [
-                f"ADscan detected stale or missing current-vantage inventory data for {len(promptable_statuses)} domain(s).",
-                f"Staleness threshold: {threshold_hours}h",
-                "",
-                *lines,
-                "",
-                "Refreshing now revalidates reachable hosts, segmentation, and service target files without rerunning full Phase 1.",
-            ]
-        ),
-        title="Current-Vantage Inventory Refresh",
-        border_style="yellow",
-        expand=False,
-    )
-
     confirmer = getattr(shell, "_questionary_confirm", None)
-    prompt = "Refresh stale current-vantage inventory now?"
+    prompt = "Refresh current-vantage inventory now?"
     should_refresh = (
         bool(confirmer(prompt, default=False))
         if callable(confirmer)
         else bool(Confirm.ask(prompt, default=False))
     )
     if not should_refresh:
-        for status in promptable_statuses:
-            _record_prompt_decision(shell, domain=status.domain, decision="skip")
-        print_info("Skipping stale current-vantage inventory refresh by user choice.")
+        print_info("Skipping current-vantage inventory refresh by user choice.")
         print_instruction(
             "Run `refresh_inventory <domain>` later if you want to revalidate current-vantage reachability."
         )
         return []
 
-    selected_domains = [status.domain for status in promptable_statuses]
+    selected_statuses = statuses
+    selected_domains = [status.domain for status in selected_statuses]
     checkbox = getattr(shell, "_questionary_checkbox", None)
-    if len(promptable_statuses) > 1 and callable(checkbox):
+    if len(selected_statuses) > 1 and callable(checkbox):
         options = [
             f"{status.domain} | "
-            f"{'missing report' if status.reason == 'missing_reachability_report' else f'last refresh { _format_age(status.age_seconds)} ago'}"
-            for status in promptable_statuses
+            f"{'missing report' if not status.report_exists else 'has report'}"
+            for status in selected_statuses
         ]
         selected_labels = checkbox(
             "Select domains whose current-vantage inventory should be refreshed now:",
@@ -557,32 +524,47 @@ def maybe_offer_workspace_current_vantage_refresh(
             default_values=list(options),
         )
         if not selected_labels:
-            for status in promptable_statuses:
-                _record_prompt_decision(shell, domain=status.domain, decision="skip")
-            print_info("Skipping stale current-vantage inventory refresh by user choice.")
+            print_info("Skipping current-vantage inventory refresh by user choice.")
             return []
         selected_domains = [
             status.domain
-            for status, label in zip(promptable_statuses, options, strict=False)
+            for status, label in zip(selected_statuses, options, strict=False)
             if label in selected_labels
         ]
 
     refreshed_domains: list[str] = []
-    selected_domain_set = set(selected_domains)
-    for status in promptable_statuses:
-        if status.domain not in selected_domain_set:
-            _record_prompt_decision(shell, domain=status.domain, decision="skip")
     for domain in selected_domains:
         if refresh_current_vantage_inventory(
             shell,
             domain=domain,
-            reason=f"{trigger}:stale_inventory_prompt",
+            reason=f"{trigger}:inventory_prompt",
         ):
-            _record_prompt_decision(shell, domain=domain, decision="refresh")
             refreshed_domains.append(domain)
-        else:
-            _record_prompt_decision(shell, domain=domain, decision="refresh_attempt_failed")
     return refreshed_domains
+
+
+def refresh_current_vantage_inventory_for_all_domains(
+    shell: Any,
+    *,
+    reason: str,
+) -> list[str]:
+    """Refresh every known domain in the active workspace, returning successes."""
+
+    domains_data = getattr(shell, "domains_data", {})
+    domains: list[str] = []
+    if isinstance(domains_data, dict):
+        domains.extend(
+            str(domain).strip() for domain in domains_data.keys() if str(domain).strip()
+        )
+    current_domain = str(getattr(shell, "current_domain", "") or "").strip()
+    if current_domain and current_domain not in domains:
+        domains.append(current_domain)
+
+    refreshed: list[str] = []
+    for domain in sorted(set(domains), key=str.lower):
+        if refresh_current_vantage_inventory(shell, domain=domain, reason=reason):
+            refreshed.append(domain)
+    return refreshed
 
 
 __all__ = [
@@ -592,4 +574,5 @@ __all__ = [
     "list_current_vantage_inventory_statuses",
     "maybe_offer_workspace_current_vantage_refresh",
     "refresh_current_vantage_inventory",
+    "refresh_current_vantage_inventory_for_all_domains",
 ]

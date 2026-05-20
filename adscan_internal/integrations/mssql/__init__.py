@@ -1,88 +1,78 @@
-"""MSSQL integration via NetExec.
+"""MSSQL integration — fully native impacket TDS backend.
 
-This package provides integration with NetExec for MSSQL exploitation:
-- Remote command execution via xp_cmdshell
-- SeImpersonatePrivilege verification
-- Privilege escalation through MSSQL
+The NetExec subprocess runner that this package shipped during the
+migration window has been retired: there is now a single execution
+surface — :class:`ImpacketMSSQLBackend` — and one premium presentation
+layer for the CLI.
 
-The integration includes:
-- Runner: Execute NetExec MSSQL commands with automatic error handling
-- Parsers: Extract structured data from command outputs
-- Helpers: Utility functions for MSSQL operations
+Typical usage::
 
-Example usage:
     from adscan_internal.integrations.mssql import (
-        MSSQLRunner,
-        MSSQLContext,
-        parse_whoami_priv_output,
+        ImpacketMSSQLBackend,
+        print_mssql_sweep_card,
     )
 
-    # Setup context
-    ctx = MSSQLContext(
-        netexec_path="/path/to/netexec",
-        command_runner=run_command_fn,
+    backend = ImpacketMSSQLBackend(host="sql01.corp.local")
+    sweep = backend.sweep_privileges(
+        domain="CORP", username="alice", secret="Password123!"
     )
-
-    # Execute remote command
-    runner = MSSQLRunner()
-    result = runner.execute_command(
-        host="10.0.0.1",
-        ctx=ctx,
-        username="admin",
-        password="pass",
-        command="whoami /priv",
-    )
-
-    # Check for SeImpersonatePrivilege
-    if result:
-        has_priv = check_seimpersonate_privilege(result.stdout)
-        print(f"Has SeImpersonate: {has_priv}")
+    if sweep:
+        print_mssql_sweep_card(sweep)
 """
 
-from .runner import MSSQLRunner, MSSQLContext, ExecutionResult
+from .helpers import is_hash_authentication
+from .models import (
+    CommandExecution,
+    IdentityFingerprint,
+    ImpersonationGrant,
+    IntegrityHint,
+    LinkedServer,
+    PivotChain,
+    PivotHop,
+    PrivilegeSweep,
+    ServerLogin,
+    XpCmdshellStatus,
+    coalesce_permissions,
+)
 from .native_backend import ImpacketMSSQLBackend, NativeMSSQLQueryResult
 from .parsers import (
-    parse_whoami_priv_output,
+    WindowsPrivilege,
     check_seimpersonate_privilege,
-    parse_command_output,
-    extract_netexec_mssql_output,
-    check_xp_cmdshell_enabled,
-    check_xp_cmdshell_disabled,
-    has_authenticated_mssql_access,
-    parse_linked_servers,
-    parse_xp_cmdshell_enable_success,
+    parse_whoami_priv_output,
     parse_xp_cmdshell_enable_failure_reason,
-    parse_link_xpcmd_execution_success,
-    parse_link_xpcmd_identity,
 )
-from .helpers import (
-    build_mssql_auth_string,
-    build_mssql_execute_command,
-    is_hash_authentication,
+from .presentation import (
+    print_mssql_command_card,
+    print_mssql_pivot_chain,
+    print_mssql_sweep_card,
+    print_query_progress,
 )
 
 __all__ = [
-    # Runner
-    "MSSQLRunner",
-    "MSSQLContext",
-    "ExecutionResult",
+    # Native backend + typed contracts
     "ImpacketMSSQLBackend",
     "NativeMSSQLQueryResult",
-    # Parser functions
+    "CommandExecution",
+    "IdentityFingerprint",
+    "ImpersonationGrant",
+    "IntegrityHint",
+    "LinkedServer",
+    "PivotChain",
+    "PivotHop",
+    "PrivilegeSweep",
+    "ServerLogin",
+    "XpCmdshellStatus",
+    "coalesce_permissions",
+    # Premium presentation
+    "print_mssql_sweep_card",
+    "print_mssql_command_card",
+    "print_mssql_pivot_chain",
+    "print_query_progress",
+    # Source-agnostic parsers
+    "WindowsPrivilege",
     "parse_whoami_priv_output",
     "check_seimpersonate_privilege",
-    "parse_command_output",
-    "extract_netexec_mssql_output",
-    "check_xp_cmdshell_enabled",
-    "check_xp_cmdshell_disabled",
-    "has_authenticated_mssql_access",
-    "parse_linked_servers",
-    "parse_xp_cmdshell_enable_success",
     "parse_xp_cmdshell_enable_failure_reason",
-    "parse_link_xpcmd_execution_success",
-    "parse_link_xpcmd_identity",
     # Helpers
-    "build_mssql_auth_string",
-    "build_mssql_execute_command",
     "is_hash_authentication",
 ]

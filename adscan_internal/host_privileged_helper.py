@@ -36,7 +36,6 @@ import tempfile
 import time
 from dataclasses import dataclass
 from hashlib import sha256
-from io import StringIO
 from pathlib import Path
 from socket import AF_UNIX, SOCK_STREAM, socket
 from typing import Any
@@ -54,8 +53,14 @@ _SAFE_SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9$._ -]{0,127}$")
 # accept them too to keep host-file imports consistent with CLI workspaces.
 _SAFE_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
 
+# Strict ISO 8601 with explicit timezone — used by the privileged ``set_system_time``
+# op. Must stay in sync with ``adscan_internal/services/dc_time.py::ISO_8601_STRICT_RE``.
+_SAFE_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+    r"(?:Z|[+-]\d{2}:\d{2})$"
+)
+
 _CONTAINER_WORKSPACES_DIR = "/opt/adscan/workspaces"
-_MANAGED_BLOODHOUND_SERVICES = frozenset({"bloodhound", "neo4j", "postgres"})
 
 
 def _looks_like_ntlm_hash(value: str) -> bool:
@@ -337,42 +342,6 @@ def _unique_destination_path(dst: Path) -> Path:
     raise HostHelperError("Could not find an available destination filename")
 
 
-def _validate_bloodhound_compose_path(value: str) -> str:
-    """Validate a BloodHound CE docker-compose.yml path.
-
-    The helper must never accept arbitrary filesystem paths. We allow:
-    - Managed ADscan path under ``~/.adscan/bloodhound/**/docker-compose.yml``
-    - Legacy compatibility path ``~/.config/bloodhound/docker-compose.yml``
-    """
-    if not value:
-        raise HostHelperError("Missing compose_path")
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        raise HostHelperError("compose_path must be absolute")
-    resolved = path.resolve(strict=False)
-    legacy_expected = (
-        _invoker_home_dir().resolve() / ".config" / "bloodhound" / "docker-compose.yml"
-    ).resolve(strict=False)
-    managed_root = (_invoker_adscan_root_dir().resolve() / "bloodhound").resolve(
-        strict=False
-    )
-
-    allowed = False
-    if resolved == legacy_expected:
-        allowed = True
-    elif resolved.name == "docker-compose.yml":
-        try:
-            _safe_resolve_within(managed_root, resolved)
-            allowed = True
-        except HostHelperError:
-            allowed = False
-    if not allowed:
-        raise HostHelperError(f"compose_path not allowed: {resolved}")
-    if not resolved.is_file():
-        raise HostHelperError(f"compose file not found: {resolved}")
-    return str(resolved)
-
-
 def _validate_cifs_mount_root(value: str) -> Path:
     """Validate CIFS mount root under invoking user's workspaces tree."""
     if not isinstance(value, str) or not value.strip():
@@ -598,20 +567,6 @@ def _run_cmd(
     )
 
 
-def _resolve_managed_bloodhound_container_name(service_name: str) -> str:
-    """Resolve the managed BloodHound CE container name for a known service."""
-    normalized = str(service_name or "").strip().lower()
-    if normalized not in _MANAGED_BLOODHOUND_SERVICES:
-        allowed = ", ".join(sorted(_MANAGED_BLOODHOUND_SERVICES))
-        raise HostHelperError(
-            f"Invalid BloodHound CE service: {service_name!r}. Allowed: {allowed}"
-        )
-
-    from adscan_launcher.bloodhound_ce_compose import _compose_container_name
-
-    return _compose_container_name(normalized)
-
-
 def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
     op = str(req.get("op") or "").strip()
     if not op:
@@ -661,6 +616,74 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         # `net time set -S <server>` sets local system time based on SMB/RPC.
         return _run_cmd(["net", "time", "set", "-S", ip], timeout=120)
 
+    if op == "ntp_query":
+        host = req.get("host")
+        if not isinstance(host, str):
+            return HostHelperResponse(
+                False, None, None, None, "Invalid host for ntp_query"
+            )
+        ip = _validate_ipv4(host)
+        # Prefer ntpdate -q (query only — never sets the clock).
+        if shutil_which("ntpdate"):
+            return _run_cmd(["ntpdate", "-q", ip], timeout=15)
+        if shutil_which("ntpdig"):
+            # ntpdig prints the timestamp on stdout and exits without touching
+            # the clock when invoked without -S (which would step the clock).
+            return _run_cmd(["ntpdig", "-t", "5", ip], timeout=15)
+        return HostHelperResponse(
+            False, 127, None, None, "ntpdate/ntpdig not found"
+        )
+
+    if op == "net_time_query":
+        host = req.get("host")
+        if not isinstance(host, str):
+            return HostHelperResponse(
+                False, None, None, None, "Invalid host for net_time_query"
+            )
+        ip = _validate_ipv4(host)
+        if not shutil_which("net"):
+            return HostHelperResponse(False, 127, None, None, "net not found")
+        # ``net time -S <server>`` (no ``set``) only queries — does not touch
+        # the local clock.
+        return _run_cmd(["net", "time", "-S", ip], timeout=30)
+
+    if op == "net_time_zone_query":
+        host = req.get("host")
+        if not isinstance(host, str):
+            return HostHelperResponse(
+                False, None, None, None, "Invalid host for net_time_zone_query"
+            )
+        ip = _validate_ipv4(host)
+        if not shutil_which("net"):
+            return HostHelperResponse(False, 127, None, None, "net not found")
+        # ``net time zone -S <server>`` prints the DC's UTC offset in seconds
+        # (e.g. ``-14400`` for EDT). Combined with ``net time -S`` it yields
+        # a true UTC datetime — without this, the ``net time`` channel would
+        # have to assume the DC reports UTC, which is wrong on every DC that
+        # is not configured in UTC (very common).
+        return _run_cmd(["net", "time", "zone", "-S", ip], timeout=30)
+
+    if op == "set_system_time":
+        datetime_iso = req.get("datetime_iso")
+        if not isinstance(datetime_iso, str) or not _SAFE_ISO_DATETIME_RE.match(
+            datetime_iso
+        ):
+            return HostHelperResponse(
+                False,
+                None,
+                None,
+                None,
+                "Invalid datetime_iso (require strict ISO 8601 with timezone)",
+            )
+        # ``date -u -s`` accepts ISO 8601 directly. ``timedatectl set-time``
+        # is preferred when available, but it expects a different syntax —
+        # use ``date -u -s`` as the canonical path because it works on both
+        # systemd and non-systemd hosts.
+        if shutil_which("date"):
+            return _run_cmd(["date", "-u", "-s", datetime_iso], timeout=10)
+        return HostHelperResponse(False, 127, None, None, "date binary not found")
+
+
     if op == "docker_ps_names_status":
         if not shutil_which("docker"):
             return HostHelperResponse(False, 127, None, None, "docker not found")
@@ -673,68 +696,6 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             return HostHelperResponse(False, 127, None, None, "docker not found")
         return _run_cmd(
             ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"],
-            timeout=20,
-        )
-
-    if op == "bloodhound_ce_compose_up":
-        compose_path = req.get("compose_path")
-        if not isinstance(compose_path, str):
-            return HostHelperResponse(False, None, None, None, "Invalid compose_path")
-        try:
-            validated = _validate_bloodhound_compose_path(compose_path)
-        except HostHelperError as exc:
-            return HostHelperResponse(False, None, None, None, str(exc))
-        try:
-            from contextlib import redirect_stderr, redirect_stdout
-
-            from adscan_internal.bloodhound_ce_compose import compose_up
-
-            buf_out, buf_err = StringIO(), StringIO()
-            with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                ok = bool(compose_up(Path(validated)))
-            stdout = buf_out.getvalue().strip() or None
-            stderr = buf_err.getvalue().strip() or None
-            return HostHelperResponse(
-                ok,
-                0 if ok else 1,
-                stdout,
-                stderr,
-                None if ok else "bloodhound compose up failed",
-            )
-        except Exception as exc:
-            return HostHelperResponse(False, 1, None, None, f"exception: {exc}")
-
-    if op == "bloodhound_ce_restart_service":
-        service = req.get("service")
-        if not isinstance(service, str):
-            return HostHelperResponse(False, None, None, None, "Invalid service")
-        if not shutil_which("docker"):
-            return HostHelperResponse(False, 127, None, None, "docker not found")
-        try:
-            container_name = _resolve_managed_bloodhound_container_name(service)
-        except HostHelperError as exc:
-            return HostHelperResponse(False, None, None, None, str(exc))
-        return _run_cmd(["docker", "restart", container_name], timeout=60)
-
-    if op == "bloodhound_ce_service_utc":
-        service = req.get("service")
-        if not isinstance(service, str):
-            return HostHelperResponse(False, None, None, None, "Invalid service")
-        if not shutil_which("docker"):
-            return HostHelperResponse(False, 127, None, None, "docker not found")
-        try:
-            container_name = _resolve_managed_bloodhound_container_name(service)
-        except HostHelperError as exc:
-            return HostHelperResponse(False, None, None, None, str(exc))
-        return _run_cmd(
-            [
-                "docker",
-                "exec",
-                container_name,
-                "date",
-                "-u",
-                "+%Y-%m-%dT%H:%M:%SZ (%s)",
-            ],
             timeout=20,
         )
 

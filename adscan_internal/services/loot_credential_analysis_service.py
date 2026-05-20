@@ -8,16 +8,19 @@ The service then handles:
 - optional AI historical context reuse
 - optional deeper AI pass
 - normalization and merge of findings
+- SecretIntelligenceService pass (filename-aware, always runs alongside CredSweeper)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from rich.prompt import Confirm
 
+from adscan_core import telemetry
 from adscan_internal import (
     print_info,
     print_info_debug,
@@ -27,6 +30,17 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.credsweeper_service import (
     CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
     CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+)
+from adscan_internal.services.domain_posture import get_posture
+from adscan_internal.services.secret_intelligence_service import (
+    SecretFinding,
+    SecretIndicator,
+    SecretIntelligenceService,
+)
+from adscan_internal.services.secret_scoring import (
+    ScoringPolicy,
+    is_cs_custom_rule,
+    score_cs_finding,
 )
 from adscan_internal.services.share_loot_ai_analysis_service import (
     ShareLootAICredentialFinding,
@@ -41,7 +55,16 @@ ENGINE_SKIP = "skip"
 
 @dataclass(frozen=True)
 class LootCredentialAnalysisResult:
-    """Normalized result for one post-loot credential analysis phase."""
+    """Normalized result for one post-loot credential analysis phase.
+
+    ``findings`` feeds the credential pipeline (validation, attack-path
+    materialization). ``indicators`` is a separate list of files surfaced for
+    operator review without an extracted credential — these never feed the
+    credential pipeline and never become attack paths. ``secret_findings``
+    carries the rich :class:`SecretFinding` objects produced by
+    :class:`SecretIntelligenceService` (with confidence_score and
+    score_breakdown) so the CLI can render the ranked tier panels.
+    """
 
     analysis_engine: str
     findings: dict[str, list[tuple[Any, Any, Any, Any, Any]]]
@@ -49,6 +72,8 @@ class LootCredentialAnalysisResult:
     ai_attempted: bool
     ai_success: bool | None
     used_prior_context: bool
+    indicators: list[SecretIndicator] = field(default_factory=list)
+    secret_findings: list[SecretFinding] = field(default_factory=list)
 
 
 def is_dev_loot_analysis_mode(*, shell: Any) -> bool:
@@ -186,7 +211,7 @@ def merge_grouped_credential_findings(
 ) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
     """Merge grouped findings from multiple passes."""
     merged: dict[str, list[tuple[str, float | None, str, int, str]]] = {}
-    seen: set[tuple[str, str, int, str]] = set()
+    seen: set[tuple[str, str, int | None, str]] = set()
     for findings in findings_groups:
         if not isinstance(findings, dict):
             continue
@@ -208,6 +233,186 @@ def merge_grouped_credential_findings(
                 seen.add(dedup_key)
                 bucket.append(entry)
     return merged
+
+
+def normalize_secret_intelligence_findings_to_grouped_credentials(
+    findings: list[SecretFinding],
+) -> dict[str, list[tuple[str, float | None, str, int | None, str]]]:
+    """Convert :class:`SecretFinding` objects into the grouped credential format.
+
+    The grouped format is:
+    ``{rule_name: [(value, ml_probability, context_line, line_num, file_path), ...]}``
+
+    The second slot is named ``ml_probability`` for compatibility with the
+    CredSweeper-shaped tuple, but the spray pipeline treats it as a generic
+    [0.0, 1.0] confidence prior used for prioritization and dedup
+    (see ``normalize_credsweeper_ml_probability`` in
+    ``adscan_internal.cli.creds``). We populate it with the deterministic
+    :attr:`SecretFinding.confidence_score` from the scoring engine so the
+    existing spray prioritization, deduplication, and lockout-aware filters
+    operate on SI findings as first-class citizens — direct credentials
+    rank above spray candidates above permutation seeds without any
+    additional plumbing in the spray code path.
+
+    Args:
+        findings: Raw SecretFinding list from SecretIntelligenceService.
+
+    Returns:
+        Dict keyed by rule name, values are 5-tuples in the CredSweeper format.
+    """
+    normalized: dict[str, list[tuple[str, float | None, str, int | None, str]]] = {}
+    seen: set[tuple[str, str, int | None, str]] = set()
+    for finding in findings:
+        rule_key = f"secret_intel/{finding.rule}"
+        dedup_key = (finding.value, finding.file_path, finding.line_num, rule_key)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        normalized.setdefault(rule_key, []).append(
+            (
+                finding.value,
+                float(finding.confidence_score),
+                finding.context_line,
+                finding.line_num,
+                finding.file_path,
+            )
+        )
+    return normalized
+
+
+def _rescore_cs_custom_findings(
+    findings: dict[str, list[tuple]],
+    policy: "ScoringPolicy",
+) -> dict[str, list[tuple]]:
+    """Replace ``ml_prob=0.0`` with a computed :func:`score_cs_finding` score
+    for every CredSweeper custom-rule finding.
+
+    CredSweeper primary findings (JWT, AWS keys, etc.) carry real ML
+    probabilities and are left untouched. Custom rule findings carry
+    ``ml_prob=0.0`` by default — this function populates them with a
+    policy-aware :class:`ScoreBreakdown` total so they participate in the
+    same tier display as :class:`SecretIntelligenceService` findings.
+
+    Args:
+        findings: Grouped credential dict from the CredSweeper pass.
+        policy: AD password policy derived from posture (or defaults).
+
+    Returns:
+        A new dict with the same structure. Custom-rule entries have their
+        second tuple element replaced with the computed score.
+    """
+    rescored: dict[str, list[tuple]] = {}
+    for rule_name, entries in findings.items():
+        if not is_cs_custom_rule(rule_name):
+            # Primary rule — keep original ML probability unchanged
+            rescored[rule_name] = entries
+            continue
+        rescored_entries: list[tuple] = []
+        for entry in entries:
+            if len(entry) < 5:
+                rescored_entries.append(entry)
+                continue
+            value, _ml_prob, context_line, line_num, file_path = entry[:5]
+            if not value:
+                rescored_entries.append(entry)
+                continue
+            breakdown = score_cs_finding(
+                value=str(value),
+                rule_name=rule_name,
+                policy=policy,
+            )
+            rescored_entries.append(
+                (value, float(breakdown.total), context_line, line_num, file_path)
+            )
+        rescored[rule_name] = rescored_entries
+    return rescored
+
+
+def _run_secret_intelligence_pass(
+    loot_dir: str,
+    *,
+    scoring_policy: "ScoringPolicy | None" = None,
+) -> tuple[
+    dict[str, list[tuple[str, float | None, str, int | None, str]]],
+    list[SecretIndicator],
+    list[SecretFinding],
+]:
+    """Run SecretIntelligenceService over the loot directory synchronously.
+
+    SecretIntelligenceService exposes an ``async def analyze_path()`` entry
+    point. This wrapper runs it inside a temporary event loop so it can be
+    called from the sync ``run_loot_credential_analysis`` orchestrator without
+    nesting loops.
+
+    Args:
+        loot_dir: Absolute path to the loot directory.
+        scoring_policy: Optional posture-derived :class:`ScoringPolicy`. When
+            ``None`` SI uses its built-in defaults (Windows 2003 baseline).
+            The orchestrator passes a posture-derived policy when available.
+
+    Returns:
+        Tuple ``(grouped_findings, indicators)``. ``grouped_findings`` is the
+        CredSweeper-shaped dict that merges into the credential pipeline.
+        ``indicators`` is the operator review queue — files surfaced because
+        their filename suggests credentials but no value was extracted.
+        Both are empty on failure.
+    """
+    try:
+        svc = SecretIntelligenceService()
+        si_result = asyncio.run(svc.analyze_path(Path(loot_dir), policy=scoring_policy))
+        si_grouped = normalize_secret_intelligence_findings_to_grouped_credentials(
+            si_result.findings
+        )
+        total = sum(len(v) for v in si_grouped.values())
+        print_info_debug(
+            "[secret_intelligence] Pass completed: "
+            f"loot_dir={loot_dir} total_findings={total} "
+            f"grouped_rules={len(si_grouped)} "
+            f"indicators={len(si_result.indicators)}"
+        )
+        return si_grouped, list(si_result.indicators), list(si_result.findings)
+    except RuntimeError as exc:
+        # asyncio.run() raises RuntimeError when called inside an existing loop.
+        # In that case, fall back to creating a dedicated loop to avoid breaking
+        # the caller's async context.
+        if "cannot be called from a running event loop" not in str(exc):
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[secret_intelligence] Pass skipped due to error: {type(exc).__name__}"
+            )
+            return {}, [], []
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                svc = SecretIntelligenceService()
+                si_result = loop.run_until_complete(
+                    svc.analyze_path(Path(loot_dir), policy=scoring_policy)
+                )
+                si_grouped = normalize_secret_intelligence_findings_to_grouped_credentials(
+                    si_result.findings
+                )
+                total = sum(len(v) for v in si_grouped.values())
+                print_info_debug(
+                    "[secret_intelligence] Pass completed (dedicated loop): "
+                    f"loot_dir={loot_dir} total_findings={total} "
+                    f"grouped_rules={len(si_grouped)} "
+                    f"indicators={len(si_result.indicators)}"
+                )
+                return si_grouped, list(si_result.indicators), list(si_result.findings)
+            finally:
+                loop.close()
+        except Exception as inner_exc:  # noqa: BLE001
+            telemetry.capture_exception(inner_exc)
+            print_info_debug(
+                f"[secret_intelligence] Pass skipped (dedicated loop error): {type(inner_exc).__name__}"
+            )
+            return {}, [], []
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[secret_intelligence] Pass skipped due to error: {type(exc).__name__}"
+        )
+        return {}, []
 
 
 def parse_ai_loot_local_source(
@@ -287,7 +492,12 @@ def run_loot_credential_analysis(
     jobs: int,
     credsweeper_findings: dict[str, list[tuple[Any, Any, Any, Any, Any]]] | None = None,
 ) -> LootCredentialAnalysisResult:
-    """Run the configured credential analysis engine for one local loot directory."""
+    """Run the configured credential analysis engine for one local loot directory.
+
+    SecretIntelligenceService always runs alongside CredSweeper (merge mode).
+    Its findings cover structural blind spots (bare-string files, multi-line
+    context, vault containers) that CredSweeper cannot detect regardless of rules.
+    """
     analysis_engine = select_loot_credential_analysis_engine(
         shell=shell,
         analysis_context=analysis_context,
@@ -296,6 +506,8 @@ def run_loot_credential_analysis(
         candidate_files=candidate_files,
     )
     findings = dict(credsweeper_findings or {})
+    indicators: list[SecretIndicator] = []
+    secret_findings: list[SecretFinding] = []
     ai_attempted = False
     ai_success: bool | None = None
     used_prior_context = False
@@ -313,25 +525,80 @@ def run_loot_credential_analysis(
             used_prior_context=False,
         )
 
-    if analysis_engine in {ENGINE_CREDSWEEPER, ENGINE_BOTH} and not findings:
-        if not credsweeper_path:
-            print_warning("CredSweeper is not configured; skipping deterministic credential analysis.")
-        else:
-            credsweeper_service = shell._get_credsweeper_service()
-            findings = credsweeper_service.analyze_path_with_options(
-                loot_dir,
-                credsweeper_path=credsweeper_path,
-                json_output_dir=credsweeper_output_dir,
-                include_custom_rules=True,
-                rules_profile=(
-                    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
-                    if "document" in phase
-                    else CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT
-                ),
-                custom_ml_threshold="0.0",
-                doc="document" in phase,
-                jobs=jobs,
+    # Resolve scoring policy once — used for both CS custom rescoring and SI.
+    # Position: before the CS pass so that CS custom findings are rescored
+    # with the same policy that SI uses.
+    scoring_policy: ScoringPolicy | None = None
+    if analysis_engine in {ENGINE_CREDSWEEPER, ENGINE_BOTH}:
+        try:
+            posture = get_posture(getattr(shell, "domains_data", None) or {}, domain=domain)
+            scoring_policy = ScoringPolicy.from_password_policy(
+                getattr(posture, "password_policy", None)
             )
+            print_info_debug(
+                "[scoring] Policy resolved before CS+SI passes: "
+                f"min_length={scoring_policy.min_length} "
+                f"require_complexity={scoring_policy.require_complexity} "
+                f"source={scoring_policy.source}"
+            )
+        except Exception as _exc:  # noqa: BLE001
+            telemetry.capture_exception(_exc)
+            print_info_debug(
+                f"[scoring] Policy lookup failed; using defaults: {type(_exc).__name__}"
+            )
+
+    if analysis_engine in {ENGINE_CREDSWEEPER, ENGINE_BOTH} and not findings:
+        credsweeper_service = shell._get_credsweeper_service()
+        findings = credsweeper_service.analyze_path_with_options(
+            loot_dir,
+            credsweeper_path=credsweeper_path,
+            json_output_dir=credsweeper_output_dir,
+            include_custom_rules=True,
+            rules_profile=(
+                CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
+                if "document" in phase
+                else CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT
+            ),
+            custom_ml_threshold="0.0",
+            doc="document" in phase,
+            jobs=jobs,
+        )
+        # Rescore CS custom rule findings — replace ml_prob=0.0 with a
+        # policy-aware confidence_score so they rank in the same tier system
+        # as SI findings (Direct / Spray / Seeds).
+        if findings and scoring_policy is not None:
+            findings = _rescore_cs_custom_findings(findings, scoring_policy)
+            print_info_debug(
+                "[scoring] CS custom findings rescored: "
+                f"phase={mark_sensitive(phase_label, 'text')}"
+            )
+
+    # Always run SecretIntelligenceService alongside CredSweeper — covers the
+    # bare-string / multi-line / binary cases CredSweeper structurally cannot handle.
+    # Findings merge into the credential pipeline; indicators stay separate as
+    # operator review-queue items (never become attack paths).
+    # scoring_policy was already resolved before the CS pass and is reused here.
+    if analysis_engine in {ENGINE_CREDSWEEPER, ENGINE_BOTH}:
+        si_grouped, si_indicators, si_findings = _run_secret_intelligence_pass(
+            loot_dir, scoring_policy=scoring_policy
+        )
+        if si_grouped:
+            findings = merge_grouped_credential_findings(findings, si_grouped)
+            si_total = sum(len(v) for v in si_grouped.values())
+            print_info_debug(
+                "[secret_intelligence] Merged into main findings: "
+                f"phase={mark_sensitive(phase_label, 'text')} "
+                f"si_findings={si_total}"
+            )
+        if si_indicators:
+            indicators.extend(si_indicators)
+            print_info_debug(
+                "[secret_intelligence] Review-queue indicators emitted: "
+                f"phase={mark_sensitive(phase_label, 'text')} "
+                f"indicators={len(si_indicators)}"
+            )
+        if si_findings:
+            secret_findings.extend(si_findings)
 
     if analysis_engine in {ENGINE_AI, ENGINE_BOTH}:
         ai_attempted = True
@@ -380,6 +647,7 @@ def run_loot_credential_analysis(
                     ai_attempted=True,
                     ai_success=False,
                     used_prior_context=used_prior_context,
+                    indicators=indicators,
                 )
         else:
             ai_findings = normalize_ai_loot_findings_to_grouped_credentials(
@@ -426,4 +694,6 @@ def run_loot_credential_analysis(
         ai_attempted=ai_attempted,
         ai_success=ai_success,
         used_prior_context=used_prior_context,
+        indicators=indicators,
+        secret_findings=secret_findings,
     )

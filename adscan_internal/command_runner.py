@@ -44,6 +44,7 @@ def build_text_preview(
     head: int = 10,
     tail: int = 10,
     include_omission_notice: bool = True,
+    max_line_length: int | None = None,
 ) -> str:
     """Build a compact head/tail preview for one multiline text payload.
 
@@ -52,6 +53,9 @@ def build_text_preview(
         head: Number of non-empty lines to keep from the beginning.
         tail: Number of non-empty lines to keep from the end when truncation occurs.
         include_omission_notice: Whether to include an omitted-lines marker.
+        max_line_length: When set, individual lines longer than this are truncated
+            with a ``[…N chars]`` suffix. Useful for scripts that embed large
+            inline payloads (e.g. JSON manifests) as a single line.
 
     Returns:
         A newline-joined preview string. Empty when the input has no non-empty lines.
@@ -68,11 +72,16 @@ def build_text_preview(
     )
     omitted_lines = len(lines) - len(head_lines) - len(tail_lines)
 
+    def _cap(line: str) -> str:
+        if max_line_length and len(line) > max_line_length:
+            return line[:max_line_length] + f" […{len(line)} chars]"
+        return line
+
     preview_lines: list[str] = []
-    preview_lines.extend(head_lines)
+    preview_lines.extend(_cap(ln) for ln in head_lines)
     if include_omission_notice and omitted_lines > 0:
         preview_lines.append(f"... ({omitted_lines} line(s) omitted) ...")
-    preview_lines.extend(tail_lines)
+    preview_lines.extend(_cap(ln) for ln in tail_lines)
     return "\n".join(preview_lines)
 
 

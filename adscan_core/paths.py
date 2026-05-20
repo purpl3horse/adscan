@@ -35,6 +35,27 @@ def get_run_dir() -> Path:
     return get_adscan_home_dir() / "run"
 
 
+def get_sessions_dir() -> Path:
+    """Per-launcher session directories under ``run/sessions/``.
+
+    Each launcher process owns a unique sub-directory here that holds its
+    private host-helper socket. The whole sub-directory is bind-mounted
+    into the container at ``/run/adscan`` so multiple launchers never
+    fight over a fixed socket path.
+    """
+    return get_run_dir() / "sessions"
+
+
+def get_locks_dir() -> Path:
+    """File-lock directory for per-workspace / install / resolver locks."""
+    return get_run_dir() / "locks"
+
+
+def get_resolver_locks_dir() -> Path:
+    """Lock directory for atomic loopback-IP claims (in-container Unbound)."""
+    return get_locks_dir() / "resolvers"
+
+
 def get_state_dir() -> Path:
     explicit = os.getenv("ADSCAN_STATE_DIR", "").strip()
     if explicit:

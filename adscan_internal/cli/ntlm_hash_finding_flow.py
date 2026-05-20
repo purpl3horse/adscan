@@ -104,7 +104,7 @@ def _classify_ntlm_principal_risk(
             "is_high_value": is_high_value,
         }
 
-    bh_service_getter = getattr(shell, "_get_bloodhound_service", None)
+    bh_service_getter = getattr(shell, "_get_graph_service", None)
     bh_service = bh_service_getter() if callable(bh_service_getter) else None
     for username in computer_accounts:
         normalized = username.strip().lower()

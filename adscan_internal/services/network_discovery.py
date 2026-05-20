@@ -10,8 +10,12 @@ thin wrappers while still preserving legacy behaviour.
 from __future__ import annotations
 
 from typing import Protocol
+import asyncio
 import re
+import secrets
 import shlex
+import socket
+import struct
 import time
 
 from adscan_internal import telemetry
@@ -22,6 +26,7 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_info_verbose,
 )
+from adscan_internal.services.async_bridge import run_async_sync
 
 
 class NetworkDiscoveryHost(Protocol):
@@ -80,7 +85,12 @@ def _infer_domain_from_netexec_banner(
         last_hostname: str | None = None
         protocol_label = protocol.lower()
         for attempt in range(1, max(attempts, 1) + 1):
-            proc = host.run_command(cmd, timeout=timeout_seconds, ignore_errors=True)
+            proc = host.run_command(
+                cmd,
+                timeout=timeout_seconds,
+                ignore_errors=True,
+                allow_timeout_recovery=False,
+            )
             if not proc:
                 if attempt < attempts:
                     marked_ip = mark_sensitive(ip_clean, "ip")
@@ -148,6 +158,103 @@ def _infer_domain_from_netexec_banner(
         return None, None
 
 
+def _nc_to_fqdn(nc: str) -> str | None:
+    """Convert an LDAP distinguishedName base to a dotted FQDN.
+
+    ``"DC=ais,DC=local"``  →  ``"ais.local"``
+    Returns ``None`` when *nc* contains no DC components.
+    """
+    parts = [
+        seg[3:]
+        for seg in nc.replace(" ", "").split(",")
+        if seg[:3].upper() == "DC=" and seg[3:]
+    ]
+    return ".".join(parts).lower() if parts else None
+
+
+async def _infer_domain_from_ldap_native(
+    dc_ip: str,
+    *,
+    timeout: int = 8,
+) -> tuple[str | None, str | None]:
+    """Infer domain FQDN and hostname from an anonymous LDAP rootDSE read.
+
+    Tries LDAPS (636) first, then plain LDAP (389). Reads ``defaultNamingContext``
+    for the domain and ``dnsHostName`` for the hostname — both attributes are
+    always returned in the rootDSE from Windows DCs, even with anonymous access.
+
+    Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` on failure.
+
+    This replaces the ``nxc ldap -u '' -p ''`` subprocess call for the common
+    case. The nxc path in ``infer_domain_from_ldap_banner`` is retained as a
+    fallback for environments where LDAP is firewalled on both 389 and 636.
+    """
+    try:
+        from badldap.commons.factory import LDAPConnectionFactory
+    except ImportError:
+        return None, None
+
+    last_exc: Exception | None = None
+    for transport, port in (("ldaps", 636), ("ldap", 389)):
+        url = f"{transport}+simple://@{dc_ip}:{port}"
+        try:
+            factory = LDAPConnectionFactory.from_url(url)
+            client = factory.get_client()
+            # Disable signing and channel binding — anonymous binds do not
+            # negotiate either, and asserting them causes connect failures.
+            for flag in ("_disable_signing", "_disable_channel_binding"):
+                if hasattr(client, flag):
+                    setattr(client, flag, True)
+            ok, err = await asyncio.wait_for(client.connect(), timeout=timeout)
+            if not ok:
+                raise err or RuntimeError(f"anonymous {transport.upper()} bind returned ok=False")
+
+            # badldap fetches rootDSE attributes during connect and stores them
+            # in client._serverinfo (also reachable via client.get_server_info()).
+            server_info: dict | None = None
+            if hasattr(client, "get_server_info"):
+                server_info = client.get_server_info()
+            if not isinstance(server_info, dict):
+                server_info = getattr(client, "_serverinfo", None)
+            if not isinstance(server_info, dict):
+                continue
+
+            # defaultNamingContext → "DC=ais,DC=local" → "ais.local"
+            raw_nc = server_info.get("defaultNamingContext")
+            if not raw_nc:
+                raw_nc = (server_info.get("namingContexts") or [None])[0]
+            nc_str = str(raw_nc[0] if isinstance(raw_nc, list) else raw_nc).strip() if raw_nc else ""
+            domain = _nc_to_fqdn(nc_str) if nc_str else None
+
+            # dnsHostName → "dc01.ais.local"
+            raw_host = server_info.get("dnsHostName")
+            hostname: str | None = None
+            if raw_host:
+                hostname = str(raw_host[0] if isinstance(raw_host, list) else raw_host).strip() or None
+
+            if domain:
+                print_info_debug(
+                    f"[ldap_infer] native rootDSE ({transport.upper()} {dc_ip}:{port}): "
+                    f"domain={mark_sensitive(domain, 'domain')} "
+                    f"host={mark_sensitive(hostname or 'N/A', 'hostname')}"
+                )
+                return domain, hostname
+
+        except asyncio.TimeoutError:
+            print_info_debug(
+                f"[ldap_infer] native {transport.upper()} anonymous probe timed out "
+                f"after {timeout}s — trying next transport"
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+
+    if last_exc:
+        print_info_debug(f"[ldap_infer] native LDAP anonymous probe failed: {last_exc}")
+    return None, None
+
+
 def infer_domain_from_smb_banner(
     host: NetworkDiscoveryHost,
     *,
@@ -187,15 +294,42 @@ def infer_domain_from_ldap_banner(
     attempts: int = 3,
     retry_delay_seconds: float = 1.0,
 ) -> tuple[str | None, str | None]:
-    """Infer a domain (FQDN) from NetExec LDAP banner output against a target IP.
+    """Infer a domain (FQDN) and DC hostname from a target IP via LDAP.
 
-    LDAP is often available on DCs even when SMB/445 is filtered, so this is a
-    stronger fallback than SMB for DC/DNS candidate IPs.
+    Tries an anonymous rootDSE read (native, no subprocess) first — this
+    covers >99% of DCs where port 389 or 636 is reachable. Falls back to
+    the nxc subprocess path only when the native probe fails (e.g. both LDAP
+    ports blocked by firewall, or badldap import unavailable).
+
+    Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` when both paths fail.
     """
+    ip_clean = (target_ip or "").strip()
+    if not ip_clean:
+        return None, None
+
+    # Native path — anonymous LDAP bind → rootDSE (defaultNamingContext + dnsHostName).
+    # Uses a short timeout (≤8s) so it fails fast when LDAP is not available.
+    native_timeout = min(timeout_seconds, 8)
+    try:
+        domain, hostname = run_async_sync(
+            _infer_domain_from_ldap_native(ip_clean, timeout=native_timeout)
+        )
+        if domain:
+            return domain, hostname
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[ldap_infer] native path raised unexpectedly: {exc}")
+
+    # Subprocess fallback — nxc ldap, used when native probe cannot connect
+    # (both 389 and 636 firewalled, or badldap import unavailable in this env).
+    print_info_debug(
+        f"[ldap_infer] native LDAP probe returned no domain for "
+        f"{mark_sensitive(ip_clean, 'ip')}; falling back to nxc"
+    )
     return _infer_domain_from_netexec_banner(
         host,
         protocol="ldap",
-        target_ip=target_ip,
+        target_ip=ip_clean,
         timeout_seconds=timeout_seconds,
         attempts=attempts,
         retry_delay_seconds=retry_delay_seconds,
@@ -203,19 +337,112 @@ def infer_domain_from_ldap_banner(
     )
 
 
-def extract_netbios(host: NetworkDiscoveryHost, domain: str) -> str | None:
-    """Extract the NetBIOS name for a domain using ``nmblookup``.
+def _encode_nbns_name(name: str = "*") -> bytes:
+    """Encode a NetBIOS name in the wire format used by NBNS (RFC 1002).
 
-    The behaviour mirrors the legacy ``PentestShell.do_extract_netbios`` method:
-    - Try to obtain the NetBIOS name via ``nmblookup -A``.
-    - If that fails, fall back to the first label of the domain (upper‑cased).
+    The wildcard ``*`` is used for NBSTAT (node status) queries: it's padded
+    with NULs to 16 bytes and each nibble is encoded as an ASCII letter
+    ('A'..'P'), producing a 32-byte label prefixed with 0x20 and terminated
+    with 0x00.
+    """
+    raw = name.encode("ascii")[:16].ljust(16, b"\x00")
+    encoded = bytearray()
+    for byte in raw:
+        encoded.append(0x41 + (byte >> 4))
+        encoded.append(0x41 + (byte & 0x0F))
+    return bytes([0x20]) + bytes(encoded) + b"\x00"
+
+
+def _query_netbios_name_native(
+    target_ip: str,
+    *,
+    timeout: float = 3.0,
+    retries: int = 2,
+) -> str | None:
+    """Query the NetBIOS workgroup/domain name of a host via NBSTAT (UDP/137).
+
+    This replaces the legacy ``nmblookup -A`` subprocess with a self-contained
+    UDP query. Returns the NetBIOS domain/workgroup name (suffix 0x00 with the
+    group bit set), or ``None`` if the host does not respond or no group name
+    is reported.
+    """
+    target = (target_ip or "").strip()
+    if not target:
+        return None
+
+    txn_id = secrets.randbits(16)
+    header = struct.pack(">HHHHHH", txn_id, 0x0000, 1, 0, 0, 0)
+    question = _encode_nbns_name("*") + struct.pack(">HH", 0x0021, 0x0001)
+    packet = header + question
+
+    last_exc: Exception | None = None
+    for _ in range(max(retries, 1)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(timeout)
+            sock.sendto(packet, (target, 137))
+            data, _ = sock.recvfrom(4096)
+        except (socket.timeout, OSError) as exc:
+            last_exc = exc
+            continue
+        finally:
+            sock.close()
+
+        # Skip 12-byte header + question (encoded name 34 bytes + qtype 2 + qclass 2)
+        offset = 12 + 34 + 4
+        # Answer: name (compressed pointer 2B or full 34B), type(2), class(2), ttl(4), rdlength(2)
+        if offset >= len(data):
+            continue
+        if data[offset] & 0xC0:
+            offset += 2
+        else:
+            offset += 34
+        offset += 2 + 2 + 4 + 2  # type, class, ttl, rdlength
+        if offset >= len(data):
+            continue
+        num_names = data[offset]
+        offset += 1
+
+        for _ in range(num_names):
+            if offset + 18 > len(data):
+                break
+            name_bytes = data[offset:offset + 15].rstrip(b" \x00")
+            suffix = data[offset + 15]
+            flags = struct.unpack(">H", data[offset + 16:offset + 18])[0]
+            offset += 18
+            # Domain/workgroup: suffix 0x00 with group bit set (0x8000)
+            if suffix == 0x00 and (flags & 0x8000):
+                try:
+                    return name_bytes.decode("ascii", errors="replace").strip()
+                except Exception:  # noqa: BLE001
+                    return None
+        return None
+
+    if last_exc is not None:
+        print_info_debug(f"NBSTAT query to {mark_sensitive(target, 'ip')} failed: {last_exc}")
+    return None
+
+
+def extract_netbios(
+    host: NetworkDiscoveryHost,
+    domain: str,
+    *,
+    dc_ip: str | None = None,
+) -> str | None:
+    """Extract the NetBIOS name for a domain using a native NBSTAT (UDP/137) query.
+
+    Resolution order:
+    1. Native NBSTAT query against the DC IP (``dc_ip`` argument, or
+       ``host.pdc`` / first entry of ``host.dcs`` as fallback).
+    2. First label of the FQDN, upper-cased.
 
     Args:
-        host: Object providing ``run_command`` (typically the interactive shell).
+        host: Object providing host context (``pdc`` / ``dcs`` attributes).
         domain: Domain name from which to derive NetBIOS.
+        dc_ip: Optional explicit DC IP to query.
 
     Returns:
-        The extracted or derived NetBIOS name, or ``None`` in case of error.
+        The extracted or derived NetBIOS name, or ``None`` on unrecoverable error.
     """
     try:
         marked_domain = mark_sensitive(domain, "domain")
@@ -223,15 +450,23 @@ def extract_netbios(host: NetworkDiscoveryHost, domain: str) -> str | None:
         if not domain_clean:
             return None
 
-        command = f"nmblookup -A {shlex.quote(domain_clean)} | grep -i group | awk '{{print $1}}' | sort | uniq"
-        proc = host.run_command(command, timeout=300)
+        ip_candidate = (dc_ip or "").strip() or (getattr(host, "pdc", "") or "").strip()
+        if not ip_candidate:
+            dcs = getattr(host, "dcs", None) or []
+            if dcs:
+                ip_candidate = (dcs[0] or "").strip()
 
-        if proc and proc.returncode == 0 and proc.stdout:
-            netbios = proc.stdout.strip()
-            return netbios
+        if ip_candidate:
+            netbios = _query_netbios_name_native(ip_candidate)
+            if netbios:
+                return netbios
+            print_info_debug(
+                f"NBSTAT did not return a domain/workgroup name for {mark_sensitive(ip_candidate, 'ip')}."
+            )
+        else:
+            print_info_debug("No DC IP available for NBSTAT query; falling back to FQDN label.")
 
-        # If NetBIOS is not obtained, take the first part of the domain and convert it to uppercase.
-        netbios_default = (domain or "").split(".")[0].upper()
+        netbios_default = domain_clean.split(".")[0].upper()
         marked_netbios_default = mark_sensitive(netbios_default, "domain")
         print_info_verbose(
             f"Could not extract NetBIOS from domain {marked_domain}, using {marked_netbios_default} as default."

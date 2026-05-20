@@ -201,6 +201,13 @@ def init_logging(
     logger = logging.getLogger("adscan")
     logger.setLevel(logging.DEBUG)  # Always capture all levels to file
 
+    # Vendor-noise taming is centralized in
+    # ``adscan_internal.services.native_log_taming`` and invoked once at CLI
+    # startup (see adscan.py). Do not install vendor-noise filters here —
+    # ``adscan_core`` is shared with the host launcher and must not import
+    # ``adscan_internal`` directly. See § "Vendor noise — single source of
+    # truth" in CLAUDE.md.
+
     # CRITICAL: Preserve existing handlers BEFORE clearing handlers
     # This prevents losing debug/verbose mode and telemetry during module re-execution (e.g., PyInstaller).
     preserved_console_level = None

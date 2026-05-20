@@ -9,7 +9,6 @@ This file remains as a compatibility shim for existing imports.
 from __future__ import annotations
 
 from adscan_launcher.docker_commands import (  # noqa: F401
-    DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
     DEFAULT_DEV_DOCKER_IMAGE,
     DEFAULT_DOCKER_IMAGE,
     DEFAULT_HOST_HELPER_SOCKET_NAME,
@@ -23,7 +22,6 @@ from adscan_launcher.docker_commands import (  # noqa: F401
 )
 
 __all__ = [
-    "DEFAULT_BLOODHOUND_ADMIN_PASSWORD",
     "DEFAULT_DEV_DOCKER_IMAGE",
     "DEFAULT_DOCKER_IMAGE",
     "DEFAULT_HOST_HELPER_SOCKET_NAME",

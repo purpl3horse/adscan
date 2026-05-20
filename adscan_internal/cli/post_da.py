@@ -1,7 +1,7 @@
 """Post-compromise orchestration helpers for audit workflows.
 
-This module centralizes the post-Domain-Admin logic that refreshes BloodHound
-data and re-runs attack-path analysis in audit mode.
+This module centralizes the post-Domain-Admin logic that refreshes ADscan's
+relationship graph and re-runs attack-path analysis in audit mode.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class PostDAShell(Protocol):
     domains_data: dict[str, object]
     license_mode: str | None
 
-    def do_bloodhound_collector(
+    def do_graph_collection(
         self,
         target_domain: str,
         *,
@@ -35,7 +35,7 @@ class PostDAShell(Protocol):
         auth_domain: str | None = None,
     ) -> list[str]: ...
 
-    def do_bloodhound_attack_paths(self, args: str) -> None: ...
+    def do_attack_paths(self, args: str) -> None: ...
 
 
 def get_domain_post_da_state(shell: PostDAShell, domain: str) -> dict[str, object]:
@@ -145,13 +145,14 @@ def collect_attack_path_snapshot_counts(shell: PostDAShell, domain: str) -> tupl
         return 0, 0
 
 
-def run_audit_post_da_bloodhound_refresh(
+def run_audit_post_da_graph_refresh(
     shell: PostDAShell,
     domain: str,
     username: str,
     password: str,
 ) -> None:
     """Refresh graph collection and rerun path analysis after DA in audit mode."""
+
     if shell.type != "audit":
         return
     if not _should_offer_privileged_refresh(shell, domain):
@@ -183,33 +184,15 @@ def run_audit_post_da_bloodhound_refresh(
     )
 
     try:
-        generated_zip_paths = shell.do_bloodhound_collector(
+        shell.do_graph_collection(
             domain,
             auth_username=username,
             auth_password=password,
             auth_domain=domain,
         )
 
-        from adscan_internal.bloodhound_legacy import get_bloodhound_mode
-
-        if get_bloodhound_mode() == "ce":
-            from adscan_internal.cli.bloodhound import (
-                upload_bloodhound_ce_zip_files,
-            )
-
-            upload_ok = upload_bloodhound_ce_zip_files(
-                shell,
-                domain,
-                wait_for_manual_on_failure=False,
-                zip_paths=generated_zip_paths or None,
-            )
-            if not upload_ok:
-                print_warning(
-                    "Automatic upload of refreshed graph collection ZIP files did not fully complete."
-                )
-
         print_info("Re-running Attack Paths Discovery with refreshed data.")
-        shell.do_bloodhound_attack_paths(domain)
+        shell.do_attack_paths(domain)
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_warning(
@@ -232,8 +215,24 @@ def run_audit_post_da_bloodhound_refresh(
     state["bh_da_refresh_last_unresolved_paths_after"] = current_unresolved
 
 
+def run_audit_post_da_bloodhound_refresh(
+    shell: PostDAShell,
+    domain: str,
+    username: str,
+    password: str,
+) -> None:
+    """Backward-compatible alias for the post-DA graph refresh workflow."""
+    run_audit_post_da_graph_refresh(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+    )
+
+
 __all__ = [
     "collect_attack_path_snapshot_counts",
     "get_domain_post_da_state",
+    "run_audit_post_da_graph_refresh",
     "run_audit_post_da_bloodhound_refresh",
 ]

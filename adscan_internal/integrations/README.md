@@ -12,27 +12,23 @@ Tools in this directory are:
 
 ## Current Integrations
 
-### bloodhound-cli
+### local graph compatibility
 
-**Location**: `bloodhound_cli/`
-**Purpose**: BloodHound data querying and analysis
-**Edition**: Both BloodHound CE and Legacy (Neo4j)
-**Service**: [BloodHoundService](../services/bloodhound_service.py)
+**Location**: local graph services
+**Purpose**: ADscan-native graph querying and attack-path analysis
+**Service**: [LocalGraphService](../services/local_graph_service.py)
 
-BloodHound integration for Active Directory attack path analysis. Provides:
+ADscan now uses its local collector output and `attack_graph.json` for Active
+Directory attack path analysis. Provides:
 - User and computer enumeration
 - Session detection
 - ACL/ACE analysis
 - Attack path discovery
-- Data upload (CE only)
 
 **Dependencies**:
-- neo4j>=5.0.0
 - requests>=2.31.0
 - rich>=13.7.0
 - pydantic-settings>=2.4.0
-
-**Import path**: `from adscan_internal.integrations.bloodhound_cli.core import ...`
 
 ## Adding New Integrations
 

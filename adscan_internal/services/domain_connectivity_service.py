@@ -23,14 +23,13 @@ def build_connectivity_vantage(shell: Any, *, source_domain: str) -> dict[str, s
     )
     mode = str(network_vantage.get("mode") or "").strip().lower() or "direct"
     if mode == "pivot_assisted":
-        pivot_method = str(network_vantage.get("refresh_source") or "").strip() or str(
-            network_vantage.get("pivot_method") or ""
-        ).strip()
+        pivot_method = (
+            str(network_vantage.get("refresh_source") or "").strip()
+            or str(network_vantage.get("pivot_method") or "").strip()
+        )
         pivot_host = str(network_vantage.get("pivot_host") or "").strip()
         pivot_tool = str(network_vantage.get("pivot_tool") or "").strip()
-        vantage_id = (
-            f"pivot_assisted:{pivot_method or pivot_tool or 'pivot'}:{pivot_host or 'unknown'}"
-        )
+        vantage_id = f"pivot_assisted:{pivot_method or pivot_tool or 'pivot'}:{pivot_host or 'unknown'}"
         return {
             "id": vantage_id,
             "mode": "pivot_assisted",
@@ -102,7 +101,9 @@ def _reachable_from_report_status(status: str) -> bool:
     }
 
 
-def _load_domain_reachability_report(shell: Any, *, source_domain: str) -> dict[str, Any] | None:
+def _load_domain_reachability_report(
+    shell: Any, *, source_domain: str
+) -> dict[str, Any] | None:
     """Load the persisted current-vantage reachability report for one domain."""
     report_path = os.path.join(
         str(getattr(shell, "current_workspace_dir", "") or "").strip(),
@@ -154,7 +155,10 @@ def reconcile_domain_connectivity_from_current_vantage_report(
         summary = normalized.get("summary", {})
         if not isinstance(summary, dict):
             continue
-        if str(summary.get("source_domain") or "").strip().lower() != source_domain.lower():
+        if (
+            str(summary.get("source_domain") or "").strip().lower()
+            != source_domain.lower()
+        ):
             continue
         pdc_ip = str(summary.get("pdc_ip") or "").strip()
         if not pdc_ip:
@@ -188,10 +192,130 @@ def reconcile_domain_connectivity_from_current_vantage_report(
     return newly_reachable_domains
 
 
+def reconcile_domain_connectivity_from_pivot_targets(
+    shell: Any,
+    *,
+    source_domain: str,
+    targets: list[dict[str, Any]],
+    pivot_host: str,
+    pivot_method: str,
+    pivot_tool: str,
+    source_service: str,
+) -> list[str]:
+    """Update trusted-domain connectivity using confirmed pivot-probe targets.
+
+    Args:
+        shell: Active ADscan shell with workspace-scoped domain connectivity state.
+        source_domain: Domain where the trusted-domain relationship was discovered.
+        targets: Confirmed pivot reachability targets from WinRM/MSSQL probing.
+        pivot_host: Host used as the pivot.
+        pivot_method: Logical pivot method identifier.
+        pivot_tool: Pivot tool name, for example ``Ligolo``.
+        source_service: Service that provided the pivot capability.
+
+    Returns:
+        Trusted domains that changed from unreachable to reachable from this pivot.
+    """
+    if not isinstance(getattr(shell, "domain_connectivity", None), dict):
+        return []
+    if not targets:
+        return []
+
+    target_by_ip: dict[str, dict[str, Any]] = {}
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        ip_value = str(target.get("ip") or "").strip()
+        if not ip_value:
+            continue
+        reachable_ports = [
+            int(port)
+            for port in target.get("reachable_ports", [])
+            if str(port).strip().isdigit()
+        ]
+        if not reachable_ports:
+            continue
+        target_by_ip[ip_value] = target
+    if not target_by_ip:
+        return []
+
+    updates: dict[str, dict[str, Any]] = {}
+    newly_reachable_domains: list[str] = []
+    for trusted_domain, raw_entry in shell.domain_connectivity.items():
+        normalized = normalize_domain_connectivity_entry(raw_entry)
+        summary = normalized.get("summary", {})
+        if not isinstance(summary, dict):
+            continue
+        if (
+            str(summary.get("source_domain") or "").strip().lower()
+            != source_domain.lower()
+        ):
+            continue
+        pdc_ip = str(summary.get("pdc_ip") or summary.get("host") or "").strip()
+        if not pdc_ip:
+            continue
+        target = target_by_ip.get(pdc_ip)
+        if not isinstance(target, dict):
+            continue
+        was_reachable = bool(summary.get("reachable"))
+        if not was_reachable:
+            newly_reachable_domains.append(trusted_domain)
+        updates[trusted_domain] = {
+            "domain": trusted_domain,
+            "source_domain": source_domain,
+            "pdc_ip": pdc_ip,
+            "host": pdc_ip,
+            "reachable": True,
+            "status": "reachable_via_pivot",
+            "classification": str(
+                target.get("original_classification")
+                or target.get("classification")
+                or "trusted_domain_pdc_reachable_via_pivot"
+            ).strip(),
+            "open_ports": [
+                int(port)
+                for port in target.get("reachable_ports", [])
+                if str(port).strip().isdigit()
+            ],
+            "hostname_candidates": list(target.get("hostname_candidates") or []),
+            "selection_reason": str(target.get("selection_reason") or "").strip(),
+            "method": "pivot_reachability_probe",
+            "pivot_host": pivot_host,
+            "pivot_method": pivot_method,
+            "pivot_tool": pivot_tool,
+            "source_service": source_service,
+        }
+
+    if not updates:
+        return []
+    previous_vantage: dict[str, Any] = {}
+    source_state = getattr(shell, "domains_data", {}).setdefault(source_domain, {})
+    if isinstance(source_state, dict):
+        previous_vantage = dict(source_state.get("network_vantage") or {})
+        source_state["network_vantage"] = {
+            "mode": "pivot_assisted",
+            "pivot_host": pivot_host,
+            "refresh_source": pivot_method,
+            "pivot_tool": pivot_tool,
+            "source_service": source_service,
+        }
+    try:
+        merge_domain_connectivity(
+            shell,
+            source_domain=source_domain,
+            connectivity_updates=updates,
+        )
+    finally:
+        if isinstance(source_state, dict):
+            source_state["network_vantage"] = previous_vantage
+    return newly_reachable_domains
+
+
 __all__ = [
     "build_connectivity_vantage",
     "merge_domain_connectivity",
     "normalize_domain_connectivity_entry",
     "reconcile_domain_connectivity_from_current_vantage_report",
+    "reconcile_domain_connectivity_from_pivot_targets",
     "utc_now_iso",
 ]

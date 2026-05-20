@@ -183,29 +183,6 @@ def parse_netexec_gmsa_credentials(output: str) -> list[tuple[str, str]]:
     return [(match.group(1), match.group(2)) for match in pattern.finditer(normalized)]
 
 
-def parse_netexec_laps_credentials(output: str) -> list[tuple[str, str, str]]:
-    """Parse NetExec LAPS output for computer credentials.
-
-    Args:
-        output: Raw NetExec stdout/stderr.
-
-    Returns:
-        List of (computer_name, laps_user, laps_password) tuples.
-    """
-    if not output:
-        return []
-
-    normalized = normalize_cli_output(output)
-    pattern = re.compile(
-        r"Computer:\s*(\S+?)\$\s+User:\s*(\S*)\s+Password:\s*([^\s]+)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    return [
-        (match.group(1), match.group(2), match.group(3))
-        for match in pattern.finditer(normalized)
-    ]
-
-
 @dataclass(frozen=True)
 class NetexecExecStatus:
     """Parsed status for NetExec remote command execution."""

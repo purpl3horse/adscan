@@ -72,6 +72,14 @@ def extract_adcs_template_names(details: Mapping[str, Any] | None) -> list[str]:
             else:
                 _append(entry)
 
+    # Compromise-centric ESC edges carry the abused templates / CAs in
+    # ``vulnerable_resources`` (the canonical post-derivation field).
+    raw_resources = details.get("vulnerable_resources")
+    if isinstance(raw_resources, list):
+        for entry in raw_resources:
+            if isinstance(entry, dict):
+                _append(entry.get("name"))
+
     summary = details.get("templates_summary")
     if isinstance(summary, str) and summary.strip():
         for item in summary.split(","):
@@ -83,6 +91,21 @@ def extract_adcs_template_names(details: Mapping[str, Any] | None) -> list[str]:
             _append(candidate)
 
     return sorted({name for name in templates if name}, key=str.lower)
+
+
+def has_compromise_centric_target(details: Mapping[str, Any] | None) -> bool:
+    """Return True when the edge already targets the impersonated principal.
+
+    Compromise-centric ESC edges carry ``vulnerable_resources`` in their notes
+    (set by ``_persist_esc_compromise_steps``). Their ``to`` is the actual
+    principal compromised (Domain Admins, Domain Controllers), so display
+    redirects must not override the target — the templates belong as a
+    relation-column annotation, not as a fake terminal.
+    """
+    if not isinstance(details, Mapping):
+        return False
+    raw_resources = details.get("vulnerable_resources")
+    return isinstance(raw_resources, list) and bool(raw_resources)
 
 
 def format_adcs_templates_summary(
@@ -128,6 +151,12 @@ def resolve_adcs_display_target(
     if not is_adcs_relation(relation):
         return fallback
 
+    # Compromise-centric edges (post _persist_esc_compromise_steps) already point
+    # at the impersonated principal. Do not override the target — the templates
+    # surface as a relation annotation instead.
+    if has_compromise_centric_target(details):
+        return fallback
+
     info = details if isinstance(details, Mapping) else {}
     relation_key = str(relation or "").strip().lower()
     ca_name = str(
@@ -135,6 +164,15 @@ def resolve_adcs_display_target(
     ).strip()
     template_names = extract_adcs_template_names(info)
 
+    if relation_key == "adcsesc13":
+        linked_group = str(
+            info.get("effective_group")
+            or info.get("linked_group")
+            or info.get("policy_group")
+            or info.get("issuance_policy_group")
+            or ""
+        ).strip()
+        return linked_group or fallback
     if relation_key in _CA_FIRST_RELATIONS and ca_name:
         return ca_name
     if len(template_names) == 1:

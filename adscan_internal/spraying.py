@@ -47,6 +47,17 @@ class SprayEligibilityResult:
             principals after considering current BadPwdCount values.
         used_policy_data: True when lockout policy/badpwd counts were used.
         notes: Human-readable notes about fallbacks/limitations.
+        no_lockout_enforced: True when the domain reports no enforceable lockout
+            (``lockout_threshold`` is ``None`` or ``0``, or the policy service
+            decided no lockout applies). Stored as an explicit boolean rather
+            than derived at every call site because the policy-service computation
+            already combined ``lockout_threshold == 0`` with extra signals (PSO
+            absence, ``msDS-LockoutThreshold`` reads, etc.) that the bare
+            threshold field cannot reproduce. Downstream callers in
+            ``cli/spraying.py`` consult this to gate variation sprays and to
+            decide whether to enforce the safe-attempt reserve. Defaults to
+            ``False`` so legacy constructors that never knew about this flag
+            keep behaving like "lockout is enforced" — the conservative direction.
     """
 
     input_users: list[str]
@@ -57,6 +68,7 @@ class SprayEligibilityResult:
     minimum_remaining_attempts: Optional[int]
     used_policy_data: bool
     notes: list[str]
+    no_lockout_enforced: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,8 +319,9 @@ def compute_spray_eligibility(
             lockout_threshold=lockout_threshold,
             safe_remaining_threshold=safe_remaining_threshold,
             minimum_remaining_attempts=None,
-            used_policy_data=False,
+            used_policy_data=True,
             notes=notes,
+            no_lockout_enforced=True,
         )
 
     if lockout_threshold == 0:
@@ -325,6 +338,7 @@ def compute_spray_eligibility(
             minimum_remaining_attempts=None,
             used_policy_data=True,
             notes=notes,
+            no_lockout_enforced=True,
         )
 
     used_policy_data = (

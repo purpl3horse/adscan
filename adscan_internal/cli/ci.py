@@ -34,6 +34,14 @@ from adscan_internal.workspaces import (
     create_workspace_dir,
     write_initial_workspace_variables,
 )
+from adscan_core.rich_output_collection import (
+    PhaseChapter,
+    SessionHeader,
+    SessionLootCard,
+    print_phase_chapter,
+    print_session_header,
+    print_session_loot_card,
+)
 
 try:
     from adscan_internal.services.report_service import (
@@ -43,6 +51,31 @@ try:
 except ImportError:  # pragma: no cover - public LITE repo excludes report generation
     ReportService = None  # type: ignore[assignment]
     ReportGenerationConfig = None  # type: ignore[assignment]
+
+
+# Canonical chapter list for `adscan ci`. ci.py itself only orchestrates a few
+# of these — the inner scan phases (enumeration, kerberos, ACL, BloodHound,
+# exploitation) all live inside shell.do_start_auth / do_start_unauth and do
+# not have stable insertion points here. We surface the chapter divider only
+# at boundaries we can confidently identify in this file.
+_CI_PHASES: tuple[tuple[str, str], ...] = (
+    ("Preflight", "DNS validation, connectivity, and credential sanity checks."),
+    ("Reconnaissance", "Domain mapping, trust enumeration, and authentication."),
+    ("Scan", "Users, groups, kerberoast, ACLs, BloodHound, and exploitation."),
+    ("Reporting", "Compile findings, render report, and stage artefacts."),
+    ("Loot", "Owned accounts, attack-path materialisation, and summary."),
+)
+
+
+def _chapter(number: int) -> PhaseChapter:
+    """Build a PhaseChapter for the given 1-indexed phase number."""
+    title, subtitle = _CI_PHASES[number - 1]
+    return PhaseChapter(
+        number=number,
+        title=title,
+        subtitle=subtitle,
+        all_phases=tuple(name for name, _ in _CI_PHASES),
+    )
 
 
 @dataclass(frozen=True)
@@ -123,6 +156,23 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         shell.load_workspace_data(ws_dir)
         created_workspace = True
 
+    # --- Premium session header ---
+    _ci_domain = str(getattr(args, "domain", "") or "")
+    _ci_dc = str(getattr(args, "dc_ip", "") or "")
+    _ci_user = str(getattr(args, "username", "") or "")
+    _ci_cred = (
+        f"{_ci_user} / {_ci_domain.upper()}" if _ci_user and _ci_domain else _ci_user
+    )
+    print_session_header(
+        SessionHeader(
+            workspace=str(shell.current_workspace or ""),
+            target_domain=_ci_domain,
+            dc_ip=_ci_dc,
+            credential_label=_ci_cred,
+            scan_mode="ci",
+        )
+    )
+
     from adscan_internal.cli.common import build_telemetry_context
 
     telemetry_context = build_telemetry_context(shell=shell, trigger="ci_start")
@@ -176,12 +226,18 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 "Auto mode not found. Please configure it using 'set auto <value>'."
             )
             return False
+        # Chapter 1: Preflight (DNS validation, connectivity)
+        print_phase_chapter(_chapter(1))
         emit_phase("dns_validation")
         if not shell.do_check_dns(args.domain, args.dc_ip):
             return False
         emit_phase("dns_configuration")
         shell.do_clear_all(None)
         shell.scan_mode = None
+        # Chapter 2: Reconnaissance + Chapter 3: Scan are merged here because
+        # the entire authenticated scan pipeline runs inside do_start_auth
+        # without external phase boundaries we can hook from this file.
+        print_phase_chapter(_chapter(2))
         shell.do_start_auth(
             f"{args.domain} {args.dc_ip} {args.username} {args.password}"
         )
@@ -220,6 +276,8 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         shell.hosts = args.hosts
         shell.do_clear_all(None)
         shell.scan_mode = None
+        # Chapter 2: Reconnaissance — the unauth path is pure recon.
+        print_phase_chapter(_chapter(2))
         if getattr(args, "dc_ip", None):
             shell.do_start_unauth(str(args.dc_ip))
         else:
@@ -280,6 +338,8 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     report_file_path = None
     if success and flags_valid and getattr(args, "generate_report", False):
+        # Chapter 4: Reporting
+        print_phase_chapter(_chapter(4))
         emit_phase("report_generation")
         print_info("Generating report as requested...")
         if shell.current_workspace_dir:
@@ -362,6 +422,25 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
             f"Workspace '{marked_current_workspace_1}' kept (--keep-workspace specified)"
         )
 
+    # --- End-of-run loot card ---
+    try:
+        # Chapter 5: Loot — final act, the loot card is its centrepiece.
+        print_phase_chapter(_chapter(5))
+        _loot_domain = str(
+            getattr(args, "domain", "") or getattr(shell, "current_domain", "") or ""
+        )
+        _domains_data = getattr(shell, "domains_data", {}) or {}
+        _domain_info = _domains_data.get(_loot_domain, {}) or {}
+        _owned = list(_domain_info.get("owned_accounts", []) or [])
+        print_session_loot_card(
+            SessionLootCard(
+                domain=_loot_domain,
+                owned_accounts=_owned,
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass  # loot card is cosmetic — never block exit
+
     shell.do_exit(exit=False)
     return exit_code
 
@@ -397,7 +476,20 @@ def run_generate_report(
         Path to generated report file, or None on failure
     """
     if ReportService is None or ReportGenerationConfig is None:
-        print_error("Report generation module is not available.")
+        # LITE — the PRO report service is stripped from the image. Render
+        # the canonical PRO upsell panel instead of a flat error so the
+        # operator sees the same CTA they would get from ``adscan deliver``
+        # (host) or ``deliver`` (REPL). The panel surfaces ``adscan demo``
+        # as the zero-risk preview path and ``adscanpro.com/pro`` as the
+        # upgrade URL — single source of truth for the PRO ask.
+        #
+        # Note: ``do_generate_report`` in adscan.py gates earlier so the
+        # operator never reaches this branch with prompts already
+        # answered. This stays as the final safety net for non-REPL
+        # callers (e.g. ``adscan ci`` invoking the report path directly).
+        from adscan_core.pro_upsell import print_pro_upsell
+
+        print_pro_upsell("generate_report", "direct_invocation")
         return None
 
     if not os.path.exists(report_file):
@@ -441,4 +533,15 @@ def run_generate_report(
     )
 
     result_path = report_service.generate_report(config)
+
+    # Offer to open the freshly generated report. Auto-skipped in non-interactive
+    # contexts (TTY check + ADSCAN_NONINTERACTIVE), so this is safe to call from
+    # both the shell `generate_report` command and `adscan ci`.
+    if result_path is not None:
+        from adscan_internal.services.host_open import prompt_and_open
+
+        result_path_obj = Path(result_path) if not isinstance(result_path, Path) else result_path
+        if result_path_obj.is_file():
+            prompt_and_open(result_path_obj, prompt="Open the report now?")
+
     return str(result_path) if result_path else None
