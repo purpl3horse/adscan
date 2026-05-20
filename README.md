@@ -5,7 +5,6 @@
 # ADscan - Active Directory Pentesting Tool for Linux
 
 [![PyPI version](https://img.shields.io/pypi/v/adscan.svg)](https://pypi.org/project/adscan/)
-[![CI](https://github.com/ADScanPro/adscan/actions/workflows/ci.yml/badge.svg)](https://github.com/ADScanPro/adscan/actions/workflows/ci.yml)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/adscan)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
