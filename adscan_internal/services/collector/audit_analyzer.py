@@ -250,9 +250,114 @@ def analyze_audit_findings(
                 )
             )
 
+        wpp = _analyze_weak_password_policy(domain_policy)
+        if wpp is not None:
+            findings.append(wpp)
+
     findings.extend(_password_compliance_findings(result))
 
     return findings
+
+
+# CIS Microsoft Windows Server benchmark threshold for the
+# Default Domain Password Policy minimum length. Below this we
+# call the policy "weak" (NIST 800-63B Memorized Secrets §5.1.1
+# recommends ≥8 for users, but in an enterprise DDPP context
+# CIS / DISA STIG / Microsoft Baseline align on 14 as
+# the bar for enterprise environments).
+_WEAK_PWD_POLICY_MIN_LENGTH = 14
+# Hard-failure threshold — below this, a single 8-char password
+# is crackable in hours with a consumer GPU and a wordlist+rules
+# pass. Treated as a high-severity sub-issue on its own.
+_CRACKABLE_PWD_POLICY_MIN_LENGTH = 8
+
+
+def _analyze_weak_password_policy(
+    domain_policy: DomainPolicy,
+) -> AuditFinding | None:
+    """Consolidate weak Default Domain Password Policy sub-issues.
+
+    Three independent CIS-aligned checks against the Default Domain
+    Password Policy:
+
+    * **Account lockout disabled** (lockoutThreshold == 0) — password
+      spraying carries no lockout risk. CIS calls for ≥5 attempts
+      threshold; Microsoft Baseline asks for 10.
+    * **Min password length below threshold** (<14 chars) — falls
+      below CIS / DISA STIG / Microsoft Baseline for enterprise. A
+      sub-issue at <8 is "crackable in hours" territory and elevates
+      severity on its own.
+    * **Complexity disabled** (DOMAIN_PASSWORD_COMPLEX bit unset) —
+      passwords need not include character-class diversity, dropping
+      effective entropy.
+
+    All three sub-issues collapse into ONE consolidated finding with
+    dynamic severity so the report renders a single, accurate
+    "Weak Domain Password Policy" entry instead of three near-duplicate
+    rows. The composite ``detail`` string enumerates the active
+    sub-issues so the auditor sees exactly which knobs are loose.
+
+    Returns ``None`` when the policy meets every threshold — no
+    finding emitted.
+    """
+    sub_issues: list[str] = []
+    has_no_lockout = False
+    has_short_pwd = False
+    has_crackable_pwd = False
+    has_no_complexity = False
+
+    if domain_policy.lockout_threshold == 0:
+        sub_issues.append("account lockout disabled (spray-safe)")
+        has_no_lockout = True
+
+    min_len = domain_policy.min_pwd_length
+    if isinstance(min_len, int) and 0 < min_len < _WEAK_PWD_POLICY_MIN_LENGTH:
+        sub_issues.append(
+            f"min length {min_len} chars (CIS recommends ≥{_WEAK_PWD_POLICY_MIN_LENGTH})"
+        )
+        has_short_pwd = True
+        if min_len < _CRACKABLE_PWD_POLICY_MIN_LENGTH:
+            has_crackable_pwd = True
+
+    # ``complexity_enabled is None`` means the attribute was unreadable
+    # (insufficient permissions, very old DC). Skip the sub-issue rather
+    # than reporting a false positive — we cannot prove it is disabled.
+    if domain_policy.complexity_enabled is False:
+        sub_issues.append("complexity requirement disabled")
+        has_no_complexity = True
+
+    if not sub_issues:
+        return None
+
+    # Dynamic severity matrix:
+    #   - 3 sub-issues all active                            → HIGH
+    #     (full spraying + crack + weak passwords = trivial credential access)
+    #   - Crackable length (<8) + any other sub-issue        → HIGH
+    #     (sub-8 alone is already at hashcat reach in minutes)
+    #   - 2 sub-issues active                                → MEDIUM
+    #   - 1 sub-issue active                                 → LOW
+    #     unless it is the crackable-length case             → MEDIUM
+    active_count = sum((has_no_lockout, has_short_pwd, has_no_complexity))
+    if active_count >= 3:
+        severity = "high"
+    elif has_crackable_pwd and active_count >= 2:
+        severity = "high"
+    elif active_count == 2:
+        severity = "medium"
+    elif has_crackable_pwd:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    detail = "Weak Default Domain Password Policy — " + " · ".join(sub_issues)
+
+    return AuditFinding(
+        category="weak_password_policy",
+        samaccountname="(domain)",
+        object_id="",
+        detail=detail,
+        severity=severity,
+    )
 
 
 def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:

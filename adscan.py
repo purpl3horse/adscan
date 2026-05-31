@@ -828,6 +828,12 @@ def _normalize_interactive_text(value: str) -> str:
         A sanitized string with control/format characters removed and
         surrounding whitespace trimmed.
     """
+    # A cancelled/absent prompt returns Python ``None``; ``str(None)`` would
+    # yield the truthy string ``"None"`` and defeat downstream ``if not value``
+    # abort guards (this ran DCSync against a bogus "None" account). Normalise
+    # None/empty to "" so cancellation aborts cleanly.
+    if value is None:
+        return ""
     sanitized_chars: list[str] = []
     for ch in str(value):
         codepoint = ord(ch)
@@ -3014,7 +3020,7 @@ def _assess_version_compliance(
 
 PipToolsConfig = {  # pylint: disable=invalid-name
     "impacket": {
-        "spec": "impacket==0.13.0",
+        "spec": "impacket==0.13.1",
         "check_target": "impacket.version",
         "check_type": "module",
         "exe_name": None,  # Impacket scripts are usually called directly, or we'd list them individually
@@ -3151,6 +3157,19 @@ try:
     tame_native_stack_loggers()
 except Exception:
     # Never let logger taming prevent the main CLI from starting.
+    pass
+
+# Drain the persistent telemetry queue from previous CLI runs that
+# failed to deliver (crash, network blip, oversize body). Runs on a
+# daemon background thread with a small delay so the welcome panel
+# renders first; if the user closes the CLI mid-drain, the remaining
+# files are picked up by the next invocation.
+try:
+    from adscan_internal.telemetry import start_telemetry_queue_drain
+
+    start_telemetry_queue_drain()
+except Exception:
+    # Best-effort — telemetry queue must never block CLI startup.
     pass
 
 # If running inside the ADscan Docker runtime, ingest any entrypoint diagnostics
@@ -8528,7 +8547,6 @@ def handle_install(install_args=None):
             get_free_disk_space_bytes=_get_free_disk_space_bytes,
             is_docker_env=is_docker_env,
             is_docker_official_installed=_is_docker_official_installed,
-            is_docker_compose_plugin_available=_is_docker_compose_plugin_available,
                 install_docker_prerequisites=_install_docker_prerequisites,
             install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
             setup_external_tool=_setup_external_tool,
@@ -10253,6 +10271,24 @@ class PentestShell:
         # Guard against duplicate workspace/HTML exports during shutdown
         self._shutdown_in_progress = False
         self.session_command_type: str | None = SESSION_COMMAND_TYPE or "start"
+
+        # Tier 2 — live chunked streaming.
+        # ``_telemetry_streamer`` is the SessionStreamer instance when
+        # the runtime command (start / ci / tui) is in the eligible
+        # set AND telemetry is enabled AND the direct sessions URL is
+        # embedded. ``None`` otherwise — the legacy single-shot path
+        # then ships the session at exit via ``capture_session_end``.
+        # See ``adscan_core.telemetry.make_session_streamer`` for the
+        # full eligibility check.
+        self._telemetry_streamer: Any = None
+        try:
+            self._init_telemetry_streamer()
+        except Exception as exc:  # noqa: BLE001
+            # Best-effort: telemetry must never break shell startup.
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"(telemetry-streamer) init failed: {type(exc).__name__}: {exc}"
+            )
 
         # CTF flow control: once a domain is compromised ("pwned"), we stop the remaining
         # pipeline and run only a small allowlist of post-compromise actions.
@@ -14627,9 +14663,17 @@ class PentestShell:
         *,
         ui_silent: bool = False,
         password_change_attempted: bool = False,
+        recovery_attempted: bool = False,
         source_steps: list[object] | None = None,
     ):
-        """Verifies domain credentials against the domain's PDC using NetExec."""
+        """Verifies domain credentials against the domain's PDC using NetExec.
+
+        Args:
+            recovery_attempted: When True, the USER_NOT_FOUND branch will NOT
+                re-enter the centralized credential-recovery service. Candidate
+                verification calls and the winner re-persist set this to break
+                the recursion (mirrors ``password_change_attempted``).
+        """
         from rich.panel import Panel
 
         from adscan_internal.rich_output import mark_sensitive
@@ -14816,6 +14860,7 @@ class PentestShell:
                     suggestion.suggested_password,
                     ui_silent=ui_silent,
                     password_change_attempted=True,
+                    recovery_attempted=recovery_attempted,
                     source_steps=source_steps,
                 )
             )
@@ -15002,25 +15047,100 @@ class PentestShell:
                     new_password,
                     ui_silent=ui_silent,
                     password_change_attempted=True,
+                    recovery_attempted=recovery_attempted,
                 )
             )
 
         if status == CredentialStatus.USER_NOT_FOUND:
-            if not ui_silent:
-                print_error(
-                    f"User '[bold]{marked_user}[/bold]' not found on domain "
-                    f"'[bold]{marked_domain_name}[/bold]'."
+            print_error(
+                f"User '[bold]{marked_user}[/bold]' not found on domain "
+                f"'[bold]{marked_domain_name}[/bold]'."
+            ) if not ui_silent else print_info_verbose(
+                f"[ui_silent] User not found on domain {marked_domain_name}."
+            )
+
+            # ui_silent / recovery_attempted callers are themselves part of a
+            # recovery (candidate verification or the winner re-persist), or
+            # are background batch checks; never re-enter recovery from them.
+            # This is the infinite-loop guard (mirrors password_change_attempted).
+            if ui_silent or recovery_attempted:
+                return False
+
+            from adscan_core.rich_output import confirm_ask, prompt_ask
+            from adscan_internal.services.credential_recovery_service import (
+                recover_user_not_found,
+            )
+
+            def _verify_candidate(candidate_user: str) -> bool:
+                """One auth attempt: the recovered secret is the oracle."""
+                return bool(
+                    self.verify_domain_credentials(
+                        domain_name,
+                        candidate_user,
+                        cred_value,
+                        ui_silent=True,
+                        recovery_attempted=True,
+                        source_steps=source_steps,
+                    )
                 )
-                new_user = Prompt.ask(
-                    "Re enter the correct username. Write 'n' to skip",
+
+            def _persist(resolved_user: str) -> None:
+                self.add_credential(
+                    domain_name,
+                    resolved_user,
+                    cred_value,
+                    source_steps=source_steps,
+                )
+
+            def _spray() -> None:
+                self.spraying_with_password(
+                    domain_name,
+                    cred_value,
+                    source_context={
+                        "auth_username": user,
+                        "origin": "credential_recovery_user_not_found",
+                    },
+                    source_steps=source_steps,
+                )
+
+            def _confirm_spray() -> bool:
+                return bool(
+                    confirm_ask(
+                        "Spray the recovered password across the known accounts "
+                        "to find its owner?",
+                        default=True,
+                    )
+                )
+
+            def _prompt_manual_username() -> str | None:
+                answer = prompt_ask(
+                    "Enter the correct username, or 'n' to skip",
                     default="n",
                 )
-                if new_user != "n":
-                    self.add_credential(domain_name, new_user, cred_value)
-            else:
-                print_info_verbose(
-                    f"[ui_silent] User not found on domain {marked_domain_name}; prompt suppressed."
+                answer = (answer or "").strip()
+                return None if not answer or answer.lower() == "n" else answer
+
+            try:
+                recover_user_not_found(
+                    self,
+                    domain=domain_name,
+                    failed_user=user,
+                    cred_value=cred_value,
+                    verify_candidate=_verify_candidate,
+                    add_credential=_persist,
+                    spray=_spray,
+                    confirm_spray=_confirm_spray,
+                    prompt_manual_username=_prompt_manual_username,
+                    source_steps=source_steps,
                 )
+            except Exception as exc_recovery:  # noqa: BLE001
+                telemetry.capture_exception(exc_recovery)
+                print_error(
+                    "Credential recovery failed; the credential was not adopted."
+                )
+            # The original (stored) username is still not found; recovery
+            # persists any resolved/manual credential itself via add_credential,
+            # so the verdict for THIS call stays False.
             return False
 
         if status == CredentialStatus.TIMEOUT:
@@ -15890,23 +16010,37 @@ class PentestShell:
             if stop_after_phase == 6:
                 return
 
-        # ========== PHASE 7: Audit-only Extras ==========
+        # ========== PHASE 7: CVE Verification ==========
+        # In audit mode, the passive hygiene findings (SMBv1, password policy,
+        # SMB signing, MAQ risk, stale users, etc.) were already surfaced after
+        # the native collector in Phase 2 — see `_print_collector_enrichment_panel`
+        # under intelligence.py. The legacy `Configuration Enumeration` sub-step
+        # that re-derived the same findings via `nxc` was retired here: it lived
+        # at `ask_for_enum_configs` (enum.py:99) and stays callable manually if
+        # an operator wants to invoke it from the shell, but no longer auto-fires
+        # in the scan flow because it duplicated the collector output.
+        #
+        # What remains in Phase 7 is the only thing the collector cannot do
+        # passively: read-only CVE verification against DCs (Zerologon, NoPac)
+        # — detection only, no exploitation — followed by a consolidated audit
+        # summary that rehydrates hygiene findings + CVE results from disk into
+        # a single closing panel for the auditor.
         if self.type == "audit":
-            _enter_phase("Audit-only Extras")
-            # Keep the existing broader CVE scan UX here for audit.
+            _enter_phase("CVE Verification")
             if _run_step(
-                "CVE Vulnerability Scan",
+                "CVE Vulnerability Check",
                 lambda: self.ask_for_enum_cve(domain),
                 step_number=1,
-                total_steps=2,
+                total_steps=1,
             ):
                 return
-            _run_step(
-                "Configuration Enumeration",
-                lambda: self.ask_for_enum_configs(domain),
-                step_number=2,
-                total_steps=2,
-            )
+            try:
+                self._render_audit_summary_panel(domain)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_warning_debug(
+                    f"[audit_summary] render failed: {type(exc).__name__}: {exc}"
+                )
 
         # In audit post-compromise we want to map as much as possible, then let the
         # operator decide which remaining paths to validate/exploit.
@@ -16000,6 +16134,260 @@ class PentestShell:
         # emitted. Earlier phases are closed automatically by ``_enter_phase``
         # transitions; only the last phase needs an explicit close.
         _close_active_phase()
+
+    # ------------------------------------------------------------------
+    # Audit Summary — consolidated closing panel for audit mode
+    # ------------------------------------------------------------------
+    #
+    # Single-source-of-truth rule: this panel re-renders findings that
+    # already live on disk; it never recomputes them. Hygiene findings
+    # come from ``<workspace>/technical_report.json`` (written by the
+    # collector + `_persist_collector_findings`); active CVE results
+    # come from ``<workspace>/cves/<scan_id>/report.json`` (written by
+    # `persist_report` in cve_scanner.ux.report). If either file is
+    # missing or empty the section degrades to a neutral "no data
+    # recorded" line — never an alarming red error.
+    #
+    # The schema mapping below is the contract with `_persist_collector_findings`
+    # (intelligence.py:375 _CAT_KEY). When you add a new audit category
+    # there, add its display row here too.
+
+    _AUDIT_HYGIENE_ROWS: tuple[tuple[str, str, str, str], ...] = (
+        # (technical_report.json key, display label, singular unit, plural unit)
+        # Singular vs plural is selected by count so "1 computer" reads
+        # naturally instead of "1 computers". Domain-wide findings use the
+        # same singular/plural string when grammatical number does not apply.
+        ("smb_v1_enabled", "SMBv1 enabled", "computer", "computers"),
+        ("smb_signing_disabled", "SMB signing not required", "computer", "computers"),
+        ("password_not_required", "Password not required", "account", "accounts"),
+        ("password_never_expires", "Password never expires", "account", "accounts"),
+        ("stale_passwords", "Passwords older than current policy", "account", "accounts"),
+        ("stale_enabled_users", "Stale enabled users", "account", "accounts"),
+        ("krbtgt_password_age", "krbtgt password age", "rotation overdue", "rotations overdue"),
+        ("rc4_only_accounts", "RC4-only accounts", "account", "accounts"),
+        ("obsolete_computers", "Obsolete operating systems", "computer", "computers"),
+        ("machine_account_quota_risk", "Machine Account Quota risk", "domain-wide", "domain-wide"),
+        ("weak_password_policy", "Weak password policy", "domain-wide", "domain-wide"),
+    )
+
+    _AUDIT_SEVERITY_STYLE: dict[str, tuple[str, str]] = {
+        # severity → (badge text, Rich style)
+        "critical": ("CRITICAL", "bold red"),
+        "high": ("HIGH    ", "red"),
+        "medium": ("MEDIUM  ", "yellow"),
+        "low": ("LOW     ", "cyan"),
+        "info": ("INFO    ", "dim"),
+    }
+
+    _AUDIT_SEVERITY_ORDER: dict[str, int] = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+        "info": 4,
+    }
+
+    def _render_audit_summary_panel(self, domain: str) -> None:
+        """Render the closing audit summary for ``domain``.
+
+        Re-renders the data already written to disk by Phase 2 (collector
+        hygiene findings) and Phase 7 (CVE probe results) into a single
+        consolidated panel — no recomputation. Safe to call multiple
+        times; degrades gracefully when either data source is missing.
+
+        Only runs in audit mode; the caller is responsible for the
+        ``self.type == "audit"`` guard.
+        """
+        from pathlib import Path
+        from json import JSONDecodeError, load as _json_load
+        from rich.console import Group
+        from rich.text import Text
+        from adscan_internal.services.cve_scanner.ux.report import (
+            latest_scan_dir,
+            load_report_summary,
+        )
+
+        workspace_dir_raw = getattr(self, "current_workspace_dir", None)
+        if not workspace_dir_raw:
+            print_info_debug(
+                "[audit_summary] no workspace_dir on shell — skipping panel"
+            )
+            return
+        workspace_dir = Path(workspace_dir_raw)
+
+        # ── Hygiene findings ────────────────────────────────────────────
+        hygiene_rows: list[tuple[str, str, str, int]] = []
+        # rows: (severity_badge, label, value_text, severity_order)
+        report_path = workspace_dir / "technical_report.json"
+        if report_path.is_file():
+            try:
+                with report_path.open("r", encoding="utf-8") as fh:
+                    report = _json_load(fh)
+            except (OSError, JSONDecodeError) as exc:
+                telemetry.capture_exception(exc)
+                report = None
+            if isinstance(report, dict):
+                findings_root = (
+                    report.get("findings")
+                    if isinstance(report.get("findings"), dict)
+                    else report
+                )
+                for key, label, unit_singular, unit_plural in self._AUDIT_HYGIENE_ROWS:
+                    entry = findings_root.get(key) if isinstance(findings_root, dict) else None
+                    if not isinstance(entry, dict):
+                        continue
+                    details = entry.get("details") if isinstance(entry.get("details"), dict) else entry
+                    count = details.get("count") if isinstance(details, dict) else None
+                    if not isinstance(count, int) or count <= 0:
+                        continue
+                    severity_raw = ""
+                    if isinstance(details, dict):
+                        severity_raw = str(details.get("severity_summary") or "").lower().strip()
+                    badge, style = self._AUDIT_SEVERITY_STYLE.get(
+                        severity_raw, self._AUDIT_SEVERITY_STYLE["info"]
+                    )
+                    order = self._AUDIT_SEVERITY_ORDER.get(severity_raw, 99)
+                    if unit_singular == unit_plural:
+                        # Policy-level finding (MAQ, etc.) — the count is
+                        # always 1 by construction and reads as noise.
+                        # Show just the descriptive scope.
+                        value_text = unit_singular
+                    else:
+                        units = unit_singular if count == 1 else unit_plural
+                        value_text = f"{count} {units}"
+                    hygiene_rows.append(
+                        (f"[{style}]{badge}[/{style}]", label, value_text, order)
+                    )
+        hygiene_rows.sort(key=lambda r: (r[3], r[1]))
+
+        # ── CVE probe results ───────────────────────────────────────────
+        cve_rows: list[tuple[str, str, str]] = []
+        # rows: (status_glyph_styled, cve_label, host_or_result)
+        scan_dir = latest_scan_dir(workspace_dir)
+        cve_report = load_report_summary(scan_dir) if scan_dir else None
+        if isinstance(cve_report, dict):
+            results = cve_report.get("results") if isinstance(cve_report.get("results"), list) else []
+            # Group by (cve_id, aka, status) so a CVE probed on multiple
+            # hosts collapses into one row with the host list.
+            by_cve: dict[tuple[str, str, str], list[str]] = {}
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                cve_id = str(entry.get("cve_id") or "").strip()
+                if not cve_id:
+                    continue
+                aka = str(entry.get("aka") or "").strip()
+                status = str(entry.get("status") or "").strip().lower()
+                host = str(entry.get("host") or "").strip()
+                by_cve.setdefault((cve_id, aka, status), []).append(host)
+            # Stable display order: vulnerable first, then errors, then
+            # not_vulnerable, then anything else. Within a bucket, alpha.
+            status_order = {
+                "vulnerable": 0,
+                "error": 1,
+                "not_vulnerable": 2,
+                "not_applicable": 3,
+                "skipped": 4,
+            }
+            grouped = sorted(
+                by_cve.items(),
+                key=lambda kv: (status_order.get(kv[0][2], 99), kv[0][0]),
+            )
+            for (cve_id, aka, status), hosts in grouped:
+                label = f"{aka} ({cve_id})" if aka else cve_id
+                hosts_clean = sorted({h for h in hosts if h})
+                # All four icons are detection states, not action verbs.
+                # "Vulnerable" means "the read-only check determined the host
+                # appears vulnerable" — no exploitation occurred. Glyph chosen
+                # accordingly: ⚠ (attention) rather than ✗ (which implies failure
+                # or attack execution).
+                if status == "vulnerable":
+                    glyph = "[bold red]⚠ Vulnerable[/bold red]"
+                    detail = (
+                        f"detected on {', '.join(hosts_clean)}"
+                        if hosts_clean
+                        else "(no host detail)"
+                    )
+                elif status == "not_vulnerable":
+                    glyph = "[green]✓ Not vulnerable[/green]"
+                    detail = (
+                        f"{len(hosts_clean)} host(s) checked"
+                        if hosts_clean
+                        else "—"
+                    )
+                elif status == "error":
+                    glyph = "[yellow]· Check error[/yellow]"
+                    detail = ", ".join(hosts_clean) if hosts_clean else "(no host detail)"
+                elif status == "not_applicable":
+                    glyph = "[dim]— Not applicable[/dim]"
+                    detail = ", ".join(hosts_clean) if hosts_clean else "—"
+                else:
+                    glyph = f"[dim]{status or 'unknown'}[/dim]"
+                    detail = ", ".join(hosts_clean) if hosts_clean else "—"
+                cve_rows.append((glyph, label, detail))
+
+        # ── Build the renderable ────────────────────────────────────────
+        body_parts: list[Any] = []
+
+        def _section_heading(text: str) -> Text:
+            head = Text()
+            head.append(text, style="bold")
+            return head
+
+        # Passive findings section
+        body_parts.append(_section_heading("Passive findings — from collector"))
+        if hygiene_rows:
+            hyg_table = Table.grid(padding=(0, 2))
+            hyg_table.add_column(justify="left", no_wrap=True)  # severity badge
+            hyg_table.add_column(justify="left", overflow="fold")  # label
+            hyg_table.add_column(justify="right", no_wrap=True)  # value
+            for badge, label, value, _ in hygiene_rows:
+                hyg_table.add_row(badge, label, value)
+            body_parts.append(hyg_table)
+        else:
+            body_parts.append(
+                Text(
+                    "  No passive findings recorded — clean posture or "
+                    "collector did not run in this scan.",
+                    style="dim",
+                )
+            )
+
+        body_parts.append(Text(""))  # blank line separator
+
+        # CVE verification section — read-only detection, no exploitation.
+        body_parts.append(_section_heading("CVE verification — read-only checks"))
+        if cve_rows:
+            cve_table = Table.grid(padding=(0, 2))
+            cve_table.add_column(justify="left", no_wrap=True)  # status glyph
+            cve_table.add_column(justify="left", overflow="fold")  # cve label
+            cve_table.add_column(justify="left", overflow="fold")  # host/detail
+            for glyph, label, detail in cve_rows:
+                cve_table.add_row(glyph, label, detail)
+            body_parts.append(cve_table)
+        else:
+            body_parts.append(
+                Text(
+                    "  No CVE checks recorded — skipped or no scan results "
+                    "on disk yet.",
+                    style="dim",
+                )
+            )
+
+        body_parts.append(Text(""))
+
+        # Footer — pointers, not noise.
+        footer = Text()
+        footer.append("Workspace: ", style="dim")
+        footer.append(str(workspace_dir), style="dim italic")
+        body_parts.append(footer)
+
+        print_panel(
+            Group(*body_parts),
+            title=f"🛡  Audit Summary — {domain}",
+            title_align="left",
+            border_style="cyan",
+        )
 
     def _capture_scan_complete(self, domain: str) -> None:
         """Capture scan_complete telemetry event with case study metrics."""
@@ -16330,7 +16718,7 @@ class PentestShell:
                     f"No DC targets file found for {target_domain} and no PDC IP configured."
                 )
                 return
-        _dispatch_cves(self, f"scan --targets {dcs_file}")
+        _dispatch_cves(self, f"scan --dc-scope --targets {dcs_file}")
 
     def do_enum_cve_all(self, target_domain: str) -> None:
         """Enumerate CVEs on all domain hosts using the native async scanner.
@@ -17544,6 +17932,25 @@ class PentestShell:
         from adscan_internal.cli.dumps import run_do_dump_lsa
 
         return run_do_dump_lsa(self, args)
+
+    def do_dump_lsass(self, args):
+        """
+        Dumps the LSASS process credentials from specified hosts within a domain.
+
+        Args:
+            args (list): A list containing:
+                0: domain (str) - The domain name.
+                1: username (str) - The username for authentication.
+                2: password (str) - The password for the specified username.
+                3: host (str) - The target host or 'All' for all hosts in the domain.
+                4: islocal (str) - Indicates if the operation is local ('true') or remote ('false').
+
+        Dumps LSASS via the native async SMB stack with PPL-aware backend
+        selection. Supports a single host or all hosts in the domain.
+        """
+        from adscan_internal.cli.dumps import run_do_dump_lsass
+
+        return run_do_dump_lsass(self, args)
 
     def ask_for_local_cred_reuse(self, domain, user, cred):
         if Confirm.ask(
@@ -19880,7 +20287,7 @@ class PentestShell:
                             )
                     if found_passwords and domain:
                         try:
-                            from adscan_internal.services.report_service import (
+                            from adscan_core.reporting.technical_report import (
                                 record_technical_finding,
                             )
 
@@ -19936,7 +20343,7 @@ class PentestShell:
                             )
                     if found_autologin and domain:
                         try:
-                            from adscan_internal.services.report_service import (
+                            from adscan_core.reporting.technical_report import (
                                 record_technical_finding,
                             )
 
@@ -20925,7 +21332,41 @@ class PentestShell:
                         f"The user {marked_username} is not present in the control exposure inventory for domain {marked_domain}"
                     )
                 return False
-            # Continue with old admin check
+
+            # Modern path when the exported file is absent: build the
+            # identity-risk snapshot on demand from collected memberships /
+            # attack-graph. This is robust to the attack-graph report step not
+            # having run, uses real group-membership classification (Tier-0 /
+            # control exposure) instead of a stale adminCount, and — crucially —
+            # avoids a live LDAP adminCount probe that crashes ("Cannot run the
+            # event loop while another loop is running") when invoked from inside
+            # an async dump loop, which silently dropped DA detection + follow-ups.
+            try:
+                from adscan_internal.services.identity_risk_service import (
+                    load_or_build_identity_risk_snapshot,
+                )
+
+                snapshot = load_or_build_identity_risk_snapshot(self, domain)
+            except Exception as snap_exc:  # noqa: BLE001
+                telemetry.capture_exception(snap_exc)
+                snapshot = None
+            if isinstance(snapshot, dict) and snapshot.get("users"):
+                uname = username.split("@", 1)[0].strip().lower()
+                control_exposed = {
+                    str(u).split("@", 1)[0].strip().lower()
+                    for u in snapshot.get("control_exposure_identities", [])
+                }
+                if uname in control_exposed:
+                    if logging:
+                        print_warning(
+                            f"The user {mark_sensitive(username, 'user')} is a "
+                            "control-exposed/Tier-0 principal in domain "
+                            f"{mark_sensitive(domain, 'domain')} (identity-risk snapshot)"
+                        )
+                    return True
+                return False
+
+            # Last resort only when we have no collected identity data at all.
             return self.check_old_admin_count(domain, username, password, logging)
 
         except Exception as e:
@@ -24557,9 +24998,14 @@ class PentestShell:
 
         # Depth budget counts only actionable edges. Structural relations
         # (MemberOf, Contains, GpLink, TrustedBy, HasSIDHistory) flow freely
-        # — see ``_count_actionable_edges`` in attack_graph_core. So 4 here
-        # means up to 4 attack actions, which fits every real kill chain.
-        max_depth = 4
+        # — see ``_count_actionable_edges`` in attack_graph_core. So 6 here
+        # means up to 6 attack actions. 4 was the historical default but it
+        # truncated real GOAD-class kill chains (ASREPRoast → GenericAll →
+        # GenericAll → GenericWrite → ReadLAPSPassword → DumpLSA needs 5-6
+        # actions); 6 matches the engine's existing per-scope safety cap
+        # (``_effective_max_depth``: user+all → 6) so it adds no risk of
+        # path explosion beyond what the cap already permits.
+        max_depth = 6
         if len(parts) >= 2:
             try:
                 max_depth = int(parts[1])
@@ -25552,7 +25998,7 @@ class PentestShell:
         self.report[domain]["vulnerabilities"][key] = value
 
         try:
-            from adscan_internal.services.report_service import (
+            from adscan_core.reporting.technical_report import (
                 record_technical_finding,
             )
 
@@ -25585,7 +26031,7 @@ class PentestShell:
         self.update_report_for_domain(domain)
 
         try:
-            from adscan_internal.services.report_service import (
+            from adscan_core.reporting.technical_report import (
                 record_technical_finding,
             )
 
@@ -25722,8 +26168,8 @@ class PentestShell:
         renderer_arg = "cytoscape"
         template_arg = "premium"
         _THEME_MAP = {
-            "Corporate Light — white/navy, print-safe": "corporate_light",
-            "Premium Dark — navy/cyan palette": "premium_dark",
+            "Editorial — warm bone, ember accent (premium, McKinsey-grade)": "editorial",
+            "Corporate — white/navy, print-safe (Big-4 / auditor)": "corporate_light",
         }
         _theme_keys = list(_THEME_MAP.keys())
         theme_idx = self._questionary_select("Report theme:", _theme_keys)
@@ -27000,7 +27446,11 @@ class PentestShell:
         """
         from adscan_internal.cli.start import run_start_unauth
 
-        run_start_unauth(self, args)
+        scan_ctx = self._begin_scan_lifecycle(auth_mode="unauth", args=args)
+        try:
+            run_start_unauth(self, args)
+        finally:
+            self._end_scan_lifecycle(scan_ctx)
 
     def do_start_auth(self, args):
         """Start an authenticated domain scan workflow.
@@ -27014,7 +27464,297 @@ class PentestShell:
         """
         from adscan_internal.cli.start import run_start_auth
 
-        run_start_auth(self, args)
+        scan_ctx = self._begin_scan_lifecycle(auth_mode="auth", args=args)
+        try:
+            run_start_auth(self, args)
+        finally:
+            self._end_scan_lifecycle(scan_ctx)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Scan lifecycle helpers — drive Tier 2 streaming markers.
+    #
+    # ``do_start_unauth`` and ``do_start_auth`` are the two commands
+    # the operator runs from the interactive shell to fire a scan. We
+    # wrap them with these helpers so the streamer (when active) emits
+    # a ``scan_started`` lifecycle chunk on entry and a
+    # ``scan_finished`` chunk on exit, regardless of how the scan
+    # ended (success, exception, KeyboardInterrupt). The streamer
+    # itself decides whether to ship the markers — if it's not running
+    # (telemetry off, command_type not in scope, no direct URL) these
+    # helpers are cheap no-ops.
+    # ──────────────────────────────────────────────────────────────────
+
+    def _begin_scan_lifecycle(self, *, auth_mode: str, args: Any) -> dict[str, Any]:
+        streamer = getattr(self, "_telemetry_streamer", None)
+        scan_started_at = time.monotonic()
+        ctx: dict[str, Any] = {
+            "auth_mode": auth_mode,
+            "started_at": scan_started_at,
+        }
+        if streamer is None:
+            return ctx
+        try:
+            domain = self._resolve_scan_domain_for_lifecycle(args)
+        except Exception:  # noqa: BLE001
+            domain = None
+        ctx["domain"] = domain
+        try:
+            streamer.emit_lifecycle(
+                "scan_started",
+                {
+                    "auth_mode": auth_mode,
+                    "domain": domain,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            print_info_debug(
+                f"(telemetry-streamer) scan_started emit failed: {type(exc).__name__}: {exc}"
+            )
+        return ctx
+
+    def _end_scan_lifecycle(self, ctx: dict[str, Any]) -> None:
+        streamer = getattr(self, "_telemetry_streamer", None)
+        if streamer is None:
+            return
+        try:
+            duration = max(0.0, time.monotonic() - float(ctx.get("started_at") or 0.0))
+            findings = self._collect_scan_metadata_for_lifecycle()
+            findings.update(
+                {
+                    "auth_mode": ctx.get("auth_mode"),
+                    "domain": ctx.get("domain"),
+                    "duration_seconds": round(duration, 2),
+                }
+            )
+            streamer.emit_lifecycle("scan_finished", findings)
+        except Exception as exc:  # noqa: BLE001
+            print_info_debug(
+                f"(telemetry-streamer) scan_finished emit failed: {type(exc).__name__}: {exc}"
+            )
+
+    def _resolve_scan_domain_for_lifecycle(self, args: Any) -> Optional[str]:
+        """Best-effort: capture the domain the operator targeted.
+
+        ``start_unauth`` / ``start_auth`` accept either a positional
+        domain or fall back to the shell's current domain. We mirror
+        that resolution shallowly here without firing any side effect.
+        """
+        argv = args.split() if isinstance(args, str) else (args or [])
+        if argv:
+            cand = str(argv[0]).strip()
+            if cand:
+                return cand
+        return getattr(self, "current_domain", None) or None
+
+    def _collect_scan_metadata_for_lifecycle(self) -> dict[str, Any]:
+        """Snapshot scan outcome counters for the scan_finished marker.
+
+        All fields are best-effort: a missing attribute or transient
+        exception simply omits that key from the chunk metadata. The
+        server displays whatever arrives.
+        """
+        metadata: dict[str, Any] = {}
+        try:
+            attack_summaries = getattr(self, "_attack_path_summaries", None)
+            if isinstance(attack_summaries, list):
+                metadata["attack_paths_count"] = len(attack_summaries)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hasattr(self, "_session_compromise_status"):
+                metadata["compromise_status"] = str(self._session_compromise_status)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hasattr(self, "compromised_users"):
+                metadata["compromised_users_count"] = len(self.compromised_users)
+        except Exception:  # noqa: BLE001
+            pass
+        return metadata
+
+    def _init_telemetry_streamer(self) -> None:
+        """Spin up the Tier 2 streamer when the command is eligible.
+
+        Called from ``__init__`` after the shell's command_type is set.
+        The factory in ``adscan_core.telemetry`` returns ``None`` when
+        any eligibility check fails (command not in scope, telemetry
+        disabled, no direct ingest URL, missing token) — in which case
+        we silently keep the Tier 1 single-shot path.
+
+        Once started, the streamer immediately emits a
+        ``session_started`` lifecycle chunk so the server can bootstrap
+        the sessions row + live-view route before any scan fires.
+        """
+        from adscan_core import telemetry as _tel
+
+        # Diagnostic breadcrumb so ``--debug`` always shows the streamer
+        # init was reached (silent failure modes upstream were
+        # historically the hardest to diagnose).
+        print_info_debug(
+            f"(telemetry-streamer) init: command_type="
+            f"{self.session_command_type!r}"
+        )
+
+        # Normally the launcher seeds ADSCAN_SESSION_TRACE_ID before
+        # docker run. When running adscan directly (``uv run adscan
+        # start`` for dev/CI smoke tests) the launcher is bypassed —
+        # seed a trace id ourselves so live streaming still works
+        # end-to-end. ``capture_session_end`` reads from the same env
+        # var, so a single seed covers both ingest paths.
+        trace_id = os.getenv("ADSCAN_SESSION_TRACE_ID") or ""
+        if not trace_id:
+            import uuid as _uuid
+
+            trace_id = _uuid.uuid4().hex
+            os.environ["ADSCAN_SESSION_TRACE_ID"] = trace_id
+            print_info_debug(
+                f"(telemetry-streamer) seeded ADSCAN_SESSION_TRACE_ID: {trace_id!r}"
+            )
+        else:
+            print_info_debug(
+                f"(telemetry-streamer) using inherited "
+                f"ADSCAN_SESSION_TRACE_ID: {trace_id!r}"
+            )
+
+        command_type = (self.session_command_type or "start").lower()
+        # Privacy: we never pass ``current_workspace`` to the streamer
+        # — only the derived ``workspace_id_hash`` does, and that's
+        # snapshotted on every chunk via ``_version_payload`` below so
+        # the dashboard picks up workspace changes the moment
+        # ``workspace_select`` runs.
+        #
+        # Environment label resolved once at process start; we mirror
+        # the value the legacy path computes in capture_session_end.
+        environment = (
+            os.getenv("ADSCAN_SESSION_ENV") or os.getenv("ADSCAN_ENV") or "prod"
+        ).strip().lower() or "prod"
+
+        started_at_dt = datetime.now(timezone.utc)
+        session_started_monotonic = time.monotonic()
+        self._streamer_session_started_at = started_at_dt
+        self._streamer_session_started_monotonic = session_started_monotonic
+
+        def _export_html() -> str:
+            # ``clear=False`` is load-bearing: Rich's
+            # ``Console.export_html()`` clears the internal record
+            # buffer by default. Without this flag, each streamer tick
+            # would receive ONLY the chars rendered since the previous
+            # tick — and ``capture_session_end`` at session exit would
+            # see an empty buffer because the streamer had already
+            # drained everything. The diff math (``sanitized[sent_chars:]``)
+            # also breaks because the cursor outruns the buffer the
+            # first time it's reset, producing zero-byte chunks for the
+            # rest of the session (we observed this in production —
+            # ``raw_html_chars`` collapsing from 81K → 1.2K → 1.1K
+            # between consecutive ticks).
+            try:
+                return TELEMETRY_CONSOLE.export_html(clear=False)
+            except Exception:  # noqa: BLE001
+                return ""
+
+        def _version_payload() -> dict[str, Any]:
+            # Version + lab/workspace block included on every chunk so
+            # the server can bootstrap the sessions row from the first
+            # chunk that arrives. We reuse the canonical helper that
+            # ``capture_session_end`` already uses for the legacy
+            # single-shot payload — same source of truth, same shape,
+            # zero drift between the two ingest paths.
+            try:
+                from adscan_core.version_context import (
+                    get_telemetry_version_fields as _ver,
+                )
+
+                fields = dict(_ver() or {})
+            except Exception:  # noqa: BLE001
+                fields = {}
+            # Carry the workspace identity on every chunk in case it
+            # changed mid-session (``workspace_select`` after the
+            # streamer already started). The server takes whichever
+            # value arrives on the latest chunk for the row update.
+            #
+            # Privacy: only the stable ``workspace_id_hash`` ever
+            # leaves the host. The raw workspace name is
+            # customer-sensitive (think "acme-corp-prod") and stays
+            # local — single source of truth for that rule is
+            # ``_build_session_metadata`` in telemetry.py.
+            try:
+                workspace_now = getattr(self, "current_workspace", None)
+                if workspace_now:
+                    from adscan_core.telemetry import (
+                        compute_workspace_id_hash as _wsh,
+                    )
+                    ws_hash = _wsh(workspace_now)
+                    if ws_hash:
+                        fields["workspace_id_hash"] = ws_hash
+            except Exception:  # noqa: BLE001
+                pass
+            return fields
+
+        streamer = _tel.make_session_streamer(
+            trace_id=trace_id,
+            user_id_hash=str(_tel.TELEMETRY_ID),
+            command_type=command_type,
+            session_scope="runtime",
+            environment=environment,
+            started_at=started_at_dt,
+            export_html_fn=_export_html,
+            version_payload_fn=_version_payload,
+        )
+        if streamer is None:
+            # ``make_session_streamer`` already emitted the specific
+            # ``skipped: <reason>`` line. No extra log needed here.
+            return
+        self._telemetry_streamer = streamer
+
+        # Fire ``session_started`` immediately so the server bootstraps
+        # the sessions row + the operator can already open the live
+        # page in the viewer. The chunk content at this point is the
+        # short banner + welcome panel, exactly what the operator just
+        # saw in the terminal.
+        # Privacy: never put the raw workspace name in lifecycle
+        # metadata. The streamer's ``version_payload_fn`` snapshot
+        # already carries ``workspace_id_hash`` on every chunk.
+        try:
+            streamer.emit_lifecycle(
+                "session_started",
+                {
+                    "command_type": command_type,
+                    "environment": environment,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            print_info_debug(
+                f"(telemetry-streamer) session_started emit failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _finalise_telemetry_streamer(self) -> None:
+        """Close the streamer and ship the final chunk with ``is_final``.
+
+        Called from ``capture_session_end`` BEFORE the legacy
+        single-shot export runs — if the streamer was active for this
+        session, the legacy export is then skipped (the server already
+        has the full content via assembled chunks).
+        """
+        streamer = getattr(self, "_telemetry_streamer", None)
+        if streamer is None:
+            return
+        try:
+            streamer.finalise(
+                finished_at=datetime.now(timezone.utc),
+                compromise_status=getattr(self, "_session_compromise_status", None),
+                compromised_users_count=(
+                    len(self._session_compromised_users)
+                    if hasattr(self, "_session_compromised_users")
+                    else None
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print_info_debug(
+                f"(telemetry-streamer) finalise failed: {type(exc).__name__}: {exc}"
+            )
+        finally:
+            self._telemetry_streamer = None
 
     def scan_service(self, service, hosts, domain=None):
         """Scans a specific service using netexec."""
@@ -27586,6 +28326,30 @@ class PentestShell:
         command_type = _resolve_command_type(shell=self)
         if _is_session_capture_allowed(command_type):
             metadata = _build_command_metadata(shell=self)
+            # Tier 2: when the streamer is active, it has been shipping
+            # chunks throughout the session. We finalise it here — that
+            # blocks until the final ``is_final=true`` chunk is sent and
+            # then resets ``self._telemetry_streamer = None``. The legacy
+            # single-shot export still runs for the path it covers
+            # (commands not in the stream-eligible set), because
+            # ``capture_session_end`` is the canonical single sink and
+            # the rest of the pipeline (PostHog event, exit summary,
+            # case-study metrics) depends on it. The duplicate upload of
+            # the same Rich recording is harmless: the server's chunk
+            # endpoint stitches via ``trace_id`` so the row already
+            # exists; the legacy POST with the same ``user_id_hash``
+            # creates a SECOND row only when the trace ids differ, which
+            # they don't in a streaming session. (If we ever observe
+            # duplicates in production we add an explicit skip-when-
+            # streamed flag here — for now keep both pipelines coherent.)
+            try:
+                self._finalise_telemetry_streamer()
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"(telemetry-streamer) finalise hook in do_exit failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             telemetry.capture_session_end(console=TELEMETRY_CONSOLE, metadata=metadata)
 
         # Capture session summary event (Hormozi: Monitor Give:Ask ratio)
@@ -27748,6 +28512,7 @@ class PentestShell:
                 "mssql_check_impersonate",
             ],
             "Credential Harvesting": [
+                "dump_lsass",
                 "dump_lsa",
                 "dump_sam",
                 "dump_dpapi",
@@ -27942,6 +28707,15 @@ except Exception as _shell_cmd_bind_exc:  # noqa: BLE001 — non-fatal
         _shell_cmd_bind_telemetry.capture_exception(_shell_cmd_bind_exc)
     except Exception:
         pass
+
+# Convenience alias: ``navigator`` → ``mitre_navigator``. The registry binds
+# ``do_mitre_navigator`` above; the alias is set here (after binding) because
+# the registry has no alias mechanism. Both resolve to the same handler so the
+# behaviour and help text stay single-sourced in the registry spec.
+if hasattr(PentestShell, "do_mitre_navigator") and not hasattr(
+    PentestShell, "do_navigator"
+):
+    PentestShell.do_navigator = PentestShell.do_mitre_navigator
 
 
 # --- Helper function to get tool executable paths ---
@@ -28502,7 +29276,6 @@ def _build_check_context(handle_check_fn):
         preflight_install_dns=preflight_install_dns,
         setup_external_tool=_setup_external_tool,
         is_docker_official_installed=_is_docker_official_installed,
-        is_docker_compose_plugin_available=_is_docker_compose_plugin_available,
         is_docker_env=is_docker_env,
         is_rustup_available=_is_rustup_available,
         get_rusthound_verification_status=_get_rusthound_verification_status,
@@ -28686,7 +29459,7 @@ if __name__ == "__main__":
     install_parser.add_argument(
         "--allow-low-disk",
         action="store_true",
-        help="Continue installation even if free disk space is below 10GB (not recommended).",
+        help="Continue installation even if free disk space is below 15GB (not recommended).",
     )
     install_parser.add_argument(
         "--pull-timeout",
@@ -28748,7 +29521,18 @@ if __name__ == "__main__":
     )
     # Non-interactive CI scan for automated testing
     ci_parser = subparsers.add_parser(
-        "ci", help="Run non-interactive CI scan (skips all prompts, uses defaults)"
+        "ci",
+        help="[EXPERIMENTAL] Run ADscan in autonomous mode (skips all prompts, applies defaults)",
+        description=(
+            "EXPERIMENTAL · BETA — Autonomous (non-interactive) scan mode.\n\n"
+            "Skips every prompt, applies sensible defaults, and runs the full "
+            "ADscan pipeline end-to-end. Intended for CI/CD, automated lab "
+            "validation (HTB/GOAD), and unattended engagements.\n\n"
+            "STATUS — Beta. Behaviour, defaults, and output format may change "
+            "between releases. Use `adscan start` for interactive scans where "
+            "operator judgement is preferred."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ci_parser.add_argument(
         "mode",
@@ -29117,7 +29901,7 @@ if __name__ == "__main__":
     # Set global verbose mode (VERBOSE_MODE) if --verbose is passed with start/install/auto command
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "install", "check")
+        and args.command in ("start", "ci", "install", "check", "mitre-navigator")
         and hasattr(args, "verbose")
         and args.verbose
     ):
@@ -29132,7 +29916,7 @@ if __name__ == "__main__":
     # Debug mode (public in OSS launcher/runtime; does not enable SECRET_MODE).
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "install", "check")
+        and args.command in ("start", "ci", "install", "check", "deliver", "mitre-navigator")
         and hasattr(args, "debug")
         and args.debug
     ):

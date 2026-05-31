@@ -283,6 +283,8 @@ def _probe_one_target(
     username: str,
     password: str,
     auth_mode: str,
+    kdc_ip: str | None = None,
+    workspace_dir: str | None = None,
     clock_skew_retry: _ClockSkewRetryCoordinator | None = None,
     posture_sink: Optional[PostureSink] = None,
     posture_snapshot: Optional["DomainPosture"] = None,
@@ -298,6 +300,8 @@ def _probe_one_target(
                 password=password,
                 auth_mode=auth_mode,
                 kerberos_spn_host=target.kerberos_spn_host,
+                kdc_ip=kdc_ip,
+                workspace_dir=workspace_dir,
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
                 domain_for_posture=domain,
@@ -399,6 +403,17 @@ def run_winrm_access_probe_sweep(
     if not probe_targets:
         return []
 
+    # Resolve the target domain's KDC IP so kerbad can mint a TGT for
+    # plaintext-password / NT-hash Kerberos auth without depending on the
+    # container's system krb5 (single source of truth: resolve_dc_ip).
+    sweep_kdc_ip: str | None = None
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+
+        sweep_kdc_ip = resolve_dc_ip(domain_data or {}) or None
+    except Exception:  # noqa: BLE001 - best-effort; None keeps legacy behaviour
+        sweep_kdc_ip = None
+
     worker_count = max(
         1, min(max_workers or DEFAULT_WINRM_PROBE_WORKERS, len(probe_targets))
     )
@@ -424,6 +439,8 @@ def run_winrm_access_probe_sweep(
                 username=username,
                 password=password,
                 auth_mode=auth_mode,
+                kdc_ip=sweep_kdc_ip,
+                workspace_dir=workspace_dir,
                 clock_skew_retry=clock_skew_retry,
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
@@ -491,6 +508,8 @@ async def probe_winrm_available(
     password: str,
     auth_mode: str = "auto",
     kerberos_spn_host: str | None = None,
+    kdc_ip: str | None = None,
+    workspace_dir: str | None = None,
     timeout: int = 10,
     posture_sink: Optional[PostureSink] = None,
     posture_snapshot: Optional["DomainPosture"] = None,
@@ -514,6 +533,12 @@ async def probe_winrm_available(
             and NTLM otherwise.
         kerberos_spn_host: Optional SPN hostname override (FQDN) used when
             authenticating with Kerberos against an IP target.
+        kdc_ip: Optional KDC IP for the target domain. Threaded into the PSRP
+            service so kerbad can mint a TGT for plaintext-password / NT-hash
+            Kerberos auth without relying on the container's system krb5.
+        workspace_dir: Optional workspace root. When set, the PSRP service
+            prefers an already-minted ccache for this principal under
+            ``domains/<domain>/kerberos/tickets/<user>.ccache``.
         timeout: Per-call timeout in seconds.
 
     Notes:
@@ -532,6 +557,8 @@ async def probe_winrm_available(
             username=username,
             password=password,
             auth_mode=auth_mode,
+            kdc_ip=kdc_ip,
+            workspace_dir=workspace_dir,
             clock_skew_retry=None,
             posture_sink=posture_sink,
             posture_snapshot=posture_snapshot,

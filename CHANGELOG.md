@@ -14,6 +14,25 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+## [9.0.1] - 2026-05-31
+
+### Added
+- Automatic credential recovery when a discovered account is not found in the
+  domain: the recovered secret is fuzzy-matched against enumerated users and
+  verified live, with a lockout-safe password-spray fallback to identify the
+  account the secret actually belongs to.
+
+### Changed
+
+### Fixed
+- WinRM Kerberos authentication now reuses the workspace TGT ticket cache (or
+  mints one from the recovered password), fixing "matching credential not
+  found" failures in environments without a local Kerberos credential cache.
+- MSSQL Kerberos logins now target the domain KDC explicitly, fixing
+  authentication when the runtime cannot resolve the KDC via DNS.
+
+### Removed
+
 ## [9.0.0] - 2026-05-20
 
 ### Added
@@ -55,7 +74,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v9.0.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v9.0.1...HEAD
+[9.0.1]: https://github.com/ADScanPro/adscan/compare/v9.0.0...v9.0.1
 [9.0.0]: https://github.com/ADScanPro/adscan/compare/v8.0.0...v9.0.0
 [8.0.0]: https://github.com/ADScanPro/adscan/compare/v7.2.0...v8.0.0
 [7.2.0]: https://github.com/ADScanPro/adscan/compare/v7.1.0...v7.2.0

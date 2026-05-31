@@ -58,6 +58,10 @@ PYPSRP_KERBEROS_INFRA_ERROR_MARKERS: tuple[str, ...] = (
     "CANNOT RESOLVE NETWORK ADDRESS FOR KDC",
     "KDC IS UNAVAILABLE",
     "KDC_UNREACH",
+    # pyspnego/GSSAPI could not find a usable local credential to mint a TGT
+    # (no krb5.conf/KDC resolution in the container). This is an infrastructure
+    # failure, not a credential rejection — route it to the NTLM fallback.
+    "MATCHING CREDENTIAL NOT FOUND",
     # Network wrappers below pyspnego.
     "CONNECTION REFUSED",
     "CONNECTIONREFUSED",

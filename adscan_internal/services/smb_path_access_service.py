@@ -390,6 +390,7 @@ class SMBPathAccessService(BaseService):
         auth_mode: str,
         use_kerberos: bool,
         kdc_host: str | None,
+        spn_host: str | None,
         timeout_seconds: int,
         marked_host: str,
         marked_share: str,
@@ -401,7 +402,7 @@ class SMBPathAccessService(BaseService):
         is_hash = _looks_like_ntlm_hash(credential)
         config = SMBConfig(
             target_ip=host_clean,
-            target_hostname=host_clean,
+            target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
             password=None if is_hash or use_kerberos else credential,
@@ -549,6 +550,7 @@ class SMBPathAccessService(BaseService):
         is_hash: bool,
         use_kerberos: bool,
         kdc_host: str | None,
+        spn_host: str | None,
         timeout_seconds: int,
         marked_host: str,
         marked_share: str,
@@ -559,7 +561,7 @@ class SMBPathAccessService(BaseService):
         """Async implementation of probe_write_access."""
         config = SMBConfig(
             target_ip=host_clean,
-            target_hostname=host_clean,
+            target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
             password=None if is_hash or use_kerberos else credential,
@@ -703,6 +705,7 @@ class SMBPathAccessService(BaseService):
         is_hash: bool,
         use_kerberos: bool,
         kdc_host: str | None,
+        spn_host: str | None,
         timeout_seconds: int,
         remote_name_clean: str,
         file_contents: bytes,
@@ -716,7 +719,7 @@ class SMBPathAccessService(BaseService):
         """Async implementation of upload_file (single attempt)."""
         config = SMBConfig(
             target_ip=host_clean,
-            target_hostname=host_clean,
+            target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
             password=None if is_hash or use_kerberos else credential,
@@ -840,6 +843,7 @@ class SMBPathAccessService(BaseService):
         is_hash: bool,
         use_kerberos: bool,
         kdc_host: str | None,
+        spn_host: str | None,
         timeout_seconds: int,
         marked_host: str,
         marked_share: str,
@@ -850,7 +854,7 @@ class SMBPathAccessService(BaseService):
         """Async implementation of delete_file (single attempt)."""
         config = SMBConfig(
             target_ip=host_clean,
-            target_hostname=host_clean,
+            target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
             password=None if is_hash or use_kerberos else credential,
@@ -943,6 +947,7 @@ class SMBPathAccessService(BaseService):
         auth_domain: str = "",
         use_kerberos: bool = False,
         kdc_host: str | None = None,
+        spn_host: str | None = None,
         timeout_seconds: int = 30,
     ) -> SMBPathSecuritySnapshot:
         """Collect theoretical SMB share/path descriptors for later ACL evaluation."""
@@ -993,6 +998,7 @@ class SMBPathAccessService(BaseService):
                 auth_mode=auth_mode,
                 use_kerberos=use_kerberos,
                 kdc_host=kdc_host,
+                spn_host=spn_host,
                 timeout_seconds=timeout_seconds,
                 marked_host=marked_host,
                 marked_share=marked_share,
@@ -1069,6 +1075,7 @@ class SMBPathAccessService(BaseService):
         auth_domain: str = "",
         use_kerberos: bool = False,
         kdc_host: str | None = None,
+        spn_host: str | None = None,
         timeout_seconds: int = 30,
     ) -> SMBPathWriteProbeResult:
         """Probe whether one credential context can create a file in an SMB path."""
@@ -1125,6 +1132,7 @@ class SMBPathAccessService(BaseService):
                 is_hash=is_hash,
                 use_kerberos=use_kerberos,
                 kdc_host=kdc_host,
+                spn_host=spn_host,
                 timeout_seconds=timeout_seconds,
                 marked_host=marked_host,
                 marked_share=marked_share,
@@ -1148,6 +1156,7 @@ class SMBPathAccessService(BaseService):
         delete_after: bool = True,
         use_kerberos: bool = False,
         kdc_host: str | None = None,
+        spn_host: str | None = None,
         timeout_seconds: int = 30,
     ) -> SMBFileUploadResult:
         """Upload one file to an SMB path and optionally delete it afterwards."""
@@ -1210,6 +1219,7 @@ class SMBPathAccessService(BaseService):
                 is_hash=is_hash,
                 use_kerberos=use_kerberos,
                 kdc_host=kdc_host,
+                spn_host=spn_host,
                 timeout_seconds=timeout_seconds,
                 remote_name_clean=remote_name_clean,
                 file_contents=file_contents,
@@ -1258,6 +1268,7 @@ class SMBPathAccessService(BaseService):
                     is_hash=is_hash,
                     use_kerberos=False,
                     kdc_host=None,
+                    spn_host=spn_host,
                     timeout_seconds=timeout_seconds,
                     remote_name_clean=remote_name_clean,
                     file_contents=file_contents,
@@ -1295,6 +1306,7 @@ class SMBPathAccessService(BaseService):
         auth_domain: str = "",
         use_kerberos: bool = False,
         kdc_host: str | None = None,
+        spn_host: str | None = None,
         timeout_seconds: int = 30,
     ) -> SMBFileDeleteResult:
         """Delete one file from an SMB share/path."""
@@ -1343,6 +1355,7 @@ class SMBPathAccessService(BaseService):
                 is_hash=is_hash,
                 use_kerberos=use_kerberos,
                 kdc_host=kdc_host,
+                spn_host=spn_host,
                 timeout_seconds=timeout_seconds,
                 marked_host=marked_host,
                 marked_share=marked_share,
@@ -1388,6 +1401,7 @@ class SMBPathAccessService(BaseService):
                     is_hash=is_hash,
                     use_kerberos=False,
                     kdc_host=None,
+                    spn_host=spn_host,
                     timeout_seconds=timeout_seconds,
                     marked_host=marked_host,
                     marked_share=marked_share,
@@ -1426,6 +1440,7 @@ class SMBPathAccessService(BaseService):
         delete_after: bool = True,
         use_kerberos: bool = False,
         kdc_host: str | None = None,
+        spn_host: str | None = None,
         timeout_seconds: int = 30,
     ) -> SMBPathWriteProbeResult:
         """Upload one probe file to an SMB path and optionally delete it afterwards."""
@@ -1441,6 +1456,7 @@ class SMBPathAccessService(BaseService):
             delete_after=delete_after,
             use_kerberos=use_kerberos,
             kdc_host=kdc_host,
+            spn_host=spn_host,
             timeout_seconds=timeout_seconds,
         )
         return SMBPathWriteProbeResult(

@@ -74,6 +74,7 @@ class ImpacketMSSQLBackend:
         client_factory: ClientFactory | None = None,
         kerberos_target_hostname: str | None = None,
         domain: str | None = None,
+        kdc_host: str | None = None,
     ) -> None:
         from adscan_internal.services._kerberos_spn import (
             normalize_kerberos_target_hostname,
@@ -83,6 +84,15 @@ class ImpacketMSSQLBackend:
         self.port = int(port)
         self.database = str(database)
         self._client_factory = client_factory or self._default_client_factory
+        # KDC endpoint for impacket's self-minted AS-REQ/TGS-REQ. Impacket's
+        # ``kerberosLogin`` resolves the KDC by DNS from the domain name when
+        # ``kdcHost`` is None — which fails inside a container without AD DNS.
+        # Pass the DC/KDC IP here so the Kerberos requests reach the right
+        # endpoint regardless of container DNS. This is the transport target,
+        # NOT a service SPN, so an IP is acceptable and must NOT be promoted to
+        # an FQDN. Defaults to ``None`` to preserve legacy DNS-resolution
+        # behavior for callers that do not supply it.
+        self._kdc_host = str(kdc_host) if kdc_host else None
         # Impacket builds the Kerberos SPN as ``MSSQLSvc/<remoteName>:<port>``
         # from the third positional arg of ``tds.MSSQL(...)``. A short hostname
         # or IP yields a ticket the server rejects (same pattern as LDAP/SMB).
@@ -568,6 +578,7 @@ class ImpacketMSSQLBackend:
                         username,
                         "",
                         domain,
+                        kdcHost=self._kdc_host,
                         useCache=True,
                     )
                 )
@@ -582,6 +593,7 @@ class ImpacketMSSQLBackend:
                         "",
                         domain,
                         hashes=hash_value,
+                        kdcHost=self._kdc_host,
                         useCache=False,
                     )
                 )
@@ -603,6 +615,7 @@ class ImpacketMSSQLBackend:
                     username,
                     secret,
                     domain,
+                    kdcHost=self._kdc_host,
                     useCache=False,
                 )
             )

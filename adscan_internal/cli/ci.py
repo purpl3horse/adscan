@@ -38,6 +38,7 @@ from adscan_core.rich_output_collection import (
     PhaseChapter,
     SessionHeader,
     SessionLootCard,
+    print_ci_autonomous_callout,
     print_phase_chapter,
     print_session_header,
     print_session_loot_card,
@@ -170,8 +171,15 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
             dc_ip=_ci_dc,
             credential_label=_ci_cred,
             scan_mode="ci",
+            experimental=True,
         )
     )
+    # Premium one-shot callout that frames the autonomous flow + sets
+    # operator expectations (BETA, defaults may shift, fallback paths).
+    # Always shown — the cost of redundancy here is much lower than the
+    # cost of an operator believing autonomous output equals supported
+    # contract.
+    print_ci_autonomous_callout()
 
     from adscan_internal.cli.common import build_telemetry_context
 

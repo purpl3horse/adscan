@@ -744,11 +744,24 @@ def build_cli_runtime_snapshot(
         if isinstance(domain_data, dict):
             creds = domain_data.get("credentials", {})
             creds_count = len(creds) if isinstance(creds, dict) else 0
+            # Surface the Kerberos-relevant FQDN/hostname keys on every
+            # command. Captures the workspace state at the exact moment
+            # the user runs a command — the next bug report triggered by
+            # stale FQDN data (e.g. v8 → v9 workspace migration) will
+            # carry the field provenance inline instead of requiring a
+            # second round trip to the user. See BACKLOG entry "v8→v9
+            # workspace migration — stale Kerberos target hostname"
+            # for the diagnostic story that motivated these fields.
             domain_state = {
                 "domain": context_domain,
                 "auth": str(domain_data.get("auth", "unknown")),
                 "pdc": str(domain_data.get("pdc", "N/A")),
                 "pdc_hostname": str(domain_data.get("pdc_hostname", "N/A")),
+                "pdc_hostname_fqdn": str(
+                    domain_data.get("pdc_hostname_fqdn", "N/A")
+                ),
+                "pdc_fqdn": str(domain_data.get("pdc_fqdn", "N/A")),
+                "dc_fqdn": str(domain_data.get("dc_fqdn", "N/A")),
                 "username": str(domain_data.get("username", "N/A")),
                 "credentials_count": creds_count,
             }
@@ -783,6 +796,85 @@ def build_cli_runtime_snapshot(
     }
 
 
+def _flatten_runtime_snapshot_for_exception(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a ``build_cli_runtime_snapshot`` dict to file-log-safe scalars.
+
+    Strips nested dicts (notably ``domain_state``) up to one level, marking
+    sensitive fields so the resulting dict can be passed directly to the
+    exception logger's ``context`` parameter. Returns a flat ``{str: str}``
+    dictionary that ``_format_exception_context`` knows how to render as
+    ``key=value`` pairs alongside the traceback.
+    """
+    flat: dict[str, Any] = {}
+    flat["workspace"] = mark_sensitive(
+        str(snapshot.get("current_workspace") or "None"), "path"
+    )
+    flat["interface"] = snapshot.get("interface")
+    flat["pentest_type"] = snapshot.get("pentest_type")
+    flat["auto"] = snapshot.get("automatic_mode")
+    flat["current_domain"] = mark_sensitive(
+        str(snapshot.get("starting_domain") or "None"), "domain"
+    )
+    flat["context_domain"] = mark_sensitive(
+        str(snapshot.get("context_domain") or "None"), "domain"
+    )
+    flat["domains_loaded"] = snapshot.get("domains_loaded")
+
+    domain_state = snapshot.get("domain_state")
+    if isinstance(domain_state, dict):
+        flat["domain"] = mark_sensitive(
+            str(domain_state.get("domain", "N/A")), "domain"
+        )
+        flat["auth"] = str(domain_state.get("auth", "unknown"))
+        flat["pdc"] = mark_sensitive(str(domain_state.get("pdc", "N/A")), "ip")
+        flat["pdc_hostname"] = mark_sensitive(
+            str(domain_state.get("pdc_hostname", "N/A")), "hostname"
+        )
+        flat["pdc_hostname_fqdn"] = mark_sensitive(
+            str(domain_state.get("pdc_hostname_fqdn", "N/A")), "hostname"
+        )
+        flat["pdc_fqdn"] = mark_sensitive(
+            str(domain_state.get("pdc_fqdn", "N/A")), "hostname"
+        )
+        flat["dc_fqdn"] = mark_sensitive(
+            str(domain_state.get("dc_fqdn", "N/A")), "hostname"
+        )
+        flat["username"] = mark_sensitive(
+            str(domain_state.get("username", "N/A")), "user"
+        )
+        flat["credentials_count"] = domain_state.get("credentials_count", 0)
+    return flat
+
+
+def install_exception_context_provider(shell: Any) -> None:
+    """Wire the shell into the exception logger's diagnostic-context hook.
+
+    After this call, any ``print_exception`` invoked anywhere in ADscan that
+    does not pass an explicit ``context`` will automatically attach the
+    current workspace + active domain snapshot (including the FQDN/hostname
+    keys that drive Kerberos targeting) to the file log.
+
+    The provider is intentionally lazy — it runs at exception time, so the
+    snapshot reflects the workspace state at the moment of failure, not at
+    the moment of registration. Idempotent: re-installing on the same shell
+    replaces the provider with a fresh closure.
+    """
+    try:
+        from adscan_core.output._log import register_exception_context_provider
+
+        def _provider() -> dict[str, Any] | None:
+            try:
+                snapshot = build_cli_runtime_snapshot(shell=shell)
+                return _flatten_runtime_snapshot_for_exception(snapshot)
+            except Exception:
+                return None
+
+        register_exception_context_provider(_provider)
+    except Exception:
+        # Diagnostic plumbing must never crash the host process.
+        pass
+
+
 def log_cli_command_context(
     shell: Any,
     command_name: str,
@@ -792,6 +884,12 @@ def log_cli_command_context(
 ) -> None:
     """Emit a compact workspace/domain snapshot for CLI command execution."""
     try:
+        # Make sure the exception logger has a current snapshot provider
+        # bound to this shell — registering here covers shells that were
+        # constructed before install_exception_context_provider was wired
+        # in adscan.py, and is cheap (function call + global assign).
+        install_exception_context_provider(shell)
+
         snapshot = build_cli_runtime_snapshot(
             shell=shell,
             command_name=command_name,
@@ -829,6 +927,15 @@ def log_cli_command_context(
         marked_pdc_host = mark_sensitive(
             str(domain_state.get("pdc_hostname", "N/A")), "hostname"
         )
+        marked_pdc_host_fqdn = mark_sensitive(
+            str(domain_state.get("pdc_hostname_fqdn", "N/A")), "hostname"
+        )
+        marked_pdc_fqdn = mark_sensitive(
+            str(domain_state.get("pdc_fqdn", "N/A")), "hostname"
+        )
+        marked_dc_fqdn = mark_sensitive(
+            str(domain_state.get("dc_fqdn", "N/A")), "hostname"
+        )
         marked_username = mark_sensitive(
             str(domain_state.get("username", "N/A")), "user"
         )
@@ -839,6 +946,9 @@ def log_cli_command_context(
             f"auth={auth} "
             f"pdc={marked_pdc} "
             f"pdc_hostname={marked_pdc_host} "
+            f"pdc_hostname_fqdn={marked_pdc_host_fqdn} "
+            f"pdc_fqdn={marked_pdc_fqdn} "
+            f"dc_fqdn={marked_dc_fqdn} "
             f"username={marked_username} "
             f"credentials_count={creds_count}"
         )

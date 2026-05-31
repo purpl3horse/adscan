@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -308,7 +309,7 @@ def _persist_collector_findings(
     if result is None:
         return
     try:
-        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_core.reporting.technical_report import record_technical_finding
     except ImportError:
         return
 
@@ -340,25 +341,6 @@ def _persist_collector_findings(
             },
         )
 
-    # ── Credential fields (CredSweeper) ───────────────────────────────────
-    cred_fields = getattr(result, "credential_findings", None) or []
-    if cred_fields:
-        _safe_record(
-            key="credential_in_ldap_attribute",
-            details={
-                "count": len(cred_fields),
-                "findings": [
-                    {
-                        "samaccountname": f.samaccountname,
-                        "field": f.field,
-                        "rule_name": f.rule_name,
-                        "ml_probability": f.ml_probability,
-                    }
-                    for f in cred_fields
-                ],
-            },
-        )
-
     # ── Audit findings (audit scope only) ─────────────────────────────────
     audit = getattr(result, "audit_findings", None) or []
     if not audit:
@@ -383,6 +365,7 @@ def _persist_collector_findings(
         "smb_v1_enabled": "smb_v1_enabled",
         "smb_signing_disabled": "smb_signing_disabled",
         "rc4_only": "rc4_only_accounts",
+        "weak_password_policy": "weak_password_policy",
     }
 
     for category, findings in by_cat.items():
@@ -687,46 +670,38 @@ def _print_collector_enrichment_panel(
     domain_policy = result.domain_policy
 
     if result.collection_scope == "audit" and (audit_findings or domain_policy):
+        # Severity badges with fixed-width text + colour. Two-track signal
+        # so the panel stays usable under NO_COLOR / colourblind operators
+        # (the badge text alone communicates severity), while the colour
+        # reinforces it for everyone else. Width is uniform so badges
+        # column-align without table machinery.
         severity_colors = {
             "critical": "[bold red]CRITICAL[/bold red]",
-            "high": "[red]HIGH[/red]",
-            "medium": "[yellow]MEDIUM[/yellow]",
-            "low": "[dim]LOW[/dim]",
+            "high":     "[red]HIGH    [/red]",
+            "medium":   "[yellow]MEDIUM  [/yellow]",
+            "low":      "[cyan]LOW     [/cyan]",
+            "info":     "[dim]INFO    [/dim]",
         }
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
-        summary_lines: list[str] = []
+        # Single-section layout: every actionable observation goes into
+        # the Findings list. The legacy "Domain Policy" section was a
+        # symptom of an inconsistent contract — half of its rows were
+        # already classified findings by ``audit_analyzer.py`` (e.g. MAQ
+        # as LOW), the rest (account lockout, min length, complexity)
+        # were rendered here but never persisted to ``technical_report.json``
+        # and never reached the catalogued vuln list. The new
+        # ``weak_password_policy`` consolidated finding closes that gap
+        # so password-policy weaknesses now travel end-to-end (panel →
+        # technical_report → PDF).
+        finding_lines: list[str] = []
+        footer_lines: list[str] = []
 
-        if domain_policy:
-            maq = domain_policy.machine_account_quota
-            if maq is not None and maq > 0:
-                summary_lines.append(
-                    f"[bold red]Machine Account Quota: {maq}[/bold red]"
-                    "  — any domain user can join computers"
-                )
-            if domain_policy.lockout_threshold == 0:
-                summary_lines.append(
-                    "[yellow]Account lockout: DISABLED[/yellow]"
-                    "  — spraying safe from lockout"
-                )
-            if (
-                domain_policy.min_pwd_length is not None
-                and domain_policy.min_pwd_length < 12
-            ):
-                summary_lines.append(
-                    f"[yellow]Min password length: "
-                    f"{domain_policy.min_pwd_length}[/yellow]"
-                    "  — below recommended 12 chars"
-                )
-            # Surface the last password-policy attribute change from
-            # msDS-ReplAttributeMetaData (per-attribute, not the generic
-            # whenChanged which includes unrelated domain-object updates).
-            pwd_last_changed = getattr(domain_policy, "pwd_policy_last_changed", None)
-            if pwd_last_changed:
-                summary_lines.append(
-                    f"[grey70]Password policy attributes last modified:[/grey70] "
-                    f"{pwd_last_changed[:10]}"
-                )
+        # Categories that are noise here because the same data is already
+        # the headline of another finding. Currently empty since the
+        # consolidation of MAQ + password-policy made every category
+        # carry distinct signal.
+        _DUPLICATE_OF_OTHER_FINDING: set[str] = set()
 
         category_labels = {
             "stale_user": "Stale enabled users (>90d no logon)",
@@ -739,6 +714,7 @@ def _print_collector_enrichment_panel(
             "smb_v1_enabled": "SMBv1 protocol enabled",
             "smb_signing_disabled": "SMB signing not required",
             "rc4_only": "RC4-only accounts",
+            "weak_password_policy": "Weak password policy",
             "pwd_policy_never_modified": "Password policy never modified",
         }
         # Denominator sets for contextual X/total display.
@@ -757,16 +733,84 @@ def _print_collector_enrichment_panel(
         for f in audit_findings:
             by_category.setdefault(f.category, []).append(f)
 
+        # Pre-compiled at module scope would be cleaner but keeping the
+        # regex local makes the krbtgt special-case self-contained — the
+        # only consumer is this branch.
+        _KRBTGT_AGE_DAYS_RE = re.compile(r"(\d+)\s+days")
+
         for cat, items in sorted(
             by_category.items(),
             key=lambda x: min(severity_order.get(f.severity, 9) for f in x[1]),
         ):
+            if cat in _DUPLICATE_OF_OTHER_FINDING:
+                continue
             label = category_labels.get(cat, cat)
             worst_sev = min(items, key=lambda f: severity_order.get(f.severity, 9)).severity
             sev = severity_colors.get(worst_sev, worst_sev)
             count = len(items)
 
-            if cat in _USER_HYGIENE_CATS and total_enabled_users > 0:
+            if cat == "machine_quota_risk":
+                # MAQ is a domain-wide finding; the count is always 1 and
+                # adds no signal. The interesting value is the MAQ itself
+                # (extracted from the finding detail, format set by
+                # ``audit_analyzer.py``: ``ms-DS-MachineAccountQuota = N — …``).
+                # When we cannot parse it, fall back to the consequence
+                # text so the row still reads correctly.
+                first = items[0]
+                m = re.search(r"=\s*(\d+)", first.detail or "")
+                if m:
+                    count_str = (
+                        f"[bold]{m.group(1)}[/bold] "
+                        f"[dim]— any domain user can join computers[/dim]"
+                    )
+                else:
+                    count_str = (
+                        "[bold]MAQ > 0[/bold] "
+                        "[dim]— any domain user can join computers[/dim]"
+                    )
+            elif cat == "weak_password_policy":
+                # Composite finding — the value is the enumeration of
+                # active sub-issues, persisted in ``detail`` by
+                # ``_analyze_weak_password_policy`` with format
+                # ``Weak Default Domain Password Policy — <issue> · <issue>``.
+                # Trim the prefix so the headline reads cleanly inline.
+                first = items[0]
+                sub_part = (first.detail or "").split("— ", 1)[-1]
+                if sub_part and sub_part != (first.detail or ""):
+                    count_str = (
+                        f"[bold]{sub_part}[/bold]"
+                    )
+                else:
+                    count_str = (
+                        f"[bold]{count}[/bold] sub-issue(s)"
+                    )
+            elif cat == "krbtgt_age":
+                # krbtgt is a single-object finding; the count is always 1
+                # and adds no signal. The *interesting* number is "how
+                # many days since rotation" — that lives in the finding's
+                # detail string (``audit_analyzer.py``). Parse it out and
+                # render it directly so the operator sees the rotation
+                # gap, not a meaningless ``1``.
+                days_ago: int | None = None
+                for item in items:
+                    m = _KRBTGT_AGE_DAYS_RE.search(item.detail or "")
+                    if m:
+                        try:
+                            days_ago = int(m.group(1))
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                if days_ago is not None:
+                    count_str = (
+                        f"[bold]{days_ago}[/bold] days "
+                        f"[dim]since last rotation (>180d recommended)[/dim]"
+                    )
+                else:
+                    # Defensive fallback when audit_analyzer changes the
+                    # detail format. The finding still surfaces; just
+                    # without the headline number.
+                    count_str = f"[bold]{count}[/bold] [dim](rotation overdue)[/dim]"
+            elif cat in _USER_HYGIENE_CATS and total_enabled_users > 0:
                 count_str = f"[bold]{count}[/bold][dim]/{total_enabled_users} enabled users[/dim]"
             elif cat in _COMPUTER_HYGIENE_CATS and total_computers > 0:
                 count_str = f"[bold]{count}[/bold][dim]/{total_computers} computers[/dim]"
@@ -777,13 +821,51 @@ def _print_collector_enrichment_panel(
             hv_suffix = (
                 f"  [red]({hv_count} privileged)[/red]" if hv_count > 0 else ""
             )
-            summary_lines.append(f"{sev}  {label}: {count_str}{hv_suffix}")
+            finding_lines.append(f"{sev}  {label}: {count_str}{hv_suffix}")
+
+        # ── Footer: contextual metadata (not findings) ─────────────────
+        # The last password-policy attribute change date is contextual:
+        # useful for the auditor to know but not actionable on its own
+        # (the operator decides whether a multi-year-old policy is
+        # concerning given the engagement scope). Render it dim and
+        # under the findings list so it never competes for attention
+        # with a real finding.
+        if domain_policy is not None:
+            pwd_last_changed = getattr(domain_policy, "pwd_policy_last_changed", None)
+            if pwd_last_changed:
+                footer_lines.append(
+                    f"[dim]Password policy attributes last modified: "
+                    f"{pwd_last_changed[:10]}[/dim]"
+                )
+
+        # Single-section render. ``Findings`` is the only header — any
+        # contextual metadata lives in the dim footer.
+        summary_lines: list[str] = []
+        if finding_lines:
+            summary_lines.append(
+                f"[bold]Findings ({len(finding_lines)})[/bold]"
+            )
+            summary_lines.extend(f"  {line}" for line in finding_lines)
+        if footer_lines:
+            if summary_lines:
+                summary_lines.append("")  # blank line before footer
+            summary_lines.extend(footer_lines)
 
         if summary_lines:
+            # Panel title MUST NOT carry sensitivity markers. Rich `Panel`
+            # measures the title width *before* the real console's
+            # ``MarkerStrippingTextIO`` removes the zero-width characters
+            # from the write path, so the border drawing (╭ ╮) gets
+            # misaligned by the count of invisible markers — the panel
+            # appears "broken" at the corners. The domain is still
+            # sanitised end-to-end: the at-export regex in
+            # ``_sanitize_rich_output`` matches ``[A-Za-z0-9._-]+\.<tld>``
+            # tokens anywhere in the recording, including panel titles,
+            # so removing the markers here costs no telemetry coverage.
             print_panel(
                 "\n".join(summary_lines),
                 title=(
-                    f"[bold blue]Domain Hygiene Audit — {marked_domain}[/bold blue]"
+                    f"[bold blue]Domain Hygiene Audit — {domain}[/bold blue]"
                 ),
                 border_style=BRAND_COLORS["info"],
             )
@@ -1384,7 +1466,7 @@ def run_attack_path_discovery(
     shell: Any,
     target_domain: str,
     *,
-    max_depth: int = 4,
+    max_depth: int = 6,  # requested actionable-edge budget; bounded by _effective_max_depth (user+all caps at 6)
     build_only: bool = False,
 ) -> None:
     """Build and display attack paths from ADscan's local attack graph.

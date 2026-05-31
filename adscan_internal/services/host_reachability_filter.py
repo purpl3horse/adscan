@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from rich.console import Console
 
+from adscan_internal import get_console
 from adscan_internal.services.network_probe_service import (
     SERVICE_PROBE_PORTS,
     TCPProbeResult,
@@ -137,7 +138,7 @@ def print_reachability_summary(
     if not result.offline:
         return
 
-    target_console = console or Console(highlight=False)
+    target_console = console or get_console()
     svc = f"  [{_MUTED}]({service_label})[/{_MUTED}]" if service_label else ""
     target_console.print(
         f"  [{_MUTED}]◈  Reachability sweep:"
@@ -156,7 +157,7 @@ def render_no_reachable_panel(
     """Render a clean Rich panel when 0 hosts are reachable."""
     from rich.panel import Panel
 
-    target_console = console or Console(highlight=False)
+    target_console = console or get_console()
     target_console.print(
         Panel(
             f"[{_MUTED}]  All {result.total} target hosts are offline or filtering "

@@ -23,16 +23,20 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import print_info_debug
+from adscan_internal.services.posture_sink import PostureSink
 from adscan_internal.services.smb_transport import (
     SMBAuthError,
     SMBConfig,
     SMBConnectionError,
     smb_machine_with_fallback,
 )
+
+if TYPE_CHECKING:  # pragma: no cover
+    from adscan_internal.services.domain_posture import DomainPosture
 
 
 class SMBPrivilegeStatus(str, Enum):
@@ -59,6 +63,10 @@ class SMBPrivilegeConfig:
     kdc_ip:          KDC for auth_domain (required for Kerberos in cross-domain scenarios).
     use_kerberos:    Force Kerberos; skip NTLM entirely.
     timeout:         Per-host connection timeout in seconds.
+    posture_sink:    Optional sink for Intelligence Updates emitted by the
+                     transport when it observes a domain-wide hardening signal.
+    posture_snapshot: Optional posture snapshot threaded into the ``SMBConfig``
+                     so the planner prunes impossible auth combinations.
     """
     target_ip: str
     domain: str
@@ -72,6 +80,8 @@ class SMBPrivilegeConfig:
     kdc_ip: str | None = None
     use_kerberos: bool = False
     timeout: int = 15
+    posture_sink: Optional[PostureSink] = None
+    posture_snapshot: Optional["DomainPosture"] = None
 
     def __post_init__(self) -> None:
         # Auto-route an NT hash that landed in the password field. See
@@ -153,6 +163,8 @@ async def check_smb_privilege(config: SMBPrivilegeConfig) -> SMBPrivilegeResult:
         kdc_ip=config.kdc_ip,
         use_kerberos=config.use_kerberos,
         timeout=config.timeout,
+        posture_sink=config.posture_sink,
+        posture_snapshot=config.posture_snapshot,
     )
 
     host_label = config.target_hostname or config.target_ip

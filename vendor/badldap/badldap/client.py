@@ -58,6 +58,9 @@ class MSLDAPClient:
 		self._disable_channel_binding = False
 		self._disable_signing = False
 		self._null_channel_binding = False
+		# ADSCAN PATCH (2026-05-29) — opt-in StartTLS-before-bind, mirrored
+		# onto the inner connection in ``connect()``. See connection.py.
+		self._use_starttls = False
 		if self.target is not None:
 			self.ldap_query_page_size = self.target.ldap_query_page_size
 		
@@ -114,6 +117,17 @@ class MSLDAPClient:
 			return False, e
 
 	async def connect(self):
+		# ADSCAN PATCH (2026-05-25) — every failure path in this function must
+		# disconnect ``self._con`` before returning. The inner
+		# ``MSLDAPClientConnection`` creates a ``__handle_incoming`` task in
+		# ``connect()`` (vendor/badldap/badldap/connection.py:226) that is only
+		# cancelled by ``disconnect()``. If the outer method returns ``(False, err)``
+		# without cleaning up, the task leaks: it stays parked on a socket read,
+		# holds an FD open, occupies an event-loop slot, and eventually emits
+		# the ``Task was destroyed but it is pending!`` asyncio warning that
+		# corrupts Rich Live rendering and saturates the loop. The posture
+		# probes (which intentionally elicit bind failures with bogus creds)
+		# are the canonical victim — they would leak 1 task per probe.
 		try:
 			self.disconnected_evt = asyncio.Event()
 			if self._con is None:
@@ -121,12 +135,19 @@ class MSLDAPClient:
 				self._con._disable_channel_binding = self._disable_channel_binding
 				self._con._disable_signing = self._disable_signing
 				self._con._null_channel_binding = self._null_channel_binding
+				self._con._use_starttls = self._use_starttls
 				_, err = await self._con.connect()
 				if err is not None:
 					raise err
 				if self._con.is_anon is False:
 					res, err = await self._con.bind()
 					if err is not None:
+						# ADSCAN PATCH: bind failed — tear down the connection
+						# so ``__handle_incoming`` doesn't leak.
+						try:
+							await self._con.disconnect()
+						except Exception:
+							pass
 						return False, err
 				else:
 					logger.debug('Skipping bind for no auth!')
@@ -149,6 +170,15 @@ class MSLDAPClient:
 					self.__keepalive_task = asyncio.create_task(self.__keepalive(res['defaultNamingContext']))
 			return True, None
 		except Exception as e:
+			# ADSCAN PATCH: any post-connect failure (get_serverinfo,
+			# get_ad_info, get_domain_name) must also tear down the
+			# connection. By the time we land here ``_con.connect()``
+			# already created ``__handle_incoming``.
+			if self._con is not None:
+				try:
+					await self._con.disconnect()
+				except Exception:
+					pass
 			return False, e
 
 	def get_server_info(self):

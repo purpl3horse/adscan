@@ -1771,6 +1771,87 @@ def _strip_display_record_prefix(
     return new_record
 
 
+# Access/session edges: the attacker gains EXECUTION on a host *as a specific
+# principal*, so the accessing principal (the edge source) determines the
+# privilege of that access. Re-arriving at a node via one of these from a
+# DIFFERENT principal is a privilege change, not a redundant loop. Control/ACL
+# edges (GenericAll, GenericWrite, …) are NOT here: re-controlling an
+# already-controlled node is redundant regardless of who does it.
+_ACCESS_CAPABILITY_RELATIONS: frozenset[str] = frozenset(
+    {"canpsremote", "canrdp", "adminto", "sqladmin", "sqlaccess", "executedcom"}
+)
+
+
+def _excise_display_record_loop(
+    record: dict[str, Any],
+    *,
+    first_index: int,
+    last_index: int,
+    reason: str,
+) -> dict[str, Any]:
+    """Excise the loop between the first and last occurrence of a repeated node.
+
+    Keeps the ``origin → … → X`` prefix and the ``X → … → end`` suffix, dropping
+    only the noisy middle ``X → … → X`` detour. Unlike
+    :func:`_strip_display_record_prefix` (which re-roots at the last occurrence
+    and loses the scoped origin), this preserves how the attacker reached ``X``
+    from the requested principal.
+    """
+    nodes = record.get("nodes")
+    rels = record.get("relations")
+    if not isinstance(nodes, list) or not isinstance(rels, list):
+        return record
+    if not (0 <= first_index < last_index < len(nodes)):
+        return record
+    if last_index > len(rels):
+        return record
+
+    new_nodes = list(nodes[: first_index + 1]) + list(nodes[last_index + 1 :])
+    new_rels = list(rels[:first_index]) + list(rels[last_index:])
+    if len(new_nodes) < 2 or not new_rels:
+        # Would collapse to a single node / no executable steps — keep original.
+        return record
+
+    new_record: dict[str, Any] = dict(record)
+    new_record["nodes"] = new_nodes
+    new_record["relations"] = new_rels
+    new_record["_exact_signature"] = (tuple(new_nodes), tuple(new_rels))
+    if isinstance(new_record.get("source"), str):
+        new_record["source"] = str(new_nodes[0])
+    if isinstance(new_record.get("target"), str):
+        new_record["target"] = str(new_nodes[-1])
+
+    steps = record.get("steps")
+    if isinstance(steps, list):
+        kept_steps = [
+            s
+            for s in (list(steps[:first_index]) + list(steps[last_index:]))
+            if isinstance(s, dict)
+        ]
+        for idx, step in enumerate(kept_steps, start=1):
+            step["step"] = idx
+        new_record["steps"] = kept_steps
+
+    new_record["length"] = sum(
+        1
+        for rel in new_rels
+        if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
+    )
+    new_record["status"] = _derive_display_status_from_steps(
+        new_record.get("steps", [])
+    )
+
+    meta = new_record.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        new_record["meta"] = meta
+    meta.setdefault("full_length", record.get("length"))
+    meta["minimized"] = True
+    meta["minimized_reason"] = reason
+    meta["minimized_start_label"] = str(new_nodes[0])
+    return new_record
+
+
 def _minimize_display_record_by_redundant_memberof(
     record: dict[str, Any],
     *,
@@ -1920,26 +2001,77 @@ def _minimize_display_record_by_repeated_labels(
     if len(lowered_nodes) == len(set(lowered_nodes)):
         return record
 
-    last_seen: dict[str, int] = {}
+    # Self-loop transparency: a self-loop step (from == to — the DumpLSA /
+    # DumpLSASS / DumpDPAPI in-place overlays) renders as two CONSECUTIVE
+    # identical node labels (``X → DumpLSA → X``). The only way two adjacent
+    # node labels are equal is a self-loop, and a self-loop is an in-place
+    # context upgrade, NOT a loop back to an already-visited node. It must not
+    # count as a repeat — otherwise a legitimate chain like
+    #   adscan → … → ReadLAPSPassword → BRAAVOS$ → DumpLSA → BRAAVOS$ → ADCSESC7 → DA
+    # is stripped to ``BRAAVOS$ → ADCSESC7 → DA`` and wrongly re-sourced at the
+    # computer. Collapse consecutive-identical runs, detect genuine (non-adjacent)
+    # repeats on that view, then map the strip point back to the original index.
+    collapsed_to_original: list[int] = []
     for idx, label in enumerate(lowered_nodes):
-        if not label:
-            continue
-        last_seen[label] = idx
-
-    # Find the latest index that repeats some earlier label.
-    start_idx = 0
-    for idx, label in enumerate(lowered_nodes):
-        if not label:
-            continue
-        last_idx = last_seen.get(label, idx)
-        if last_idx > idx:
-            start_idx = max(start_idx, last_idx)
-
-    if start_idx <= 0:
+        if collapsed_to_original and lowered_nodes[collapsed_to_original[-1]] == label:
+            collapsed_to_original[-1] = idx  # extend the self-loop run; keep its last index
+        else:
+            collapsed_to_original.append(idx)
+    collapsed_labels = [lowered_nodes[i] for i in collapsed_to_original]
+    if len(collapsed_labels) == len(set(collapsed_labels)):
+        # Every repetition was a self-loop run — no genuine loop to minimize.
         return record
-    return _strip_display_record_prefix(
+
+    last_seen: dict[str, int] = {}
+    for cpos, label in enumerate(collapsed_labels):
+        if not label:
+            continue
+        last_seen[label] = cpos
+
+    # Find the latest collapsed position that repeats some earlier label.
+    start_cpos = 0
+    for cpos, label in enumerate(collapsed_labels):
+        if not label:
+            continue
+        last_cpos = last_seen.get(label, cpos)
+        if last_cpos > cpos:
+            start_cpos = max(start_cpos, last_cpos)
+
+    if start_cpos <= 0:
+        return record
+
+    # The genuine repeat to collapse is the label at ``start_cpos``. Find its
+    # first and last ORIGINAL occurrence.
+    repeated_label = collapsed_labels[start_cpos]
+    orig_positions = [i for i, lbl in enumerate(lowered_nodes) if lbl == repeated_label]
+    first_index = orig_positions[0]
+    last_index = orig_positions[-1]
+    if first_index >= last_index:
+        return record
+
+    # Context-aware guard: a re-arrival at the repeated node via an ACCESS edge
+    # (CanPSRemote / CanRDP / AdminTo / SQLAdmin …) from a DIFFERENT principal is
+    # a privilege change (e.g. ``BRAAVOS$`` as the user vs. as a dumped admin),
+    # NOT a redundant loop — keep the path whole. Control edges (GenericAll, …)
+    # are always collapsible: re-controlling an already-controlled node is
+    # redundant regardless of which principal does it.
+    incoming_rel = (
+        str(rels[last_index - 1] or "").strip().lower() if last_index >= 1 else ""
+    )
+    accessor_last = lowered_nodes[last_index - 1] if last_index >= 1 else ""
+    accessor_first = lowered_nodes[first_index - 1] if first_index >= 1 else ""
+    if (
+        incoming_rel in _ACCESS_CAPABILITY_RELATIONS
+        and accessor_last
+        and accessor_last != accessor_first
+    ):
+        return record
+
+    # Excise the middle loop, preserving the scoped origin → X prefix.
+    return _excise_display_record_loop(
         record,
-        start_node_index=start_idx,
+        first_index=first_index,
+        last_index=last_index,
         reason="repeated_node_label",
     )
 

@@ -1414,7 +1414,7 @@ def run_attack_paths(
     shell: BloodHoundShell,
     target_domain: str,
     *,
-    max_depth: int = 4,
+    max_depth: int = 6,  # requested actionable-edge budget; bounded by _effective_max_depth (user+all caps at 6)
     build_only: bool = False,
 ) -> None:
     """Enumerate theoretical attack steps from low-priv users.
@@ -1452,7 +1452,7 @@ def run_cross_domain_attack_paths(
     shell: "BloodHoundShell",
     domains: list[str],
     *,
-    max_depth: int = 4,
+    max_depth: int = 6,  # requested actionable-edge budget; bounded by _effective_max_depth caps
 ) -> None:
     """Run cross-domain attack path discovery using a merged multi-domain graph.
 
@@ -4322,7 +4322,7 @@ def execute_stale_enabled_users(
         value = segmented_users if users else False
         shell.update_report_field(domain, "stale_enabled_users", value)
         try:
-            from adscan_internal.services.report_service import record_technical_finding
+            from adscan_core.reporting.technical_report import record_technical_finding
 
             record_technical_finding(
                 shell,
@@ -4395,7 +4395,7 @@ def execute_tier0_highvalue_sprawl(
         }
         shell.update_report_field(domain, "control_exposure_sprawl", value)
         try:
-            from adscan_internal.services.report_service import record_technical_finding
+            from adscan_core.reporting.technical_report import record_technical_finding
 
             record_technical_finding(
                 shell,

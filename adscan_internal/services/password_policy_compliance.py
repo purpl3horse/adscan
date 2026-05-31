@@ -138,6 +138,127 @@ def _enabled_users(result: CollectionResult) -> list[CollectorNode]:
     ]
 
 
+def ad_duration_to_days(raw: object) -> int | None:
+    """Convert an AD duration attribute (negative 100-ns FILETIME) to whole days.
+
+    Canonical converter shared by the live policy API (``posture_probe``) and
+    the duration legs of policy resolution. AD stores ``maxPwdAge`` /
+    ``minPwdAge`` (and the PSO equivalents) as negative 100-nanosecond
+    intervals; ``0`` and the int64 ``never-expires`` sentinel both mean
+    "no limit".
+
+    Args:
+        raw: Raw attribute value (int, str, or ``None``).
+
+    Returns:
+        Whole days enforced, or ``None`` when absent, zero, unparseable, or
+        the never-expires sentinel.
+    """
+    try:
+        ft_int = int(raw) if raw is not None else None
+    except (ValueError, TypeError):
+        return None
+    if ft_int is None or ft_int == 0:
+        return None
+    if ft_int <= -(2**63) + 1:
+        return None
+    seconds = abs(ft_int) / _100NS_PER_SECOND
+    days = int(seconds // 86400)
+    return days if days > 0 else None
+
+
+def ad_duration_to_minutes(raw: object) -> int | None:
+    """Convert an AD duration attribute (negative 100-ns FILETIME) to minutes.
+
+    Canonical converter for ``lockoutObservationWindow`` / ``lockoutDuration``
+    (and the PSO equivalents). Same sentinel handling as
+    :func:`ad_duration_to_days`. ``0`` (e.g. ``lockoutDuration`` =
+    admin-unlock-only) maps to ``None``.
+
+    Args:
+        raw: Raw attribute value (int, str, or ``None``).
+
+    Returns:
+        Whole minutes, or ``None`` when absent, zero, unparseable, or the
+        never-expires sentinel.
+    """
+    try:
+        ft_int = int(raw) if raw is not None else None
+    except (ValueError, TypeError):
+        return None
+    if ft_int is None or ft_int == 0:
+        return None
+    if ft_int <= -(2**63) + 1:
+        return None
+    seconds = abs(ft_int) / _100NS_PER_SECOND
+    minutes = int(seconds // 60)
+    return minutes if minutes > 0 else None
+
+
+def select_winning_pso_dn(
+    *,
+    resultant_pso_dn: str | None,
+    user_dn: str,
+    principal_dns: tuple[str, ...] | list[str],
+    candidate_psos: list[tuple[str, tuple[str, ...], int | None]],
+) -> str | None:
+    """Resolve the effective PSO DN for a principal — single algorithm.
+
+    Pure helper shared by the offline collector path
+    (:func:`_select_pso_for_user`) and the live LDAP path
+    (``posture_probe.resolve_resultant_password_policy``). It deliberately
+    operates on primitives only (DN strings, precedence ints) so neither path
+    has to materialise the other's object model.
+
+    Selection mirrors the AD PSO precedence rule:
+
+    1. ``resultant_pso_dn`` (``msDS-ResultantPSO``) is authoritative when it is
+       present *and* matches one of the candidate PSOs.
+    2. Otherwise, among the PSOs whose ``applies_to`` covers the user DN or any
+       of the principal's (group) DNs, pick the one with the lowest numeric
+       ``msDS-PasswordSettingsPrecedence`` (``None`` precedence sorts last).
+    3. No covering PSO -> ``None`` (caller falls back to the domain default).
+
+    Args:
+        resultant_pso_dn: Value of ``msDS-ResultantPSO`` on the user object, or
+            ``None`` when absent/unreadable.
+        user_dn: The user's distinguished name.
+        principal_dns: Group DNs (incl. nested) the user is a member of.
+        candidate_psos: ``(pso_dn, applies_to_dns, precedence)`` tuples.
+
+    Returns:
+        The winning PSO DN (in the casing of ``candidate_psos``) or ``None``.
+    """
+    psos_by_dn_upper = {dn.upper(): dn for dn, _applies, _prec in candidate_psos if dn}
+
+    if isinstance(resultant_pso_dn, str) and resultant_pso_dn:
+        winner = psos_by_dn_upper.get(resultant_pso_dn.upper())
+        if winner is not None:
+            return winner
+
+    if not candidate_psos:
+        return None
+
+    covered: set[str] = {user_dn.upper()} if user_dn else set()
+    covered.update(dn.upper() for dn in principal_dns if dn)
+    if not covered:
+        return None
+
+    matches: list[tuple[str, int]] = []
+    for dn, applies_to, precedence in candidate_psos:
+        if not dn:
+            continue
+        for trustee in applies_to:
+            if trustee.upper() in covered:
+                # ``precedence`` lower wins; treat None as worst.
+                matches.append((dn, precedence if precedence is not None else 2**31))
+                break
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[1])
+    return matches[0][0]
+
+
 def _select_pso_for_user(
     node: CollectorNode,
     psos_by_dn: dict[str, PasswordSettingsObject],
@@ -156,25 +277,22 @@ def _select_pso_for_user(
     to the Default Domain Policy.
     """
     resultant_dn = node.properties.get("resultantpso")
-    if isinstance(resultant_dn, str) and resultant_dn.upper() in psos_by_dn:
-        return psos_by_dn[resultant_dn.upper()]
-
-    if not psos_sorted:
+    candidate_psos = [
+        (pso.distinguished_name, pso.applies_to, pso.precedence)
+        for pso in psos_sorted
+        if pso.distinguished_name
+    ]
+    winning_dn = select_winning_pso_dn(
+        resultant_pso_dn=resultant_dn if isinstance(resultant_dn, str) else None,
+        user_dn=node.distinguished_name or "",
+        # Offline analysis intentionally does not expand group membership
+        # (documented conservative behaviour — never overstates findings).
+        principal_dns=(),
+        candidate_psos=candidate_psos,
+    )
+    if winning_dn is None:
         return None
-    user_dn = (node.distinguished_name or "").upper()
-    if not user_dn:
-        return None
-    matches: list[PasswordSettingsObject] = []
-    for pso in psos_sorted:
-        for trustee in pso.applies_to:
-            if trustee.upper() == user_dn:
-                matches.append(pso)
-                break
-    if not matches:
-        return None
-    # ``precedence`` lower wins; treat None as worst (highest int).
-    matches.sort(key=lambda p: (p.precedence if p.precedence is not None else 2**31))
-    return matches[0]
+    return psos_by_dn.get(winning_dn.upper())
 
 
 def _resolve_max_pwd_age_days(
@@ -358,8 +476,11 @@ def analyze_password_compliance(
 
 
 __all__ = [
+    "ad_duration_to_days",
+    "ad_duration_to_minutes",
     "analyze_password_compliance",
     "filetime_to_datetime",
     "parse_generalized_time",
     "policy_never_modified",
+    "select_winning_pso_dn",
 ]

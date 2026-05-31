@@ -151,6 +151,22 @@ def import_optional_report_service_module(
         raise
 
 
+# Write primitives that were relocated to ``adscan_core`` so they survive the
+# LITE image strip (the PRO report service and its shim are removed from LITE).
+# When the stripped module is absent, these attrs are resolved from the core
+# module instead — that is what makes the LITE technical_report.json populate.
+_CORE_REPORT_ATTRS: frozenset[str] = frozenset(
+    {
+        "record_technical_finding",
+        "record_technical_event",
+        "record_control_evidence",
+        "initialize_technical_report",
+        "TECHNICAL_REPORT_FILENAME",
+        "TECHNICAL_REPORT_SCHEMA_VERSION",
+    }
+)
+
+
 def load_optional_report_service_attr(
     attr_name: str,
     *,
@@ -159,13 +175,23 @@ def load_optional_report_service_attr(
     prefix: str = "[report]",
     module_name: str = "adscan_internal.services.report_service",
 ) -> T | None:
-    """Load an attribute from an optional report-service module."""
+    """Load an attribute from an optional report-service module.
+
+    Recorders relocated to ``adscan_core.reporting.technical_report`` are
+    resolved from the core module when the PRO report service is stripped from
+    the LITE image, so the writer no longer no-ops in LITE.
+    """
     module = import_optional_report_service_module(
         module_name,
         action=action,
         debug_printer=debug_printer,
         prefix=prefix,
     )
-    if module is None:
-        return None
-    return getattr(module, attr_name, None)
+    if module is not None:
+        attr = getattr(module, attr_name, None)
+        if attr is not None:
+            return attr
+    if attr_name in _CORE_REPORT_ATTRS:
+        core_module = import_module("adscan_core.reporting.technical_report")
+        return getattr(core_module, attr_name, None)
+    return None

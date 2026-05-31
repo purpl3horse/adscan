@@ -461,6 +461,7 @@ def _render_bulk_next_hint(
     *,
     finding_count: int,
     succeeded: int,
+    domain: str | None = None,
     extra: str | None = None,
 ) -> None:
     """Action-oriented `Next:` hint shown after a bulk summary.
@@ -468,8 +469,18 @@ def _render_bulk_next_hint(
     Verdict-first language: leads with what was recovered (`{finding_count}
     credentials`) and points the operator at the most useful next step
     instead of leaving them at an empty prompt.
+
+    ``domain`` is interpolated into command suggestions so the operator
+    can copy-paste the hint verbatim. When the caller has no domain
+    context the literal ``<domain>`` placeholder is shown — never the
+    bare ``attack_paths owned`` form, which would parse as ``domain=owned``
+    and fail at runtime.
     """
     kind = dump_kind.upper()
+    # Use the literal placeholder only as a last resort — every bulk
+    # dump entrypoint owns a `domain` parameter, so this branch is
+    # defensive against a future caller that forgets to pass it.
+    domain_token = (domain or "").strip() or "<domain>"
     if finding_count == 0 and succeeded == 0:
         hint = (
             "Verify reachability and credentials; check the OPSEC panel for "
@@ -483,7 +494,7 @@ def _render_bulk_next_hint(
     elif kind == "SAM":
         hint = (
             "Use the reuse matrix above to spot multi-host admins, then run "
-            "`attack_paths owned` to materialize the new edges."
+            f"`attack_paths {domain_token} owned` to materialize the new edges."
         )
     elif kind == "LSA":
         hint = (
@@ -498,7 +509,7 @@ def _render_bulk_next_hint(
     elif kind == "LSASS":
         hint = (
             "Recovered identities are now in the credential store; run "
-            "`attack_paths owned` and check if any cred is DA-eligible."
+            f"`attack_paths {domain_token} owned` and check if any cred is DA-eligible."
         )
     else:
         hint = "Continue with the next attack-path action."
@@ -512,17 +523,111 @@ def _render_bulk_next_hint(
 
 
 
+def _load_dump_ip_hostname_inventory(shell: Any, domain: str) -> dict | None:
+    """Load the workspace IP→hostname inventory for one domain, if available."""
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    domains_dir = getattr(shell, "domains_dir", None) or ""
+    if not workspace_dir or not domains_dir:
+        return None
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (
+            load_workspace_ip_hostname_inventory,
+        )
+
+        return (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=workspace_dir,
+                domains_dir=domains_dir,
+                domain=domain,
+            )
+            or None
+        )
+    except Exception:  # noqa: BLE001 - inventory is best-effort
+        return None
+
+
 def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfig:
     """Build an SMBConfig from the shell's current credential context.
 
     Used by the native dump path to build an aiosmb connection without any
     subprocess-based credential dumping dependency.
+
+    ``host`` may be an IP. Kerberos service tickets cannot bind to ``cifs/<ip>``,
+    so we route the (possibly-IP) target through the centralized
+    :func:`resolve_spn_or_decide_ntlm` helper: it resolves the host FQDN from the
+    workspace inventory / ``domains_data`` for the SPN, and when no FQDN is
+    recoverable it decides whether NTLM is a permitted fallback (posture-gated).
+    Without this the dump aborted with "Kerberos cannot use IP address as the
+    service SPN host" against any lateral host reached only by IP.
     """
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.domain_posture import get_posture
+    from adscan_internal.services.kerberos_spn_resolution import (
+        resolve_spn_or_decide_ntlm,
+    )
+
     creds = getattr(shell, "current_creds", None) or {}
-    dc_ip = creds.get("dc_ip") or getattr(shell, "current_dc_ip", None) or host
+    domains_data = getattr(shell, "domains_data", None) or {}
+    inventory = _load_dump_ip_hostname_inventory(shell, domain)
+    try:
+        posture_snapshot = get_posture(domains_data, domain=domain)
+    except Exception:  # noqa: BLE001 - posture read is best-effort
+        posture_snapshot = None
+
+    resolved_dc_ip = None
+    try:
+        resolved_dc_ip = resolve_dc_ip(domains_data.get(domain) or {})
+    except Exception:  # noqa: BLE001
+        resolved_dc_ip = None
+    # The Kerberos KDC is ALWAYS the domain's DC — never the target host. When
+    # dumping a lateral member server (e.g. BRAAVOS) the target host is not a
+    # KDC, so falling back to it makes Kerberos try to reach a KDC on port 88 of
+    # the member (ECONNREFUSED). See CLAUDE.md § "DC/KDC IP from domains_data —
+    # always resolve_dc_ip()": a silent None must NOT degrade to the target IP.
+    kdc_ip = (
+        resolved_dc_ip
+        or creds.get("dc_ip")
+        or getattr(shell, "current_dc_ip", None)
+    )
+    is_dc_target = bool(
+        host and resolved_dc_ip and str(host).strip() == str(resolved_dc_ip).strip()
+    )
+
+    resolution = resolve_spn_or_decide_ntlm(
+        target_host=host,
+        domain=domain,
+        domains_data=domains_data,
+        ip_hostname_inventory=inventory,
+        resolver_ip=kdc_ip,
+        posture_snapshot=posture_snapshot,
+        is_dc_target=is_dc_target,
+    )
+
+    # Original Kerberos intent from the credential material (ccache/aes ⇒ Kerberos).
+    wants_kerberos = bool(creds.get("ccache_path") or creds.get("aes_key"))
+    has_ntlm_cred = bool(creds.get("password") or creds.get("nt_hash"))
+
+    if resolution.kerberos_viable:
+        spn_host = resolution.spn_host
+        use_kerberos = wants_kerberos
+    else:
+        # No FQDN for the SPN. Use NTLM when we hold an NTLM-capable credential
+        # and posture has not observed NTLM disabled (HIGH). Otherwise leave the
+        # original intent and let the transport surface a clear error — never
+        # silently request cifs/<ip>, which the KDC rejects.
+        spn_host = host
+        if has_ntlm_cred and resolution.ntlm_fallback_ok:
+            use_kerberos = False
+        else:
+            use_kerberos = wants_kerberos
+        print_info_debug(
+            f"[dump] SMB SPN resolution for {host}: {resolution.reason}; "
+            f"use_kerberos={use_kerberos} has_ntlm_cred={has_ntlm_cred}"
+        )
+
     return SMBConfig(
         target_ip=host,
-        target_hostname=host,
+        target_hostname=spn_host,
         domain=domain,
         auth_domain=creds.get("auth_domain") or domain,
         username=creds.get("username"),
@@ -530,8 +635,10 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
         nt_hash=creds.get("nt_hash"),
         aes_key=creds.get("aes_key"),
         ccache_path=creds.get("ccache_path"),
-        use_kerberos=bool(creds.get("ccache_path") or creds.get("aes_key")),
-        kdc_ip=dc_ip,
+        use_kerberos=use_kerberos,
+        kdc_ip=kdc_ip,
+        ip_hostname_inventory=inventory,
+        posture_snapshot=posture_snapshot,
     )
 
 
@@ -3497,8 +3604,17 @@ def _render_bulk_summary(
     dump_kind: str,
     results: list[tuple[str, Any]],
     finding_count: int,
+    *,
+    domain: str | None = None,
 ) -> None:
-    """Premium Rich Panel summary replacing the old print_info_table approach."""
+    """Premium Rich Panel summary replacing the old print_info_table approach.
+
+    ``domain`` is threaded to :func:`_render_bulk_next_hint` so the
+    follow-up suggestion (e.g. ``attack_paths {domain} owned``) renders
+    with the live domain rather than a placeholder. Optional with a
+    ``None`` default so legacy call sites keep compiling — but every
+    bulk dump entrypoint should pass it.
+    """
     total = len(results)
     succeeded = sum(1 for _, r in results if getattr(r, "success", False))
     failed = total - succeeded
@@ -3537,7 +3653,10 @@ def _render_bulk_summary(
         _CONSOLE.print(fail_table)
 
     _render_bulk_next_hint(
-        dump_kind, finding_count=finding_count, succeeded=succeeded
+        dump_kind,
+        finding_count=finding_count,
+        succeeded=succeeded,
+        domain=domain,
     )
 
 
@@ -3775,7 +3894,7 @@ def _native_execute_dump_sam_bulk(
         shell, domain=domain, credentials=bulk_credentials
     )
     _print_bulk_summary(dump_kind="SAM", summary=bulk_summary)
-    _render_bulk_summary("SAM", results, finding_count)
+    _render_bulk_summary("SAM", results, finding_count, domain=domain)
 
     # Post-dump reuse matrix: pure data match, no network. Highlights
     # credentials that grant local admin on multiple hosts.
@@ -3846,7 +3965,7 @@ def _native_execute_dump_lsa_bulk(
         include_machine_accounts=include_machine_accounts,
     )
     _print_bulk_summary(dump_kind="LSA", summary=bulk_summary)
-    _render_bulk_summary("LSA", results, finding_count)
+    _render_bulk_summary("LSA", results, finding_count, domain=domain)
 
 
 def _native_execute_dump_dpapi_bulk(
@@ -3884,7 +4003,7 @@ def _native_execute_dump_dpapi_bulk(
         )
     )
     _CONSOLE.print()
-    _render_bulk_summary("DPAPI", results, finding_count)
+    _render_bulk_summary("DPAPI", results, finding_count, domain=domain)
 
 
 def _native_execute_dump_lsass_bulk(
@@ -4665,9 +4784,13 @@ def _native_execute_dump_dpapi(
         )
 
     config = _build_smb_config_from_shell(shell, host, domain)
+    # ``_build_smb_config_from_shell`` already resolves the SPN FQDN into
+    # ``target_hostname`` (from the workspace inventory) and anchors ``kdc_ip``
+    # to the domain DC. Do NOT overwrite ``target_hostname`` with the raw IP —
+    # that reintroduces the ``cifs/<ip>`` Kerberos failure this builder fixes.
     config.target_ip = host
-    config.target_hostname = host
-    config.kdc_ip = pdc_ip
+    if pdc_ip:
+        config.kdc_ip = pdc_ip
 
     display.dpapi_phase_done(2, 4, True, "Acquiring keys...")
 
@@ -5361,6 +5484,47 @@ def run_do_dump_lsa(shell: Any, args: str) -> None:
         username=username,
         password=password,
         host=host,
+        islocal=islocal,
+    )
+
+
+def run_do_dump_lsass(shell: Any, args: str) -> None:
+    """
+    Dumps LSASS credentials from specified hosts within a domain.
+
+    Args:
+        shell: The active `PentestShell` instance (from `adscan.py`).
+        args: A string containing space-separated arguments:
+            - domain (str): The domain name.
+            - username (str): The username for authentication.
+            - password (str): The password for the specified username.
+            - host (str): The target host or 'All' for all hosts in the domain.
+            - islocal (str): Indicates if the operation is local ('true') or remote ('false').
+
+    The function dumps LSASS via the native async SMB stack (PPL-aware backend
+    selection: WerFaultSecure / SilentProcessExit / comsvcs / nanodump). Bulk
+    targets are executed by the native async batch orchestrator.
+
+    Usage:
+        dump_lsass <domain> <username> <password> <host> <islocal>
+    """
+    args_list = args.split()
+    if len(args_list) != 5:
+        print_warning(
+            "Usage: dump_lsass <domain> <username> <password> <host> <islocal>"
+        )
+        return
+    domain = args_list[0]
+    username = args_list[1]
+    password = args_list[2]
+    host = args_list[3]
+    islocal = args_list[4]
+    run_dump_lsass(
+        shell,
+        domain=domain,
+        host=host,
+        username=username,
+        password=password,
         islocal=islocal,
     )
 

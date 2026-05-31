@@ -55,6 +55,7 @@ from adscan_internal.services.posture_probe import ProbePhase, ProbeResult
 
 _PROBE_CONSTRAINT_LABEL: dict[ConstraintCategory, str] = {
     ConstraintCategory.LDAPS_AVAILABLE: "LDAPS availability",
+    ConstraintCategory.LDAP_STARTTLS_AVAILABLE: "StartTLS availability",
     ConstraintCategory.LDAP_SIGNING: "LDAP signing required",
     ConstraintCategory.LDAP_CHANNEL_BINDING: "LDAP channel binding",
     ConstraintCategory.NTLM_AUTHENTICATION: "NTLM acceptance",
@@ -82,7 +83,20 @@ _PROBE_HARDENING_LABEL: dict[tuple[ConstraintCategory, TriState], str] = {
     (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.REQUIRED): (
         "LDAP channel binding required"
     ),
-    (ConstraintCategory.LDAPS_AVAILABLE, TriState.DISABLED): "LDAPS unavailable",
+    # LDAPS is the only inverse-polarity category here: the SECURE state is
+    # ENABLED (the encrypted channel is offered), not a non-default toggle.
+    # LDAPS *available* is therefore the hardening signal; LDAPS *unavailable*
+    # is a plaintext-downgrade weakness and lives in the permissive map below
+    # — matching both the report renderer (``render_detected_posture``) and the
+    # ``ldaps_unavailable`` finding emitted from posture (which fires on
+    # DISABLED, never ENABLED).
+    (ConstraintCategory.LDAPS_AVAILABLE, TriState.ENABLED): "LDAPS available",
+    # StartTLS shares LDAPS's inverse polarity: StartTLS *available* on 389 is
+    # the hardening signal (an encrypted-channel option), StartTLS
+    # *unavailable* is the plaintext-downgrade weakness (permissive map below).
+    (ConstraintCategory.LDAP_STARTTLS_AVAILABLE, TriState.ENABLED): (
+        "StartTLS available"
+    ),
     (ConstraintCategory.SMB_SIGNING, TriState.REQUIRED): "SMB signing required",
 }
 
@@ -96,6 +110,7 @@ _HARDENING_SORT_ORDER: list[ConstraintCategory] = [
     ConstraintCategory.LDAP_SIGNING,
     ConstraintCategory.LDAP_CHANNEL_BINDING,
     ConstraintCategory.LDAPS_AVAILABLE,
+    ConstraintCategory.LDAP_STARTTLS_AVAILABLE,
     ConstraintCategory.SMB_SIGNING,
 ]
 
@@ -112,13 +127,28 @@ _PROBE_PERMISSIVE_LABEL: dict[tuple[ConstraintCategory, TriState], str] = {
     (ConstraintCategory.KERBEROS_ETYPE_PROBE, TriState.DISABLED): (
         "Standard Kerberos salt"
     ),
-    (ConstraintCategory.LDAPS_AVAILABLE, TriState.ENABLED): "LDAPS available",
+    # LDAPS unavailable = the DC offers only plaintext LDAP/389 → a
+    # downgrade vector, surfaced as the ``ldaps_unavailable`` finding. See
+    # the inverse-polarity note in ``_PROBE_HARDENING_LABEL`` above.
+    (ConstraintCategory.LDAPS_AVAILABLE, TriState.DISABLED): "LDAPS unavailable",
+    (ConstraintCategory.LDAP_STARTTLS_AVAILABLE, TriState.DISABLED): (
+        "StartTLS unavailable"
+    ),
+    (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.DISABLED): (
+        "LDAP channel binding not enforced"
+    ),
 }
 
 
 _PROGRESS_HINTS_BY_CATEGORY_DONE: dict[tuple[ConstraintCategory, TriState], str] = {
     (ConstraintCategory.LDAPS_AVAILABLE, TriState.ENABLED): "port 636 → ✓ Available",
     (ConstraintCategory.LDAPS_AVAILABLE, TriState.DISABLED): "port 636 → ✗ Unreachable",
+    (ConstraintCategory.LDAP_STARTTLS_AVAILABLE, TriState.ENABLED): (
+        "StartTLS/389 → ✓ Available"
+    ),
+    (ConstraintCategory.LDAP_STARTTLS_AVAILABLE, TriState.DISABLED): (
+        "StartTLS/389 → ✗ Unavailable"
+    ),
     (ConstraintCategory.LDAP_SIGNING, TriState.REQUIRED): (
         "strongerAuthRequired → ✓ Required"
     ),
@@ -142,6 +172,12 @@ _PROGRESS_HINTS_BY_CATEGORY_DONE: dict[tuple[ConstraintCategory, TriState], str]
     ),
     (ConstraintCategory.SMB_SIGNING, TriState.REQUIRED): (
         "negotiate flags → ✓ Required"
+    ),
+    (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.REQUIRED): (
+        "LDAPS bind no-CBT → ✗ Rejected (SEC_E_BAD_BINDINGS)"
+    ),
+    (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.DISABLED): (
+        "LDAPS bind no-CBT → ✓ Accepted"
     ),
 }
 
@@ -172,13 +208,44 @@ _QUALIFIER_KNOWN = "· already known"
 
 @dataclass
 class _RowState:
-    """Tracking row for one probed category."""
+    """Tracking row for one probed category.
+
+    ``status`` values:
+      * ``pending``  — pre-allocated before the probe engine started this
+        row. Shown with a grey hourglass + ``"queued…"`` hint so the panel
+        line-count is stable from the very first render (avoids the Rich
+        Live header-stacking anti-pattern where a growing renderable
+        leaves ghost frames in scrollback).
+      * ``running``  — probe engine has fired ``on_progress(cat, None)``.
+        Spinner + ``"checking…"``.
+      * ``done`` / ``skipped`` / ``failed`` — final states with their
+        own icon + hint copy.
+    """
 
     category: ConstraintCategory
     phase: ProbePhase
-    status: str = "running"  # running | done | skipped | failed
+    status: str = "pending"  # pending | running | done | skipped | failed
     result: Optional[ProbeResult] = None
     started_at: float = field(default_factory=time.monotonic)
+
+
+# Canonical probe inventory — used by the live widget to pre-allocate
+# rows so the rendered panel has a STABLE line count from frame 1.
+# Matches the probe sets driven by
+# ``adscan_internal.services.posture_probe.probe_unauth`` /
+# ``probe_auth``. Order here is the order the operator sees in the panel.
+_PREALLOCATED_UNAUTH_CATEGORIES: list[ConstraintCategory] = [
+    ConstraintCategory.LDAPS_AVAILABLE,
+    ConstraintCategory.LDAP_STARTTLS_AVAILABLE,
+    ConstraintCategory.LDAP_SIGNING,
+    ConstraintCategory.LDAP_CHANNEL_BINDING,
+]
+_PREALLOCATED_AUTH_CATEGORIES: list[ConstraintCategory] = [
+    ConstraintCategory.KERBEROS_RC4,
+    ConstraintCategory.NTLM_AUTHENTICATION,
+    ConstraintCategory.SMB_SIGNING,
+    ConstraintCategory.KERBEROS_ETYPE_PROBE,
+]
 
 
 class PostureProbeLiveView:
@@ -213,20 +280,51 @@ class PostureProbeLiveView:
         self._current_phase: Optional[ProbePhase] = None
         self._started = time.monotonic()
         self._console = get_console()
-        # alt_screen=False: the posture probe panel is intentionally
-        # inline so the matrix stays in the operator's scrollback
-        # alongside the probe summary printed afterwards.
         self._session: Optional[LiveSession] = None
         self._is_tty = sys.stdout.isatty() and os.environ.get("ADSCAN_NO_LIVE") != "1"
+
+        # Pre-allocate every probe row up front. Combined with
+        # ``alt_screen=True`` in ``__enter__``, this gives the panel a
+        # stable rendered shape from frame 1 AND contains all refreshes
+        # inside an isolated terminal buffer so ghost frames cannot leak
+        # into the operator's scrollback. The pre-allocation alone is
+        # not enough on ``alt_screen=False`` in practice — at
+        # ``refresh_per_second=10`` Rich Live's overwrite logic loses
+        # frames whenever a refresh is interrupted by another
+        # ``update()`` mid-write, and the partial output ends up as a
+        # ghost above the current Live region. See CLAUDE.md
+        # § "Rich Live UX — Stable line-count rule" for the canonical
+        # pattern.
+        for cat in _PREALLOCATED_UNAUTH_CATEGORIES:
+            self._rows[cat] = _RowState(category=cat, phase=ProbePhase.UNAUTH, status="pending")
+            self._order.append(cat)
+        if username:
+            for cat in _PREALLOCATED_AUTH_CATEGORIES:
+                self._rows[cat] = _RowState(category=cat, phase=ProbePhase.AUTH, status="pending")
+                self._order.append(cat)
 
     # ---- context management -------------------------------------------------
 
     def __enter__(self) -> "PostureProbeLiveView":
         if self._is_tty:
             try:
+                # ``alt_screen=True`` is required even though every row is
+                # pre-allocated. Rich Live with ``alt_screen=False`` is
+                # fragile in inline mode: any refresh that gets interrupted
+                # mid-write (asyncio yielding, terminal slow to ingest, a
+                # second ``update()`` arriving inside a single refresh
+                # tick at 10 FPS) leaves the partial render in the
+                # operator's scrollback as a ghost panel. Alt-screen
+                # isolates the entire live region inside a separate
+                # terminal buffer that the kernel disposes of on exit —
+                # ghost frames become topologically impossible. The
+                # ``summary`` callback below re-prints the FINAL panel
+                # state to the real scrollback so the operator still
+                # has the matrix visible for review after the run.
                 self._session = LiveSession(
                     self._render(),
-                    config=LiveSessionConfig(refresh_per_second=10, alt_screen=False),
+                    config=LiveSessionConfig(refresh_per_second=10, alt_screen=True),
+                    summary=self._print_final_panel,
                 )
                 self._session.__enter__()
             except Exception as exc:  # noqa: BLE001
@@ -245,6 +343,28 @@ class PostureProbeLiveView:
             except Exception as ext_exc:  # noqa: BLE001
                 telemetry.capture_exception(ext_exc)
             self._session = None
+
+    def _print_final_panel(self, console: Any) -> None:
+        """Re-print the final posture-probe panel to the operator's scrollback.
+
+        Called by ``LiveSession`` after the alt-screen pops. Without this
+        callback, switching to ``alt_screen=True`` (required to avoid
+        ghost frames) would wipe the panel from scrollback on exit and
+        the operator would only see the post-run summary. With it, the
+        scrollback receives:
+
+          1. The final panel (this callback) — full matrix of results.
+          2. The standalone :func:`render_posture_probe_summary` panel
+             that the lifecycle prints right after the widget exits —
+             the executive-tier digest.
+
+        That ordering matches the operator's reading flow: detail first,
+        digest below.
+        """
+        try:
+            console.print(self._render())
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- public API ---------------------------------------------------------
 
@@ -326,13 +446,19 @@ class PostureProbeLiveView:
             self._rows[c] for c in self._order if self._rows[c].phase is ProbePhase.AUTH
         ]
 
-        if unauth_rows or self._current_phase is ProbePhase.UNAUTH:
-            heading = Text("Phase 1 — Anonymous probes", style="bold")
-            groups.append(heading)
-            groups.append(self._render_rows(unauth_rows))
-            groups.append(Text())
+        # Phase 1 is ALWAYS rendered (rows are pre-allocated in __init__).
+        # Conditional rendering based on whether rows exist would cause
+        # the panel to grow between refreshes, triggering the Rich Live
+        # header-stacking anti-pattern.
+        groups.append(Text("Phase 1 — Anonymous probes", style="bold"))
+        groups.append(self._render_rows(unauth_rows))
+        groups.append(Text())
 
-        if auth_rows or self._current_phase is ProbePhase.AUTH:
+        # Phase 2 is rendered only when auth probes are configured (i.e.
+        # the widget was constructed with a username). That decision is
+        # made at __init__ time and never changes during the session, so
+        # the line count is still stable across refreshes.
+        if auth_rows:
             user_label = self.username or ""
             if user_label:
                 phase_heading = Text()
@@ -349,8 +475,14 @@ class PostureProbeLiveView:
             groups.append(Text())
 
         # Footer: X/Y physical probes complete · elapsed Y.Ys
+        # "Complete" means reached a final state (done/skipped/failed) —
+        # not "pending" (queued) and not "running" (in-flight).
         total = len(self._rows)
-        complete = sum(1 for r in self._rows.values() if r.status != "running")
+        complete = sum(
+            1
+            for r in self._rows.values()
+            if r.status in ("done", "skipped", "failed")
+        )
         elapsed = time.monotonic() - self._started
         footer = Text()
         footer.append(f"{complete}/{total} physical probes complete", style="dim")
@@ -372,8 +504,11 @@ class PostureProbeLiveView:
         table.add_column(width=2)
         table.add_column(no_wrap=False)
         table.add_column(no_wrap=False, style="dim")
+        # Rows are pre-allocated in ``__init__`` so this list is never
+        # empty in practice. Defensive empty-state kept as a safety net
+        # (would only trigger if a future caller bypassed pre-allocation).
         if not rows:
-            table.add_row(Text("⏳", style="dim"), Text("preparing…", style="dim"), "")
+            table.add_row(Text("○", style="dim"), Text("queued…", style="dim"), "")
             return table
         for row in rows:
             icon = self._row_icon(row)
@@ -384,6 +519,11 @@ class PostureProbeLiveView:
 
     @staticmethod
     def _row_icon(row: _RowState) -> Text:
+        if row.status == "pending":
+            # Open circle = "queued, not started". Visually distinct from
+            # the ⏳ hourglass used for "actively running" so the operator
+            # can tell at a glance which probes haven't begun yet.
+            return Text("○", style="dim")
         if row.status == "running":
             return Text("⏳", style="dim")
         if row.status == "done":
@@ -392,17 +532,29 @@ class PostureProbeLiveView:
             return Text("⊘", style="dim")
         if row.status == "failed":
             return Text("✗", style="dim")
-        return Text("⏳", style="dim")
+        return Text("○", style="dim")
 
     @staticmethod
     def _row_hint(row: _RowState) -> str:
+        if row.status == "pending":
+            return "queued…"
         if row.status == "running":
             return "checking…"
         result = row.result
         if result is None:
             return ""
         if row.status == "skipped":
+            # Distinguish "freshness skip" (posture already known with HIGH
+            # confidence from a prior cycle) from "dependency skip" (e.g.
+            # CBT skipped because LDAPS unavailable). The freshness-skip
+            # path emits a result with state≠UNKNOWN that was carried over
+            # from posture; the dependency-skip path emits a synthetic
+            # result with state=UNKNOWN and a human-readable ``message``
+            # — show that message verbatim to avoid the confusing
+            # "already known: unknown (low)" copy.
             try:
+                if result.state is TriState.UNKNOWN and result.message:
+                    return result.message
                 state_label = result.state.value
                 conf_label = result.confidence.value
             except Exception:  # noqa: BLE001

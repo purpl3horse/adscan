@@ -25,11 +25,15 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from adscan_core.version_context import RUNTIME_CONTRACT_VERSION
+from adscan_launcher.docker_pull_diagnostics import (
+    classify_pull_failure,
+    record_last_failure,
+    strip_ansi,
+)
 from adscan_launcher.output import (
     print_info_debug,
     print_warning,
     print_warning_verbose,
-    print_error,
     print_instruction,
 )
 from adscan_launcher.paths import get_state_dir
@@ -203,6 +207,66 @@ def docker_needs_sudo(timeout: int = 5) -> bool:
     return bool(_DOCKER_PERMISSION_DENIED_RE.search(diagnostic))
 
 
+# One-shot hook fired immediately before the launcher hands the
+# terminal to a containerised process via ``docker run``. The launcher
+# session-capture flow uses it to flush the ``launcher_preflight`` Rich
+# recording at the exact handoff moment, instead of waiting for the
+# container (which may run for hours) to exit. See
+# ``_run_host_command_with_session_capture`` in adscan_launcher/cli.py.
+#
+# Contract:
+#   * One-shot: cleared as soon as it fires so a single launcher
+#     invocation cannot accidentally double-send the session.
+#   * Best-effort: exceptions are swallowed — the hook must never block
+#     the real ``docker run`` from happening.
+#   * Only fires for ``docker run`` (the actual container exec).
+#     ``docker info``, ``docker pull``, ``docker image inspect`` etc.
+#     are launcher-only operations and don't trigger the hook.
+_pre_container_exec_hook: Callable[[], None] | None = None
+
+
+def register_pre_container_exec_hook(hook: Callable[[], None] | None) -> None:
+    """Install (or clear) the pre-``docker run`` flush hook."""
+    global _pre_container_exec_hook  # pylint: disable=global-statement
+    _pre_container_exec_hook = hook
+
+
+def _is_container_exec_argv(argv: Sequence[str]) -> bool:
+    """Return True when ``argv`` is a ``docker run`` invocation.
+
+    Recognises both the bare ``["docker", "run", …]`` form and the
+    sudo-prefixed ``["sudo", …, "docker", "run", …]`` form that
+    ``run_docker`` produces when the daemon socket is root-owned.
+    """
+    items = list(argv)
+    for idx, value in enumerate(items):
+        if value == "docker" and idx + 1 < len(items) and items[idx + 1] == "run":
+            return True
+    return False
+
+
+def _fire_pre_container_exec_hook(argv: Sequence[str]) -> None:
+    """Invoke and clear the pre-``docker run`` hook, once, best-effort."""
+    if not _is_container_exec_argv(argv):
+        return
+    global _pre_container_exec_hook  # pylint: disable=global-statement
+    hook = _pre_container_exec_hook
+    if hook is None:
+        return
+    _pre_container_exec_hook = None  # one-shot guard before invoke
+    try:
+        # ``hook`` is guaranteed non-None here by the early-return above,
+        # but pylint's type narrowing from ``is None`` checks is unreliable
+        # for module-level Optional vars — silence the false positive
+        # rather than complicate the runtime path.
+        hook()  # pylint: disable=not-callable
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(
+            f"[docker] pre-container-exec hook failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def run_docker(
     argv: Sequence[str],
     *,
@@ -234,6 +298,7 @@ def run_docker(
     # capturing output. Let Docker inherit the real TTY so interactive UIs
     # (questionary/prompt_toolkit) behave correctly.
     if capture_output:
+        _fire_pre_container_exec_hook(cmd)
         proc = subprocess.run(
             cmd,
             capture_output=True,
@@ -252,6 +317,7 @@ def run_docker(
             _DOCKER_PERMISSION_WARNING_SHOWN = True
         return proc
 
+    _fire_pre_container_exec_hook(cmd)
     return subprocess.run(  # noqa: S603
         cmd,
         timeout=timeout,
@@ -396,6 +462,7 @@ def run_docker_stream(
         cmd = ["sudo", f"--preserve-env={preserve_env}"] + cmd
 
     use_pty = bool(sys.stdout.isatty() and sys.stdin.isatty() and not os.getenv("CI"))
+    _fire_pre_container_exec_hook(cmd)
     if use_pty:
         # If we pipe stdout/stderr, Docker disables its rich progress UI because it
         # thinks it's not attached to a TTY. Use a PTY in interactive sessions so
@@ -513,10 +580,74 @@ def run_docker_stream(
     )
 
 
+def _handle_pull_failure(
+    *,
+    image: str,
+    rc: int,
+    stdout: str,
+    stderr: str,
+    timeout: int | None,
+    surface_failure: bool,
+) -> None:
+    """Classify a docker pull failure and route side-effects.
+
+    Three jobs:
+    1. Strip ANSI so telemetry / debug logs are readable.
+    2. Classify the failure and record it for the higher-level panel
+       renderer to consume (``consume_last_failure`` in
+       ``docker_pull_diagnostics``).
+    3. Emit a compact debug-level log of the cleaned tail (no raw ANSI
+       dump to the user — that lives in the premium panel rendered later).
+
+    The DNS-specific guidance and the timeout warning are gated by
+    ``surface_failure``. The multi-attempt retry loop in
+    ``_ensure_image_pulled_with_legacy_fallback`` passes ``False`` for
+    intermediate attempts so the user only sees one coherent message
+    per outcome (retrying / recovered / permanently failed) instead of
+    a noisy chain of partial failures and warnings.
+    """
+    clean_stderr = strip_ansi(stderr or "")
+    clean_stdout = strip_ansi(stdout or "")
+    diagnosis = classify_pull_failure(clean_stderr, clean_stdout)
+    record_last_failure(diagnosis)
+    timed_out = bool(timeout is not None and rc == -9)
+    if timed_out and surface_failure:
+        print_warning(
+            f"Docker image pull did not finish within {timeout}s and was aborted."
+        )
+    evidence_blob = "; ".join(diagnosis.evidence) if diagnosis.evidence else "(no tail)"
+    print_info_debug(
+        f"[docker] pull failed: image={image} rc={rc} kind={diagnosis.kind} "
+        f"rate_limit_likely={diagnosis.rate_limit_likely} "
+        f"surface={surface_failure} tail={evidence_blob!r}"
+    )
+    if surface_failure:
+        _emit_pull_failure_dns_guidance(diagnostic=f"{clean_stderr}\n{clean_stdout}")
+
+
 def ensure_image_pulled(
-    image: str, *, timeout: int | None = None, stream_output: bool = False
+    image: str,
+    *,
+    timeout: int | None = None,
+    stream_output: bool = False,
+    surface_failure: bool = True,
 ) -> bool:
-    """Ensure a docker image exists locally (pull if needed)."""
+    """Ensure a docker image exists locally (pull if needed).
+
+    Args:
+        image: Docker image reference to pull.
+        timeout: Hard ceiling in seconds. ``None`` disables it.
+        stream_output: When True, the underlying ``docker pull`` streams
+            to the terminal directly (progress bar visible). When False,
+            stdout/stderr are captured for diagnostics.
+        surface_failure: When True (default), a failed pull emits
+            user-visible guidance (DNS hints, timeout warning) in
+            addition to recording the diagnosis. The retry loop sets
+            this to False on intermediate attempts so only the final
+            outcome reaches the user — see ``_handle_pull_failure``.
+            The diagnosis is always recorded regardless, so the eventual
+            failure panel still has full context.
+    """
     if not docker_available():
         return False
     # Pull is idempotent and simplest.
@@ -526,17 +657,14 @@ def ensure_image_pulled(
         )
         if rc == 0:
             return True
-        timed_out = bool(timeout is not None and rc == -9)
-        if timed_out:
-            print_warning(
-                "Docker image pull did not finish within "
-                f"{timeout}s and was aborted (rc={rc})."
-            )
-        print_error(
-            f"docker pull failed: image={image!r}, rc={rc}, "
-            f"stderr_tail={stderr!r}, stdout_tail={stdout!r}, timeout={timeout!r}"
+        _handle_pull_failure(
+            image=image,
+            rc=rc,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=timeout,
+            surface_failure=surface_failure,
         )
-        _emit_pull_failure_dns_guidance(diagnostic=f"{stderr}\n{stdout}")
         return False
 
     proc = run_docker(
@@ -544,17 +672,14 @@ def ensure_image_pulled(
     )
     if proc.returncode == 0:
         return True
-    timed_out = bool(timeout is not None and int(proc.returncode) == -9)
-    if timed_out:
-        print_warning(
-            "Docker image pull did not finish within "
-            f"{timeout}s and was aborted (rc={proc.returncode})."
-        )
-    print_error(
-        f"docker pull failed: image={image!r}, rc={proc.returncode}, "
-        f"stderr_tail={proc.stderr!r}, stdout_tail={proc.stdout!r}, timeout={timeout!r}"
+    _handle_pull_failure(
+        image=image,
+        rc=int(proc.returncode),
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        timeout=timeout,
+        surface_failure=surface_failure,
     )
-    _emit_pull_failure_dns_guidance(diagnostic=f"{proc.stderr}\n{proc.stdout}")
     return False
 
 
@@ -790,6 +915,23 @@ def build_adscan_run_command(
             "ADSCAN_HOST_HELPER_SOCK=/run/adscan/host-helper.sock",
         ]
     )
+
+    # Forward debug / instrumentation env vars from host to container when
+    # the operator has set them. Without this, an ``ADSCAN_NO_LIVE=1`` on
+    # the host shell never reaches the runtime that actually owns the
+    # Rich Live surfaces, so the toggle is silently a no-op. Each var is
+    # opt-in (only forwarded when explicitly set) so the default runtime
+    # behaviour is unchanged.
+    _OPT_FORWARD_ENV_VARS = (
+        "ADSCAN_NO_LIVE",            # disable LiveSession (probe / dashboards)
+        "ADSCAN_TELEMETRY_TRACE",    # extra telemetry diagnostics (chunks, etc.)
+        "ADSCAN_NO_POSTURE_PROBE",   # skip proactive posture probe phase
+        "ADSCAN_DIAG_RICH",          # rich_output diagnostic stderr trace
+    )
+    for _name in _OPT_FORWARD_ENV_VARS:
+        _value = os.environ.get(_name)
+        if _value is not None and _value != "":
+            cmd.extend(["-e", f"{_name}={_value}"])
 
     # Optional GUI passthrough (X11) for interactive desktop features (e.g., xfreerdp).
     #

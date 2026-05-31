@@ -27,7 +27,6 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, IntPrompt, Prompt
@@ -53,13 +52,14 @@ from adscan_internal.services.gpo_immediate_task_service import (
     GPOImmediateTaskResult,
     GPOPayload,
 )
+from adscan_internal import get_console
 from adscan_internal.services.gpo_writable_filter import (
     WritableGPOCandidate,
     discover_writable_gpos,
 )
 
 
-_console = Console()
+_console = get_console()
 
 
 # ---------------------------------------------------------------------------

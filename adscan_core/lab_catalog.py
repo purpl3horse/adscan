@@ -86,6 +86,8 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "Garfield",
         "Logging",
         "PingPong",
+        "Eighteen",
+        "Breach",
         "Intercept",
         "Sidecar",
         "Push",

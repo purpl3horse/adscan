@@ -71,7 +71,7 @@ DEMO_DOCS_URL = "https://adscanpro.com/docs"
 
 # Color tokens (mirrors adscan_core.theme — kept inline so we don't widen the
 # public theme surface for one command).
-_CYAN = "#00D4FF"
+_CYAN = "#1AA0AE"  # ADscan brand teal (on-dark accent, site --brand-accent); name kept for call-site stability
 _AMBER = "#FF9500"
 _CRIMSON = "#DC2626"
 _STEEL = "#4A9EBA"

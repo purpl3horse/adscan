@@ -25,6 +25,12 @@ from rich.prompt import Confirm
 
 from adscan_launcher import telemetry
 from adscan_launcher import runtime_session as _runtime_session
+from adscan_launcher.docker_pull_diagnostics import (
+    PullFailureDiagnosis,
+    consume_last_failure,
+    get_presentation,
+    peek_last_failure,
+)
 from adscan_launcher.docker_runtime import (
     DockerRunConfig,
     build_adscan_run_command,
@@ -82,7 +88,14 @@ _DOCKER_SERVICE_UNIT_MISSING_RE = re.compile(
     r"(unit\s+docker\.service\s+could\s+not\s+be\s+found|could\s+not\s+find\s+the\s+requested\s+service\s+docker)",
     re.IGNORECASE,
 )
-_MIN_DOCKER_INSTALL_FREE_GB = 10
+# Re-exported from adscan_core so callers that already imported it from
+# this module keep working; the canonical value lives in
+# adscan_core/host_resource_thresholds.py so launcher and runtime
+# (adscan_internal) cannot drift.
+from adscan_core.host_resource_thresholds import (  # noqa: E402
+    MIN_DOCKER_INSTALL_FREE_GB as _MIN_DOCKER_INSTALL_FREE_GB,
+)
+
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
 _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = 1.0
 _LOW_MEMORY_WARNING_THRESHOLD_GB = 1.5
@@ -1239,20 +1252,92 @@ def _run_docker_pull_network_preflight(
     return False
 
 
+def _emit_pull_retry_notice(
+    *,
+    reason: str,
+    diagnosis: "PullFailureDiagnosis | None" = None,
+) -> None:
+    """Render a compact, premium-styled "retry pending" line.
+
+    The retry path used to emit a yellow ``print_warning("Docker image
+    pull failed. Retrying once...")`` BEFORE the retry was attempted.
+    That message was alarming and turned out to be misleading: most
+    transient retries succeed in seconds because Docker reuses the
+    layers already cached from the failed attempt. The new message is
+    informational, names the classified cause so the operator sees what
+    went wrong, and signals that recovery is in progress — no scary
+    glyph, no panel, no whiplash.
+    """
+    pieces = ["[dim]First attempt failed[/dim]"]
+    if diagnosis is not None:
+        presentation = get_presentation(diagnosis.kind)
+        pieces.append(
+            f"[dim]·[/dim] {presentation.glyph} [bold]{presentation.title}[/bold]"
+        )
+    pieces.append(f"[dim]·[/dim] {reason}")
+    print_info(" ".join(pieces))
+
+
+def _emit_pull_recovery_notice(
+    *,
+    first_failure: "PullFailureDiagnosis | None",
+) -> None:
+    """Render a sober recovery line after a successful retry.
+
+    Pairs with ``_emit_pull_retry_notice``: the operator saw the
+    transient failure, now they see the operation finished cleanly.
+    Single line, dim secondary tone so it does not steal attention from
+    the eventual ``pulled successfully`` line that follows.
+    """
+    if first_failure is None:
+        print_info("[dim]Recovered automatically on retry.[/dim]")
+        return
+    presentation = get_presentation(first_failure.kind)
+    print_info(
+        f"[dim]Recovered on retry after[/dim] {presentation.glyph} "
+        f"[dim]{presentation.title}.[/dim] "
+        f"[dim]Docker reused cached layers from the previous attempt.[/dim]"
+    )
+
+
 def _ensure_image_pulled_with_legacy_fallback(
     *,
     pull_timeout: int | None,
     stream_output: bool,
 ) -> str | None:
-    """Pull preferred image, then fallback to legacy naming if needed."""
+    """Pull preferred image, then fallback to legacy naming if needed.
+
+    Failure UX contract:
+
+    * Intermediate attempts (first try, transient retry, post-daemon-
+      recovery retry) are silent on success-or-defer paths. The
+      ``ensure_image_pulled`` call sets ``surface_failure=False`` so the
+      DNS guidance and timeout warning do not fire mid-loop — the
+      diagnosis is still recorded for the eventual panel.
+    * Between attempts, a compact info line names the cause and signals
+      that a retry is in flight (see ``_emit_pull_retry_notice``).
+    * When a retry succeeds, a single dim recovery line acknowledges
+      the transient failure without alarm (see
+      ``_emit_pull_recovery_notice``).
+    * The final premium failure panel is rendered exactly once by the
+      caller of this function via ``_print_docker_image_pull_failure_guidance``,
+      using the diagnosis of the *last* attempt.
+    """
     if not _ensure_docker_daemon_available_for_pull(stage="pre_pull"):
         return None
     dns_preflight_ok = _run_docker_pull_dns_preflight()
     network_preflight_ok = _run_docker_pull_network_preflight()
     preflight_ok = bool(dns_preflight_ok and network_preflight_ok)
 
-    def _on_pull_success(selected_image: str, *, preferred_image: str) -> str:
-        """Emit non-blocking preflight note when pull succeeds after warning."""
+    def _on_pull_success(
+        selected_image: str,
+        *,
+        preferred_image: str,
+        first_failure: "PullFailureDiagnosis | None" = None,
+    ) -> str:
+        """Emit recovery/preflight notes, then return the resolved image."""
+        if first_failure is not None:
+            _emit_pull_recovery_notice(first_failure=first_failure)
         if not preflight_ok:
             print_info(
                 "Continuing after non-blocking network preflight warning. "
@@ -1283,28 +1368,37 @@ def _ensure_image_pulled_with_legacy_fallback(
     for idx, candidate in enumerate(candidates):
         candidate_to_pull = _normalize_image_reference_for_runtime(candidate)
         if idx > 0:
-            print_warning(
-                "Primary Docker image pull failed; trying legacy image naming: "
-                f"{candidate_to_pull}"
+            print_info(
+                "[dim]Primary image unavailable — trying legacy naming[/dim] "
+                f"[dim]·[/dim] {candidate_to_pull}"
             )
+        # First attempt: classify on failure but do NOT surface guidance
+        # — the retry path below decides whether to recover quietly or
+        # promote the failure to the caller.
         if ensure_image_pulled(
-            candidate_to_pull, timeout=pull_timeout, stream_output=stream_output
+            candidate_to_pull,
+            timeout=pull_timeout,
+            stream_output=stream_output,
+            surface_failure=False,
         ):
             return _on_pull_success(
                 candidate_to_pull,
                 preferred_image=preferred,
             )
 
+        first_failure = peek_last_failure()
         daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
             run_docker_command_func=_run_docker_status_command
         )
         if daemon_running:
-            print_warning(
-                "Docker image pull failed. Retrying once in case of transient network/registry issues..."
+            _emit_pull_retry_notice(
+                reason="[dim]retrying with cached layers…[/dim]",
+                diagnosis=first_failure,
             )
             print_info_debug(
                 "[docker] transient pull retry: "
                 f"image={mark_sensitive(candidate_to_pull, 'detail')} "
+                f"first_kind={first_failure.kind if first_failure else 'unknown'} "
                 f"diagnostic={mark_sensitive(daemon_diagnostic, 'detail')}"
             )
             telemetry.capture(
@@ -1312,17 +1406,24 @@ def _ensure_image_pulled_with_legacy_fallback(
                 {
                     "image": candidate_to_pull,
                     "reason": "transient_pull_failure",
+                    "first_failure_kind": first_failure.kind if first_failure else "unknown",
                 },
             )
             time.sleep(1.5)
+            # Retry attempt: also silent on failure — if it fails, we
+            # fall through to the daemon-recovery branch or to the loop
+            # exit, at which point the caller renders the final panel
+            # using whichever diagnosis is freshest.
             if ensure_image_pulled(
                 candidate_to_pull,
                 timeout=pull_timeout,
                 stream_output=stream_output,
+                surface_failure=False,
             ):
                 return _on_pull_success(
                     candidate_to_pull,
                     preferred_image=preferred,
+                    first_failure=first_failure,
                 )
             daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
                 run_docker_command_func=_run_docker_status_command
@@ -1330,9 +1431,9 @@ def _ensure_image_pulled_with_legacy_fallback(
         if daemon_running:
             continue
 
-        print_warning(
-            "Docker daemon became unavailable during image pull; "
-            "attempting recovery before retrying."
+        _emit_pull_retry_notice(
+            reason="[dim]daemon became unavailable — recovering before retry…[/dim]",
+            diagnosis=first_failure,
         )
         print_info_debug(
             "[docker] daemon diagnostic after pull failure: "
@@ -1341,15 +1442,21 @@ def _ensure_image_pulled_with_legacy_fallback(
         if not _ensure_docker_daemon_available_for_pull(stage="post_pull_failure"):
             return None
 
-        print_info("Retrying image pull after Docker daemon recovery...")
+        # Daemon recovered: final attempt for THIS candidate. We surface
+        # the failure here because if this one fails too there is nothing
+        # left for this candidate — the caller's panel is the right
+        # place to render it, so we still keep surface_failure=False and
+        # let _print_docker_image_pull_failure_guidance own the panel.
         if ensure_image_pulled(
             candidate_to_pull,
             timeout=pull_timeout,
             stream_output=stream_output,
+            surface_failure=False,
         ):
             return _on_pull_success(
                 candidate_to_pull,
                 preferred_image=preferred,
+                first_failure=first_failure,
             )
     return None
 
@@ -1494,6 +1601,70 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
         print_instruction(f"Installation guide: {_DOCKER_INSTALL_DOCS_URL}")
 
 
+def _render_premium_pull_failure_panel(
+    *,
+    diagnosis: PullFailureDiagnosis,
+    image: str,
+    command_name: str,
+    pull_timeout: int | None,
+) -> None:
+    """Render the premium, classified failure panel.
+
+    Self-contained: pulls the presentation metadata, substitutes the
+    operator's actual retry command + image into the fix steps, and
+    emits a single Rich panel with semantic chrome. No raw ANSI dump;
+    no version-specific copy. The presentation tables in
+    ``docker_pull_diagnostics`` are the single source of truth — if you
+    want to change wording or chrome, edit that file, not this one.
+    """
+    presentation = get_presentation(diagnosis.kind)
+    suggested_timeout = 7200 if pull_timeout is None else max(pull_timeout, 7200)
+    retry_command = f"adscan {command_name}"
+
+    body_lines: list[str] = []
+    if presentation.what_lines:
+        body_lines.append("[bold]What happened[/bold]")
+        body_lines.extend(f"  {ln}" for ln in presentation.what_lines)
+        body_lines.append("")
+    if presentation.why_lines:
+        body_lines.append("[bold]Why[/bold]")
+        body_lines.extend(f"  {ln}" for ln in presentation.why_lines)
+        body_lines.append("")
+    if presentation.fix_steps:
+        body_lines.append("[bold]Fix[/bold]")
+        for step in presentation.fix_steps:
+            rendered = step.format(retry_command=retry_command, image_name=image)
+            body_lines.append(f"  [cyan]$[/cyan] {rendered}")
+        body_lines.append("")
+    if diagnosis.evidence:
+        body_lines.append("[bold]Registry said[/bold]")
+        for line in diagnosis.evidence:
+            # Truncate over-long lines so the panel stays scannable.
+            shown = line if len(line) <= 200 else line[:197] + "..."
+            body_lines.append(f"  [dim]{mark_sensitive(shown, 'detail')}[/dim]")
+        body_lines.append("")
+    if presentation.followup:
+        body_lines.append(f"[dim]{presentation.followup}[/dim]")
+
+    # For `unknown`, surface the timeout escape hatch since the panel
+    # has no targeted remediation. Network_timeout already shows it
+    # in its own Fix block, so don't double up.
+    if diagnosis.kind == "unknown":
+        body_lines.append("")
+        body_lines.append("[dim]Need more time on a slow link:[/dim]")
+        body_lines.append(
+            f"  [cyan]$[/cyan] adscan {command_name} --pull-timeout {suggested_timeout}"
+        )
+
+    body = "\n".join(body_lines).rstrip()
+    print_panel(
+        body,
+        title=f"{presentation.glyph}  {presentation.title}",
+        border_style=presentation.border_style,
+        title_align="left",
+    )
+
+
 def _print_docker_image_pull_failure_guidance(
     *,
     image: str,
@@ -1502,17 +1673,25 @@ def _print_docker_image_pull_failure_guidance(
 ) -> None:
     """Print targeted guidance for Docker image pull failures.
 
-    Distinguishes daemon/runtime failures from network/registry failures so users
-    get relevant troubleshooting steps.
+    Two paths:
+
+    * Daemon down → short-circuit with the daemon recovery checklist
+      (the pull never reached the registry, so a registry classification
+      would be misleading).
+    * Daemon up → render the premium classified failure panel using the
+      diagnosis recorded by ``ensure_image_pulled``. Falls back to the
+      ``unknown`` presentation if no diagnosis was recorded (e.g. the
+      pull short-circuited before any failure capture).
     """
     daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
         run_docker_command_func=_run_docker_status_command
     )
 
-    print_error("Failed to pull the ADscan Docker image.")
     if not daemon_running:
+        print_error("Failed to pull the ADscan Docker image.")
         print_warning(
-            "Docker daemon is not reachable. ADscan cannot pull images until Docker API is available."
+            "Docker daemon is not reachable. ADscan cannot pull images until "
+            "Docker API is available."
         )
         print_info_debug(
             "[docker] daemon diagnostic (image_pull_failure): "
@@ -1531,24 +1710,38 @@ def _print_docker_image_pull_failure_guidance(
         print_instruction(f"Retry command: adscan {command_name}")
         return
 
-    print_instruction("Retry the command, or pull manually and retry:")
-    pull_cmd_prefix = "sudo " if (docker_needs_sudo() and os.geteuid() != 0) else ""
-    print_instruction(f"  {pull_cmd_prefix}docker pull {image}")
-    suggested_timeout = 7200 if pull_timeout is None else max(pull_timeout, 7200)
-    print_instruction(
-        "If you are on a slow network, increase the pull timeout and retry:"
+    diagnosis = consume_last_failure()
+    if diagnosis is None:
+        # Pull failed but no diagnosis was recorded (shouldn't happen in
+        # practice — defensive fallback). Synthesize an "unknown" so the
+        # operator still sees a structured panel rather than nothing.
+        diagnosis = PullFailureDiagnosis(kind="unknown", evidence=[])
+
+    _render_premium_pull_failure_panel(
+        diagnosis=diagnosis,
+        image=image,
+        command_name=command_name,
+        pull_timeout=pull_timeout,
     )
-    print_instruction(f"  adscan {command_name} --pull-timeout {suggested_timeout}")
-    print_instruction("To disable the pull timeout entirely:")
-    print_instruction(f"  adscan {command_name} --pull-timeout 0")
-    print_instruction(
-        "If the error mentions 'content descriptor ... not found', this is usually a "
-        "registry/tag consistency issue. Retry shortly."
+
+    telemetry.capture(
+        "docker_pull_failure_classified",
+        {
+            "kind": diagnosis.kind,
+            "rate_limit_likely": diagnosis.rate_limit_likely,
+            "has_evidence": bool(diagnosis.evidence),
+            "command_name": command_name,
+        },
     )
-    print_instruction(
-        "Emergency compatibility fallback (may use older image naming): "
-        f"{_ALLOW_LEGACY_IMAGE_FALLBACK_ENV}=1 adscan {command_name}"
-    )
+
+    if diagnosis.kind in ("manifest_not_found", "unknown"):
+        # Only surface the legacy-image escape hatch where it might
+        # actually help. Manifest_not_found is the canonical case
+        # (preferred tag rotated away); unknown is the catch-all.
+        print_instruction(
+            "Emergency compatibility fallback (may use older image naming): "
+            f"{_ALLOW_LEGACY_IMAGE_FALLBACK_ENV}=1 adscan {command_name}"
+        )
 
 
 def get_docker_image_name() -> str:

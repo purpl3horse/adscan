@@ -304,13 +304,13 @@ def questionary_style(questionary_module: Any) -> Any:
     """Return shared Questionary style used across prompts."""
     return questionary_module.Style(
         [
-            ("qmark", "fg:#00D4FF bold"),
+            ("qmark", "fg:#1AA0AE bold"),
             ("question", "bold white"),
-            ("answer", "fg:#00D4FF bold"),
-            ("pointer", "fg:#00D4FF bold"),
-            ("highlighted", "fg:#00D4FF bold"),
-            ("selected", "fg:#00D4FF bold"),
-            ("separator", "fg:#00D4FF"),
+            ("answer", "fg:#1AA0AE bold"),
+            ("pointer", "fg:#1AA0AE bold"),
+            ("highlighted", "fg:#1AA0AE bold"),
+            ("selected", "fg:#1AA0AE bold"),
+            ("separator", "fg:#1AA0AE"),
             ("instruction", "fg:#cccccc"),
             ("text", "white"),
             ("choice", "white"),
@@ -319,10 +319,56 @@ def questionary_style(questionary_module: Any) -> Any:
     )
 
 
+def _rich_numeric_select_value(*, title: str, options: list[str]) -> str | None:
+    """Rich-based numeric single-select usable inside an active event loop.
+
+    ``questionary``/``prompt_toolkit`` cannot run a prompt session inside a
+    running asyncio loop. This fallback renders a numbered menu and reads the
+    choice with ``rich.prompt.IntPrompt`` (which needs no event loop of its
+    own) — mirroring the text/confirm fallbacks. Returns ``None`` only when
+    truly non-interactive (so the caller resolves its own default) or on
+    cancellation.
+    """
+    if not options:
+        return None
+    if default_should_disable_interactive_prompts():
+        return None
+    try:
+        from rich.prompt import IntPrompt
+
+        from adscan_core.output._state import get_console
+
+        console = get_console()
+        console.print(title)
+        for idx, option in enumerate(options, start=1):
+            console.print(f"  {idx}. {option}")
+        choice = IntPrompt.ask(
+            "Select an option (number)",
+            choices=[str(i) for i in range(1, len(options) + 1)],
+            default=1,
+            console=console,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return None
+    except Exception:  # noqa: BLE001 - never let the fallback crash the caller
+        return None
+    index = int(choice)
+    if 1 <= index <= len(options):
+        return options[index - 1]
+    return None
+
+
 def questionary_select_value(*, title: str, options: list[str]) -> str | None:
     """Render a Questionary single-select prompt and return selected value."""
-    if not options or is_running_event_loop():
+    if not options:
         return None
+    if is_running_event_loop():
+        # prompt_toolkit cannot nest a prompt session inside a running asyncio
+        # loop. Returning None here silently skipped the prompt — callers read
+        # that as "cancelled", which (e.g.) ran DCSync against a bogus target
+        # when the follow-up executes inside the dump's loop. Fall back to a
+        # Rich numeric select that works without its own event loop.
+        return _rich_numeric_select_value(title=title, options=options)
     try:
         import questionary  # type: ignore
     except Exception:
@@ -337,6 +383,60 @@ def questionary_select_value(*, title: str, options: list[str]) -> str | None:
         return None
 
 
+def _rich_numeric_checkbox_values(
+    *,
+    title: str,
+    options: list[str],
+    default_values: list[str] | None = None,
+    labels_by_value: dict[str, str] | None = None,
+) -> list[str] | None:
+    """Rich-based multi-select usable inside an active event loop.
+
+    Companion to :func:`_rich_numeric_select_value` for checkbox prompts —
+    ``questionary`` cannot run inside a running asyncio loop. Reads
+    comma-separated numbers (or ``all`` / ``none`` / Enter for defaults).
+    """
+    if not options:
+        return None
+    if default_should_disable_interactive_prompts():
+        return None
+    resolved_defaults = {str(v) for v in (default_values or []) if str(v).strip()}
+    try:
+        from rich.prompt import Prompt
+
+        from adscan_core.output._state import get_console
+
+        console = get_console()
+        console.print(title)
+        for idx, option in enumerate(options, start=1):
+            label = str((labels_by_value or {}).get(str(option), str(option)))
+            mark = "x" if str(option) in resolved_defaults else " "
+            console.print(f"  [{mark}] {idx}. {label}")
+        raw = Prompt.ask(
+            "Select (comma-separated numbers, 'all', 'none', Enter=defaults)",
+            default="",
+            console=console,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return None
+    except Exception:  # noqa: BLE001 - never let the fallback crash the caller
+        return None
+    cleaned = str(raw or "").strip().lower()
+    if cleaned == "":
+        return [str(o) for o in options if str(o) in resolved_defaults]
+    if cleaned == "all":
+        return [str(o) for o in options]
+    if cleaned == "none":
+        return []
+    chosen: list[str] = []
+    for token in cleaned.replace(" ", "").split(","):
+        if token.isdigit() and 1 <= int(token) <= len(options):
+            value = str(options[int(token) - 1])
+            if value not in chosen:
+                chosen.append(value)
+    return chosen or None
+
+
 def questionary_checkbox_values_raw(
     *,
     title: str,
@@ -345,8 +445,17 @@ def questionary_checkbox_values_raw(
     labels_by_value: dict[str, str] | None = None,
 ) -> list[str] | None:
     """Render Questionary checkbox without extra logging logic."""
-    if not options or is_running_event_loop():
+    if not options:
         return None
+    if is_running_event_loop():
+        # prompt_toolkit cannot nest inside a running asyncio loop — fall back to
+        # a Rich numeric multi-select (see _rich_numeric_select_value rationale).
+        return _rich_numeric_checkbox_values(
+            title=title,
+            options=options,
+            default_values=default_values,
+            labels_by_value=labels_by_value,
+        )
     try:
         import questionary  # type: ignore
     except Exception:

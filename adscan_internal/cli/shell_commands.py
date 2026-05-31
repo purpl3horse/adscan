@@ -132,6 +132,26 @@ def _parse_deliver_args(args: str) -> argparse.Namespace:
     return parser.parse_args(shlex.split(args) if args.strip() else [])
 
 
+def _parse_mitre_navigator_args(args: str) -> argparse.Namespace:
+    """Parse a shell-side ``mitre_navigator`` arg string.
+
+    Mirrors the flag surface declared by the canonical subparser in
+    :mod:`adscan_internal.cli.mitre_navigator` so the namespace the
+    entrypoint reads (``workspace``/``output``/``client``/``engagement``/
+    ``web``/``no_html``/``no_history``/``verbose``) is fully populated.
+    """
+    parser = argparse.ArgumentParser(prog="mitre_navigator", add_help=False)
+    parser.add_argument("--workspace", dest="workspace", default=None)
+    parser.add_argument("--output", dest="output", default=None)
+    parser.add_argument("--client", dest="client", default=None)
+    parser.add_argument("--engagement", dest="engagement", default=None)
+    parser.add_argument("--web", dest="web", action="store_true")
+    parser.add_argument("--no-html", dest="no_html", action="store_true")
+    parser.add_argument("--no-history", dest="no_history", action="store_true")
+    parser.add_argument("-v", "--verbose", dest="verbose", action="store_true")
+    return parser.parse_args(shlex.split(args) if args.strip() else [])
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -210,6 +230,24 @@ def _run_deliver(shell: Any, args: str) -> None:
             os.environ.pop("ADSCAN_CURRENT_WORKSPACE", None)
         else:
             os.environ["ADSCAN_CURRENT_WORKSPACE"] = prev
+
+
+def _run_mitre_navigator(shell: Any, args: str) -> None:
+    """Export a MITRE ATT&CK Navigator layer from the active workspace.
+
+    Reuses the canonical entrypoint
+    :func:`adscan_internal.cli.mitre_navigator.run_mitre_navigator_sync`
+    with zero logic duplication. The active workspace directory is injected
+    as ``--workspace`` when the operator did not pass one explicitly, so the
+    export targets the session's current workspace without a prompt.
+    """
+    from adscan_internal.cli.mitre_navigator import run_mitre_navigator_sync
+
+    parsed = _parse_mitre_navigator_args(args)
+    ws_dir = getattr(shell, "current_workspace_dir", None)
+    if ws_dir and not getattr(parsed, "workspace", None):
+        parsed.workspace = str(ws_dir)
+    run_mitre_navigator_sync(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +342,30 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
             "  deliver --frameworks ens,iso27001,dora      # multi-framework compliance kit\n"
         ),
         handler=_run_deliver,
+        suggested_after=("start_auth", "start_unauth"),
+        is_deliverable=True,
+    ),
+    ShellCommandSpec(
+        verb="mitre_navigator",
+        category=_DELIVERABLES_CATEGORY,
+        short_help="Export a MITRE ATT&CK Navigator layer (JSON) from the latest scan.",
+        long_help=(
+            "Usage:\n"
+            "  mitre_navigator [--workspace NAME] [--output DIR]\n"
+            "                  [--client NAME] [--engagement CODE]\n"
+            "                  [--web] [--no-html] [--no-history] [-v]\n\n"
+            "Generate a MITRE ATT&CK Navigator v4.5 layer from the latest scan.\n"
+            "LITE writes a community-watermarked navigator-layer.json that loads\n"
+            "directly in the official MITRE ATT&CK Navigator UI. PRO additionally\n"
+            "produces an interactive HTML bundle, a posture diff vs the previous\n"
+            "scan, and a history snapshot.\n\n"
+            "Inside the shell, the workspace is auto-detected — no flag needed.\n\n"
+            "Examples:\n"
+            "  mitre_navigator\n"
+            "  mitre_navigator --workspace Essos\n"
+            "  mitre_navigator --no-html --no-history     # JSON-only (CI)\n"
+        ),
+        handler=_run_mitre_navigator,
         suggested_after=("start_auth", "start_unauth"),
         is_deliverable=True,
     ),

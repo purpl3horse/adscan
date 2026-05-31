@@ -36,6 +36,35 @@ from adscan_internal.services.remote_exec import (
     build_smb_config_from_credential,
 )
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal import get_console
+
+
+def _load_flags_ip_hostname_inventory(shell: Any, domain: str) -> dict | None:
+    """Load the workspace IP->hostname inventory for one domain, if available.
+
+    Used to promote a raw-IP CTF target to its FQDN so Kerberos service tickets
+    bind to ``cifs/<fqdn>`` rather than the rejected ``cifs/<ip>``. Best-effort:
+    returns ``None`` when the workspace has no resolution report yet.
+    """
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    domains_dir = getattr(shell, "domains_dir", None) or ""
+    if not workspace_dir or not domains_dir:
+        return None
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (
+            load_workspace_ip_hostname_inventory,
+        )
+
+        return (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=workspace_dir,
+                domains_dir=domains_dir,
+                domain=domain,
+            )
+            or None
+        )
+    except Exception:  # noqa: BLE001 - inventory is best-effort
+        return None
 
 
 def ask_for_flags(
@@ -242,11 +271,48 @@ def execute_get_flags(
         is_hash = bool(getattr(shell, "is_hash", lambda _v: False)(password))
         secret_kind = "nt_hash" if is_hash else "password"
 
-    domain_entry = (
-        shell.domains_data.get(domain) if hasattr(shell, "domains_data") else None
-    ) or {}
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.domain_posture import get_posture
+    from adscan_internal.services.kerberos_spn_resolution import (
+        resolve_spn_or_decide_ntlm,
+    )
+
+    domains_data = getattr(shell, "domains_data", None) or {}
+    domain_entry = domains_data.get(domain) or {}
     pdc_ip = domain_entry.get("pdc_ip") or domain_entry.get("pdc")
-    kdc_ip = domain_entry.get("kdc_ip") or pdc_ip
+    # The Kerberos KDC is ALWAYS the target domain's DC — never the target host.
+    # ``resolve_dc_ip`` walks pdc -> dc_ip -> dcs[0] so a silent ``None`` never
+    # degrades to the member host (Kerberos would then hit port 88 of a non-KDC).
+    # See CLAUDE.md "DC/KDC IP from domains_data - always resolve_dc_ip()".
+    kdc_ip = (
+        domain_entry.get("kdc_ip")
+        or resolve_dc_ip(domain_entry)
+        or pdc_ip
+    )
+
+    try:
+        posture_snapshot = get_posture(domains_data, domain=domain)
+    except Exception:  # noqa: BLE001 - posture read is best-effort
+        posture_snapshot = None
+
+    inventory = _load_flags_ip_hostname_inventory(shell, domain)
+    is_dc_target = bool(
+        host and kdc_ip and str(host).strip() == str(kdc_ip).strip()
+    )
+    # ``host`` may be a raw IP (lateral CTF target reached by address only).
+    # Kerberos service tickets cannot bind to ``cifs/<ip>``; route through the
+    # centralized resolver so we either get an FQDN for the SPN or a
+    # posture-gated NTLM-fallback decision — never request ``cifs/<ip>`` blindly.
+    resolution = resolve_spn_or_decide_ntlm(
+        target_host=host,
+        domain=domain,
+        domains_data=domains_data,
+        ip_hostname_inventory=inventory,
+        resolver_ip=kdc_ip,
+        posture_snapshot=posture_snapshot,
+        is_dc_target=is_dc_target,
+    )
+    spn_host = resolution.spn_host if resolution.kerberos_viable else host
 
     from adscan_internal import print_info_debug as _dbg
     _dbg(
@@ -254,6 +320,8 @@ def execute_get_flags(
         f"user={mark_sensitive(username, 'user')} "
         f"secret_kind={secret_kind} "
         f"host={mark_sensitive(host, 'hostname')} "
+        f"spn_host={mark_sensitive(str(spn_host or '-'), 'hostname')} "
+        f"kerberos_viable={resolution.kerberos_viable} "
         f"pdc_ip={mark_sensitive(str(pdc_ip or '-'), 'ip')} "
         f"kdc_ip={mark_sensitive(str(kdc_ip or '-'), 'ip')}"
     )
@@ -265,17 +333,23 @@ def execute_get_flags(
     # as the wrong user (ACCESS_DENIED on C$, wrong WinRM auth).
     # Pre-obtain TGT+CIFS TGS explicitly via kerbad and hand a ccache_path to
     # the config so there is no ambiguity regardless of the secret type.
+    # Gated on ``kerberos_viable``: with only an IP and no resolvable FQDN we
+    # must NOT mint ``cifs/<ip>`` — fall through to NTLM with the raw secret.
     effective_secret = password
     effective_kind = secret_kind
     _smb_ccache_tmp: str | None = None
-    if secret_kind in {"nt_hash", "password"} and kdc_ip:
+    if (
+        secret_kind in {"nt_hash", "password"}
+        and kdc_ip
+        and resolution.kerberos_viable
+    ):
         try:
             import tempfile as _tf
             from adscan_internal.services.kerberos_transport import (
                 KerberosConfig as _KrbCfg,
                 get_tgs as _get_tgs,
             )
-            _spn = f"cifs/{host}"
+            _spn = f"cifs/{spn_host}"
             _krb = _KrbCfg(
                 username=username,
                 domain=domain,
@@ -312,8 +386,11 @@ def execute_get_flags(
         username=username,
         secret=effective_secret,
         secret_kind=effective_kind,
-        target_host=host,
-        target_ip=pdc_ip or host,
+        # ``target_host`` is the SPN host (FQDN when resolvable); ``target_ip`` is
+        # the ACTUAL target we connect to — never the PDC, which would silently
+        # point every probe at the wrong machine.
+        target_host=spn_host,
+        target_ip=host,
         kdc_ip=kdc_ip,
         prefer_kerberos=False,
     )
@@ -362,9 +439,8 @@ def execute_get_flags(
 
 def _fallback_console():
     """Return a default Rich console when ``shell.console`` is missing."""
-    from rich.console import Console
 
-    return Console()
+    return get_console()
 
 
 __all__ = [

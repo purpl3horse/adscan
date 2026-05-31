@@ -64,16 +64,12 @@ def _print(panel: Panel, *, kind: str = "panel") -> None:
     if suppress_rich():
         return
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     if _handle_spacing(kind, True, "auto"):
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +108,8 @@ def print_kv_section(
         if suppress_rich():
             return
         console = _get_console()
-        telemetry_console = _get_telemetry_console()
+        _get_telemetry_console()
         console.print(table)
-        if telemetry_console is not None:
-            telemetry_console.print(table)
         return
 
     header = Text()

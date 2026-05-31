@@ -145,6 +145,7 @@ class WinRMPSRPService:
         auth_mode: str = "auto",
         kerberos_spn_host: str | None = None,
         kdc_ip: str | None = None,
+        workspace_dir: str | None = None,
         posture_sink: Optional[PostureSink] = None,
         posture_snapshot: Optional["DomainPosture"] = None,
         domain_for_posture: Optional[str] = None,
@@ -154,6 +155,13 @@ class WinRMPSRPService:
         self.username = username
         self.password = password
         self.kdc_ip: str | None = kdc_ip
+        # Optional workspace root used to locate an already-minted Kerberos
+        # ccache for this principal under
+        # ``<workspace>/domains/<domain>/kerberos/tickets/<user>.ccache``.
+        # When set, the plaintext-password Kerberos path prefers that ticket
+        # over issuing a fresh AS-REQ. Back-compat: ``None`` keeps the legacy
+        # behaviour (no workspace ccache lookup).
+        self.workspace_dir: str | None = str(workspace_dir or "").strip() or None
         self.auth_mode = str(auth_mode or "auto").strip().lower() or "auto"
         # Promote short SPN host to FQDN. pypsrp builds the Kerberos SPN
         # ``http/<host>`` from this value; a short hostname yields a ticket the
@@ -217,14 +225,90 @@ class WinRMPSRPService:
         """Return True when the configured secret is a bare 32-hex NT hash."""
         return bool(re.fullmatch(r"[0-9A-Fa-f]{32}", str(self.password or "").strip()))
 
-    def _obtain_tgt_ccache_for_nt_hash(self) -> str | None:
-        """Request TGT + WinRM service ticket using the NT hash via kerbad.
+    def _resolve_existing_workspace_ccache(self) -> str | None:
+        """Return a valid workspace ccache path for this principal, if any.
 
-        Uses ``get_tgs`` (TGT → TGS in one call) so the resulting ccache
-        contains both the TGT and the HTTP/<host> service ticket. pyspnego
-        then finds the service ticket directly in the ccache without needing
-        to contact the KDC — which may be unreachable or unconfigured in
-        krb5.conf inside the container.
+        Looks up the canonical
+        ``<workspace>/domains/<domain>/kerberos/tickets/<user>.ccache`` ticket
+        (the same single-source-of-truth layout used by
+        ``ensure_user_ccache``) and validates it via ``klist`` before handing
+        it to pyspnego.  When the workspace directory is unknown or the ticket
+        is missing/expired, returns ``None`` so the caller can fall back to a
+        fresh kerbad AS-REQ.
+
+        Returns ``None`` on any error (best-effort — never raises).
+        """
+        workspace_dir = self.workspace_dir
+        if not workspace_dir:
+            return None
+        try:
+            from adscan_internal.services.kerberos_ticket_service import (
+                KerberosTicketService,
+            )
+
+            service = KerberosTicketService()
+            ticket_path = service.get_ticket_for_user(
+                workspace_dir=workspace_dir,
+                domain=self.domain,
+                username=self.username,
+            )
+            if not ticket_path:
+                return None
+            if not os.path.exists(ticket_path):
+                return None
+            # ``is_ticket_valid`` returns True/False/None (None = unable to
+            # validate, e.g. klist absent).  Treat None as "assume usable" so a
+            # container without klist still benefits from the workspace ticket;
+            # only a definitive False (expired/unreadable) discards it.
+            valid = service.is_ticket_valid(ticket_path=ticket_path)
+            if valid is False:
+                print_info_debug(
+                    f"[winrm_psrp] workspace ccache present but invalid/expired for "
+                    f"{mark_sensitive(self.username, 'user')}@"
+                    f"{str(self.domain or '').upper()}; will mint a fresh TGT"
+                )
+                return None
+            print_info_debug(
+                f"[winrm_psrp] using existing workspace ccache for "
+                f"{mark_sensitive(self.username, 'user')}@"
+                f"{str(self.domain or '').upper()} "
+                f"path={mark_sensitive(ticket_path, 'path')}"
+            )
+            return ticket_path
+        except Exception as exc:  # noqa: BLE001 - best-effort lookup
+            print_info_debug(
+                f"[winrm_psrp] workspace ccache lookup failed (ignored): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _obtain_tgt_ccache_for_nt_hash(self) -> str | None:
+        """Back-compat shim — prefetch a TGT+TGS ccache from the NT hash.
+
+        Retained so existing call sites and tests that target the NT-hash entry
+        point keep working.  Delegates to :meth:`_obtain_tgt_ccache`.
+        """
+        return self._obtain_tgt_ccache(nt_hash=self.password)
+
+    def _obtain_tgt_ccache(
+        self,
+        *,
+        password: str | None = None,
+        nt_hash: str | None = None,
+    ) -> str | None:
+        """Request TGT + WinRM service ticket via kerbad and cache it on disk.
+
+        Accepts either a plaintext ``password`` or a bare ``nt_hash`` (exactly
+        one should be supplied).  Uses ``get_tgs`` (TGT → TGS in one call) so
+        the resulting ccache contains both the TGT and the ``HTTP/<host>``
+        service ticket.  pyspnego then finds the service ticket directly in the
+        ccache without needing to contact the KDC — which may be unreachable or
+        unconfigured in ``krb5.conf`` inside the container.
+
+        kerbad resolves the KDC itself from ``kdc_ip`` (when provided) so this
+        bypasses the broken system MIT krb5 that caused the GSSAPI
+        ``Matching credential not found`` failure on plaintext-password
+        Kerberos auth.
 
         The ccache path is stored in ``_tgt_ccache_path`` and reused for the
         lifetime of this service instance so repeated cascade retries don't
@@ -276,7 +360,8 @@ class WinRMPSRPService:
                 username=self.username,
                 domain=self.domain,
                 kdc_ip=kdc,
-                nt_hash=self.password,
+                password=password,
+                nt_hash=nt_hash,
                 posture_snapshot=self._posture_snapshot,
             )
 
@@ -296,15 +381,16 @@ class WinRMPSRPService:
             tmp.close()
             self._tgt_ccache_path = tmp.name
             _WINRM_CCACHE_CACHE[_cache_key] = (tmp.name, time.time())
+            _secret_kind = "NT hash" if nt_hash else "password"
             print_info_debug(
-                f"[winrm_psrp] NT hash → TGT+TGS obtained for "
+                f"[winrm_psrp] {_secret_kind} → TGT+TGS obtained for "
                 f"{mark_sensitive(self.username, 'user')}@"
                 f"{str(self.domain or '').upper()} spn={spn}"
             )
             return self._tgt_ccache_path
         except Exception as exc:
             print_info_debug(
-                f"[winrm_psrp] NT hash TGT+TGS request failed, will fall back to NTLM: "
+                f"[winrm_psrp] TGT+TGS request failed, will fall back to NTLM: "
                 f"{type(exc).__name__}: {exc}"
             )
             return None
@@ -386,7 +472,23 @@ class WinRMPSRPService:
             elif not str(password or "").strip():
                 password = None
             else:
-                username = self._build_kerberos_username()
+                # Plaintext password + Kerberos. pyspnego cannot use the
+                # container's system MIT krb5 to acquire its own TGT (no
+                # krb5.conf / KDC resolution → GSSAPI "Matching credential not
+                # found"). Mirror the NT-hash branch: prefer an existing
+                # workspace ccache for this principal, else kerbad-prefetch a
+                # TGT+TGS from the password (kerbad knows the KDC IP). On
+                # success hand pyspnego the ticket; on failure fall through to
+                # the password so the NTLM fallback can use it.
+                ccache_path = self._resolve_existing_workspace_ccache()
+                if not ccache_path:
+                    ccache_path = self._obtain_tgt_ccache(password=password)
+                if ccache_path:
+                    kerberos_ticket_path = ccache_path
+                    password = None
+                    username = None  # principal is embedded in the ccache
+                else:
+                    username = self._build_kerberos_username()
             if not self._looks_like_ccache_path() and not str(username or "").strip():
                 username = None
 
@@ -951,10 +1053,34 @@ class WinRMPSRPService:
             with self._temporary_kerberos_env(auth_settings):
                 return operation(client, auth_settings)
         except Exception as exc:
+            # "Matching credential not found" is overloaded: with a ccache it
+            # usually means the HTTP/<host> service ticket isn't present and a
+            # WSMAN service-class retry resolves it; WITHOUT a ccache it means
+            # pyspnego could not acquire its own TGT (the broken container
+            # krb5) and only NTLM can save the operation. Prefer the WSMAN
+            # service-class retry first when it is still available so the
+            # in-ccache SPN case is not short-circuited to NTLM.
+            wsman_fallback_auth = self._retry_auth_settings_with_wsmam_fallback(
+                auth_settings
+            )
+            # The WSMAN service-class retry only helps when an actual ccache is
+            # in play (the HTTP/<host> ticket may be missing while a
+            # WSMAN/<host> ticket exists). Without a ccache the failure is the
+            # local-credential acquisition failure, which only NTLM can fix.
+            has_ccache = bool(str(auth_settings.kerberos_ticket_path or "").strip())
+            wsman_retry_available = bool(
+                wsman_fallback_auth
+                and has_ccache
+                and (
+                    self._is_matching_credential_not_found_error(exc)
+                    or self._is_probable_kerberos_spn_key_mismatch(exc)
+                )
+            )
             if (
                 auth_settings.auth == "kerberos"
                 and self._ntlm_fallback_allowed
                 and self._is_kerberos_infra_error(exc)
+                and not wsman_retry_available
             ):
                 # Note: auth_mode == "auto" guard removed — the posture plan
                 # legitimately changes auth_mode from "auto" to "kerberos"
@@ -970,7 +1096,7 @@ class WinRMPSRPService:
                 with self._temporary_kerberos_env(fallback_auth):
                     return operation(fallback_client, fallback_auth)
 
-            fallback_auth = self._retry_auth_settings_with_wsmam_fallback(auth_settings)
+            fallback_auth = wsman_fallback_auth
             if not (
                 fallback_auth
                 and (

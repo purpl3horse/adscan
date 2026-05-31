@@ -57,6 +57,9 @@ _CONSTRAINT_DISPLAY_MAP: dict[tuple[ConstraintCategory, TriState], str] = {
     (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.REQUIRED): (
         "LDAP channel binding required"
     ),
+    (ConstraintCategory.LDAP_CHANNEL_BINDING, TriState.DISABLED): (
+        "LDAP channel binding not enforced"
+    ),
     (ConstraintCategory.SMB_SIGNING, TriState.REQUIRED): "SMB signing required",
 }
 

@@ -16,10 +16,12 @@ the function body.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import sys
-from typing import Callable, Dict, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Optional
 
 from rich.console import Console
 
@@ -324,6 +326,262 @@ def _diag_log(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tee Console — auto-mirror every visible print into the telemetry recording
+# ---------------------------------------------------------------------------
+#
+# Why this exists.
+#
+# The session viewer is built from a separate ``Console`` with
+# ``record=True`` that captures everything the operator sees so it can be
+# replayed by reviewers. Before this subclass, the only way a panel /
+# table / Rich renderable made it into the recording was if the call
+# site went through one of the canonical helpers (``print_panel``,
+# ``print_info``, …) — those helpers mirror manually with two
+# ``console.print()`` calls in sequence.
+#
+# Direct call sites — ``console.print(Panel(...))``,
+# ``shell.console.print(table)``, ``self._console.print(some_table)``,
+# 191 occurrences across the runtime — bypassed the recording entirely.
+# Posture probe panels, credential-dump tables, ADCS pre-flight,
+# CVE results, inventory timelines, the CTF flags panel, ligolo
+# tables — all of that high-value content was missing from session
+# replays. We discovered this by spot-checking customer recordings.
+#
+# What this subclass does.
+#
+# ``_TeeConsole`` overrides ``print()`` to also call the telemetry
+# console's ``print()`` with the same arguments. Once installed as
+# ``_console``, every ``console.print(...)`` in ADscan — old, new, via
+# helper, via direct call, via Rich Live exit, anywhere — lands in the
+# recording. There is nothing for future code to remember.
+#
+# Auto-mirror opt-out (for canonical helpers only).
+#
+# The canonical helpers were written before this subclass existed; they
+# already do ``console.print(x); telemetry_console.print(x)`` explicitly.
+# Without an opt-out, the helpers would double-print into the recording.
+# The :func:`_explicit_telemetry_mirror` context manager turns
+# auto-mirror off for the duration of the helper's manual mirror; the
+# helper keeps its existing two-line pattern and the recording stays
+# clean. New code does NOT need this — just call ``console.print()``.
+
+_skip_auto_mirror: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "adscan_skip_auto_mirror", default=False
+)
+
+# ---------------------------------------------------------------------------
+# Deferred live-log buffers — capture print_* output emitted DURING a Live
+# render so it can be flushed AFTER the alt-screen pops.
+# ---------------------------------------------------------------------------
+#
+# Why this exists.
+#
+# A ``LiveSession`` with ``alt_screen=True`` + ``redirect_io=True`` (the
+# premium default) routes every ``print_*`` call issued WHILE Live is
+# rendering into Rich Live's internal log region, which lives inside the
+# alternate-screen buffer and is DISCARDED when the alt-screen pops on
+# exit. Operators therefore lose all diagnostic logs emitted from inside a
+# live render (e.g. posture-probe per-probe timings) unless they re-run the
+# whole thing with ``ADSCAN_NO_LIVE=1``.
+#
+# A prior decision (CLAUDE.md § "Diagnostic logs during Live") rejected the
+# stdout-capture approach (touching ``sys.stdout`` / Rich ``redirect_*`` /
+# ``FileProxy``) as fragile. Instead we reuse the EXISTING ``_TeeConsole``
+# interception point: while a deferred buffer is active, every visible
+# ``print()`` ALSO appends its renderable(s) to the top buffer — in
+# ADDITION to the normal visible-print + telemetry-mirror behaviour. The
+# ``LiveSession`` pops the buffer after the alt-screen has popped and
+# re-prints the captured renderables to the operator's real scrollback.
+#
+# The buffers form a stack so nested ``LiveSession`` contexts each capture
+# their own slice. Each entry stores the ``(args, kwargs)`` exactly as
+# passed to ``print()`` — for ``print_*`` helpers these are fresh
+# strings / ``Text`` / ``Panel`` objects per call, so re-printing them
+# later faithfully preserves styling and layout. We deliberately store the
+# objects as-passed rather than snapshotting to text: a text snapshot would
+# bake in the alt-screen console's width / colour-system and lose the
+# ability to re-render at the real terminal's dimensions on flush.
+
+# Each buffer is a list of ``(args, kwargs)`` tuples captured from
+# ``_TeeConsole.print`` while that buffer sits on top of the stack.
+_DEFERRED_LIVE_BUFFERS: list[list[tuple[tuple[Any, ...], Dict[str, Any]]]] = []
+
+
+def push_deferred_live_buffer() -> object:
+    """Start capturing visible ``print()`` output into a fresh deferred buffer.
+
+    Pushes a new empty buffer onto the deferred-live-log stack and returns
+    it as an opaque token. While at least one buffer is active, every
+    :meth:`_TeeConsole.print` call ALSO appends its ``(args, kwargs)`` to
+    the top buffer, in addition to the normal visible + telemetry paths.
+
+    The returned token must be passed back to
+    :func:`pop_deferred_live_buffer` to stop capturing and retrieve the
+    captured entries. Callers should always pair push/pop in a
+    ``try/finally`` so a buffer is never left dangling on the stack.
+
+    Returns:
+        An opaque token identifying the pushed buffer.
+    """
+    buffer: list[tuple[tuple[Any, ...], Dict[str, Any]]] = []
+    _DEFERRED_LIVE_BUFFERS.append(buffer)
+    return buffer
+
+
+def pop_deferred_live_buffer(
+    token: object,
+) -> list[tuple[tuple[Any, ...], Dict[str, Any]]]:
+    """Stop capturing into ``token`` and return its captured entries.
+
+    Tolerant of double-pop and out-of-order pop: if the token is no longer
+    on the stack (already popped, or popped on an exception path) the token
+    itself is returned (when it looks like a captured list) and the stack
+    is left untouched. If the token is on the stack but not on top (nested
+    misuse) it is removed in place.
+
+    Args:
+        token: The opaque token returned by
+            :func:`push_deferred_live_buffer`.
+
+    Returns:
+        The list of captured ``(args, kwargs)`` entries (empty if the
+        token was never a buffer).
+    """
+    try:
+        # Fast path: token is on top of the stack.
+        if _DEFERRED_LIVE_BUFFERS and _DEFERRED_LIVE_BUFFERS[-1] is token:
+            return _DEFERRED_LIVE_BUFFERS.pop()
+        # Tolerant path: remove by identity wherever it sits, return it.
+        for index, buffer in enumerate(_DEFERRED_LIVE_BUFFERS):
+            if buffer is token:
+                return _DEFERRED_LIVE_BUFFERS.pop(index)
+    except Exception:  # noqa: BLE001 — never break the caller on teardown
+        pass
+    # Already popped / never pushed: return the token if it is a captured
+    # list (so the caller can still flush what was captured), else empty.
+    if isinstance(token, list):
+        return token
+    return []
+
+
+class _TeeConsole(Console):
+    """Visible :class:`rich.console.Console` that mirrors print to telemetry.
+
+    Subclasses :class:`rich.console.Console` and only adds the auto-mirror
+    side effect to :meth:`print`. Every other ``Console`` method is
+    inherited unchanged — ``rule``, ``log``, ``status`` etc. still work
+    as before. The mirror is best-effort: any failure on the telemetry
+    side is swallowed because a broken record buffer must never break
+    the user-visible flow.
+    """
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        # Always render to the visible terminal first. If the visible
+        # render itself raises, we let that propagate — that's a real
+        # bug the operator needs to see.
+        super().print(*args, **kwargs)
+
+        # Deferred live-log capture (best-effort, additive). While a
+        # ``LiveSession`` with alt-screen has pushed a buffer, also stash
+        # the renderable so it can be flushed to the real scrollback after
+        # the alt-screen pops. This never replaces or short-circuits the
+        # visible print above or the telemetry mirror below — it is purely
+        # an ADDITIONAL sink, and any failure here is swallowed so it can
+        # never break the user-visible flow.
+        if _DEFERRED_LIVE_BUFFERS:
+            try:
+                _DEFERRED_LIVE_BUFFERS[-1].append((args, dict(kwargs)))
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Opt-out for canonical helpers that already mirror manually
+        # (see the module docstring for the rationale).
+        if _skip_auto_mirror.get():
+            return
+
+        telemetry_console = _telemetry_console
+        if telemetry_console is None or telemetry_console is self:
+            return
+        try:
+            telemetry_console.print(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            # Best-effort: never let telemetry recording break the
+            # user-visible flow. The recording loses one frame; the
+            # operator's terminal is unaffected.
+            pass
+
+
+@contextmanager
+def _explicit_telemetry_mirror():
+    """Disable :class:`_TeeConsole` auto-mirror for the wrapped block.
+
+    Use ONLY from the canonical helpers in
+    ``adscan_core/output/_*.py`` that already perform a manual mirror
+    (``console.print(x); telemetry_console.print(x)`` pattern). Wrapping
+    that two-line block keeps the recording from receiving the same
+    renderable twice.
+
+    Do NOT use from new code. New code just calls ``console.print()`` and
+    relies on auto-mirror.
+    """
+    token = _skip_auto_mirror.set(True)
+    try:
+        yield
+    finally:
+        _skip_auto_mirror.reset(token)
+
+
+def _ensure_tee_console(console: Optional[Console]) -> Console:
+    """Return a :class:`_TeeConsole` for the given console.
+
+    If ``console`` is already a :class:`_TeeConsole`, returns it. If it
+    is a plain :class:`Console`, upgrades it **in place** to a
+    ``_TeeConsole`` so the object the caller passed *is* the shared
+    visible console. If ``console`` is ``None``, returns a default
+    ``_TeeConsole``.
+
+    Why in-place. ``_TeeConsole`` adds only an overridden :meth:`print`
+    (no ``__init__``, no ``__slots__``), so its instance layout is
+    identical to ``Console`` and a ``__class__`` reassignment is safe and
+    preserves every piece of state — ``file``, ``theme``, ``width``, and
+    crucially the ``record`` flag. Rebuilding a fresh ``_TeeConsole``
+    here used to orphan the caller's reference and silently force
+    ``record=False``: any caller that later read from the console it
+    passed (e.g. ``console.export_text()`` in tests, or width queries)
+    saw an empty / divergent object instead of the live shared console.
+
+    This makes the install path idempotent and lets callers keep passing
+    plain ``Console`` instances; the state module transparently upgrades
+    them without breaking identity.
+    """
+    if console is None:
+        return _TeeConsole()
+    if isinstance(console, _TeeConsole):
+        return console
+    if type(console) is Console:
+        # Layout-compatible in-place upgrade: preserves identity and all
+        # instance state (file, theme, width, record).
+        console.__class__ = _TeeConsole
+        return console
+    # Exotic Console subclass we can't safely re-class in place. Mirror
+    # the visible-side configuration so behaviour is preserved, and carry
+    # the record flag across so capture is not silently dropped.
+    return _TeeConsole(
+        file=console.file,
+        force_terminal=console.is_terminal,
+        force_jupyter=console.is_jupyter,
+        force_interactive=console.is_interactive,
+        soft_wrap=console.soft_wrap,
+        theme=getattr(console, "_theme_stack", None) and None,  # rebuilt via theme
+        width=console.width if not console.is_terminal else None,
+        no_color=getattr(console, "no_color", False),
+        markup=True,
+        emoji=True,
+        record=getattr(console, "record", False),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Console init / getters
 # ---------------------------------------------------------------------------
 
@@ -346,7 +604,11 @@ def init_rich_output(
     """
     global _console, _verbose_mode, _debug_mode, _secret_mode, _logger
     previous_console = _console
-    _console = console
+    # Upgrade any incoming vanilla ``Console`` to a ``_TeeConsole`` so
+    # that every ``console.print(...)`` site (helper or direct) is
+    # automatically mirrored into the telemetry recording. See the
+    # ``_TeeConsole`` docstring above for the full rationale.
+    _console = _ensure_tee_console(console)
 
     # CRITICAL FIX: If console is already initialized and modes are already active,
     # don't overwrite them with False values (prevents reset during module reimport)
@@ -620,6 +882,9 @@ __all__ = [
     "mark_passthrough",
     "mark_sensitive",
     "mark_dict_values",
+    # deferred live-log capture
+    "push_deferred_live_buffer",
+    "pop_deferred_live_buffer",
     # console wrapper
     "TelemetryAwareConsole",
 ]

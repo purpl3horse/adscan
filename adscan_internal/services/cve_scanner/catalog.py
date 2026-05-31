@@ -352,6 +352,81 @@ CVE_CATALOG: tuple[CVEDefinition, ...] = (
 )
 
 
+def scope_applies_to_target(scope: TargetScope, *, is_dc: bool) -> bool:
+    """Return whether a catalog ``scope`` runs against a target.
+
+    This is the **single source of truth** for the scope→target gate.
+    ``runner._applies`` delegates here so the live scheduler and any
+    pre-scan display (e.g. the confirmation panel) can never disagree
+    about which checks will actually execute.
+
+    Semantics:
+
+    - ``ALL_HOSTS`` runs against every target (DC or member host).
+    - ``DCS_ONLY`` / ``DOMAIN_LDAP`` run only against domain controllers.
+
+    Args:
+        scope: The catalog entry's :class:`TargetScope`.
+        is_dc: Whether the target is a domain controller.
+
+    Returns:
+        ``True`` when a check with ``scope`` would run against the target.
+    """
+
+    if scope is TargetScope.ALL_HOSTS:
+        return True
+    if scope in (TargetScope.DCS_ONLY, TargetScope.DOMAIN_LDAP):
+        return is_dc
+    return False
+
+
+def cves_for_target(*, is_dc: bool) -> tuple[CVEDefinition, ...]:
+    """Return the catalog entries that will run against a target type.
+
+    Data-driven counterpart to the scheduler: pass ``is_dc=True`` for the
+    "Domain Controllers only" scope (DC-scoped checks PLUS the all-hosts
+    checks like coercion that also run against a DC), or ``is_dc=False``
+    for a non-DC member host (all-hosts checks only). The result is the
+    exact set the scan would execute, so any operator-facing list derived
+    from it can never drift from reality.
+
+    Args:
+        is_dc: Whether the targeted host(s) are domain controllers.
+
+    Returns:
+        The applicable :class:`CVEDefinition` entries, in catalog order.
+    """
+
+    return tuple(
+        cve
+        for cve in CVE_CATALOG
+        if scope_applies_to_target(cve.target_scope, is_dc=is_dc)
+    )
+
+
+def cve_akas_for_target(*, is_dc: bool) -> tuple[str, ...]:
+    """Return the de-duplicated display labels (``aka``) for a target type.
+
+    Convenience wrapper over :func:`cves_for_target` for building the
+    operator-facing CVE list in the confirmation panel. Order follows the
+    catalog; duplicates (none today, but cheap insurance) are dropped.
+
+    Args:
+        is_dc: Whether the targeted host(s) are domain controllers.
+
+    Returns:
+        The ordered, de-duplicated ``aka`` labels for the applicable checks.
+    """
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for cve in cves_for_target(is_dc=is_dc):
+        if cve.aka not in seen:
+            seen.add(cve.aka)
+            out.append(cve.aka)
+    return tuple(out)
+
+
 def _normalize_selector(value: str) -> str:
     """Lower-case and strip non-alphanumeric chars for fuzzy matching.
 
@@ -415,4 +490,12 @@ def resolve_cves(selectors: tuple[str, ...]) -> tuple[CVEDefinition, ...]:
     return tuple(out)
 
 
-__all__ = ["CVE_CATALOG", "CVEDefinition", "TargetScope", "resolve_cves"]
+__all__ = [
+    "CVE_CATALOG",
+    "CVEDefinition",
+    "TargetScope",
+    "cve_akas_for_target",
+    "cves_for_target",
+    "resolve_cves",
+    "scope_applies_to_target",
+]

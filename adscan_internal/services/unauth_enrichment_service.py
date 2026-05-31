@@ -325,84 +325,65 @@ async def _enrich_ldap_via_collector(
             # possible; for entries whose objectName (DN) is not in known_dns
             # and whose sAMAccountName is empty, extract the CN from the DN.
             # Kerbrute validation downstream confirms which CNs are real users.
-            from badldap.commons.factory import LDAPConnectionFactory
+            from adscan_internal.services.ldap_transport_service import (
+                anonymous_default_naming_context,
+                async_anonymous_ldap_connection,
+            )
 
             async def _run_no_sid_query() -> None:
-                for transport, port in (("ldaps", 636), ("ldap", 389)):
-                    url = f"{transport}+simple://@{dc_ip}:{port}"
-                    try:
-                        factory = LDAPConnectionFactory.from_url(url)
-                        client = factory.get_client()
-                        ok, err = await asyncio.wait_for(
-                            client.connect(), timeout=timeout
-                        )
-                        if not ok:
-                            raise err or RuntimeError("connect failed")
-                    except Exception:  # noqa: BLE001
-                        continue
+                # Centralized anonymous SIMPLE-bind with LDAPS->LDAP fallback.
+                async with async_anonymous_ldap_connection(
+                    dc_ip, timeout=timeout
+                ) as (client, _used_ldaps):
+                    tree = anonymous_default_naming_context(client)
+                    # (objectClass=*) is the only filter the server evaluates
+                    # for accounts whose attributes are fully hidden from
+                    # anonymous queries. Baby.vl hides ALL attributes (objectClass,
+                    # sAMAccountName, objectSid) for specific accounts, so
+                    # (objectClass=user) never matches them server-side.
+                    #
+                    # Rule: keep only entries where objectClass was NOT returned.
+                    # If objectClass is visible the object is already handled —
+                    # either by the collector (users with sAMAccountName) or it's
+                    # a group/computer/OU we can identify and skip. Objects with
+                    # hidden objectClass are the unknown accounts; Kerberos
+                    # pre-auth validation is the only correct filter for them.
+                    async for entry, err in client.pagedsearch(
+                        "(objectClass=*)",
+                        ["sAMAccountName", "distinguishedName", "objectClass"],
+                        controls=None,
+                        tree=str(tree) if tree else None,
+                        search_scope=2,
+                    ):
+                        if err is not None or entry is None:
+                            continue
+                        obj_name = str(entry.get("objectName") or "").strip()
+                        attrs = entry.get("attributes") or {}
 
-                    try:
-                        tree = (client._serverinfo or {}).get("defaultNamingContext") or ""
-                        if isinstance(tree, list):
-                            tree = tree[0] if tree else ""
-                        # (objectClass=*) is the only filter the server evaluates
-                        # for accounts whose attributes are fully hidden from
-                        # anonymous queries. Baby.vl hides ALL attributes (objectClass,
-                        # sAMAccountName, objectSid) for specific accounts, so
-                        # (objectClass=user) never matches them server-side.
-                        #
-                        # Rule: keep only entries where objectClass was NOT returned.
-                        # If objectClass is visible the object is already handled —
-                        # either by the collector (users with sAMAccountName) or it's
-                        # a group/computer/OU we can identify and skip. Objects with
-                        # hidden objectClass are the unknown accounts; Kerberos
-                        # pre-auth validation is the only correct filter for them.
-                        async for entry, err in client.pagedsearch(
-                            "(objectClass=*)",
-                            ["sAMAccountName", "distinguishedName", "objectClass"],
-                            controls=None,
-                            tree=str(tree) if tree else None,
-                            search_scope=2,
-                        ):
-                            if err is not None or entry is None:
-                                continue
-                            obj_name = str(entry.get("objectName") or "").strip()
-                            attrs = entry.get("attributes") or {}
+                        def _a(k: str) -> str:
+                            v = attrs.get(k)
+                            if isinstance(v, list):
+                                return str(v[0]) if v else ""
+                            return str(v or "")
 
-                            def _a(k: str) -> str:
-                                v = attrs.get(k)
-                                if isinstance(v, list):
-                                    return str(v[0]) if v else ""
-                                return str(v or "")
+                        # Skip objects where objectClass was returned — we know
+                        # what they are (collector handles users; groups/OUs skipped).
+                        if attrs.get("objectClass"):
+                            continue
 
-                            # Skip objects where objectClass was returned — we know
-                            # what they are (collector handles users; groups/OUs skipped).
-                            if attrs.get("objectClass"):
-                                continue
+                        dn = _a("distinguishedName") or obj_name
+                        if not dn or dn.lower() in known_dns:
+                            continue
 
-                            dn = _a("distinguishedName") or obj_name
-                            if not dn or dn.lower() in known_dns:
-                                continue
+                        first_rdn = dn.split(",")[0].strip()
+                        cn_like = ""
+                        if "=" in first_rdn:
+                            rdn_key, _, rdn_val = first_rdn.partition("=")
+                            if rdn_key.strip().upper() == "CN":
+                                cn_like = rdn_val.strip()
 
-                            first_rdn = dn.split(",")[0].strip()
-                            cn_like = ""
-                            if "=" in first_rdn:
-                                rdn_key, _, rdn_val = first_rdn.partition("=")
-                                if rdn_key.strip().upper() == "CN":
-                                    cn_like = rdn_val.strip()
-
-                            if cn_like and cn_like not in cn_only_names:
-                                cn_only_names.append(cn_like)
-                    finally:
-                        try:
-                            disconnect = getattr(client, "disconnect", None)
-                            if disconnect is not None:
-                                maybe = disconnect()
-                                if asyncio.iscoroutine(maybe):
-                                    await maybe
-                        except Exception:  # noqa: BLE001
-                            pass
-                    break
+                        if cn_like and cn_like not in cn_only_names:
+                            cn_only_names.append(cn_like)
 
             await asyncio.wait_for(_run_no_sid_query(), timeout=timeout)
         except Exception as _exc:  # noqa: BLE001

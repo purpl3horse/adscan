@@ -18,8 +18,8 @@ from adscan_core.theme import ADSCAN_PRIMARY
 
 # ── Brand constants ───────────────────────────────────────────────────────────
 
-# Parsed once from the hex brand color.
-_BRAND_R, _BRAND_G, _BRAND_B = 0x00, 0xD4, 0xFF  # #00D4FF
+# Parsed once from the hex brand color (ADscan on-dark teal accent — site --brand-accent).
+_BRAND_R, _BRAND_G, _BRAND_B = 0x1A, 0xA0, 0xAE  # #1AA0AE
 
 ADSCAN_TAGLINE = "Automate the AD kill chain."
 
@@ -57,7 +57,7 @@ ADSCAN_MARK = "◈  ADscan"
 def build_gradient_ascii(width: int = 120) -> Text:
     """Return the wide ASCII logo as a Rich ``Text`` with a brand gradient.
 
-    Gradient: brand cyan (#00D4FF) at the top → white (#ffffff) at the bottom.
+    Gradient: brand teal (#1AA0AE) at the top → white (#ffffff) at the bottom.
     Falls back to a compact centered line when ``width`` is below 90.
 
     Args:

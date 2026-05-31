@@ -662,6 +662,12 @@ def build_smb_plan(
         or getattr(config, "ccache_path", None)
         or getattr(config, "aes_key", None)
     )
+    # Kerberos SPN must be an FQDN — never cifs/<ip>. When the SMB target
+    # hostname is still an IP (no FQDN was resolvable from inventory/domains_data
+    # at the config-build site), requesting Kerberos aborts on the IP-as-SPN
+    # guard with a non-recoverable ValueError. Treat that as not-viable so the
+    # Kerberos-first policy (Rule 0) does not upgrade a doomed attempt — NTLM is
+    # used instead (still gated by the NTLM-disabled posture rule below).
     kerberos_viable = bool(
         has_principal
         and has_credential_material

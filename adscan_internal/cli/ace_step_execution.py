@@ -1119,6 +1119,27 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         ):
             print_warning("ForceChangePassword execution cancelled by operator.")
             return False
+        # Ledger-ordering fix: do NOT register a cleanup obligation before the
+        # reset runs. A pre-registered "password_changed" entry left a FALSE
+        # operator-required obligation when the reset later failed (the operator
+        # was told to reset a password that was never changed). Register only
+        # AFTER the reset CONFIRMS success: a successful FCP leaves exactly one
+        # operator-required entry; a failed FCP leaves the ledger clean.
+        fcp_success = shell.exploit_force_change_password(
+            context.domain,
+            context.exec_username,
+            context.exec_password,
+            context.target_sam_or_label,
+            context.target_domain,
+            prompt_for_user_privs_after=False,
+        )
+        if not fcp_success:
+            print_warning(
+                "ForceChangePassword did not complete; the target password was not "
+                "changed. No cleanup obligation was recorded."
+            )
+            return False
+
         _acl_cleanup_register(
             shell,
             context,
@@ -1144,14 +1165,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
-        return shell.exploit_force_change_password(
-            context.domain,
-            context.exec_username,
-            context.exec_password,
-            context.target_sam_or_label,
-            context.target_domain,
-            prompt_for_user_privs_after=False,
-        )
+        return True
 
     if relation in {"genericall", "genericwrite", "writeaccountrestrictions"}:
         if target_kind in {"user", "computer"}:

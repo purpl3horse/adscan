@@ -13,6 +13,8 @@ decides:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import enum
 import os
 import re
 import urllib.parse
@@ -20,7 +22,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -47,6 +49,7 @@ from adscan_internal.services import _kerberos_recovery  # noqa: F401
 from adscan_internal.services.auth_error_classification import (
     exception_chain_text,
 )
+from adscan_internal.services.async_bridge import run_sync_off_loop
 
 
 SD_FLAGS_DACL_CONTROL: str = "sd_flags_dacl"
@@ -152,6 +155,21 @@ class ADscanLDAPConfig:
       flows where the ccache was minted by ``KerberosTicketService`` at a known path.
     - ``paged_size``: LDAP paged-search page size passed to badldap via the
       ``pagesize`` URL param. Max 1000 (badldap enforces this). Default 1000.
+    - ``require_confidential``: the operation reads (or writes) a CONFIDENTIAL
+      directory attribute (e.g. ``msDS-ManagedPassword`` for gMSA). AD only
+      returns such attributes over a SEALED channel — LDAPS (TLS) or plain LDAP
+      with GSS-API confidentiality (sign+seal) negotiated. When True the
+      LDAPS->LDAP fallback MUST NOT downgrade to an unsealed plain-LDAP channel:
+      the plain-LDAP attempt is forced to negotiate sign+seal (``sign=True``, so
+      badauth requests ``ISC_REQ.CONFIDENTIALITY`` and badldap wraps every
+      message), and any transport that cannot guarantee confidentiality
+      (anonymous / SIMPLE bind, which negotiates no GSS context) is skipped.
+      When no sealed channel can be established the connect raises
+      :class:`ConfidentialChannelUnavailableError` with an actionable message
+      instead of letting the DC reject the attribute with the cryptic
+      ``operationsError / ERROR_DS_CONFIDENTIALITY_REQUIRED``. Default False, so
+      every non-confidential operation keeps the transparent LDAPS->LDAP
+      downgrade unchanged.
     """
 
     domain: str
@@ -167,11 +185,83 @@ class ADscanLDAPConfig:
     aes_key: str | None = None
     etypes: list[int] | None = None
     channel_binding: bool = False
+    null_channel_binding: bool = False
+    """When True, badldap sends a CBT field populated with a deliberately
+    invalid token instead of either the real one or no field at all.
+    Used by the CBT posture probe's "When Supported" disambiguation step
+    (after a no-CBT bind got ``STATUS_LOGON_FAILURE``, a wrong-CBT bind
+    that gets ``SEC_E_BAD_BINDINGS`` proves the DC validates CBT only
+    when present — i.e. the "When Supported" GPO value).
+
+    Has no operational use outside posture probing. Defaults to False
+    so it never accidentally trips real consumers.
+    """
+    disable_self_heal: bool = False
+    """When True, the transport will NOT retry with a healed config on
+    a posture-recoverable failure (CBT mismatch, signing required). The
+    caller wants the raw failure to propagate so it can classify it.
+
+    Set by callers whose purpose is to ELICIT specific failures and
+    classify them — the posture probes are the canonical example. A
+    probe that tests "does the DC enforce CBT?" needs the
+    ``SEC_E_BAD_BINDINGS`` to bubble up; if the transport silently
+    retries with CBT=True and the bind succeeds, the probe thinks CBT
+    is not required, falsifying the posture. Same logic for the LDAP
+    signing probe and any future failure-eliciting consumer.
+
+    Default is ``False`` — operational consumers (collector, kerberoast,
+    ADCS enum, etc.) WANT self-heal because the operation goal is to
+    succeed, not to characterise the failure.
+    """
     sign: bool = False
     encrypt: bool = False
     tls_sni: str | None = None
     ccache_path: str | None = None
     paged_size: int = 1000
+    require_confidential: bool = False
+    use_starttls: bool = False
+    """Request an RFC 2830 StartTLS upgrade on a plain LDAP/389 connection.
+
+    When ``True`` (and ``use_ldaps`` is ``False``) the transport tells
+    badldap to wrap the TCP/389 session in TLS BEFORE binding, so the bind
+    and every query travel encrypted without needing port 636 or channel
+    binding. Set internally by :func:`async_connect_with_ldap_fallback`
+    when it inserts the StartTLS rung into the confidentiality ladder; not
+    intended to be set directly by most callers (the ladder manages it).
+    A refused StartTLS (no DC cert / unsupported) makes the ladder fall
+    through to the SASL sign+seal rung."""
+    disable_default_seal: bool = False
+    """Opt out of the seal-by-default policy for authenticated plain-LDAP/389.
+
+    By default (``False``) every AUTHENTICATED, GSS-capable bind (Kerberos or
+    NTLM-with-creds) that lands on plain LDAP/389 -- because LDAPS/636 is
+    unavailable -- negotiates GSS-API sign+seal (``sign`` is forced to
+    ``True``) so the bind, queries, and results are encrypted on the wire
+    rather than sent in cleartext. This is an OPSEC + confidentiality default:
+    passive sniffing of an unsealed 389 channel would otherwise expose every
+    LDAP query and result in sensitive internal AD environments.
+
+    Set this to ``True`` only when a caller deliberately needs the legacy
+    cleartext plain-LDAP behaviour (e.g. interoperating with a non-Windows
+    LDAP server that cannot negotiate GSS sealing where the seal-failure
+    auto-degrade below is not wanted). It does NOT affect:
+
+    - LDAPS/636 -- TLS already provides confidentiality (``sign`` is a no-op).
+    - Anonymous / SIMPLE binds -- they establish no GSS context and cannot
+      seal regardless of this flag; they stay cleartext (unavoidable).
+    - Callers that explicitly set ``sign=True`` -- already sealed.
+
+    The seal-by-default upgrade also degrades gracefully: if a default-sealed
+    plain-LDAP bind fails specifically because sealing could not be negotiated
+    (a non-Windows/legacy DC), the transport retries once unsealed with a
+    debug note -- an auth/credential failure is NOT treated as a seal failure
+    and propagates unchanged."""
+    _default_seal_applied: bool = field(default=False, repr=False)
+    """Private marker set by :func:`_apply_default_seal_to_plain_ldap` when it
+    upgrades an authenticated plain-LDAP attempt to sign+seal as the OPSEC
+    DEFAULT (not caller intent). The fallback loop reads it to know a
+    seal-negotiation failure on that attempt may be degraded back to unsealed
+    exactly once. Never set by callers; not part of the public config surface."""
     use_simple_bind: bool = False
     """Force RFC 4513 SIMPLE bind. Anonymous SIMPLE (empty creds) yields
     the ``ldap+simple://`` URL form which leaves the connection in RUNNING
@@ -600,6 +690,12 @@ class ADscanLDAPConnection:
         self._conn: Any | None = None
         self._factory: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Which confidentiality mechanism sealed the connection, populated
+        # by ``__enter__`` from the ``LDAPConnectResult``. ``None`` until
+        # the context manager is entered. Callers read it to learn whether
+        # the channel was protected by LDAPS, StartTLS, SASL sign+seal, or
+        # was cleartext (e.g. for an operator advisory).
+        self.mechanism: "ConfidentialityMechanism | None" = None
         self._entries: list[LDAPEntry] = []
         self._server_info: dict[str, Any] = {}
         # Last write-style operation exception (modify/add/delete).  Exposed so
@@ -610,9 +706,15 @@ class ADscanLDAPConnection:
     def __enter__(self) -> "ADscanLDAPConnection":
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._conn, _used_ldaps = self._loop.run_until_complete(
+        result = self._loop.run_until_complete(
             async_connect_with_ldap_fallback(self.config)
         )
+        # ``async_connect_with_ldap_fallback`` returns an
+        # ``LDAPConnectResult``; read the live client and the
+        # confidentiality mechanism that sealed it (instead of
+        # discarding the second element as the legacy code did).
+        self._conn = result.client
+        self.mechanism = result.mechanism
         self._server_info = dict(getattr(self._conn, "_serverinfo", {}) or {})
         return self
 
@@ -630,6 +732,7 @@ class ADscanLDAPConnection:
         self._conn = None
         self._factory = None
         self._loop = None
+        self.mechanism = None
         self._entries = []
         self._server_info = {}
 
@@ -939,6 +1042,65 @@ class ADscanLDAPConnection:
 
 class LDAPTransportValidationError(RuntimeError):
     """Raised when an LDAP connection opens but is not usable for queries."""
+
+
+class ConfidentialChannelUnavailableError(RuntimeError):
+    """Raised when a confidential-attribute read cannot use a sealed channel.
+
+    A CONFIDENTIAL directory attribute (``msDS-ManagedPassword``, ``unicodePwd``,
+    ...) is only returned by AD over a sealed channel: LDAPS (TLS) or plain LDAP
+    with GSS-API confidentiality (sign+seal). When ``ADscanLDAPConfig.require_confidential``
+    is set and neither a working LDAPS transport nor a sign+seal-capable plain-LDAP
+    bind is achievable, this is raised instead of silently downgrading to an
+    unsealed plain-LDAP channel that can NEVER return the attribute (the DC would
+    answer ``ERROR_DS_CONFIDENTIALITY_REQUIRED`` / omit the value)."""
+
+
+class ConfidentialityMechanism(str, enum.Enum):
+    """Which confidentiality mechanism actually sealed an LDAP connection.
+
+    Returned on the success path of :func:`async_connect_with_ldap_fallback`
+    (via :class:`LDAPConnectResult`) so callers — and downstream posture /
+    findings layers — can learn HOW the channel was protected, not just
+    whether LDAPS was used. The ordering mirrors the confidentiality ladder:
+    LDAPS (TLS/636) > StartTLS (TLS/389) > SASL sign+seal (GSS/389) > cleartext.
+    """
+
+    LDAPS = "ldaps"          # TLS on port 636
+    STARTTLS = "starttls"    # TLS on port 389 via RFC 2830 StartTLS
+    SASL_SEAL = "sasl_seal"  # GSS-API application-layer sign+seal on port 389
+    CLEARTEXT = "cleartext"  # no confidentiality (last resort, plain 389)
+
+
+@dataclass(frozen=True)
+class LDAPConnectResult:
+    """Result of :func:`async_connect_with_ldap_fallback`.
+
+    Carries the live ``MSLDAPClient`` plus the :class:`ConfidentialityMechanism`
+    that sealed it. Backward-compatible with the legacy ``(client, used_ldaps)``
+    2-tuple return: the dataclass is iterable as ``(client, used_ldaps)`` so
+    existing call sites that unpack ``conn, used_ldaps = await ...`` keep working
+    unchanged, while new callers can read ``.client`` / ``.mechanism`` directly.
+    """
+
+    client: Any
+    mechanism: "ConfidentialityMechanism"
+
+    @property
+    def used_ldaps(self) -> bool:
+        """Back-compat shim: True iff the channel was sealed by LDAPS/636 TLS."""
+        return self.mechanism is ConfidentialityMechanism.LDAPS
+
+    @property
+    def is_confidential(self) -> bool:
+        """True iff the channel is sealed by ANY mechanism (not cleartext)."""
+        return self.mechanism is not ConfidentialityMechanism.CLEARTEXT
+
+    def __iter__(self):
+        # Preserve ``conn, used_ldaps = await async_connect_with_ldap_fallback(...)``
+        # unpacking for every legacy caller. Order matches the old 2-tuple.
+        yield self.client
+        yield self.used_ldaps
 
 
 @dataclass(frozen=True)
@@ -1417,15 +1579,39 @@ def _format_exception_chain_summary(exc: BaseException, *, max_items: int = 3) -
 def is_ldaps_transport_failure(exc: BaseException) -> bool:
     """Return whether one exception looks like an LDAPS transport/TLS failure.
 
-    Includes timeout-class exceptions: when LDAPS:636 is filtered the TCP
-    connect never completes and asyncio raises TimeoutError / CancelledError.
-    These are always connectivity failures (never auth failures) at connect time,
-    so they should trigger the LDAPS→LDAP fallback just like TLS errors.
+    Includes two classes of connect-time connectivity failure, both of which
+    are *never* auth failures and so must trigger the LDAPS->LDAP fallback:
+
+    1. Timeout-class exceptions -- when LDAPS:636 is silently dropped (firewall
+       DROP) the TCP connect never completes and asyncio raises
+       ``TimeoutError`` / ``CancelledError``.
+    2. ``ConnectionError`` subclasses -- when LDAPS:636 is actively rejected
+       (firewall REJECT / ``--reject-with tcp-reset``, or the service is down)
+       asyncio raises ``ConnectionResetError`` / ``ConnectionRefusedError`` /
+       ``ConnectionAbortedError`` with a message like
+       ``"Connect call failed (\'<ip>\', 636)"``. That message contains none
+       of the string indicators below (it never says "reset by peer", "tls", or
+       "ldaps"), so before this type check such a reset on 636 silently failed
+       to fall back to plain LDAP/389 even though 389 was open. Verified from
+       sanitised customer telemetry: the native collector connected fine on
+       LDAP/389 but the LDAP description query died with
+       ``ConnectionResetError(104, "Connect call failed (\'<dc>\', 636)")``.
+
+    A ``ConnectionError`` at the socket layer is *always* a connectivity
+    event -- badldap surfaces server-side auth rejections as
+    ``LDAPBindException`` / ``LDAPServerException`` (``invalidCredentials``,
+    ``strongerAuthRequired``, ``SEC_E_LOGON_DENIED``, ``SEC_E_BAD_BINDINGS``),
+    never as a ``ConnectionError``. So matching ``ConnectionError`` here cannot
+    misclassify a post-connect auth/bind failure as a transport failure, which
+    is why it is safe even though some callers invoke this on whole-operation
+    exceptions (connect + bind + query), not just connect.
     """
-    # Timeout exceptions — port 636 filtered → TCP never connects → timeout.
+    # Connectivity-class exceptions at connect time. Port 636 filtered ->
+    # either no answer (timeout) or an active RST/refusal (ConnectionError).
+    # Both are connectivity failures, never auth failures.
     for candidate in _walk_exception_chain(exc):
         if isinstance(candidate, (TimeoutError, asyncio.TimeoutError,
-                                   asyncio.CancelledError)):
+                                   asyncio.CancelledError, ConnectionError)):
             return True
 
     indicators = (
@@ -1520,6 +1706,202 @@ def _emit_posture_signal(
         )
 
 
+def _is_seal_negotiation_failure(exc: BaseException) -> bool:
+    """Return whether a bind failure looks like a sealing/GSS-confidentiality problem.
+
+    Used only by the seal-by-default degrade path: when a plain-LDAP/389 bind
+    that we upgraded to sign+seal (CONFIDENTIALITY) fails, we want to retry it
+    UNSEALED iff the failure is specifically about negotiating confidentiality
+    against a server that cannot provide it (a non-Windows / legacy LDAP
+    server) -- NOT an auth/credential failure (which must propagate unchanged).
+
+    Returns ``True`` only for signatures that indicate the GSS confidentiality
+    layer could not be established, AND never for an unambiguous credential
+    failure. Conservatively, an ``invalidCredentials`` / ``SEC_E_LOGON_DENIED``
+    chain is treated as auth failure (returns ``False``) so a real bad-creds
+    rejection is never silently downgraded to a cleartext retry.
+    """
+    chain_text = " ".join(
+        f"{type(c).__name__}: {c}".lower() for c in _walk_exception_chain(exc)
+    )
+
+    # Unambiguous credential failures are NOT seal failures. Bail out first so a
+    # genuine bad-password / disabled-NTLM rejection never triggers a cleartext
+    # downgrade retry.
+    auth_failure_markers = (
+        "invalidcredentials",
+        "sec_e_logon_denied",
+        "preauthentication failed",
+        "krb_ap_err",
+        "client not found in kerberos database",
+        "strongerauthrequired",  # signing-required: handled by its own self-heal
+    )
+    if any(marker in chain_text for marker in auth_failure_markers):
+        return False
+
+    # Signatures that point at the confidentiality/integrity (sealing) layer
+    # failing to negotiate against a server that does not support it.
+    seal_markers = (
+        "confidentiality",
+        "sec_e_unsupported_function",
+        "sec_e_qop_not_supported",
+        "qop not supported",
+        "encryption needed",
+        "unwrap",
+        "wrap",
+        "seal",
+        "no common protection level",
+        "gss_s_failure",
+    )
+    return any(marker in chain_text for marker in seal_markers)
+
+
+def _is_starttls_unavailable(exc: BaseException) -> bool:
+    """Return whether a StartTLS-rung failure means "no usable TLS on 389".
+
+    Used only by the confidentiality ladder to decide whether a failed
+    StartTLS attempt should fall THROUGH to the SASL sign+seal rung (the DC
+    has no usable cert on 389 / does not support StartTLS) versus being a
+    hard TCP/389 failure that means the whole 389 path is dead.
+
+    Returns ``True`` for:
+
+    - A refused StartTLS extendedReq — badldap surfaces this as an
+      ``LDAPBindException`` with a non-success result code
+      (``unwillingToPerform`` / ``protocolError``), raised from
+      ``MSLDAPClientConnection.connect()`` when ``_use_starttls`` is set.
+    - A post-StartTLS TLS handshake error (``ssl.SSLError`` / "ssl handshake
+      error" / "tls"), meaning the cert is broken or absent on 389.
+    - The AD "Error initializing SSL/TLS" StartTLS comment — the DC accepted
+      the StartTLS extendedReq but cannot initialise TLS (no / broken cert),
+      surfaced by badldap as an ``LDAPBindException`` carrying that comment
+      (observed on HTB Sauna, "channel binding:No TLS cert"). Without this the
+      anonymous probe would raise out of the ladder instead of falling through
+      to the cleartext rung. (The chained ``RuntimeError('no running event
+      loop')`` sometimes seen alongside it is a benign teardown artifact, not a
+      ``ConnectionError`` — so the early-return below does not pre-empt this.)
+
+    Returns ``False`` for a bare connect-time TCP failure (the 389 socket
+    never opened) — that is a transport-dead signal the caller propagates,
+    not a "fall through to the next rung" signal. ``ConnectionError`` /
+    bare ``TimeoutError`` are therefore NOT matched here.
+    """
+    chain = _walk_exception_chain(exc)
+    # A pure connect-time TCP failure (socket never opened) is not a StartTLS
+    # availability signal — the whole 389 path is dead, propagate it.
+    for candidate in chain:
+        if isinstance(candidate, (ConnectionError,)):
+            return False
+    chain_text = " ".join(
+        f"{type(c).__name__}: {c}".lower() for c in chain
+    )
+    starttls_markers = (
+        "unwillingtoperform",
+        "protocolerror",
+        "ssl handshake error",
+        "socket ssl wrapping error",
+        "ssl: ",
+        "sslerror",
+        "tlsv1",
+        "wrong_version_number",
+        "certificate",
+        "starttls",
+        "extended operation",
+        # AD comment when the DC accepts the StartTLS extendedReq but cannot
+        # initialise TLS (no / broken cert) — observed on HTB Sauna. Both
+        # markers are safe here: this classifier is only consulted on a failure
+        # of the StartTLS rung, so any "ssl/tls" mention means "TLS unusable on
+        # 389" → fall through to the cleartext rung rather than raise.
+        "error initializing ssl/tls",
+        "ssl/tls",
+    )
+    return any(marker in chain_text for marker in starttls_markers)
+
+
+def _classify_recoverable_bind_failure(
+    exc: BaseException,
+    *,
+    cfg: "ADscanLDAPConfig",
+    transport_was_ldaps: bool,
+) -> Optional["ADscanLDAPConfig"]:
+    """Identify bind failures whose fix is a posture-driven config tweak.
+
+    When the failure matches a known *recoverable* pattern, return a new
+    ``ADscanLDAPConfig`` with the single field flipped that would have
+    avoided it. The caller appends that config to ``configs_to_try`` and
+    keeps iterating — that is the self-healing retry.
+
+    The recoverable patterns are intentionally narrow: only the failures
+    where the posture system has a clean 1:1 mapping to a transport
+    flag. Anything else (wrong creds, expired ticket, KDC down) bubbles
+    up unchanged.
+
+    Returns ``None`` when the exception is not in the recoverable set,
+    when the recovery would not change ``cfg`` (we already had the flag
+    on), or when the recovery makes no sense for the current transport
+    (CBT-on-plain-LDAP, for example).
+    """
+    import dataclasses as _dc
+
+    chain_text = " ".join(
+        f"{type(c).__name__}: {c}".lower() for c in _walk_exception_chain(exc)
+    )
+
+    # LDAP channel binding required — only meaningful on LDAPS, and only
+    # if we did NOT already have CBT on. Signature inventory verified
+    # against ``vendor/badldap/wintypes/winerror.py`` (0x80090346 →
+    # SEC_E_BAD_BINDINGS, message "Client's supplied Security Support
+    # Provider Interface (SSPI) channel bindings were incorrect.").
+    # badldap's ``format_bind_error`` substitutes the raw hex with the
+    # WINERROR code-name + message at exception-render time; we match
+    # the rendered forms but keep the hex as a defensive fallback in
+    # case any code path skips the formatter.
+    cbt_signatures = (
+        "sec_e_bad_bindings",
+        "channel bindings were incorrect",
+        "channel binding",
+        "0x80090346",
+        "80090346",
+    )
+    if (
+        transport_was_ldaps
+        and not cfg.channel_binding
+        and any(sig in chain_text for sig in cbt_signatures)
+    ):
+        print_info_debug(
+            "[ldap_transport] self-heal: bind failed with CBT signature, "
+            "queuing retry with channel_binding=True"
+        )
+        return _dc.replace(cfg, channel_binding=True)
+
+    # LDAP signing required — only meaningful on plain LDAP, and only
+    # if we did NOT already have signing on.
+    #
+    # Signatures verified against ``vendor/badldap``:
+    #   * ``badldap/commons/exceptions.py`` line 16 — LDAP result code 8
+    #     renders as ``strongerAuthRequired``.
+    #   * ``badldap/wintypes/winerror.py`` 0x00002028 — when AD adds the
+    #     extended hex code, badldap's formatter replaces it with
+    #     ``ERROR_DS_STRONG_AUTH_REQUIRED``.
+    signing_signatures = (
+        "strongerauthrequired",
+        "error_ds_strong_auth_required",
+        "0x00002028",
+    )
+    if (
+        not transport_was_ldaps
+        and not cfg.sign
+        and any(sig in chain_text for sig in signing_signatures)
+    ):
+        print_info_debug(
+            "[ldap_transport] self-heal: bind failed with signing-required "
+            "signature, queuing retry with sign=True"
+        )
+        return _dc.replace(cfg, sign=True)
+
+    return None
+
+
 def _emit_ldap_failure_posture(
     config: "ADscanLDAPConfig",
     *,
@@ -1538,10 +1920,20 @@ def _emit_ldap_failure_posture(
         f"{type(c).__name__}: {c}".lower() for c in _walk_exception_chain(exc)
     )
     # Rule 1 — LDAP signing required.
+    #
+    # Signatures inventory (vendor verification — see commit message):
+    #   * ``strongerauthrequired`` — LDAP result code 8, the protocol-
+    #     level signal RFC 4511 §4.2 defines for "client must upgrade".
+    #     badldap renders it as the lowercased string above.
+    #   * ``error_ds_strong_auth_required`` — AD-specific WINERROR
+    #     0x00002028 surfaced through badldap's formatter when the DC
+    #     attaches the extended hex code.
+    #   * ``0x00002028`` — defensive raw-hex match in case any path
+    #     bypasses the WINERROR translator.
     if (
         "strongerauthrequired" in chain_text
-        or "ldap_strong_auth_required" in chain_text
-        or "ldap signing" in chain_text
+        or "error_ds_strong_auth_required" in chain_text
+        or "0x00002028" in chain_text
     ):
         _emit_posture_signal(
             config,
@@ -1552,7 +1944,24 @@ def _emit_ldap_failure_posture(
             message="DC requires LDAP signing for unencrypted binds",
         )
     # Rule 2 — LDAP channel binding required (only meaningful on LDAPS).
-    if transport_was_ldaps and "channel binding" in chain_text:
+    #
+    # Signatures inventory (vendor verification):
+    #   * ``sec_e_bad_bindings`` / ``channel bindings were incorrect``
+    #     — WINERROR 0x80090346 surfaced via
+    #     ``vendor/badldap/wintypes/winerror.py:15005``.
+    #   * ``0x80090346`` — defensive raw-hex match if the formatter is
+    #     bypassed.
+    #   * ``channel binding`` — broad match for any phrasing variation
+    #     the DC version might produce; safe because we already gate on
+    #     ``transport_was_ldaps``.
+    cbt_signatures = (
+        "sec_e_bad_bindings",
+        "channel bindings were incorrect",
+        "channel binding",
+        "0x80090346",
+        "80090346",
+    )
+    if transport_was_ldaps and any(sig in chain_text for sig in cbt_signatures):
         _emit_posture_signal(
             config,
             category=ConstraintCategory.LDAP_CHANNEL_BINDING,
@@ -1585,13 +1994,31 @@ def _emit_ldap_success_posture(
     *,
     used_kerberos_auth: bool,
     used_ldaps: bool,
+    mechanism: "ConfidentialityMechanism | None" = None,
 ) -> None:
     """Emit posture signals for a successful LDAP bind.
 
     LDAPS success → ``LDAPS_AVAILABLE = ENABLED`` (HIGH).
+    StartTLS-on-389 success → ``LDAP_STARTTLS_AVAILABLE = ENABLED`` (HIGH).
     NTLM (password) success → ``NTLM_AUTHENTICATION = ENABLED`` (MEDIUM).
     Kerberos success is intentionally not emitted: Kerberos is the default
     auth mechanism and its success carries no hardening signal.
+
+    The ``mechanism`` confirmatory emit is an OBSERVATION (the DC actually
+    StartTLS'd at bind time), so it is legitimate to cache. It mirrors the
+    ``LDAPS_BIND_OK`` emit. We DELIBERATELY emit NOTHING for
+    ``ConfidentialityMechanism.CLEARTEXT``: cleartext means "no confidential
+    mechanism was available" — an absence / our-situation, not a DC
+    observation. Caching an absence is forbidden (CLAUDE.md § Posture
+    caching policy, Invariant 2). The cleartext outcome is surfaced only via
+    the operator advisory (a separate, ephemeral CLI surface), never the
+    posture cache.
+
+    The reactive emits here leave ``probe_schema_version`` unset (``None``)
+    via ``_emit_posture_signal`` — a reactive transport observation must not
+    stamp/wipe the probe's schema version (CLAUDE.md § Schema-version
+    invalidation); ``None`` is treated as version-agnostic and trusts the
+    cache until the natural TTL expires.
     """
     if used_ldaps:
         _emit_posture_signal(
@@ -1601,6 +2028,15 @@ def _emit_ldap_success_posture(
             confidence=SignalConfidence.HIGH,
             signal_code="LDAPS_BIND_OK",
             message="LDAPS bind succeeded on port 636",
+        )
+    if mechanism is ConfidentialityMechanism.STARTTLS:
+        _emit_posture_signal(
+            config,
+            category=ConstraintCategory.LDAP_STARTTLS_AVAILABLE,
+            state=TriState.ENABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_STARTTLS_BIND_OK",
+            message="StartTLS upgrade succeeded on LDAP/389 at bind time",
         )
     if not used_kerberos_auth:
         _emit_posture_signal(
@@ -1733,37 +2169,154 @@ def _diag_dump_bind_exception(exc: BaseException) -> None:
         )
 
 
+def _plain_ldap_can_seal(config: "ADscanLDAPConfig") -> bool:
+    """Return whether a plain-LDAP (389) bind for *config* can negotiate sealing.
+
+    Sealing (GSS-API confidentiality) over plain LDAP requires an authenticated
+    SASL bind that establishes a GSS context — Kerberos (``use_kerberos=True``) or
+    NTLM (a username plus a password/hash, via the non-simple-bind path). An
+    anonymous bind or an RFC 4513 SIMPLE bind establishes no GSS context, so
+    badldap cannot wrap (seal) any message regardless of the ``sign`` flag.
+
+    Used only by the confidential-attribute policy in
+    :func:`async_connect_with_ldap_fallback`; never gates non-confidential reads.
+    """
+    if config.use_kerberos:
+        return True
+    if config.use_simple_bind:
+        # SIMPLE bind is RFC 4513 cleartext-over-transport; no GSS sealing.
+        return False
+    has_user = bool(str(config.username or "").strip())
+    has_secret = bool(str(config.password or ""))
+    # NTLM bind with credentials → SASL GSS-SPNEGO → can negotiate sealing.
+    return has_user and has_secret
+
+
+def _apply_default_seal_to_plain_ldap(
+    configs_to_try: list[tuple["ADscanLDAPConfig", bool]],
+) -> list[tuple["ADscanLDAPConfig", bool]]:
+    """Seal authenticated plain-LDAP/389 attempts by default (OPSEC default).
+
+    Walks the prepared transport attempts and, for every PLAIN-LDAP (port 389)
+    attempt whose bind is AUTHENTICATED and GSS-capable (Kerberos or
+    NTLM-with-creds, per :func:`_plain_ldap_can_seal`), forces ``sign=True`` so
+    badldap negotiates GSS-API sign+seal and the bind/queries/results are
+    encrypted on the wire instead of sent in cleartext.
+
+    Strictly scoped — leaves untouched:
+
+    - LDAPS/636 attempts (``is_ldaps=True``) — TLS already seals; ``sign`` is a
+      harmless no-op there.
+    - Anonymous / SIMPLE plain-LDAP attempts — they establish no GSS context
+      and cannot seal; cleartext is unavoidable, so they pass through as-is.
+    - Attempts whose caller already set ``sign=True`` — already sealed.
+    - Attempts whose caller opted out via ``disable_default_seal=True``.
+    - Attempts whose caller set ``disable_self_heal=True`` — failure-eliciting
+      callers (posture probes) that need the raw, unsealed DC response.
+
+    Each upgraded attempt gets the private ``_default_seal_applied=True`` marker
+    so the fallback loop can tell a transport-applied DEFAULT seal apart from
+    caller-requested ``sign=True`` -- only the former is degraded back to
+    unsealed on a genuine seal-negotiation failure.
+
+    Returns a new list; the input list is not mutated.
+    """
+    import dataclasses as _dc_seal
+
+    upgraded: list[tuple["ADscanLDAPConfig", bool]] = []
+    for cfg, is_ldaps in configs_to_try:
+        if (
+            is_ldaps
+            # The StartTLS rung is already confidential at the transport layer
+            # (TLS via RFC 2830); GSS sign+seal on top would be redundant and
+            # can conflict, so leave it unsealed.
+            or getattr(cfg, "use_starttls", False)
+            or cfg.sign
+            or getattr(cfg, "disable_default_seal", False)
+            # ``disable_self_heal`` marks a failure-ELICITING caller (the posture
+            # probes) that needs the RAW DC response — e.g. the LDAP-signing
+            # probe deliberately binds unsigned on 389 to read back
+            # ``strongerAuthRequired``. Sealing it would mask that answer, so the
+            # same flag that suppresses the reactive self-heal also suppresses
+            # this proactive seal upgrade.
+            or getattr(cfg, "disable_self_heal", False)
+            or not _plain_ldap_can_seal(cfg)
+        ):
+            upgraded.append((cfg, is_ldaps))
+            continue
+        sealed_cfg = _dc_seal.replace(cfg, sign=True, _default_seal_applied=True)
+        upgraded.append((sealed_cfg, is_ldaps))
+    return upgraded
+
+
 async def async_connect_with_ldap_fallback(
     config: "ADscanLDAPConfig",
-) -> tuple[Any, bool]:
-    """Async LDAPS→LDAP fallback for native badldap consumers.
+    *,
+    connect_timeout: float | None = None,
+) -> "LDAPConnectResult":
+    """Async LDAP confidentiality ladder for native badldap consumers.
 
     Preferred over direct ``LDAPConnectionFactory.from_url()`` calls because it:
-    - Tries LDAPS (port 636) first
+    - Walks the confidentiality ladder LDAPS(636) -> LDAP/389+StartTLS ->
+      LDAP/389+SASL sign+seal -> cleartext(last resort)
     - Detects TLS transport failures via :func:`is_ldaps_transport_failure`
-    - Retries transparently on plain LDAP (port 389)
+    - Detects StartTLS unavailability via :func:`_is_starttls_unavailable`
+    - Retries transparently down the ladder
     - Handles cross-domain referrals when ``config.auth_domain``/``config.auth_kdc`` are set
 
     Args:
         config: LDAP connection config. Set ``config.use_ldaps = True`` (the default);
             the fallback will downgrade to ``False`` automatically if LDAPS is unavailable.
+        connect_timeout: Optional per-transport connect budget in seconds. When set,
+            each ``conn.connect()`` is wrapped in ``asyncio.wait_for`` so a silently
+            DROPped LDAPS:636 port surfaces a ``TimeoutError`` (classified as a
+            transport failure by :func:`is_ldaps_transport_failure`) and the fallback
+            proceeds to plain LDAP:389 instead of hanging. ``None`` (default) preserves
+            the legacy unbounded-connect behaviour for authenticated callers that rely
+            on the underlying transport's own timeouts.
 
     Returns:
-        ``(connected_client, used_ldaps)`` where *connected_client* is a live
-        ``MSLDAPClient`` and *used_ldaps* records which transport succeeded.
+        :class:`LDAPConnectResult` carrying the live ``MSLDAPClient``
+        (``.client``) and the :class:`ConfidentialityMechanism` that
+        sealed it (``.mechanism``). The result is iterable as the legacy
+        ``(client, used_ldaps)`` 2-tuple and exposes a ``.used_ldaps``
+        property, so existing callers that unpack ``conn, used_ldaps =
+        await ...`` keep working unchanged.
 
     Raises:
-        Exception: last connection error when both LDAPS and plain LDAP fail.
+        Exception: last connection error when every ladder rung fails.
     """
     modules = _load_badldap_modules()
     LDAPConnectionFactory = modules["LDAPConnectionFactory"]
 
+    # ---- Build the confidentiality ladder (per LDAP connection) -------------
+    # Order, strongest-confidentiality-first:
+    #   1. LDAPS (636)               — TLS transport; works for ANY bind
+    #   2. LDAP/389 + StartTLS        — TLS post-upgrade (RFC 2830); ANY bind,
+    #                                   incl. anonymous/SIMPLE; needs a DC cert,
+    #                                   no channel binding required
+    #   3. LDAP/389 + SASL sign+seal  — GSS app-layer seal; AUTHENTICATED only;
+    #                                   no cert needed (applied below by
+    #                                   ``_apply_default_seal_to_plain_ldap``)
+    #   4. LDAP/389 cleartext         — last resort (degrade hook / anon no-cert)
+    # StartTLS sits ABOVE SASL-seal because it covers anonymous/SIMPLE binds
+    # (no GSS context) and 636-filtered-but-cert-present DCs, and needs no CBT.
     configs_to_try: list[tuple["ADscanLDAPConfig", bool]] = []
+    import dataclasses as _dc
     if config.use_ldaps:
         configs_to_try.append((config, True))
-        import dataclasses as _dc
-
-        plain_config = _dc.replace(config, use_ldaps=False)
+        # Rung 2: plain 389 + StartTLS, between LDAPS and the seal/cleartext rung.
+        starttls_config = _dc.replace(config, use_ldaps=False, use_starttls=True)
+        configs_to_try.append((starttls_config, False))
+        # Rung 3/4: plain 389 (seal-by-default upgrades authenticated binds;
+        # degrade hook drops to cleartext if the DC cannot seal).
+        plain_config = _dc.replace(config, use_ldaps=False, use_starttls=False)
+        configs_to_try.append((plain_config, False))
+    elif config.use_starttls:
+        # Caller explicitly asked for StartTLS on 389 — honour it, with a plain
+        # 389 fallback below if StartTLS is unavailable.
+        configs_to_try.append((config, False))
+        plain_config = _dc.replace(config, use_starttls=False)
         configs_to_try.append((plain_config, False))
     else:
         configs_to_try.append((config, False))
@@ -1778,7 +2331,12 @@ async def async_connect_with_ldap_fallback(
         from adscan_internal.services.auth_plan import (
             LDAPTransport as _PlanTransport,
             NoViableLDAPAuthError,
+            _has_high_confidence,
             build_ldap_auth_plan,
+        )
+        from adscan_internal.services.domain_posture import (
+            ConstraintCategory as _PlanConstraint,
+            TriState as _PlanTriState,
         )
         import dataclasses as _dc_plan
 
@@ -1799,10 +2357,42 @@ async def async_connect_with_ldap_fallback(
             (a for a in plan.attempts if a.transport is _PlanTransport.LDAP), None
         )
 
+        # §1.F — teach the ladder the StartTLS rung. When posture HIGH-knows
+        # StartTLS is unavailable (refused / port-closed / cert-broken, observed
+        # by the P2 ``LDAP_STARTTLS_AVAILABLE`` probe) drop the StartTLS rung so
+        # the ladder does not waste a round-trip on a doomed StartTLS
+        # extendedReq before falling to SASL-seal. ENABLED HIGH keeps it ordered
+        # above SASL-seal (the existing ladder order); UNKNOWN / LOW / absent
+        # keeps it (conservative baseline — never prune on non-observed state,
+        # identical discipline to ``_has_high_confidence``). The planner's own
+        # rules (LDAPS / CBT / signing / NTLM / RC4) are untouched below.
+        starttls_state = config.posture_snapshot.get(
+            _PlanConstraint.LDAP_STARTTLS_AVAILABLE
+        )
+        starttls_disabled_high = (
+            _has_high_confidence(
+                starttls_state.effective_state, starttls_state.confidence
+            )
+            and starttls_state.effective_state is _PlanTriState.DISABLED
+        )
+
         pruned: list[tuple["ADscanLDAPConfig", bool]] = []
         for cfg, is_ldaps in configs_to_try:
             transport_key = _PlanTransport.LDAPS if is_ldaps else _PlanTransport.LDAP
             if transport_key not in plan_transports:
+                continue
+            # The StartTLS rung carries its own transport-layer confidentiality
+            # (TLS via RFC 2830) and needs neither GSS sign+seal nor channel
+            # binding, so it is preserved as-is — applying the plan's
+            # ``sign``/``channel_binding`` overrides to it would double-wrap
+            # the connection. The plan overrides only shape the LDAPS and the
+            # plain SASL-seal rungs.
+            if getattr(cfg, "use_starttls", False):
+                if starttls_disabled_high:
+                    # Observed-unavailable StartTLS — drop the rung. LDAPS,
+                    # SASL-seal, and cleartext rungs are untouched.
+                    continue
+                pruned.append((cfg, is_ldaps))
                 continue
             override = ldaps_overrides if is_ldaps else ldap_overrides
             if override is not None and (
@@ -1821,6 +2411,19 @@ async def async_connect_with_ldap_fallback(
                 "Posture pruning produced no viable LDAP transport"
             )
     # ------------------------------------------------------------------------
+
+    # ---- Seal authenticated plain-LDAP/389 by default (OPSEC default) ---------
+    # When LDAPS/636 is unavailable and the transparent fallback drops to plain
+    # LDAP/389, an AUTHENTICATED bind + its queries + its results would travel
+    # in CLEARTEXT unless the DC happens to require signing. For a security tool
+    # operating in sensitive internal AD, that is a confidentiality exposure
+    # (passive sniffing). We pre-empt the reactive ``strongerAuthRequired``
+    # retry by forcing GSS-API sign+seal on every authenticated, GSS-capable
+    # plain-LDAP attempt. Anonymous/SIMPLE binds cannot seal and are left as-is;
+    # LDAPS is untouched (TLS already seals). Callers may opt out via
+    # ``disable_default_seal`` or by explicitly setting ``sign``.
+    configs_to_try = _apply_default_seal_to_plain_ldap(configs_to_try)
+    # ---------------------------------------------------------------------------
 
     # Refresh stale Kerberos ticket once before the LDAPS/LDAP attempts.  The
     # refresh result applies to every fallback attempt below — both transports
@@ -1853,10 +2456,87 @@ async def async_connect_with_ldap_fallback(
         )
         _diag_dump_ccache(config.ccache_path)
 
+    # ---- Confidential-attribute sealing policy --------------------------------
+    # When the caller is reading a CONFIDENTIAL attribute (gMSA managed password,
+    # etc.) the channel MUST be sealed or the DC refuses the value with
+    # ``ERROR_DS_CONFIDENTIALITY_REQUIRED``. LDAPS is sealed by TLS. Plain LDAP is
+    # sealed ONLY when an authenticated GSS bind (Kerberos or NTLM) negotiates
+    # confidentiality — which badldap does iff ``_disable_signing`` is False, i.e.
+    # ``cfg.sign=True``. An anonymous / SIMPLE bind establishes no GSS context and
+    # can never seal, so that plain-LDAP attempt is dropped entirely.
+    #
+    # The general (non-confidential) LDAPS->LDAP downgrade is untouched: this block
+    # only runs when ``config.require_confidential`` is True.
+    confidential_dropped_unsealed = False
+    if getattr(config, "require_confidential", False):
+        import dataclasses as _dc_conf
+
+        sealed_configs: list[tuple["ADscanLDAPConfig", bool]] = []
+        for cfg, is_ldaps in configs_to_try:
+            if is_ldaps:
+                # LDAPS is sealed by TLS — accept unchanged.
+                sealed_configs.append((cfg, is_ldaps))
+                continue
+            if getattr(cfg, "use_starttls", False):
+                # StartTLS provides transport-layer confidentiality (TLS via
+                # RFC 2830) for ANY bind, including anonymous/SIMPLE. It is a
+                # VALID confidential rung — so a 636-filtered-but-cert-present
+                # DC can still read gMSA/LAPS over StartTLS even without a GSS
+                # sealing context. Accept unchanged; if StartTLS turns out to
+                # be unavailable at connect time, the rung fails and the loop
+                # falls through to the SASL-seal rung below.
+                sealed_configs.append((cfg, is_ldaps))
+                continue
+            if not _plain_ldap_can_seal(cfg):
+                # Anonymous / SIMPLE bind over plain LDAP can never seal.
+                confidential_dropped_unsealed = True
+                continue
+            # Force sign+seal so badldap negotiates GSS confidentiality (389).
+            sealed_cfg = (
+                cfg if cfg.sign else _dc_conf.replace(cfg, sign=True)
+            )
+            sealed_configs.append((sealed_cfg, is_ldaps))
+        if confidential_dropped_unsealed:
+            print_info_debug(
+                "[ldap_transport] confidential read: dropped unsealed plain-LDAP "
+                "attempt (anonymous/SIMPLE bind cannot negotiate sealing)"
+            )
+        if not sealed_configs:
+            raise ConfidentialChannelUnavailableError(
+                "gMSA / confidential-attribute read requires a sealed channel, "
+                "but none is available: LDAPS (port 636) is unreachable and no "
+                "authenticated (Kerberos or NTLM) bind is configured to negotiate "
+                "LDAP sign+seal on port 389. The managed password cannot be read "
+                "over an unsealed plain-LDAP channel. Provide credentials for an "
+                "authenticated bind, or restore LDAPS reachability to the DC."
+            )
+        configs_to_try = sealed_configs
+    # ---------------------------------------------------------------------------
+
     last_exc: Exception | None = None
     last_attempt_was_ldaps: bool = False
     ldaps_disabled_emitted: bool = False
-    for cfg, is_ldaps in configs_to_try:
+
+    # Self-healing retry budget. For each recoverable posture category
+    # (CBT, LDAP signing) we allow EXACTLY ONE injected retry per
+    # ``async_connect_with_ldap_fallback`` invocation. The budget is
+    # global to the loop so a CBT failure cannot cascade into a CBT
+    # retry that ALSO fails with CBT and triggers a third attempt. The
+    # bound is intentional: anything beyond "fail once, learn, fix
+    # once" is a sign that posture inference is broken and we want a
+    # loud error, not an infinite loop.
+    _self_heal_used: set[str] = set()
+    # Separate one-shot budget for the seal-by-default DEGRADE retry
+    # (sealed authenticated plain-LDAP -> unsealed) so it can never
+    # interact with or exhaust the signing/CBT self-heal budget above.
+    _seal_degrade_used: bool = False
+    # We iterate with an index so that injected attempts (appended to
+    # ``configs_to_try`` mid-iteration) participate naturally in the
+    # loop instead of needing a recursive call.
+    cfg_index = 0
+    while cfg_index < len(configs_to_try):
+        cfg, is_ldaps = configs_to_try[cfg_index]
+        cfg_index += 1
         transport_label = "LDAPS" if is_ldaps else "LDAP"
         last_attempt_was_ldaps = is_ldaps
         try:
@@ -1900,23 +2580,58 @@ async def async_connect_with_ldap_fallback(
             if hasattr(conn, "_disable_signing"):
                 conn._disable_signing = not cfg.sign
             if hasattr(conn, "_disable_channel_binding"):
-                conn._disable_channel_binding = not cfg.channel_binding
+                # StartTLS (RFC 2830) does not enforce channel binding; keep
+                # CBT off for the StartTLS rung so it works against more DCs.
+                conn._disable_channel_binding = (
+                    True if cfg.use_starttls else not cfg.channel_binding
+                )
+            if hasattr(conn, "_null_channel_binding"):
+                conn._null_channel_binding = cfg.null_channel_binding
+            if hasattr(conn, "_use_starttls"):
+                # Tell badldap to upgrade the plain 389 session to TLS via
+                # StartTLS BEFORE bind when this rung requested it.
+                conn._use_starttls = bool(cfg.use_starttls)
 
-            ok, err = await conn.connect()
+            if connect_timeout is not None:
+                ok, err = await asyncio.wait_for(
+                    conn.connect(), timeout=connect_timeout
+                )
+            else:
+                ok, err = await conn.connect()
             if not ok:
                 raise err or RuntimeError(
                     f"{transport_label} connect returned ok=False"
                 )
 
+            # Determine which confidentiality mechanism sealed this channel.
+            #   LDAPS (636) ......... TLS transport
+            #   StartTLS (389) ...... TLS post-upgrade (RFC 2830)
+            #   SASL sign+seal (389)  GSS app-layer (``sign=True`` on 389)
+            #   cleartext (389) ..... none (unsealed plain bind)
+            if is_ldaps:
+                mechanism = ConfidentialityMechanism.LDAPS
+            elif getattr(cfg, "use_starttls", False):
+                mechanism = ConfidentialityMechanism.STARTTLS
+            elif cfg.sign:
+                mechanism = ConfidentialityMechanism.SASL_SEAL
+            else:
+                mechanism = ConfidentialityMechanism.CLEARTEXT
+            conn_label = (
+                "LDAP+StartTLS"
+                if (not is_ldaps and getattr(cfg, "use_starttls", False))
+                else transport_label
+            )
             print_info_debug(
-                f"[ldap_transport] async connect: {transport_label} on {cfg.dc_ip}"
+                f"[ldap_transport] async connect: {conn_label} on {cfg.dc_ip} "
+                f"(confidentiality={mechanism.value})"
             )
             _emit_ldap_success_posture(
                 config,
                 used_kerberos_auth=cfg.use_kerberos,
                 used_ldaps=is_ldaps,
+                mechanism=mechanism,
             )
-            return conn, is_ldaps
+            return LDAPConnectResult(client=conn, mechanism=mechanism)
 
         except Exception as exc:
             last_exc = exc
@@ -1939,6 +2654,28 @@ async def async_connect_with_ldap_fallback(
                     f"[ldap_transport] LDAPS unavailable on {config.dc_ip}, retrying on plain LDAP"
                 )
                 continue
+
+            # StartTLS rung fall-through. When THIS attempt requested StartTLS
+            # on plain 389 and the upgrade was refused / no usable DC cert is
+            # present (``_is_starttls_unavailable``), fall THROUGH to the next
+            # rung — the SASL sign+seal rung (authenticated) or the cleartext
+            # last-resort — instead of emitting a failure or raising. A bare
+            # TCP/389 failure is NOT a StartTLS-availability signal and is
+            # handled by the normal failure path below. This is purely a
+            # confidentiality-mechanism fallback, not an auth failure, so it
+            # must not emit ``_emit_ldap_failure_posture``.
+            if (
+                not is_ldaps
+                and getattr(cfg, "use_starttls", False)
+                and _is_starttls_unavailable(exc)
+            ):
+                print_info_debug(
+                    f"[ldap_transport] StartTLS unavailable on {config.dc_ip} "
+                    f"(no DC cert on 389 / not supported); falling through to "
+                    f"the next confidentiality rung"
+                )
+                continue
+
             if last_exc is not None:
                 _emit_ldap_failure_posture(
                     config,
@@ -1946,6 +2683,78 @@ async def async_connect_with_ldap_fallback(
                     used_kerberos_auth=config.use_kerberos,
                     transport_was_ldaps=last_attempt_was_ldaps,
                 )
+
+            # Seal-by-default DEGRADE hook. When THIS attempt was a
+            # transport-applied default seal (authenticated plain-LDAP we
+            # upgraded to sign+seal, marked ``_default_seal_applied``) and it
+            # failed specifically because sealing could not be negotiated
+            # against a server that cannot provide it (a non-Windows / legacy
+            # LDAP server) -- NOT an auth/credential failure -- retry once
+            # unsealed so we degrade gracefully instead of hanging or failing
+            # hard against a DC that genuinely cannot seal. Budget-gated to a
+            # single shot. A bad-creds rejection is excluded by
+            # ``_is_seal_negotiation_failure`` and propagates unchanged.
+            if (
+                not is_ldaps
+                and getattr(cfg, "_default_seal_applied", False)
+                and not getattr(config, "require_confidential", False)
+                and not _seal_degrade_used
+                and _is_seal_negotiation_failure(exc)
+            ):
+                _seal_degrade_used = True
+                import dataclasses as _dc_degrade
+
+                unsealed_cfg = _dc_degrade.replace(
+                    cfg, sign=False, _default_seal_applied=False
+                )
+                configs_to_try.append((unsealed_cfg, is_ldaps))
+                print_warning_debug(
+                    "[ldap_transport] seal-by-default: authenticated plain-LDAP "
+                    "bind could not negotiate GSS sign+seal against this DC; "
+                    "degrading to an UNSEALED plain-LDAP retry. Queries/results "
+                    "on this connection will travel in cleartext -- the DC does "
+                    "not support LDAP sealing on port 389."
+                )
+                continue
+
+            # Self-healing retry hook. The failure posture above already
+            # taught the bus what the DC requires; here we synthesise the
+            # corresponding transport config and append it to the
+            # iteration queue. The next ``while`` iteration picks it up.
+            #
+            # Budget-gated by ``_self_heal_used`` so a misclassified
+            # recovery cannot loop. The synth uses ``_dc.replace(cfg, …)``
+            # so the new attempt carries the same credentials, posture
+            # snapshot, kerberos target hostname, etc. — only the single
+            # offending flag flips.
+            #
+            # Disabled by ``config.disable_self_heal`` for failure-
+            # eliciting consumers (posture probes) — they need the raw
+            # rejection to propagate so they can classify it instead of
+            # the transport silently "fixing" the call. See the field
+            # docstring on ``ADscanLDAPConfig.disable_self_heal``.
+            recovered_cfg = (
+                None
+                if config.disable_self_heal
+                else _classify_recoverable_bind_failure(
+                    exc, cfg=cfg, transport_was_ldaps=is_ldaps
+                )
+            )
+            if recovered_cfg is not None:
+                recovery_key = (
+                    f"cbt={recovered_cfg.channel_binding}|"
+                    f"sign={recovered_cfg.sign}|"
+                    f"ldaps={is_ldaps}"
+                )
+                if recovery_key not in _self_heal_used:
+                    _self_heal_used.add(recovery_key)
+                    configs_to_try.append((recovered_cfg, is_ldaps))
+                    print_info_debug(
+                        f"[ldap_transport] self-heal: queued retry "
+                        f"{recovery_key} after recoverable bind failure on "
+                        f"{transport_label}"
+                    )
+                    continue
             raise
 
     if last_exc is not None:
@@ -1955,12 +2764,80 @@ async def async_connect_with_ldap_fallback(
             used_kerberos_auth=config.use_kerberos,
             transport_was_ldaps=last_attempt_was_ldaps,
         )
+    if confidential_dropped_unsealed:
+        # The only sealed option (LDAPS) failed and the plain-LDAP fallback was
+        # dropped because it could not seal. Surface the actionable confidential
+        # error rather than the raw LDAPS transport exception.
+        raise ConfidentialChannelUnavailableError(
+            "gMSA / confidential-attribute read requires a sealed channel, but "
+            "none succeeded: LDAPS (port 636) failed to connect and the plain-LDAP "
+            "(port 389) fallback was skipped because the configured bind "
+            "(anonymous / SIMPLE) cannot negotiate LDAP sign+seal. The managed "
+            "password cannot be read over an unsealed channel. Provide credentials "
+            "for an authenticated bind, or restore LDAPS reachability to the DC."
+        ) from last_exc
     raise last_exc or RuntimeError(
         "Both LDAPS and plain LDAP connection attempts failed"
     )
 
 
 def execute_with_ldap_fallback(
+    *,
+    operation_name: str,
+    target_domain: str,
+    dc_address: str,
+    callback: Callable[[Any], Any],
+    config_cls: type[Any] | None = None,
+    connection_cls: type[Any] | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    use_kerberos: bool = False,
+    prefer_ldaps: bool = True,
+    validate_connection: Callable[[Any], None] | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
+    kerberos_target_hostname: str | None = None,
+    allow_password_fallback_on_kerberos_failure: bool = False,
+    auth_domain: str | None = None,
+    auth_kdc: str | None = None,
+    posture_sink: "PostureSink | None" = None,
+) -> tuple[Any, bool]:
+    """Execute one LDAP-backed callback with centralized LDAPS->LDAP fallback.
+
+    Loop-safe entry point. The implementation drives a private event loop via
+    ``ADscanLDAPConnection`` (``asyncio.new_event_loop()`` +
+    ``run_until_complete()``), which raises ``RuntimeError: Cannot run the
+    event loop while another loop is running`` when called from inside an
+    active asyncio loop (e.g. the credential-dump follow-up chain). This
+    wrapper offloads the entire synchronous operation to a loop-free worker
+    thread via :func:`run_sync_off_loop` when a loop is already running, and
+    runs inline (no offload) otherwise.
+
+    See :func:`_execute_with_ldap_fallback_impl` for full argument and return
+    documentation.
+    """
+    return run_sync_off_loop(
+        _execute_with_ldap_fallback_impl,
+        operation_name=operation_name,
+        target_domain=target_domain,
+        dc_address=dc_address,
+        callback=callback,
+        config_cls=config_cls,
+        connection_cls=connection_cls,
+        username=username,
+        password=password,
+        use_kerberos=use_kerberos,
+        prefer_ldaps=prefer_ldaps,
+        validate_connection=validate_connection,
+        config_overrides=config_overrides,
+        kerberos_target_hostname=kerberos_target_hostname,
+        allow_password_fallback_on_kerberos_failure=allow_password_fallback_on_kerberos_failure,
+        auth_domain=auth_domain,
+        auth_kdc=auth_kdc,
+        posture_sink=posture_sink,
+    )
+
+
+def _execute_with_ldap_fallback_impl(
     *,
     operation_name: str,
     target_domain: str,
@@ -2189,3 +3066,157 @@ def execute_with_ldap_fallback(
                 telemetry.capture_exception(_emit_exc)
         raise last_exc
     raise RuntimeError(f"{operation_name} failed without executing any LDAP attempt")
+
+
+# ---------------------------------------------------------------------------
+# Anonymous (simple-bind) LDAP — centralized LDAPS->LDAP fallback
+# ---------------------------------------------------------------------------
+
+
+def _build_anonymous_ldap_config(
+    dc_ip: str,
+    *,
+    posture_snapshot: "DomainPosture | None" = None,
+    posture_sink: "PostureSink | None" = None,
+) -> "ADscanLDAPConfig":
+    """Build an ``ADscanLDAPConfig`` for an anonymous RFC 4513 SIMPLE bind.
+
+    Empty credentials + ``use_simple_bind=True`` route ``_build_ldap_connection_url``
+    to the ``ldap+simple://@host`` form — the canonical anonymous SIMPLE bind that
+    leaves the connection in RUNNING state after bind (required for ``pagedsearch``
+    against hardened DCs). ``use_kerberos`` and ``use_ldaps`` keep their roles: the
+    LDAPS->LDAP fallback in :func:`async_connect_with_ldap_fallback` downgrades 636→389
+    automatically.
+
+    The defaults (``sign=False``, ``channel_binding=False``) make
+    ``async_connect_with_ldap_fallback`` set ``_disable_signing=True`` and
+    ``_disable_channel_binding=True`` on the client — exactly the flag surgery the
+    hand-rolled anonymous loops performed, since anonymous binds negotiate neither.
+    """
+    return ADscanLDAPConfig(
+        domain="",
+        dc_ip=str(dc_ip or "").strip(),
+        use_ldaps=True,
+        use_kerberos=False,
+        username=None,
+        password=None,
+        use_simple_bind=True,
+        posture_snapshot=posture_snapshot,
+        posture_sink=posture_sink,
+    )
+
+
+async def async_connect_anonymous_with_ldap_fallback(
+    dc_ip: str,
+    *,
+    timeout: float = 8.0,
+    posture_snapshot: "DomainPosture | None" = None,
+    posture_sink: "PostureSink | None" = None,
+) -> "LDAPConnectResult":
+    """Async anonymous SIMPLE-bind LDAP connect with LDAPS->LDAP fallback.
+
+    The anonymous counterpart to :func:`async_connect_with_ldap_fallback`. It builds
+    an anonymous SIMPLE-bind config (empty creds, ``ldap+simple://@host``) and routes
+    it through the SAME fallback machinery, so the LDAPS(636)->LDAP(389) downgrade and
+    the type-based :func:`is_ldaps_transport_failure` classifier (connect-time
+    ``ConnectionReset`` / ``ConnectionRefused`` / ``TimeoutError`` on 636 → retry on 389)
+    are inherited for free.
+
+    Args:
+        dc_ip: Domain controller address (IP or FQDN).
+        timeout: Per-transport connect budget in seconds. A silently DROPped 636 port
+            surfaces a ``TimeoutError`` and the fallback proceeds to plain LDAP:389.
+        posture_snapshot: Optional posture snapshot for auth-plan pruning (e.g. skip a
+            doomed 636 connect when the workspace recorded LDAPS down).
+        posture_sink: Optional sink for LDAPS-availability posture signals emitted by
+            the underlying transport.
+
+    Returns:
+        ``(connected_client, used_ldaps)`` — a live ``MSLDAPClient`` bound anonymously
+        plus which transport succeeded. The caller owns the connection and must call
+        ``await client.disconnect()`` (or use
+        :func:`async_anonymous_ldap_connection`, which disconnects automatically).
+
+    Raises:
+        Exception: last connection error when both LDAPS and plain LDAP fail.
+    """
+    config = _build_anonymous_ldap_config(
+        dc_ip,
+        posture_snapshot=posture_snapshot,
+        posture_sink=posture_sink,
+    )
+    return await async_connect_with_ldap_fallback(config, connect_timeout=timeout)
+
+
+@contextlib.asynccontextmanager
+async def async_anonymous_ldap_connection(
+    dc_ip: str,
+    *,
+    timeout: float = 8.0,
+    posture_snapshot: "DomainPosture | None" = None,
+    posture_sink: "PostureSink | None" = None,
+):
+    """Async context manager yielding an anonymous-bound ``MSLDAPClient``.
+
+    Wraps :func:`async_connect_anonymous_with_ldap_fallback` and guarantees the
+    connection is disconnected on exit (even on error). Use this for the common
+    anonymous-enumeration pattern: connect anonymously, read ``_serverinfo`` for the
+    naming context, then ``pagedsearch``.
+
+    Example::
+
+        async with async_anonymous_ldap_connection(dc_ip, timeout=8) as (client, used_ldaps):
+            base_dn = anonymous_default_naming_context(client)
+            async for item, err in client.pagedsearch("(objectClass=user)", ["*"], tree=base_dn, search_scope=2):
+                ...
+    """
+    client, used_ldaps = await async_connect_anonymous_with_ldap_fallback(
+        dc_ip,
+        timeout=timeout,
+        posture_snapshot=posture_snapshot,
+        posture_sink=posture_sink,
+    )
+    try:
+        yield client, used_ldaps
+    finally:
+        try:
+            disconnect = getattr(client, "disconnect", None)
+            if disconnect is not None:
+                maybe = disconnect()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def anonymous_default_naming_context(client: Any) -> str:
+    """Return the directory's default naming context DN from a bound client.
+
+    Reads ``get_server_info()`` / ``_serverinfo`` (populated during connect) and
+    extracts ``defaultNamingContext``, falling back to the first ``namingContexts``
+    entry. Returns ``""`` when no naming context is available — callers treat that as
+    "directory denied the anonymous RootDSE read" and stop.
+    """
+    server_info: Any = None
+    getter = getattr(client, "get_server_info", None)
+    if callable(getter):
+        try:
+            server_info = getter()
+        except Exception:  # noqa: BLE001
+            server_info = None
+    if not server_info:
+        server_info = getattr(client, "_serverinfo", None)
+    if not isinstance(server_info, dict):
+        return ""
+    raw = server_info.get("defaultNamingContext")
+    if isinstance(raw, list):
+        base_dn = str(raw[0]) if raw else ""
+    elif raw:
+        base_dn = str(raw)
+    else:
+        base_dn = ""
+    if not base_dn:
+        ncs = server_info.get("namingContexts")
+        if isinstance(ncs, list) and ncs:
+            base_dn = str(ncs[0])
+    return base_dn.strip()

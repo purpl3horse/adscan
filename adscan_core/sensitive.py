@@ -15,14 +15,23 @@ from typing import Dict, Tuple
 # Sensitive data markers (invisible to user, used for automatic sanitization).
 # IMPORTANT: Keep these stable across versions to avoid breaking deterministic
 # sanitization and marker-based parsing in telemetry.
+# NOTE on the marker alphabet: U+200D (ZERO WIDTH JOINER) MUST NOT appear here.
+# ZWJ is a grapheme *joiner* (the emoji-combining char, e.g. \ud83c\udff4\u200d\u2620\ufe0f). Grapheme-aware
+# width measurement \u2014 used by Rich >= 14 (rich.cells.cell_len) and by real
+# terminals \u2014 counts a ZWJ-adjacent token as one cell narrower than it displays.
+# Because markers are stripped from the visible stream only AFTER Rich has laid
+# out a table/panel (see console_runtime.MarkerStrippingTextIO), a ZWJ marker
+# made every table column/border that contained a domain/hostname/password
+# mis-align. U+2061 (FUNCTION APPLICATION) is the safe replacement: invisible,
+# zero-width, and NON-joining, so cell_len(marked) == cell_len(plain).
 SENSITIVE_MARKERS: Dict[str, Tuple[str, str]] = {
     "user": ("\u200b\u200c", "\u200c\u200b"),
-    "domain": ("\u200b\u200d", "\u200d\u200b"),
+    "domain": ("\u200b\u2061", "\u2061\u200b"),
     "ip": ("\u200b\u2060", "\u2060\u200b"),
-    "password": ("\u200c\u200d", "\u200d\u200c"),
+    "password": ("\u200c\u2061", "\u2061\u200c"),
     "service": ("\u200c\u2060", "\u2060\u200c"),
-    "path": ("\u200d\u2060", "\u2060\u200d"),
-    "hostname": ("\u2060\u200d", "\u200d\u2060"),
+    "path": ("\u2061\u2060", "\u2060\u2061"),
+    "hostname": ("\u2060\u2061", "\u2061\u2060"),
     # Workspace markers use different zero-width characters (LTR/RTL marks)
     # to avoid overlapping with other marker sequences.
     "workspace": ("\u200e\u200f", "\u200f\u200e"),
@@ -37,7 +46,7 @@ PASSTHROUGH_MARKERS: Dict[str, Tuple[str, str]] = {
 }
 
 # All zero-width characters used by the marker system.
-MARKER_CHARS = "\u200b\u200c\u200d\u2060\u200e\u200f"
+MARKER_CHARS = "\u200b\u200c\u2061\u2060\u200e\u200f"
 
 
 def strip_sensitive_markers(text: str) -> str:
@@ -58,7 +67,7 @@ def strip_sensitive_markers(text: str) -> str:
     for marker in (
         "\u200b",
         "\u200c",
-        "\u200d",
+        "\u2061",
         "\u2060",
         "\u200e",
         "\u200f",

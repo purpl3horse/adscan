@@ -88,7 +88,7 @@ from adscan_internal.services.attack_path_target_viability_service import (
     assess_computer_target_viability,
 )
 from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
-from adscan_internal.workspaces import domain_relpath, domain_subpath
+from adscan_internal.workspaces import domain_relpath, domain_subpath, read_json_file
 
 
 class LdapShell(Protocol):
@@ -994,7 +994,7 @@ def _record_ldap_security_posture_finding(
         return
 
     try:
-        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_core.reporting.technical_report import record_technical_finding
 
         workspace_cwd = shell._get_workspace_cwd()
         artifact_path = domain_subpath(
@@ -1047,7 +1047,7 @@ def _record_obsolete_computers_finding(
         return
 
     try:
-        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_core.reporting.technical_report import record_technical_finding
 
         workspace_cwd = shell._get_workspace_cwd()
         ldap_dir = domain_subpath(workspace_cwd, shell.domains_dir, domain, "ldap")
@@ -2120,7 +2120,7 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
             telemetry.capture_exception(exc)
         _run_ldap_anonymous_followups(shell, domain)
         try:
-            from adscan_internal.services.report_service import record_technical_finding
+            from adscan_core.reporting.technical_report import record_technical_finding
 
             # Gate the evidence block on whether domain_data confirms the bind.
             record_technical_finding(
@@ -3477,17 +3477,17 @@ def _select_kerberos_wordlist_strategy(shell: LdapShell, domain: str) -> str | N
     # ── Context panel ────────────────────────────────────────────────────────
     strategy_rows = [
         (
-            "[bold #00D4FF]Detect format automatically[/bold #00D4FF]",
+            "[bold #1AA0AE]Detect format automatically[/bold #1AA0AE]",
             "Runs a compact Kerberos probe (~30–90 s) to identify\n"
             "the naming convention, then generates a focused list.",
         ),
         (
-            "[bold #00D4FF]I know the format[/bold #00D4FF]",
+            "[bold #1AA0AE]I know the format[/bold #1AA0AE]",
             "Pick the naming pattern and choose sources:\n"
             "statistically-likely names, LinkedIn employees, or manual entry.",
         ),
         (
-            "[bold #00D4FF]Use my own wordlist[/bold #00D4FF]",
+            "[bold #1AA0AE]Use my own wordlist[/bold #1AA0AE]",
             "Provide a file; ADscan will pass it directly to kerbrute.",
         ),
     ]
@@ -4337,28 +4337,79 @@ def run_ldap_descriptions(
     )
     ldap_filter = "(&(objectCategory=person)(objectClass=user))"
 
-    # ── Native query ─────────────────────────────────────────────────────
-    try:
-        rows = _native_user_description_query(
-            domain=target_domain,
-            dc_ip=pdc_target,
-            anonymous=anonymous,
-            username=username,
-            password=password,
-            nt_hash=nt_hash,
-            ldap_filter=ldap_filter,
-            attributes=list(sensitive_attrs),
-            timeout=120,
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_error(f"Error executing native LDAP description query: {exc}")
-        print_exception(show_locals=False, exception=exc)
-        return
+    # ── Source selection: prefer the persisted collector inventory ──────────
+    # The native collector already enumerated and persisted the four
+    # credential-bearing fields (description, unixUserPassword, userPassword,
+    # info) for every user into ``inventory/users.json``. When that snapshot
+    # exists, reuse it and skip the live LDAP query entirely; otherwise fall
+    # back to the live native search. Both sources converge on the same
+    # downstream artefacts, display, analysis and credential extraction.
+    cred_fields = _load_credential_fields_from_inventory(shell, target_domain)
+    using_inventory = bool(cred_fields)
 
-    if not rows:
-        print_warning("No user descriptions returned from LDAP.")
-        return
+    rows: list[dict[str, object]] = []
+    if using_inventory:
+        print_info_verbose(
+            "Using persisted LDAP user inventory; skipping live description query."
+        )
+    else:
+        # ── Native query ─────────────────────────────────────────────────────
+        # Posture wiring: let the auth planner skip a doomed LDAPS:636 connect
+        # when the workspace already knows LDAPS is unavailable (e.g. the native
+        # collector connected on LDAP/389 because 636 is filtered with RST), and
+        # let a fresh 636 transport failure on this path record the signal for
+        # downstream consumers. Mirrors the canonical pattern in cli/rdp.py.
+        posture_snapshot = None
+        posture_sink = None
+        if not anonymous:
+            domains_data = getattr(shell, "domains_data", None)
+            if domains_data is not None:
+                try:
+                    from adscan_internal import get_console
+                    from adscan_internal.cli.widgets.intelligence_update import (
+                        render_intelligence_update,
+                    )
+                    from adscan_internal.services.domain_posture import get_posture
+                    from adscan_internal.services.posture_sink import (
+                        make_workspace_posture_sink,
+                    )
+
+                    posture_snapshot = get_posture(domains_data, domain=target_domain)
+                    posture_sink = make_workspace_posture_sink(
+                        domains_data,
+                        on_finding=lambda finding: get_console().print(
+                            render_intelligence_update(finding)
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_info_debug(f"[ldap-desc] posture wiring skipped: {exc}")
+
+        try:
+            rows = _native_user_description_query(
+                domain=target_domain,
+                dc_ip=pdc_target,
+                anonymous=anonymous,
+                username=username,
+                password=password,
+                nt_hash=nt_hash,
+                ldap_filter=ldap_filter,
+                attributes=list(sensitive_attrs),
+                timeout=120,
+                posture_snapshot=posture_snapshot,
+                posture_sink=posture_sink,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error(f"Error executing native LDAP description query: {exc}")
+            print_exception(show_locals=False, exception=exc)
+            return
+
+        if not rows:
+            print_warning("No user descriptions returned from LDAP.")
+            return
+
+        cred_fields = _credential_fields_from_live_rows(rows)
 
     # ── Persist artefacts (text + JSON) ──────────────────────────────────
     workspace_cwd = shell._get_workspace_cwd()
@@ -4369,58 +4420,102 @@ def run_ldap_descriptions(
     descriptions_log = os.path.join(ldap_dir, "descriptions.log")
     descriptions_json = os.path.join(ldap_dir, "descriptions.json")
 
-    user_descriptions: dict[str, str] = {}
+    # Description-only view drives the text dump and the Rich display; the
+    # full per-field map (``cred_fields``) drives the CredSweeper analysis.
+    user_descriptions: dict[str, str] = _descriptions_only_view(cred_fields)
     json_records: list[dict[str, object]] = []
     sensitive_pattern = re.compile(r"(?i)password|pwd|pass|secret|cred|key|p@ss|p4ss")
     sensitive_findings: list[dict[str, object]] = []
 
-    try:
-        with open(descriptions_log, "w", encoding="utf-8") as log_fp:
-            log_fp.write("User:                     Description:\n")
-            for row in rows:
-                sam = str(row.get("sAMAccountName") or "").strip()
-                if not sam:
-                    continue
-                desc = str(row.get("description") or "").strip()
-                info = str(row.get("info") or "").strip()
-                comment = str(row.get("comment") or "").strip()
-                unix_pw = str(row.get("unixUserPassword") or "").strip()
-                user_pw = str(row.get("userPassword") or "").strip()
-                # Primary description for parity with the legacy parser.
-                if desc:
-                    user_descriptions[sam] = desc
-                    log_fp.write(f"{sam:<25} {desc}\n")
-                # Side-channel password fields are tracked in JSON only.
-                json_records.append(
+    if using_inventory:
+        # Build JSON records / sensitive findings from the persisted per-field
+        # map. ``comment`` is not a credential-bearing field, so it is omitted
+        # here (the live path tracks it for parity only).
+        for sam, fields in cred_fields.items():
+            desc = str(fields.get("description") or "").strip()
+            info = str(fields.get("info") or "").strip()
+            unix_pw = str(fields.get("unixUserPassword") or "").strip()
+            user_pw = str(fields.get("userPassword") or "").strip()
+            json_records.append(
+                {
+                    "samaccountname": sam,
+                    "description": desc,
+                    "info": info,
+                    "comment": "",
+                    "unixUserPassword": unix_pw,
+                    "userPassword": user_pw,
+                }
+            )
+            blob = " || ".join(filter(None, [desc, info, unix_pw, user_pw]))
+            if blob and sensitive_pattern.search(blob):
+                sensitive_findings.append(
                     {
                         "samaccountname": sam,
-                        "description": desc,
-                        "info": info,
-                        "comment": comment,
-                        "unixUserPassword": unix_pw,
-                        "userPassword": user_pw,
+                        "matched_text": blob[:300],
+                        "fields": {
+                            "description": desc,
+                            "info": info,
+                            "comment": "",
+                            "unixUserPassword": unix_pw,
+                            "userPassword": user_pw,
+                        },
                     }
                 )
-                blob = " || ".join(
-                    filter(None, [desc, info, comment, unix_pw, user_pw])
-                )
-                if blob and sensitive_pattern.search(blob):
-                    sensitive_findings.append(
+        try:
+            with open(descriptions_log, "w", encoding="utf-8") as log_fp:
+                log_fp.write("User:                     Description:\n")
+                for sam, desc in user_descriptions.items():
+                    log_fp.write(f"{sam:<25} {desc}\n")
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(f"Failed to write descriptions.log: {exc}")
+    else:
+        try:
+            with open(descriptions_log, "w", encoding="utf-8") as log_fp:
+                log_fp.write("User:                     Description:\n")
+                for row in rows:
+                    sam = str(row.get("sAMAccountName") or "").strip()
+                    if not sam:
+                        continue
+                    desc = str(row.get("description") or "").strip()
+                    info = str(row.get("info") or "").strip()
+                    comment = str(row.get("comment") or "").strip()
+                    unix_pw = str(row.get("unixUserPassword") or "").strip()
+                    user_pw = str(row.get("userPassword") or "").strip()
+                    # Primary description for parity with the legacy parser.
+                    if desc:
+                        log_fp.write(f"{sam:<25} {desc}\n")
+                    # Side-channel password fields are tracked in JSON only.
+                    json_records.append(
                         {
                             "samaccountname": sam,
-                            "matched_text": blob[:300],
-                            "fields": {
-                                "description": desc,
-                                "info": info,
-                                "comment": comment,
-                                "unixUserPassword": unix_pw,
-                                "userPassword": user_pw,
-                            },
+                            "description": desc,
+                            "info": info,
+                            "comment": comment,
+                            "unixUserPassword": unix_pw,
+                            "userPassword": user_pw,
                         }
                     )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_warning(f"Failed to write descriptions.log: {exc}")
+                    blob = " || ".join(
+                        filter(None, [desc, info, comment, unix_pw, user_pw])
+                    )
+                    if blob and sensitive_pattern.search(blob):
+                        sensitive_findings.append(
+                            {
+                                "samaccountname": sam,
+                                "matched_text": blob[:300],
+                                "fields": {
+                                    "description": desc,
+                                    "info": info,
+                                    "comment": comment,
+                                    "unixUserPassword": unix_pw,
+                                    "userPassword": user_pw,
+                                },
+                            }
+                        )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(f"Failed to write descriptions.log: {exc}")
 
     try:
         import json as _json
@@ -4442,14 +4537,15 @@ def run_ldap_descriptions(
         telemetry.capture_exception(exc)
         print_warning(f"Failed to write descriptions.json: {exc}")
 
-    # ── Render + analysis (reuse existing helpers for parity) ────────────
+    # ── Render + analysis (sweep all four credential-bearing fields) ──────
     if user_descriptions:
         _display_ldap_descriptions_with_rich(user_descriptions)
+    if cred_fields:
         try:
             _analyze_descriptions_for_passwords(
                 shell,
                 descriptions_log,
-                user_descriptions,
+                cred_fields,
                 target_domain,
                 anonymous=anonymous,
             )
@@ -4460,7 +4556,7 @@ def run_ldap_descriptions(
     # ── Surface sensitive findings into the report ───────────────────────
     if sensitive_findings:
         try:
-            from adscan_internal.services.report_service import record_technical_finding
+            from adscan_core.reporting.technical_report import record_technical_finding
 
             record_technical_finding(
                 shell,
@@ -4511,14 +4607,23 @@ def _native_user_description_query(
     ldap_filter: str,
     attributes: list[str],
     timeout: int,
+    posture_snapshot: object | None = None,
+    posture_sink: object | None = None,
 ) -> list[dict[str, object]]:
     """Run the native LDAP description-attribute search.
 
     Anonymous path uses the same ``ldap+simple://`` simple-bind pattern as
     :func:`adscan_internal.services.unauth_enrichment_service._enrich_ldap_active_users_native`.
-    Authenticated path goes through ``ADscanLDAPConnection`` so LDAPS→LDAP
+    Authenticated path goes through ``ADscanLDAPConnection`` so LDAPS->LDAP
     fallback, sign/seal toggles, and Kerberos ccache plumbing all stay
     centralized.
+
+    ``posture_snapshot`` / ``posture_sink`` are forwarded to
+    ``ADscanLDAPConfig`` so the auth planner prunes already-known-unavailable
+    LDAPS (skips a doomed 636 connect when the workspace recorded LDAPS down)
+    and a real 636 transport failure on this path emits an LDAPS-unavailable
+    signal for downstream consumers. The helper stays shell-agnostic: the
+    caller resolves these objects from ``shell`` and passes them in.
     """
     if anonymous:
         return _native_user_description_query_anonymous(
@@ -4546,6 +4651,8 @@ def _native_user_description_query(
         use_kerberos=False,
         username=username,
         password=secret,
+        posture_snapshot=posture_snapshot,
+        posture_sink=posture_sink,
     )
 
     rows: list[dict[str, object]] = []
@@ -4581,54 +4688,19 @@ def _native_user_description_query_anonymous(
     attributes: list[str],
     timeout: int,
 ) -> list[dict[str, object]]:
-    """Anonymous variant — explicit simple-bind, then paged search."""
-    import asyncio as _asyncio
-    from badldap.commons.factory import LDAPConnectionFactory
+    """Anonymous variant — centralized simple-bind, then paged search."""
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.ldap_transport_service import (
+        anonymous_default_naming_context,
+        async_anonymous_ldap_connection,
+    )
 
     async def _run() -> list[dict[str, object]]:
-        conn = None
-        last_exc: Exception | None = None
-        for transport, port in (("ldaps", 636), ("ldap", 389)):
-            url = f"{transport}+simple://@{dc_ip}:{port}"
-            try:
-                factory = LDAPConnectionFactory.from_url(url)
-                client = factory.get_client()
-                if hasattr(client, "_disable_signing"):
-                    client._disable_signing = True
-                if hasattr(client, "_disable_channel_binding"):
-                    client._disable_channel_binding = True
-                ok, err = await _asyncio.wait_for(client.connect(), timeout=timeout)
-                if not ok:
-                    raise err or RuntimeError(
-                        f"{transport.upper()} connect returned ok=False"
-                    )
-                conn = client
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                continue
-        if conn is None:
-            if last_exc is not None:
-                raise last_exc
-            return []
-
-        try:
-            server_info = None
-            if hasattr(conn, "get_server_info"):
-                server_info = conn.get_server_info()
-            if not server_info:
-                server_info = getattr(conn, "_serverinfo", None)
-            base_dn = ""
-            if isinstance(server_info, dict):
-                raw = server_info.get("defaultNamingContext")
-                if isinstance(raw, list):
-                    base_dn = str(raw[0]) if raw else ""
-                elif raw:
-                    base_dn = str(raw)
-                if not base_dn:
-                    ncs = server_info.get("namingContexts")
-                    if isinstance(ncs, list) and ncs:
-                        base_dn = str(ncs[0])
+        # Centralized anonymous SIMPLE-bind with LDAPS->LDAP fallback.
+        async with async_anonymous_ldap_connection(
+            dc_ip, timeout=timeout
+        ) as (conn, _used_ldaps):
+            base_dn = anonymous_default_naming_context(conn)
             if not base_dn:
                 return []
 
@@ -4660,31 +4732,13 @@ def _native_user_description_query_anonymous(
                 # Bind OK but search denied — return what we have.
                 telemetry.capture_exception(exc)
                 print_info_debug(
-                    f"[ldap-desc] anonymous search denied on {dc_ip}: {exc}"
+                    f"[ldap-desc] anonymous search denied on "
+                    f"{mark_sensitive(dc_ip, 'host')}: {exc}"
                 )
                 return collected
             return collected
-        finally:
-            try:
-                disconnect = getattr(conn, "disconnect", None)
-                if disconnect is not None:
-                    maybe = disconnect()
-                    if _asyncio.iscoroutine(maybe):
-                        await maybe
-            except Exception:  # noqa: BLE001
-                pass
 
-    try:
-        return _asyncio.run(_run())
-    except RuntimeError as exc:
-        if "asyncio.run() cannot be called" in str(exc) or "running event loop" in str(
-            exc
-        ):
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(_asyncio.run, _run()).result()
-        raise
+    return run_async_sync(_run())
 
 
 def run_enumerate_user_aces(shell: LdapShell, args: str) -> None:
@@ -5140,44 +5194,187 @@ def _extract_ntlm_hash_candidates_from_descriptions(
     return candidates
 
 
+# Canonical credential-bearing LDAP fields swept for leaked secrets. Keys are
+# the normalized property names the native collector persists into
+# ``inventory/users.json`` (see ldap_collector._entry_to_node); values are the
+# human-facing field labels surfaced in candidate displays and report findings.
+# All four are migrated from the legacy NetExec modules user-desc /
+# get-unixUserPassword / get-userPassword / get-info-users — keep them in sync.
+_CRED_FIELD_INVENTORY_KEYS: tuple[tuple[str, str], ...] = (
+    ("description", "description"),
+    ("unix_user_password", "unixUserPassword"),
+    ("user_password", "userPassword"),
+    ("info_field", "info"),
+)
+
+# Live LDAP rows carry the raw attribute names rather than the collector's
+# normalized property keys. Map them to the same canonical field labels.
+_CRED_FIELD_LIVE_KEYS: tuple[tuple[str, str], ...] = (
+    ("description", "description"),
+    ("unixUserPassword", "unixUserPassword"),
+    ("userPassword", "userPassword"),
+    ("info", "info"),
+)
+
+
+def _load_credential_fields_from_inventory(
+    shell: LdapShell, domain: str
+) -> dict[str, dict[str, str]]:
+    """Read persisted credential-bearing LDAP fields from ``inventory/users.json``.
+
+    The native collector already enumerated and persisted ``description``,
+    ``unixUserPassword``, ``userPassword`` and ``info`` for every user into the
+    domain inventory. Reuse that snapshot so the analysis phase does not re-query
+    LDAP when the collector has already run. Uses the same workspace-aware
+    inventory path API (``domain_subpath`` + ``read_json_file``) as
+    ``LocalGraphService._inventory_records`` — never a hand-rolled path.
+
+    Returns:
+        Mapping of ``sAMAccountName`` -> ``{field_label: value}`` for users that
+        carry at least one non-empty credential-bearing field. Empty when the
+        inventory file is absent or holds no such fields.
+    """
+    workspace_cwd = (
+        shell._get_workspace_cwd()  # noqa: SLF001
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", "")
+    )
+    domains_dir = getattr(shell, "domains_dir", "domains")
+    inventory_path = domain_subpath(
+        workspace_cwd, domains_dir, domain, "inventory", "users.json"
+    )
+    if not os.path.exists(inventory_path):
+        return {}
+
+    try:
+        payload = read_json_file(inventory_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[ldap-desc] failed to read users inventory: {exc}")
+        return {}
+
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return {}
+
+    cred_fields: dict[str, dict[str, str]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        sam = str(record.get("samaccountname") or "").strip()
+        if not sam:
+            continue
+        properties = record.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        per_user: dict[str, str] = {}
+        for prop_key, label in _CRED_FIELD_INVENTORY_KEYS:
+            value = str(properties.get(prop_key) or "").strip()
+            if value:
+                per_user[label] = value
+        if per_user:
+            cred_fields[sam] = per_user
+    return cred_fields
+
+
+def _credential_fields_from_live_rows(
+    rows: list[dict[str, object]],
+) -> dict[str, dict[str, str]]:
+    """Convert live LDAP description-query rows into the per-field credential map.
+
+    Mirrors :func:`_load_credential_fields_from_inventory` so both the
+    inventory-backed and live-query sources feed the analysis identically. Only
+    the four canonical credential-bearing fields are carried; ``comment`` stays
+    out of CredSweeper scope (it never held a migrated NetExec module).
+    """
+    cred_fields: dict[str, dict[str, str]] = {}
+    for row in rows:
+        sam = str(row.get("sAMAccountName") or "").strip()
+        if not sam:
+            continue
+        per_user: dict[str, str] = {}
+        for attr_key, label in _CRED_FIELD_LIVE_KEYS:
+            value = str(row.get(attr_key) or "").strip()
+            if value:
+                per_user[label] = value
+        if per_user:
+            cred_fields[sam] = per_user
+    return cred_fields
+
+
+def _descriptions_only_view(
+    cred_fields: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """Return a ``sAMAccountName -> description`` view for description-only helpers.
+
+    The Rich harvest display and the NTLM-hash keyword extraction operate on the
+    ``description`` field specifically; this keeps those helpers unchanged while
+    the broader analysis sweeps all four fields.
+    """
+    return {
+        sam: fields["description"]
+        for sam, fields in cred_fields.items()
+        if fields.get("description")
+    }
+
+
 def _analyze_descriptions_for_passwords(
     shell: LdapShell,
     descriptions_file: str,
-    user_descriptions: dict[str, str],
+    cred_fields: dict[str, dict[str, str]],
     domain: str,
     *,
     anonymous: bool = False,
 ) -> None:
-    """Analyze LDAP descriptions with CredSweeper library (in-memory, no subprocess).
+    """Analyze credential-bearing LDAP fields with CredSweeper (in-memory).
 
-    Mirrors the same settings used by the unauth description scan so both
-    flows behave identically: ldap_description rules, ml_threshold=0.0,
-    no_filters=True, doc=True. The library avoids the CLI subprocess and
-    credsweeper_path dependency entirely.
+    Sweeps all four migrated fields per user — ``description``,
+    ``unixUserPassword``, ``userPassword`` and ``info`` — not just
+    ``description`` (closing the prior gap where only ``description`` was
+    analysed on the live path while the collector swept all four). Mirrors the
+    CredSweeper settings used elsewhere so every flow behaves identically:
+    ldap_description rules, ml_threshold=0.0, no_filters=True, doc=True. The
+    library avoids the CLI subprocess and credsweeper_path dependency entirely.
+
+    Args:
+        shell: Runtime shell for credential storage and prompts.
+        descriptions_file: Path to the persisted descriptions artefact (used as
+            the source anchor for NTLM-hash provenance and report evidence).
+        cred_fields: Mapping of ``sAMAccountName`` -> ``{field_label: value}``
+            where ``field_label`` is one of ``description``, ``unixUserPassword``,
+            ``userPassword`` or ``info``.
+        domain: Target domain.
+        anonymous: Whether the source bind was anonymous (provenance only).
     """
-    if not user_descriptions:
+    if not cred_fields:
         return
 
     targets: list[InMemoryCredSweeperTarget] = []
-    path_index: dict[str, str] = {}  # file_path → samaccountname
+    # file_path → (samaccountname, field_label)
+    path_index: dict[str, tuple[str, str]] = {}
 
-    for sam, description in user_descriptions.items():
-        value = (description or "").strip()
-        if not value:
-            continue
-        key = f"ldap/{sam}/description"
-        targets.append(
-            InMemoryCredSweeperTarget(
-                content=value.encode("utf-8", errors="replace"),
-                file_path=key,
-                file_type=".txt",
-                info=f"{sam}/description",
+    for sam, fields in cred_fields.items():
+        for field_label, raw_value in fields.items():
+            value = (raw_value or "").strip()
+            if not value:
+                continue
+            key = f"ldap/{sam}/{field_label}"
+            targets.append(
+                InMemoryCredSweeperTarget(
+                    content=value.encode("utf-8", errors="replace"),
+                    file_path=key,
+                    file_type=".txt",
+                    info=f"{sam}/{field_label}",
+                )
             )
-        )
-        path_index[key] = sam
+            path_index[key] = (sam, field_label)
 
     if not targets:
         return
+
+    # Description-only view kept for the harvest display and the NTLM-hash
+    # keyword extractor, which are anchored to the description field.
+    descriptions_only = _descriptions_only_view(cred_fields)
 
     try:
         raw = CredSweeperLibraryService().analyze_targets_with_options(
@@ -5189,23 +5386,19 @@ def _analyze_descriptions_for_passwords(
             doc=True,
         )
 
-        # Map findings back to users via path_index — no filename heuristics needed.
+        # Map findings back to (user, field) via path_index — no heuristics needed.
         findings: dict[str, list] = {}
         for rule_name, entries in (raw or {}).items():
             mapped = []
             for value, ml_probability, context_line, line_num, file_path in entries:
-                sam = path_index.get(file_path)
-                if not sam:
+                if file_path not in path_index:
                     continue
-                # Re-emit as (value, ml_probability, context_line, line_num, file_path)
-                # but replace file_path with the descriptions_file for downstream
-                # compatibility with _extract_password_candidates_from_credsweeper_findings.
                 mapped.append((value, ml_probability, context_line, line_num, file_path))
             if mapped:
                 findings[rule_name] = mapped
 
         ntlm_hash_candidates = _extract_ntlm_hash_candidates_from_descriptions(
-            user_descriptions,
+            descriptions_only,
             source_path=descriptions_file,
         )
         if ntlm_hash_candidates:
@@ -5241,24 +5434,28 @@ def _analyze_descriptions_for_passwords(
                 fallback_source_shares=["ldap"],
             )
 
-        # Build candidates directly from path_index — avoids the old
-        # filename-heuristic approach in _extract_password_candidates_from_credsweeper_findings.
-        seen_cands: set[tuple[str, str]] = set()
+        # Build candidates directly from path_index, carrying the field each
+        # hit came from so the operator can tell a description leak apart from
+        # a unixUserPassword / userPassword / info leak. Dedupe per (user, field,
+        # value): the same secret echoed across two fields is still two findings.
+        seen_cands: set[tuple[str, str, str]] = set()
         candidates: list[dict] = []
         for rule_name, entries in findings.items():
             for value, ml_probability, context_line, _line_num, file_path in entries:
-                sam = path_index.get(file_path)
-                if not sam:
+                indexed = path_index.get(file_path)
+                if not indexed:
                     continue
+                sam, field_label = indexed
                 v = str(value or "").strip()
                 if not v or len(v) < 3:
                     continue
-                ckey = (sam.lower(), v)
+                ckey = (sam.lower(), field_label, v)
                 if ckey in seen_cands:
                     continue
                 seen_cands.add(ckey)
                 candidates.append({
                     "username": sam,
+                    "field": field_label,
                     "password": v,
                     "rule": str(rule_name or ""),
                     "ml_probability": ml_probability,
@@ -5266,27 +5463,47 @@ def _analyze_descriptions_for_passwords(
                 })
 
         if not candidates and not ntlm_hash_candidates:
-            print_info_verbose("No passwords detected in LDAP descriptions.")
+            print_info_verbose(
+                "No passwords detected in LDAP credential-bearing fields."
+            )
             return
 
-        candidate_users: dict[str, str] = {}
+        # Record the finding for the technical report from the computed
+        # candidates (carrying rule / ml_probability / username / field). This
+        # runs in both interactive and CI flows — the phase executes when
+        # shell.auto is True — so the report no longer depends on the collector
+        # having analysed the fields itself.
+        _record_credential_in_ldap_attribute_finding(
+            shell,
+            domain,
+            candidates,
+            anonymous=anonymous,
+            source_path=descriptions_file,
+        )
+
+        # Display the matching field value per candidate (not only the
+        # description), labelled by field, so non-description leaks are visible.
+        candidate_rows: dict[str, str] = {}
         for item in candidates:
             username = str(item["username"])
-            description = user_descriptions.get(username)
-            if description:
-                candidate_users[username] = description
+            field_label = str(item["field"])
+            value = str(item["password"])
+            row_key = f"{username} [{field_label}]"
+            candidate_rows[row_key] = value
 
         _display_ldap_description_candidates_with_rich(
-            candidate_users,
-            title=f"Potential Passwords in Descriptions ({len(candidate_users)} found)",
+            candidate_rows,
+            title=f"Potential Passwords in LDAP Fields ({len(candidate_rows)} found)",
             max_rows=30,
         )
 
         for item in candidates:
+            field_label = str(item["field"])
             marked_user = mark_sensitive(str(item["username"]), "user")
             marked_value = mark_sensitive(str(item["password"]), "password")
             selection = shell._questionary_select(
-                f"Candidate for {marked_user}: {marked_value}\nHow do you want to handle this?",
+                f"Candidate for {marked_user} ({field_label}): {marked_value}"
+                "\nHow do you want to handle this?",
                 [
                     "Ignore (false positive)",
                     "Save and verify now",
@@ -5314,8 +5531,64 @@ def _analyze_descriptions_for_passwords(
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_error("Error analyzing LDAP descriptions for potential passwords.")
+        print_error("Error analyzing LDAP credential-bearing fields for passwords.")
         print_exception(show_locals=False, exception=exc)
+
+
+def _record_credential_in_ldap_attribute_finding(
+    shell: LdapShell,
+    domain: str,
+    candidates: list[dict],
+    *,
+    anonymous: bool,
+    source_path: str,
+) -> None:
+    """Persist the ``credential_in_ldap_attribute`` technical finding.
+
+    Emitted from the computed CredSweeper candidates (carrying rule,
+    ml_probability, username and field), moved here from the collector
+    intelligence step so the report finding tracks the analysis that owns it.
+    LITE-safe: imports ``record_technical_finding`` from ``adscan_core``.
+    """
+    if not candidates:
+        return
+    try:
+        from adscan_core.reporting.technical_report import record_technical_finding
+
+        record_technical_finding(
+            shell,
+            domain,
+            key="credential_in_ldap_attribute",
+            value={"count": len(candidates)},
+            details={
+                "anonymous": anonymous,
+                "count": len(candidates),
+                "findings": [
+                    {
+                        "samaccountname": str(item.get("username") or ""),
+                        "field": str(item.get("field") or ""),
+                        "rule_name": str(item.get("rule") or ""),
+                        "ml_probability": item.get("ml_probability"),
+                    }
+                    for item in candidates[:50]
+                ],
+            },
+            evidence=[
+                {
+                    "type": "log",
+                    "summary": "LDAP credential-bearing fields (CredSweeper)",
+                    "artifact_path": source_path,
+                }
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not handle_optional_report_service_exception(
+            exc,
+            action="credential-in-LDAP-attribute finding sync",
+            debug_printer=print_info_debug,
+            prefix="[ldap-desc]",
+        ):
+            telemetry.capture_exception(exc)
 
 
 def _build_user_description_source_steps(
@@ -5383,12 +5656,19 @@ def execute_netexec_ldap_descriptions(
                 # Display with Rich
                 _display_ldap_descriptions_with_rich(user_descriptions)
 
-                # Analyze descriptions for passwords (regex-only, no ML)
+                # Analyze descriptions for passwords (regex-only, no ML).
+                # The NetExec UserDesc log only carries the description field;
+                # wrap it into the per-field map the analyser now expects.
                 if descriptions_file:
+                    cred_fields = {
+                        sam: {"description": desc}
+                        for sam, desc in user_descriptions.items()
+                        if desc
+                    }
                     _analyze_descriptions_for_passwords(
                         shell,
                         descriptions_file,
-                        user_descriptions,
+                        cred_fields,
                         domain,
                         anonymous=anonymous,
                     )

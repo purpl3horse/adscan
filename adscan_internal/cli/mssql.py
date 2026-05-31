@@ -1375,7 +1375,12 @@ def run_mssql_postauth_workflow(
         icon="🗄️",
     )
 
-    backend = ImpacketMSSQLBackend(host=host)
+    from adscan_internal.models.domain import resolve_dc_ip
+
+    _kdc_host = resolve_dc_ip(
+        (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    )
+    backend = ImpacketMSSQLBackend(host=host, domain=domain, kdc_host=_kdc_host)
     sweep = backend.sweep_privileges(
         domain=domain,
         username=username,
@@ -1595,7 +1600,9 @@ def run_mssql_check_impersonate(
     service = ExploitationService()
     posture_snapshot = None
     posture_sink = None
+    kdc_host = None
     try:
+        from adscan_internal.models.domain import resolve_dc_ip
         from adscan_internal.services.domain_posture import get_posture
         from adscan_internal.services.posture_sink import (
             make_workspace_posture_sink,
@@ -1605,6 +1612,9 @@ def run_mssql_check_impersonate(
         if isinstance(domains_data, dict):
             posture_snapshot = get_posture(domains_data, domain=domain)
             posture_sink = make_workspace_posture_sink(domains_data)
+            # DC/KDC IP so impacket's self-minted Kerberos requests reach the
+            # KDC without relying on container AD DNS.
+            kdc_host = resolve_dc_ip(domains_data.get(domain) or {})
     except Exception as posture_exc:
         telemetry.capture_exception(posture_exc)
 
@@ -1617,6 +1627,7 @@ def run_mssql_check_impersonate(
         posture_snapshot=posture_snapshot,
         posture_sink=posture_sink,
         domain_for_posture=domain,
+        kdc_host=kdc_host,
     )
 
     try:
@@ -1700,6 +1711,7 @@ def run_mssql_takeover(
         SeImpersonateOrchestrator,
     )
     from adscan_internal.integrations.mssql import ImpacketMSSQLBackend
+    from adscan_internal.models.domain import resolve_dc_ip
     from adscan_internal.services.smb_transport import SMBConfig
 
     marked_host = mark_sensitive(host, "hostname")
@@ -1708,7 +1720,10 @@ def run_mssql_takeover(
     else:
         print_info(f"Starting MSSQL takeover on {marked_host}...")
 
-    backend = ImpacketMSSQLBackend(host=host)
+    _kdc_host = resolve_dc_ip(
+        (getattr(shell, "domains_data", None) or {}).get(domain) or {}
+    )
+    backend = ImpacketMSSQLBackend(host=host, domain=domain, kdc_host=_kdc_host)
 
     # Build an SMB config for the AV/EDR fingerprint (best-effort, informational).
     smb_config = None

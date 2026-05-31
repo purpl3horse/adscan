@@ -52,6 +52,7 @@ from adscan_internal.services.remote_exec import (
     ExecMethod,
     execute_with_fallback,
 )
+from adscan_internal import get_console
 from adscan_internal.services.smb_transport import (
     SMBAccessDeniedError,
     SMBAuthError,
@@ -985,7 +986,6 @@ def _make_panel_callback(shell, host_intel_cache, workspace_type):
     """Return an on_intel_resolved callback that fires the host-intel panel once."""
     def _cb(fp, ranked):
         try:
-            from rich.console import Console
             from adscan_internal.cli.host_intelligence_panel import (
                 build_reason_lines,
                 render_host_intelligence_panel,
@@ -1004,7 +1004,7 @@ def _make_panel_callback(shell, host_intel_cache, workspace_type):
                 if age is not None:
                     ttl_remaining = max(0, 3600 - age)
             render_host_intelligence_panel(
-                console=Console(),
+                console=get_console(),
                 fingerprint=fp,
                 cascade=ranked,
                 reason_lines=build_reason_lines(fp, workspace_type),

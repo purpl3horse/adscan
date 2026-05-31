@@ -25,9 +25,11 @@ from adscan_core.telemetry import (  # noqa: F401,E402
     _get_known_users,
     _get_known_workspaces,
     _is_telemetry_enabled,
+    _looks_like_keyword_value,
     _maybe_sanitize_rich_output,
     _telemetry_client,
     _pseudonymize_value,
     _refresh_workspace_cache_if_needed,
     _sanitize_rich_output,
+    start_telemetry_queue_drain,
 )

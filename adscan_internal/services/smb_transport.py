@@ -130,6 +130,12 @@ class SMBConfig:
     use_kerberos: bool = False
     sign: bool = False
     encrypt: bool = False
+    disable_self_heal: bool = False
+    """When True, the transport will NOT retry with a healed config on
+    a posture-recoverable failure (SMB signing required). See
+    ``ADscanLDAPConfig.disable_self_heal`` for the full rationale —
+    same contract here.
+    """
     posture_sink: Optional[PostureSink] = None
     """Optional callable invoked when this transport observes a domain-wide
     SMB posture signal (NTLM rejected via SMB, SMB signing required, NTLM
@@ -546,6 +552,49 @@ def _emit_smb_success_posture(
 # ---------------------------------------------------------------------------
 
 
+class _SelfHealRetrySentinel(Exception):
+    """Internal-only marker used to break out of an ``async with`` block
+    when the SMB login failed with a posture-recoverable error and we want
+    to retry the connection with a healed config. Never propagates to
+    callers — :func:`smb_machine_for` catches it and loops.
+    """
+
+
+def _classify_recoverable_smb_failure(
+    exc: BaseException,
+    *,
+    cfg: "SMBConfig",
+) -> Optional["SMBConfig"]:
+    """Identify an SMB failure whose fix is a posture-driven config tweak.
+
+    Mirror of ``_classify_recoverable_bind_failure`` (LDAP) and
+    ``_classify_recoverable_kerberos_failure`` (Kerberos). Returns a new
+    :class:`SMBConfig` to retry with, or ``None`` when the failure is
+    not posture-recoverable.
+
+    Recovery rule (single one today):
+
+      * Translated error is :class:`SMBSigningRequiredError` AND
+        ``cfg.sign`` is False → retry with ``sign=True``. The signal
+        ``SMB_SIGNING REQUIRED HIGH`` is emitted by
+        :func:`_emit_smb_failure_posture` separately so the planner
+        learns regardless of retry success.
+
+    Any other failure shape (credentials rejected, host unreachable,
+    timeout) is NOT retried here — those are real errors.
+    """
+    import dataclasses as _dc
+
+    translated = _translate_aiosmb_exception(exc)
+    if isinstance(translated, SMBSigningRequiredError) and not cfg.sign:
+        print_info_debug(
+            "[smb_transport] self-heal: SMB signing required, "
+            "queuing retry with sign=True"
+        )
+        return _dc.replace(cfg, sign=True)
+    return None
+
+
 @asynccontextmanager
 async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
     """Async context manager that yields a connected ``SMBMachine``.
@@ -553,6 +602,16 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
     Translates aiosmb exceptions to ADscan SMB domain exceptions.  Callers
     must run this inside an ``asyncio`` event loop (use ``asyncio.run`` or
     ``asyncio.to_thread`` from sync boundaries).
+
+    Self-healing behaviour: when the server rejects the initial bind
+    with :class:`SMBSigningRequiredError` and the caller's config had
+    ``sign=False``, the connection is retried ONCE with ``sign=True``
+    in the same call. The posture signal
+    ``SMB_SIGNING REQUIRED HIGH`` is emitted regardless of whether the
+    retry succeeds so future operations on this domain start with
+    signing already on. The retry budget is exactly one attempt per
+    ``smb_machine_for`` call to prevent infinite loops if the server
+    rejects both.
 
     Usage::
 
@@ -563,7 +622,9 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
     Raises:
         SMBAuthError: credentials were rejected.
         SMBConnectionError: host is unreachable or connection dropped.
-        SMBSigningRequiredError: server requires signing but client didn't negotiate.
+        SMBSigningRequiredError: server requires signing AND the retry
+            with ``sign=True`` also failed (or ``sign=True`` was already
+            on, ruling out the recovery).
     """
     try:
         from aiosmb.commons.connection.factory import SMBConnectionFactory
@@ -574,46 +635,102 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
             f"aiosmb is not available in this runtime environment: {exc}"
         ) from exc
 
-    url = _build_smb_url(config)
-    print_info_debug(
-        f"[smb-transport] connecting via aiosmb to {config.target_ip}:{config.port}"
-    )
+    # Self-healing retry budget: at most one retry per call, scoped to
+    # the recovery key (sign-flag flip). Identical pattern to the LDAP
+    # transport's ``_self_heal_used`` set.
+    _self_heal_used: set[str] = set()
+    effective_config = config
 
-    factory = SMBConnectionFactory.from_url(url)
-    connection = factory.get_connection()
-
-    try:
-        async with connection:
-            _, err = await connection.login()
-            if err is not None:
-                telemetry.capture_exception(err)
-                _emit_smb_failure_posture(
-                    config, exc=err, used_kerberos_auth=config.use_kerberos
-                )
-                raise _translate_aiosmb_exception(err)
-            machine = SMBMachine(connection)
-            async with machine:
-                _emit_smb_success_posture(
-                    config,
-                    used_kerberos_auth=config.use_kerberos,
-                    connection=connection,
-                )
-                yield machine
-    except SMBTransportError:
-        # Already classified + emitted in the inner block.
-        raise
-    except asyncio.TimeoutError as exc:
-        # Network-level — not posture-relevant.
-        telemetry.capture_exception(exc)
-        raise SMBConnectionError(
-            f"SMB connection to {config.target_ip} timed out after {config.timeout}s"
-        ) from exc
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        _emit_smb_failure_posture(
-            config, exc=exc, used_kerberos_auth=config.use_kerberos
+    # Loop terminates either by ``yield`` + ``return`` (success), by a
+    # raised exception (terminal failure), or by ``next_config`` being
+    # set inside the try block (signal to retry with healed config).
+    while True:
+        url = _build_smb_url(effective_config)
+        print_info_debug(
+            f"[smb-transport] connecting via aiosmb to "
+            f"{effective_config.target_ip}:{effective_config.port}"
         )
-        raise _translate_aiosmb_exception(exc)
+
+        factory = SMBConnectionFactory.from_url(url)
+        connection = factory.get_connection()
+        next_config: Optional["SMBConfig"] = None
+
+        try:
+            async with connection:
+                _, err = await connection.login()
+                if err is not None:
+                    telemetry.capture_exception(err)
+                    _emit_smb_failure_posture(
+                        effective_config,
+                        exc=err,
+                        used_kerberos_auth=effective_config.use_kerberos,
+                    )
+                    recovered = (
+                        None
+                        if effective_config.disable_self_heal
+                        else _classify_recoverable_smb_failure(
+                            err, cfg=effective_config
+                        )
+                    )
+                    if recovered is not None:
+                        key = f"sign={recovered.sign}"
+                        if key not in _self_heal_used:
+                            # Record the retry intent, then let the
+                            # ``async with connection`` block close
+                            # cleanly by raising-to-exit. ``next_config``
+                            # is checked after the ``except`` chain to
+                            # drive the next while iteration.
+                            _self_heal_used.add(key)
+                            next_config = recovered
+                            raise _SelfHealRetrySentinel()
+                    raise _translate_aiosmb_exception(err)
+                machine = SMBMachine(connection)
+                async with machine:
+                    _emit_smb_success_posture(
+                        effective_config,
+                        used_kerberos_auth=effective_config.use_kerberos,
+                        connection=connection,
+                    )
+                    yield machine
+                return  # success — caller exited the ``async with`` cleanly
+        except _SelfHealRetrySentinel:
+            # Internal sentinel — the ``async with connection`` block has
+            # now closed cleanly, so the connection is disposed and we
+            # can safely loop back to retry with the healed config.
+            assert next_config is not None
+            effective_config = next_config
+            continue
+        except SMBTransportError:
+            # Already classified + emitted in the inner block.
+            raise
+        except asyncio.TimeoutError as exc:
+            # Network-level — not posture-relevant.
+            telemetry.capture_exception(exc)
+            raise SMBConnectionError(
+                f"SMB connection to {effective_config.target_ip} timed out "
+                f"after {effective_config.timeout}s"
+            ) from exc
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            _emit_smb_failure_posture(
+                effective_config,
+                exc=exc,
+                used_kerberos_auth=effective_config.use_kerberos,
+            )
+            recovered = (
+                None
+                if effective_config.disable_self_heal
+                else _classify_recoverable_smb_failure(
+                    exc, cfg=effective_config
+                )
+            )
+            if recovered is not None:
+                key = f"sign={recovered.sign}"
+                if key not in _self_heal_used:
+                    _self_heal_used.add(key)
+                    effective_config = recovered
+                    continue  # next iteration of the while loop
+            raise _translate_aiosmb_exception(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -693,16 +810,28 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
     )
 
     if effective_config.use_kerberos:
+        from adscan_internal.services._kerberos_spn import KerberosSpnUnresolvedError
+
         try:
             async with smb_machine_for(effective_config) as machine:
                 yield machine
             return
-        except (SMBAuthError, AttributeError, TypeError) as exc:
+        except (
+            SMBAuthError,
+            AttributeError,
+            TypeError,
+            KerberosSpnUnresolvedError,
+        ) as exc:
             # SMBAuthError — auth rejected by the server.
             # AttributeError / TypeError — can occur when Kerberos auth URL
             # construction crashes with empty credentials (username="",
             # password="") because aiosmb expects a non-None principal.
-            # In both cases, fall back to NTLM when the plan allows it.
+            # KerberosSpnUnresolvedError — the target is an IP with no
+            # resolvable FQDN, so cifs/<ip> cannot be requested. This is an
+            # infrastructure-level Kerberos failure, not a credential rejection;
+            # NTLM with the same credential is the correct fallback (the netexec
+            # sweep that fed this host already authenticated over NTLM).
+            # In all cases, fall back to NTLM when the plan allows it.
             has_nt_hash = bool(effective_config.nt_hash)
             if not plan.ntlm_fallback_allowed:
                 raise

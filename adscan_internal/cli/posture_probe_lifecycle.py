@@ -30,6 +30,42 @@ def is_posture_probe_disabled() -> bool:
     return val in {"1", "true", "yes", "on"}
 
 
+def _emit_posture_findings_best_effort(shell: Any, domain: str) -> None:
+    """Translate the freshly-updated posture cache into technical findings.
+
+    Called from both the live and silent ``arun_posture_probe`` paths
+    right before they return — at that point the posture cache is
+    confirmed persisted for ``domain`` (Wave A + Wave B + auth-phase
+    sink writes have all completed).
+
+    Lives in the lifecycle helper (not inside ``probe_unauth`` /
+    ``probe_auth``) because:
+      * Finding emission is a PRO-tier concern, not a probe concern.
+      * The bridge module is in ``adscan_internal/pro/services/`` — a
+        clean layering boundary that LITE builds simply don't ship.
+      * The single call point here means every posture phase emits
+        findings consistently regardless of which CLI verb triggered it.
+
+    Best-effort: any failure (LITE build with no ``pro/`` directory,
+    bridge import error, missing report context on ``shell``) is
+    swallowed silently after capturing to telemetry. Finding emission
+    never blocks the probe lifecycle.
+    """
+    try:
+        from adscan_internal.pro.services.posture_findings_emitter import (
+            emit_findings_from_posture,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # LITE build (no pro/) — silently skip.
+        telemetry.capture_exception(exc)
+        return
+
+    try:
+        emit_findings_from_posture(shell, domain=domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+
 def run_posture_probe(
     shell: Any,
     *,
@@ -243,6 +279,7 @@ async def arun_posture_probe(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+        _emit_posture_findings_best_effort(shell, domain)
         return results
 
     # Silent path — no Live, no summary panel.
@@ -254,6 +291,7 @@ async def arun_posture_probe(
             f"Posture probe failed for {mark_sensitive(domain, 'domain')}: "
             f"{type(exc).__name__}. Continuing with conservative defaults."
         )
+    _emit_posture_findings_best_effort(shell, domain)
     return collected
 
 

@@ -74,19 +74,6 @@ class CollectorEdge:
 
 
 @dataclass(frozen=True)
-class CredentialFieldFinding:
-    """A credential candidate found in an AD object's text field."""
-
-    samaccountname: str
-    object_id: str
-    field: str  # "description" | "unix_user_password" | "user_password" | "info_field"
-    raw_value: str
-    rule_name: str
-    ml_probability: float | None
-    context_line: str
-
-
-@dataclass(frozen=True)
 class DomainPolicy:
     """Password and account policy fetched from the domain root object."""
 
@@ -96,6 +83,13 @@ class DomainPolicy:
     max_pwd_age_days: int | None  # None = passwords never expire at domain level
     pwd_history_length: int | None
     machine_account_quota: int | None  # 0 = only admins; >0 = any domain user
+    # Default Domain Password Policy uses the legacy ``pwdProperties`` bitmask
+    # on the domain root object (the per-PSO equivalent is the dedicated
+    # ``msDS-PasswordComplexityEnabled`` boolean). Bit 0
+    # (DOMAIN_PASSWORD_COMPLEX = 0x1) drives "must meet complexity
+    # requirements". ``None`` when the attribute is unreadable / absent so
+    # callers can distinguish "not collected" from "explicitly disabled".
+    complexity_enabled: bool | None = None
     # Per-attribute replication metadata from msDS-ReplAttributeMetaData, filtered
     # to password-policy-relevant attributes only. Each entry is a 3-tuple:
     #   (ldap_attr_name, iso_timestamp, version)
@@ -221,7 +215,6 @@ class CollectionResult:
     edges: list[CollectorEdge] = field(default_factory=list)
     fsp_placeholders: dict[str, str] = field(default_factory=dict)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
-    credential_findings: list[CredentialFieldFinding] = field(default_factory=list)
     domain_policy: DomainPolicy | None = None
     psos: list[PasswordSettingsObject] = field(default_factory=list)
     shadow_credential_findings: list[ShadowCredentialFinding] = field(

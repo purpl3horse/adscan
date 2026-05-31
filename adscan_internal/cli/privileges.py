@@ -44,6 +44,18 @@ from adscan_internal.services.winrm_access_probe_service import (
     get_winrm_probe_worker_count,
     run_winrm_access_probe_sweep,
 )
+from adscan_internal.services.smb_access_probe_service import (
+    SMB_ACCESS_PROBE_BACKEND,
+    get_smb_probe_worker_count,
+    run_smb_access_probe_sweep,
+)
+from adscan_internal.services.mssql_access_probe_service import (
+    DEFAULT_MSSQL_PORT,
+    MSSQL_ACCESS_PROBE_BACKEND,
+    finding_is_sysadmin,
+    get_mssql_probe_worker_count,
+    run_mssql_access_probe_sweep,
+)
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.computers import (
     count_target_file_entries,
@@ -87,6 +99,21 @@ def _handle_confirmed_service_followups(
     func = getattr(shell, f"ask_for_{service}_access", None)
     if not callable(func):
         return
+    if not followups:
+        return
+
+    # SMB consolidates all confirmed hosts into one batched prompt (parity with
+    # the legacy netexec path); other services prompt per-host.
+    if service == "smb":
+        selected_hosts = [finding.host for finding in followups]
+        print_info_debug(
+            "[service-access] launching batch SMB follow-up: "
+            f"service={service} user={mark_sensitive(username, 'user')} "
+            f"hosts={[mark_sensitive(host, 'hostname') for host in selected_hosts]}"
+        )
+        func(domain, selected_hosts, username, password)
+        return
+
     for finding in followups:
         print_info_debug(
             "[service-access] launching service follow-up prompt: "
@@ -235,6 +262,372 @@ def _run_winrm_psrp_service_access_sweep(
             workflow_intent=workflow_intent,
         )
     return bool(confirmed_findings)
+
+
+def _resolve_service_sweep_posture(shell, *, domain):
+    """Resolve a posture sink + snapshot for one native service sweep.
+
+    Returns ``(posture_sink, posture_snapshot)``. Either may be ``None`` when
+    posture wiring fails — the native transport then uses conservative
+    defaults, identical to the WinRM PSRP sweep. Best-effort: never raises.
+    """
+    posture_sink = None
+    posture_snapshot = None
+    try:
+        from adscan_internal import get_console
+        from adscan_internal.cli.widgets.intelligence_update import (
+            render_intelligence_update,
+        )
+        from adscan_internal.services.domain_posture import get_posture
+        from adscan_internal.services.posture_sink import (
+            make_workspace_posture_sink,
+        )
+
+        posture_sink = make_workspace_posture_sink(
+            shell.domains_data,
+            on_finding=lambda finding: get_console().print(
+                render_intelligence_update(finding)
+            ),
+        )
+        posture_snapshot = get_posture(shell.domains_data, domain=domain)
+    except Exception as posture_exc:  # noqa: BLE001
+        telemetry.capture_exception(posture_exc)
+        print_info_debug(
+            f"[privileges] posture wiring skipped (non-fatal): {posture_exc}"
+        )
+    return posture_sink, posture_snapshot
+
+
+def _ensure_service_sweep_posture_fresh(shell, *, domain) -> None:
+    """Run the idempotent posture freshness guard at a native sweep entry.
+
+    Best-effort: a posture probe failure never aborts the sweep. The DC IP is
+    resolved via ``resolve_dc_ip`` so a silent ``None`` does not make Kerberos
+    fall back to the target host as KDC.
+    """
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+        from adscan_internal.services.posture_orchestration import (
+            ensure_posture_fresh,
+        )
+        from adscan_internal.services.async_bridge import run_async_sync
+
+        dc_ip = resolve_dc_ip(shell.domains_data.get(domain) or {})
+        if not dc_ip:
+            return
+        run_async_sync(
+            ensure_posture_fresh(shell, domain=domain, dc_ip=str(dc_ip))
+        )
+    except Exception as exc:  # noqa: BLE001 — posture guard is best-effort
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[privileges] ensure_posture_fresh skipped (non-fatal): {exc}"
+        )
+
+
+def _build_service_target_hostname_map(shell, *, domain, targets):
+    """Build an IP→FQDN map from the workspace inventory for Kerberos SPNs.
+
+    Only IP targets get a mapping; FQDN targets are already SPN-ready. Returns
+    an empty dict when no inventory is available (the transport then relies on
+    posture-gated NTLM fallback). Never raises.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (
+            load_workspace_ip_hostname_inventory,
+        )
+
+        workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+        domains_dir = getattr(shell, "domains_dir", None) or ""
+        if not workspace_dir or not domains_dir:
+            return mapping
+        inventory = load_workspace_ip_hostname_inventory(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+        )
+        if not isinstance(inventory, dict):
+            return mapping
+        target_set = {str(t).strip().lower() for t in targets if str(t or "").strip()}
+        for ip, candidates in inventory.items():
+            ip_norm = str(ip or "").strip()
+            if not ip_norm or ip_norm.lower() not in target_set:
+                continue
+            if not isinstance(candidates, list):
+                continue
+            for candidate in candidates:
+                fqdn = str(candidate or "").strip().rstrip(".")
+                if fqdn:
+                    mapping[ip_norm] = fqdn
+                    break
+    except Exception as exc:  # noqa: BLE001 — inventory is best-effort
+        telemetry.capture_exception(exc)
+    return mapping
+
+
+def _run_native_smb_service_access_sweep(
+    shell,
+    *,
+    workspace_dir,
+    domains_dir,
+    domain,
+    username,
+    password,
+    targets,
+    prompt,
+) -> bool:
+    """Run a native aiosmb SMB admin-access sweep and persist the results.
+
+    Mirrors :func:`_run_winrm_psrp_service_access_sweep`: posture-aware,
+    bounded concurrency, TCP pre-filter on 445, normalized findings, probe
+    history persistence, attack-graph edge recording, and the batched SMB
+    follow-up UX. Returns whether any host confirmed admin access.
+    """
+    from adscan_internal.services.async_bridge import run_async_sync
+
+    _ensure_service_sweep_posture_fresh(shell, domain=domain)
+    posture_sink, posture_snapshot = _resolve_service_sweep_posture(
+        shell, domain=domain
+    )
+
+    # Pre-flight TCP probe on 445 — skip offline hosts before paying auth cost.
+    if len(targets) > 1:
+        smb_reach = filter_reachable_hosts_sync(targets, port=445)
+        print_reachability_summary(smb_reach, service_label="SMB")
+        if not smb_reach.reachable:
+            render_no_reachable_panel(smb_reach, operation_label="SMB Access Sweep")
+            return False
+        targets = list(smb_reach.reachable)
+
+    creds = getattr(shell, "current_creds", None) or {}
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    auth_domain = creds.get("auth_domain") or domain
+    dc_ip = ""
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+
+        dc_ip = str(resolve_dc_ip(domain_data) or "")
+    except Exception:  # noqa: BLE001
+        dc_ip = ""
+    target_hostnames = _build_service_target_hostname_map(
+        shell, domain=domain, targets=targets
+    )
+    is_ccache = str(password or "").strip().lower().endswith(".ccache")
+
+    findings = run_async_sync(
+        run_smb_access_probe_sweep(
+            domain=domain,
+            username=username,
+            password=None if is_ccache else password,
+            ccache_path=password if is_ccache else None,
+            targets=targets,
+            auth_domain=auth_domain,
+            kdc_ip=dc_ip or None,
+            target_hostnames=target_hostnames,
+            max_workers=get_smb_probe_worker_count(),
+            posture_sink=posture_sink,
+            posture_snapshot=posture_snapshot,
+        )
+    )
+
+    confirmed_findings = [finding for finding in findings if finding.is_confirmed]
+    if findings:
+        render_service_access_results(
+            service="smb",
+            username=username,
+            findings=findings,
+            total_targets=len(targets),
+        )
+    else:
+        render_no_confirmed_service_access(
+            service="smb",
+            username=username,
+            total_targets=len(targets),
+        )
+
+    try:
+        record_service_access_probe_batch(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+            username=username,
+            service="smb",
+            targets=targets,
+            confirmed_hosts=[finding.host for finding in confirmed_findings],
+            source="run_native_smb_service_access_sweep",
+            backend=SMB_ACCESS_PROBE_BACKEND,
+            pivot_capable=is_service_pivot_capable("smb"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[service-access] failed to persist native SMB probe history: {exc}"
+        )
+
+    if confirmed_findings:
+        for finding in confirmed_findings:
+            try:
+                from adscan_internal.services.membership_snapshot import (
+                    add_runtime_admin_to_edge,
+                )
+
+                add_runtime_admin_to_edge(
+                    shell,
+                    domain,
+                    username=username,
+                    host_identifier=finding.host,
+                    target_hostname=target_hostnames.get(finding.host),
+                    source="smb_pwn3d_verified",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+        _handle_confirmed_service_followups(
+            shell,
+            domain=domain,
+            service="smb",
+            username=username,
+            password=password,
+            findings=confirmed_findings,
+            prompt=prompt,
+        )
+    return bool(confirmed_findings)
+
+
+def _run_native_mssql_service_access_sweep(
+    shell,
+    *,
+    workspace_dir,
+    domains_dir,
+    domain,
+    username,
+    password,
+    targets,
+    prompt,
+) -> bool:
+    """Run a native impacket MSSQL login sweep and persist the results.
+
+    Mirrors :func:`_run_native_smb_service_access_sweep`: posture-aware, TCP
+    pre-filter on 1433, normalized findings, probe history, and attack-graph
+    edges. A confirmed sysadmin login records ``SQLAdmin``; a confirmed
+    non-sysadmin login records ``SQLAccess`` — matching the netexec parity.
+    """
+    from adscan_internal.services.async_bridge import run_async_sync
+
+    _ensure_service_sweep_posture_fresh(shell, domain=domain)
+
+    if len(targets) > 1:
+        mssql_reach = filter_reachable_hosts_sync(targets, port=DEFAULT_MSSQL_PORT)
+        print_reachability_summary(mssql_reach, service_label="MSSQL")
+        if not mssql_reach.reachable:
+            render_no_reachable_panel(
+                mssql_reach, operation_label="MSSQL Access Sweep"
+            )
+            return False
+        targets = list(mssql_reach.reachable)
+
+    target_hostnames = _build_service_target_hostname_map(
+        shell, domain=domain, targets=targets
+    )
+
+    # Pass the DC/KDC IP so impacket's self-minted AS-REQ/TGS-REQ reaches the
+    # KDC even when the container has no AD DNS to resolve it from the domain.
+    from adscan_internal.models.domain import resolve_dc_ip
+
+    kdc_host = resolve_dc_ip(shell.domains_data.get(domain) or {})
+
+    findings = run_async_sync(
+        run_mssql_access_probe_sweep(
+            domain=domain,
+            username=username,
+            secret=password,
+            targets=targets,
+            target_hostnames=target_hostnames,
+            kdc_host=kdc_host,
+            max_workers=get_mssql_probe_worker_count(),
+        )
+    )
+
+    confirmed_findings = [finding for finding in findings if finding.is_confirmed]
+    if findings:
+        render_service_access_results(
+            service="mssql",
+            username=username,
+            findings=findings,
+            total_targets=len(targets),
+        )
+    else:
+        render_no_confirmed_service_access(
+            service="mssql",
+            username=username,
+            total_targets=len(targets),
+        )
+
+    try:
+        record_service_access_probe_batch(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+            username=username,
+            service="mssql",
+            targets=targets,
+            confirmed_hosts=[finding.host for finding in confirmed_findings],
+            source="run_native_mssql_service_access_sweep",
+            backend=MSSQL_ACCESS_PROBE_BACKEND,
+            pivot_capable=is_service_pivot_capable("mssql"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[service-access] failed to persist native MSSQL probe history: {exc}"
+        )
+
+    if confirmed_findings:
+        for finding in confirmed_findings:
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    upsert_netexec_privilege_edge,
+                )
+
+                relation = "SQLAdmin" if finding_is_sysadmin(finding) else "SQLAccess"
+                upsert_netexec_privilege_edge(
+                    shell,
+                    domain,
+                    username=username,
+                    relation=relation,
+                    target_ip=finding.host,
+                    target_hostname=target_hostnames.get(finding.host),
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+        _handle_confirmed_service_followups(
+            shell,
+            domain=domain,
+            service="mssql",
+            username=username,
+            password=password,
+            findings=confirmed_findings,
+            prompt=prompt,
+        )
+    return bool(confirmed_findings)
+
+
+def _service_backend_is_netexec(service: str) -> bool:
+    """Return whether the operator pinned this service's sweep to netexec.
+
+    Defaults to the native backend. The legacy netexec path is kept one
+    release behind these env flags (set to ``netexec`` to opt back in):
+      - ``ADSCAN_SMB_PRIVS_BACKEND``
+      - ``ADSCAN_MSSQL_PRIVS_BACKEND``
+    """
+    env_var = {
+        "smb": "ADSCAN_SMB_PRIVS_BACKEND",
+        "mssql": "ADSCAN_MSSQL_PRIVS_BACKEND",
+    }.get(service)
+    if not env_var:
+        return False
+    return os.getenv(env_var, "native").strip().lower() == "netexec"
+
 
 
 def _resolve_winrm_psrp_backend_reason(
@@ -831,6 +1224,48 @@ def run_service_access_sweep(
                         targets=effective_target_list,
                         prompt=prompt,
                         workflow_intent=workflow_intent,
+                    )
+                elif service == "smb" and not _service_backend_is_netexec("smb"):
+                    print_info(
+                        "Using native aiosmb backend for SMB access checks."
+                    )
+                    print_info_debug(
+                        "[privileges] service access sweep dispatch: "
+                        f"domain={marked_domain} user={marked_username} service={service} "
+                        f"backend={SMB_ACCESS_PROBE_BACKEND} "
+                        f"prompt_on_success={prompt!r} "
+                        f"targets={mark_sensitive(str(targets), 'path')}"
+                    )
+                    found_hosts = _run_native_smb_service_access_sweep(
+                        shell,
+                        workspace_dir=workspace_cwd,
+                        domains_dir=domains_dir,
+                        domain=domain,
+                        username=username,
+                        password=password,
+                        targets=effective_target_list,
+                        prompt=prompt,
+                    )
+                elif service == "mssql" and not _service_backend_is_netexec("mssql"):
+                    print_info(
+                        "Using native impacket TDS backend for MSSQL access checks."
+                    )
+                    print_info_debug(
+                        "[privileges] service access sweep dispatch: "
+                        f"domain={marked_domain} user={marked_username} service={service} "
+                        f"backend={MSSQL_ACCESS_PROBE_BACKEND} "
+                        f"prompt_on_success={prompt!r} "
+                        f"targets={mark_sensitive(str(targets), 'path')}"
+                    )
+                    found_hosts = _run_native_mssql_service_access_sweep(
+                        shell,
+                        workspace_dir=workspace_cwd,
+                        domains_dir=domains_dir,
+                        domain=domain,
+                        username=username,
+                        password=password,
+                        targets=effective_target_list,
+                        prompt=prompt,
                     )
                 else:
                     auth_str = shell.build_auth_nxc(

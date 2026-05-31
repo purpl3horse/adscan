@@ -63,6 +63,9 @@ from adscan_internal.services.cve_scanner.ux.report import (
     persist_report,
 )
 from adscan_internal.services.cve_scanner.ux.scan_log import ScanLogWriter
+from adscan_internal import get_console
+from adscan_internal.models.domain import resolve_dc_fqdn, resolve_dc_ip
+from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.ldap_transport_service import (
     async_connect_with_ldap_fallback,
 )
@@ -142,9 +145,8 @@ def _run_list() -> None:
             cve.affects_protocol,
             cve.target_scope.value,
         )
-    from rich.console import Console
 
-    Console().print(table)
+    get_console().print(table)
 
 
 def _run_report(shell: Any) -> None:
@@ -191,6 +193,7 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
     listener: str | None = None
     concurrency = 10
     audience = "technical"
+    force_dc = False
     i = 0
     while i < len(argv):
         token = argv[i]
@@ -214,10 +217,23 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
             audience = argv[i + 1]
             i += 2
             continue
+        if token == "--dc-scope":
+            # Explicit signal from the "Domain Controllers only" scope path
+            # (``do_enum_cve_dcs``): every host in the targets file is a DC,
+            # so force ``is_dc=True`` even when host-matching cannot confirm
+            # it (e.g. a freshly-written ``dcs.txt`` whose IP is not yet in
+            # ``domains_data[domain]["dcs"]``). The host-matching backstop in
+            # ``_load_targets`` still runs for the mixed "All hosts" scope.
+            force_dc = True
+            i += 1
+            continue
         print_warning(f"Ignoring unknown argument {token!r}")
         i += 1
 
-    targets = _load_targets(targets_path)
+    domain = getattr(shell, "domain", None)
+    targets = _load_targets(
+        targets_path, shell=shell, domain=domain, force_dc=force_dc
+    )
     if not targets:
         print_error("No targets to scan. Pass --targets <file> with one host per line.")
         return
@@ -229,7 +245,6 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
         return
 
     workspace_dir = _workspace_dir(shell) or Path.cwd()
-    domain = getattr(shell, "domain", None)
     masked_creds = _masked_creds(shell, domain)
 
     # Resolve credentials + DC IP once from the shell. These wire both the
@@ -490,19 +505,144 @@ def _insert_graph_edge(
         print_error(f"Failed to insert derived edge for {cve.aka}: {exc}")
 
 
-def _load_targets(path: str | None) -> tuple[ScanTarget, ...]:
+def _resolve_known_dc_identities(shell: Any, domain: str | None) -> frozenset[str]:
+    """Collect every identity token that names a DC of ``domain``.
+
+    Returns a lowercased set of IPs, FQDNs, and short hostnames drawn from
+    ``domains_data[domain]``. A scan target matches a DC when its host equals
+    any of these tokens (compared case-insensitively, and — for FQDNs — also
+    by short-label prefix). This is the auto-detect backstop that flags DCs
+    correctly regardless of how the operator selected the scope, so the
+    ``DCS_ONLY`` checks (Zerologon, NoPac, BadSuccessor) actually run.
+
+    Args:
+        shell: The interactive shell holding ``domains_data``.
+        domain: The current target domain. ``None`` short-circuits to empty.
+
+    Returns:
+        A frozenset of lowercased DC identity tokens (may be empty).
+    """
+
+    if not domain:
+        return frozenset()
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    info = domains_data.get(domain) or {}
+
+    tokens: set[str] = set()
+
+    # IPs — resolve_dc_ip walks pdc → dc_ip → dcs[0]; also fold in the full
+    # dcs[] list so a multi-DC domain flags every controller, not just the PDC.
+    dc_ip = resolve_dc_ip(info)
+    if dc_ip:
+        tokens.add(dc_ip.strip().lower())
+    for entry in info.get("dcs") or []:
+        token = str(entry or "").strip()
+        if token:
+            tokens.add(token.lower())
+
+    # FQDNs / hostnames — resolve_dc_fqdn walks the canonical alias chain;
+    # add the raw hostname fields too in case the targets file lists a short
+    # name rather than an IP.
+    fqdn = resolve_dc_fqdn(info, target_domain=domain)
+    for candidate in (
+        fqdn,
+        info.get("pdc_hostname"),
+        info.get("pdc_hostname_fqdn"),
+        info.get("pdc_fqdn"),
+        info.get("dc_fqdn"),
+        info.get("dc_hostname"),
+    ):
+        token = str(candidate or "").strip().rstrip(".")
+        if not token:
+            continue
+        token = token.lower()
+        tokens.add(token)
+        # Index the short label of any FQDN so a bare-hostname target matches.
+        if "." in token and not is_ip_address(token):
+            tokens.add(token.split(".", 1)[0])
+
+    return frozenset(tokens)
+
+
+def _target_is_dc(host: str, domain: str | None, dc_tokens: frozenset[str]) -> bool:
+    """Return ``True`` when ``host`` names a known DC of ``domain``.
+
+    Matches case-insensitively by IP, by FQDN, and by short label (so a
+    targets file entry of either ``dc01``, ``dc01.corp.local``, or
+    ``10.0.0.1`` all resolve to the same controller).
+
+    Args:
+        host: The raw target host (IP or hostname) from the targets file.
+        domain: The current target domain, used to promote short labels.
+        dc_tokens: The identity set from ``_resolve_known_dc_identities``.
+
+    Returns:
+        ``True`` when the host matches a known DC token.
+    """
+
+    if not host or not dc_tokens:
+        return False
+    candidate = host.strip().rstrip(".").lower()
+    if not candidate:
+        return False
+    if candidate in dc_tokens:
+        return True
+    # A short label target also matches when its promoted FQDN is known.
+    if "." not in candidate and not is_ip_address(candidate) and domain:
+        promoted = f"{candidate}.{str(domain).strip().rstrip('.').lower()}"
+        if promoted in dc_tokens:
+            return True
+    # An FQDN target also matches when only its short label is known.
+    if "." in candidate and not is_ip_address(candidate):
+        if candidate.split(".", 1)[0] in dc_tokens:
+            return True
+    return False
+
+
+def _load_targets(
+    path: str | None,
+    *,
+    shell: Any | None = None,
+    domain: str | None = None,
+    force_dc: bool = False,
+) -> tuple[ScanTarget, ...]:
+    """Load scan targets from ``path`` and flag the domain controllers.
+
+    Each non-comment line becomes a ``ScanTarget``. A target is marked
+    ``is_dc=True`` when ``force_dc`` is set (explicit "Domain Controllers
+    only" scope) OR when its host matches a known DC of ``domain`` (the
+    auto-detect backstop). Without this flag, ``scope_applies_to_target``
+    marks every ``DCS_ONLY`` check (Zerologon, NoPac, BadSuccessor) as
+    NOT_APPLICABLE and they never run.
+
+    Args:
+        path: Targets file, one host (IP or hostname) per line.
+        shell: Interactive shell holding ``domains_data`` (for auto-detect).
+        domain: Current target domain (for DC identity resolution).
+        force_dc: When ``True``, every target is flagged as a DC.
+
+    Returns:
+        A tuple of ``ScanTarget`` with ``is_dc`` correctly populated.
+    """
+
     if not path:
         return ()
-    p = Path(path)
-    if not p.is_file():
+    file_path = Path(path)
+    if not file_path.is_file():
         print_error(f"Targets file not found: {path}")
         return ()
+
+    dc_tokens: frozenset[str] = frozenset()
+    if shell is not None and not force_dc:
+        dc_tokens = _resolve_known_dc_identities(shell, domain)
+
     out: list[ScanTarget] = []
-    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for raw in file_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         host = raw.strip()
         if not host or host.startswith("#"):
             continue
-        out.append(ScanTarget(host=host))
+        is_dc = force_dc or _target_is_dc(host, domain, dc_tokens)
+        out.append(ScanTarget(host=host, is_dc=is_dc))
     return tuple(out)
 
 

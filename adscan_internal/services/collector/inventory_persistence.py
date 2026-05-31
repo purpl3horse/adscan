@@ -322,6 +322,9 @@ def _write_domain_policy_file(
             "max_pwd_age_days": policy.max_pwd_age_days,
             "pwd_history_length": policy.pwd_history_length,
             "machine_account_quota": policy.machine_account_quota,
+            # ``None`` distinguishes "attribute unreadable" from "explicitly
+            # disabled"; downstream renderers must treat None as unknown.
+            "complexity_enabled": policy.complexity_enabled,
             # ISO timestamp of the most recent password-policy attribute
             # change, derived from msDS-ReplAttributeMetaData. None when
             # the attribute was unreadable.

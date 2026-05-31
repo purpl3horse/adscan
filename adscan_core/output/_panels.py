@@ -33,14 +33,12 @@ def print_instruction(
         spacing: Spacing control ("auto", "none", "before", "after", "both"). Default: "auto"
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Handle spacing
     spacing_before = _handle_spacing("instruction", panel, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     # Format message (preserves Rich markup or Text object)
     if isinstance(message, Text):
@@ -57,25 +55,17 @@ def print_instruction(
             message_text, border_style="dim", box=ROUNDED, padding=(0, 1)
         )
         console.print(panel_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(panel_renderable)
         # Panels always get space after
         if spacing != "none":
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
     else:
         output = Text("   ", style="dim")
         output.append(message_text)
         console.print(output)
-        if telemetry_console is not None:
-            telemetry_console.print(output)
 
         # Handle spacing after if requested
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
 
 def print_panel(
@@ -150,7 +140,7 @@ def print_panel(
         print_panel(group_content, title="Group Panel")
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     if title is not None and title_align is None:
         title_align = "center"
@@ -163,8 +153,6 @@ def print_panel(
     spacing_before = _handle_spacing("info", True, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     def _coerce_renderable(item: object) -> RenderableType:
         """Convert a supported value into a Rich renderable.
@@ -214,20 +202,14 @@ def print_panel(
         )
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
     # Handle spacing after
     if spacing != "none":
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
         else:
             # Auto mode: panels always get space after
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
 
 def print_system_change_warning(
@@ -285,7 +267,7 @@ def print_section(
         icon: Optional icon to display before title
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     title_text = Text()
     if icon:
@@ -300,8 +282,6 @@ def print_section(
         panel_content, border_style=border_style, box=ROUNDED, padding=(1, 2)
     )
     console.print(panel_renderable)
-    if telemetry_console is not None:
-        telemetry_console.print(panel_renderable)
 
 
 def print_panel_with_table(
@@ -339,7 +319,7 @@ def print_panel_with_table(
         )
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Use brand color as default border style
     if border_style is None:
@@ -349,8 +329,6 @@ def print_panel_with_table(
     spacing_before = _handle_spacing("info", True, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     # Create panel with table inside
     panel = Panel(
@@ -363,20 +341,14 @@ def print_panel_with_table(
     )
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
     # Handle spacing after
     if spacing != "none":
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
         else:
             # Auto mode: panels always get space after
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
 
 def print_group(messages: List[tuple], group_title: Optional[str] = None):
@@ -388,7 +360,7 @@ def print_group(messages: List[tuple], group_title: Optional[str] = None):
         group_title: Optional title for the group
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
     group_items = []
 
     if group_title:
@@ -416,13 +388,9 @@ def print_group(messages: List[tuple], group_title: Optional[str] = None):
             padding=(1, 2),
         )
         console.print(panel_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(panel_renderable)
     else:
         group_renderable = Group(*group_items)
         console.print(group_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(group_renderable)
 
 
 def print_operation_header(
@@ -441,7 +409,7 @@ def print_operation_header(
         >>> print_operation_header("SMB Scan", {"Target": "10.0.0.0/24", "Mode": "Unauthenticated"})
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Build header content
     header_text = Text()
@@ -473,12 +441,8 @@ def print_operation_header(
     spacing_before = _handle_spacing("info", True, "auto")
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
 
 def print_phase_header(
@@ -516,7 +480,7 @@ def print_phase_header(
         )
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Build header text with phase progress
     header_text = Text()
@@ -553,12 +517,8 @@ def print_phase_header(
     spacing_before = _handle_spacing("info", True, "auto")
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
 
 def print_step_status(
@@ -603,12 +563,12 @@ def print_step_status(
         )
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Status styling
     status_styles = {
         "starting": ("⚡", "bold yellow"),
-        "running": ("⏳", "bold cyan"),
+        "running": ("⏳", f"bold {ADSCAN_PRIMARY}"),
         "completed": ("✓ ", "bold green"),
         "failed": ("✗", "bold red"),
         "skipped": ("○", "dim"),
@@ -639,8 +599,6 @@ def print_step_status(
         text.append(details, style="white")
 
     console.print(text)
-    if telemetry_console is not None:
-        telemetry_console.print(text)
 
 
 __all__ = [

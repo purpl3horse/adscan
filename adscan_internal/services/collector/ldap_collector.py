@@ -896,6 +896,7 @@ class ADscanLDAPCollector:
             f"acls={scope.acls} memberships={scope.group_memberships}"
         )
         self._active_scope = scope
+        sealing_mechanism: object | None = None
         try:
             with ADscanLDAPConnection(config) as conn:
                 acl_parser = ACLParser(domain=credentials.domain, connection=conn)
@@ -916,17 +917,73 @@ class ADscanLDAPCollector:
                     _adcs_t = time.monotonic()
                     self._collect_adcs(conn, credentials.domain, acl_parser, result)
                     result.adcs_elapsed = time.monotonic() - _adcs_t
+                # Capture which confidentiality mechanism sealed the channel
+                # BEFORE __exit__ resets it to None. Consumed by the operator
+                # cleartext advisory (C.b) below.
+                sealing_mechanism = conn.mechanism
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_warning_debug(f"[ldap-collector] collection failed: {exc}")
         finally:
             self._active_scope = None
+        self._maybe_advise_cleartext(credentials, config, sealing_mechanism)
         print_info_debug(
             "[ldap-collector] done "
             f"domain={mark_sensitive(credentials.domain, 'domain')} "
             f"nodes={len(result.nodes)} edges={len(result.edges)}"
         )
         return result
+
+    @staticmethod
+    def _maybe_advise_cleartext(
+        credentials: LDAPCredentials,
+        config: ADscanLDAPConfig,
+        mechanism: object | None,
+    ) -> None:
+        """Surface the operator cleartext advisory for an authenticated enum read.
+
+        Operator-only (C.b): when an AUTHENTICATED directory enumeration actually
+        proceeded over a CLEARTEXT channel, the operator should know their traffic
+        travelled in the clear and how to unblock a confidential channel. This is
+        situational CLI output and NEVER records a technical finding.
+
+        Gated so it never spams or fires on benign cases:
+
+          * Only when the channel ended up CLEARTEXT.
+          * Never for anonymous binds — cleartext is the expected, benign outcome
+            there (anonymous rootDSE / unauth sweeps), not an operator concern.
+          * Never for failure-eliciting probe contexts (``disable_self_heal``),
+            which intentionally accept cleartext.
+          * At most once per ``(domain, "ldap_enumeration")`` per run.
+        """
+        try:
+            from adscan_internal.services.ldap_transport_service import (
+                ConfidentialityMechanism,
+            )
+
+            if mechanism is not ConfidentialityMechanism.CLEARTEXT:
+                return
+            if credentials.is_anonymous:
+                return
+            if getattr(config, "disable_self_heal", False):
+                return
+
+            from adscan_internal.cli.ldap_confidentiality_advisory import (
+                render_cleartext_ldap_advisory,
+                should_advise_cleartext_once,
+            )
+
+            domain = credentials.domain or ""
+            if not should_advise_cleartext_once(domain, "ldap_enumeration"):
+                return
+            render_cleartext_ldap_advisory(
+                dc_ip=credentials.dc_ip,
+                mechanism=mechanism,
+                reason="LDAP enumeration / graph collection",
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[ldap-collector] cleartext advisory skipped: {exc}")
 
     def _collect_domain_node(
         self,
@@ -1004,6 +1061,7 @@ class ADscanLDAPCollector:
                     "lockoutObservationWindow",
                     "maxPwdAge",
                     "pwdHistoryLength",
+                    "pwdProperties",
                     "ms-DS-MachineAccountQuota",
                     # Per-attribute replication metadata — gives us the exact
                     # timestamp each password-policy attribute was last modified,
@@ -1026,6 +1084,12 @@ class ADscanLDAPCollector:
 
         attrs = _attrs(entries[0])
 
+        # NOTE: these mirror ``password_policy_compliance.ad_duration_to_days`` /
+        # ``ad_duration_to_minutes`` but intentionally keep the local
+        # "``0`` floors to ``0``" semantics that the offline DomainPolicy/PSO
+        # models depend on (the canonical converter maps a sub-unit duration to
+        # ``None``). TODO: unify once the collector models tolerate ``None`` for
+        # zero-duration fields without changing audit output.
         def _100ns_to_days(raw: int | None) -> int | None:
             if not raw:
                 return None
@@ -1038,6 +1102,16 @@ class ADscanLDAPCollector:
 
         repl_blobs = _values(attrs, "msDS-ReplAttributeMetaData")
         pwd_attrs = _parse_repl_attr_metadata(repl_blobs, _DDP_PWD_ATTRS)
+        # Decode the ``pwdProperties`` bitmask: bit 0 (DOMAIN_PASSWORD_COMPLEX
+        # = 0x1) controls whether the Default Domain Password Policy enforces
+        # complexity ("must meet complexity requirements"). When the attribute
+        # is unreadable / absent we record ``None`` so downstream consumers
+        # can distinguish "not collected" from "explicitly disabled".
+        pwd_props_raw = _int_attr(attrs, "pwdProperties")
+        if pwd_props_raw is None:
+            complexity_enabled: bool | None = None
+        else:
+            complexity_enabled = bool(pwd_props_raw & 0x1)
         result.domain_policy = DomainPolicy(
             min_pwd_length=_int_attr(attrs, "minPwdLength"),
             lockout_threshold=_int_attr(attrs, "lockoutThreshold"),
@@ -1047,6 +1121,7 @@ class ADscanLDAPCollector:
             max_pwd_age_days=_100ns_to_days(_int_attr(attrs, "maxPwdAge")),
             pwd_history_length=_int_attr(attrs, "pwdHistoryLength"),
             machine_account_quota=_int_attr(attrs, "ms-DS-MachineAccountQuota"),
+            complexity_enabled=complexity_enabled,
             pwd_attrs_when_changed=pwd_attrs,
             pwd_policy_last_changed=pwd_attrs[0][1] if pwd_attrs else None,
         )
@@ -1098,6 +1173,12 @@ class ADscanLDAPCollector:
         if not entries:
             return
 
+        # NOTE: these mirror ``password_policy_compliance.ad_duration_to_days`` /
+        # ``ad_duration_to_minutes`` but intentionally keep the local
+        # "``0`` floors to ``0``" semantics that the offline DomainPolicy/PSO
+        # models depend on (the canonical converter maps a sub-unit duration to
+        # ``None``). TODO: unify once the collector models tolerate ``None`` for
+        # zero-duration fields without changing audit output.
         def _100ns_to_days(raw: int | None) -> int | None:
             if not raw:
                 return None

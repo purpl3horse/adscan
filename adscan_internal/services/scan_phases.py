@@ -97,8 +97,8 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
     ),
     ScanPhase(
         phase_id="audit_extras",
-        title="Audit-only Extras",
-        subtitle="Broader CVE scan and configuration enumeration.",
+        title="CVE Verification",
+        subtitle="Read-only vulnerability detection on DCs (native CVE catalog). No exploitation.",
         audit_only=True,
     ),
 )

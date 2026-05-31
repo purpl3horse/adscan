@@ -89,6 +89,41 @@ TARGET_OUTCOME_SECTION_STYLES: dict[str, tuple[str, str, str]] = {
     "graph_extension": ("High-Impact Privileges", "⚠", "info"),
     "pivot": ("Pivot Opportunities", "➜", "info"),
 }
+
+# Display tiers — the operator-facing 3-level grouping the CLI table sections
+# render. Distinct on purpose from the 5-value ``outcome_class`` above, which is
+# kept verbatim because the PDF report, executive PDF, premium report.html and
+# cached records all consume those strings. This collapses the five outcome
+# classes into the three triage tiers a pentester actually reasons about, and
+# fixes the crossed-label confusion where the canonical ``COMPROMISE_ENABLER``
+# class surfaced under a section labelled "High-Impact Privileges" while the
+# section labelled "Domain Compromise Enablers" was fed by ``PRIVILEGED_ESCALATOR``.
+DISPLAY_TIER_DOMAIN_COMPROMISE = "domain_compromised"
+DISPLAY_TIER_COMPROMISE_ENABLER = "compromise_enabler"
+DISPLAY_TIER_LATERAL_PIVOT = "lateral_pivot"
+
+_OUTCOME_CLASS_TO_DISPLAY_TIER: dict[str, str] = {
+    "direct_compromise": DISPLAY_TIER_DOMAIN_COMPROMISE,
+    "tier0_foothold": DISPLAY_TIER_DOMAIN_COMPROMISE,
+    "followup_terminal": DISPLAY_TIER_COMPROMISE_ENABLER,
+    "graph_extension": DISPLAY_TIER_COMPROMISE_ENABLER,
+    "future_followup": DISPLAY_TIER_LATERAL_PIVOT,
+    "dependency_only": DISPLAY_TIER_LATERAL_PIVOT,
+    "pivot": DISPLAY_TIER_LATERAL_PIVOT,
+}
+
+DISPLAY_TIER_ORDER: tuple[str, ...] = (
+    DISPLAY_TIER_DOMAIN_COMPROMISE,
+    DISPLAY_TIER_COMPROMISE_ENABLER,
+    DISPLAY_TIER_LATERAL_PIVOT,
+)
+
+# (label, icon, style_key) — style_key indexes BRAND_COLORS at the call site.
+DISPLAY_TIER_STYLES: dict[str, tuple[str, str, str]] = {
+    DISPLAY_TIER_DOMAIN_COMPROMISE: ("Domain Compromised", "🔥", "error"),
+    DISPLAY_TIER_COMPROMISE_ENABLER: ("Compromise Enablers", "🎯", "warning"),
+    DISPLAY_TIER_LATERAL_PIVOT: ("Lateral & Pivot", "➜", "info"),
+}
 CANONICAL_SEARCH_MODE_LABELS: dict[str, str] = {
     "pivot": "Pivot Search",
     "low_priv": "Low-Priv Search",
@@ -337,6 +372,19 @@ def describe_path_target_outcome(record: dict[str, object]) -> str:
     return TARGET_OUTCOME_LABELS.get(
         get_path_target_outcome_class(record),
         "Pivot Opportunity",
+    )
+
+
+def get_path_display_tier(record: dict[str, object]) -> str:
+    """Return the 3-level operator display tier for one path.
+
+    Collapses the 5-value :func:`get_path_target_outcome_class` into the three
+    triage tiers the CLI table sections render (Domain Compromised / Compromise
+    Enablers / Lateral & Pivot). See :data:`DISPLAY_TIER_ORDER`.
+    """
+    return _OUTCOME_CLASS_TO_DISPLAY_TIER.get(
+        get_path_target_outcome_class(record),
+        DISPLAY_TIER_LATERAL_PIVOT,
     )
 
 

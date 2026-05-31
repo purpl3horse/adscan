@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
@@ -28,6 +29,12 @@ _CURRENT_VANTAGE_ROOT_FILES = (
     "enabled_computers_reachable_ips.txt",
     "enabled_computers_no_response_ips.txt",
 )
+
+# Ligolo TUN interface names are built deterministically by
+# ``pivot_service._build_ligolo_interface_name`` as ``f"lg{digest}"[:15]`` where
+# ``digest = sha1(...).hexdigest()[:10]`` — i.e. ``lg`` + exactly 10 lowercase
+# hex chars (e.g. ``lg1a2b3c4d5e``).
+_LIGOLO_INTERFACE_NAME_PATTERN = re.compile(r"lg[0-9a-f]{10}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +181,40 @@ def has_active_ligolo_tunnel_for_domain(*, workspace_dir: str, domain: str) -> b
     return False
 
 
+def is_ligolo_interface(interface_name: str | None) -> bool:
+    """Return whether ``interface_name`` is a Ligolo TUN interface by its name.
+
+    This is a name-based identity check. It matches EITHER:
+      * the deterministic naming scheme used by
+        ``pivot_service._build_ligolo_interface_name`` (``lg`` + exactly 10
+        lowercase hex chars, e.g. ``lg1a2b3c4d5e``), OR
+      * any name beginning with ``ligolo`` (case-insensitive) — defensive cover
+        for a renamed/aliased TUN or any ``ligolo*`` form the operator may have
+        selected.
+    It does NOT read or depend on the Ligolo tunnel's alive/active runtime
+    state — a TUN is a Ligolo TUN by its nature (name) regardless of whether the
+    tunnel is currently live.
+
+    Callers (e.g. the network-preflight interface-switch offer) use this to skip
+    route/interface-mismatch logic when the operator's selected interface is a
+    Ligolo TUN: such an interface intentionally has no normal source IP / default
+    route, so a route "mismatch" against it is meaningless.
+
+    Args:
+        interface_name: Interface name to test (e.g. ``shell.interface``).
+
+    Returns:
+        True iff the stripped name matches the Ligolo TUN name pattern.
+    """
+
+    name = str(interface_name or "").strip()
+    if not name:
+        return False
+    if _LIGOLO_INTERFACE_NAME_PATTERN.fullmatch(name) is not None:
+        return True
+    return name.lower().startswith("ligolo")
+
+
 def reconcile_workspace_pivot_runtime_state(
     shell: Any,
     *,
@@ -288,6 +329,7 @@ def reconcile_domain_pivot_runtime_state(
 __all__ = [
     "PivotRuntimeReconciliationResult",
     "has_active_ligolo_tunnel_for_domain",
+    "is_ligolo_interface",
     "reconcile_domain_pivot_runtime_state",
     "reconcile_workspace_pivot_runtime_state",
     "restore_direct_vantage_artifacts",

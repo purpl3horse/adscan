@@ -747,8 +747,14 @@ class KerberosEnumerationMixin:
                 paged_size=1000,
             )
             if not isinstance(connection.entries, list):
+                print_info_debug(
+                    "[kerberoast] LDAP enumeration returned no entries object "
+                    f"(type={type(connection.entries).__name__}) for "
+                    f"{mark_sensitive(str(domain), 'domain')}"
+                )
                 return []
 
+            raw_entry_count = len(connection.entries)
             collected: list[dict[str, object]] = []
             for entry in connection.entries:
                 raw_mapping = entry.entry_attributes_as_dict
@@ -773,6 +779,14 @@ class KerberosEnumerationMixin:
                         ],
                     }
                 )
+            # Raw vs filtered counts disambiguate an intermittent "0 SPN users":
+            # 0 raw on a completed search => no SPN-bearing account (or the
+            # search raced); raw>0 collected=0 => all hits disabled / sAM-less.
+            print_info_debug(
+                "[kerberoast] LDAP SPN enumeration for "
+                f"{mark_sensitive(str(domain), 'domain')}: "
+                f"raw_entries={raw_entry_count} candidates={len(collected)}"
+            )
             return collected
 
         auth_domain_data = (
@@ -1289,7 +1303,16 @@ class KerberosEnumerationMixin:
                 paged_size=1000,
             )
             if not isinstance(connection.entries, list):
+                # Search did not yield a list of entries — distinct from an
+                # empty result. Logged so an intermittent "0 candidates" can be
+                # told apart from a genuinely empty directory next time.
+                print_info_debug(
+                    "[asreproast] LDAP enumeration returned no entries object "
+                    f"(type={type(connection.entries).__name__}) for "
+                    f"{mark_sensitive(str(domain), 'domain')}"
+                )
                 return []
+            raw_entry_count = len(connection.entries)
             usernames: list[str] = []
             for entry in connection.entries:
                 raw_mapping = entry.entry_attributes_as_dict
@@ -1299,6 +1322,15 @@ class KerberosEnumerationMixin:
                 ).strip()
                 if sam:
                     usernames.append(sam)
+            # Raw vs filtered counts disambiguate the "0 AS-REP candidates"
+            # outcomes: 0 raw on a completed search => directory has no
+            # DONT_REQ_PREAUTH account (or the search raced); raw>0 filtered to
+            # 0 => every hit lacked sAMAccountName.
+            print_info_debug(
+                "[asreproast] LDAP DONT_REQ_PREAUTH enumeration for "
+                f"{mark_sensitive(str(domain), 'domain')}: "
+                f"raw_entries={raw_entry_count} candidates={len(usernames)}"
+            )
             return usernames
 
         candidates, _used_ldaps = execute_with_ldap_fallback(

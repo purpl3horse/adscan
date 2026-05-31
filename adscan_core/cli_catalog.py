@@ -32,13 +32,17 @@ PRO_ONLY_COMMANDS: frozenset[str] = frozenset({
 # free entry points). Used purely for help-listing classification.
 LITE_DELIVERABLE_COMMANDS: frozenset[str] = frozenset({
     "cheatsheet",
+    "mitre-navigator",
 })
 
 # All commands that belong to the "Client Deliverables" help category, in
-# the order they should be displayed.
+# the order they should be displayed. This tuple's only job is a stable
+# display order; the LITE-vs-PRO grouping in the launcher help is derived
+# from ``tier_for_command`` at render time, not from this ordering.
 DELIVERABLE_COMMAND_ORDER: tuple[str, ...] = (
     "deliver",
     "cheatsheet",
+    "mitre-navigator",
 )
 
 

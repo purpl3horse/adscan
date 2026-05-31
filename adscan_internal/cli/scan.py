@@ -891,6 +891,38 @@ def _run_unauth_followups_or_kerbrute(
             print_error(f"Kerberos user enumeration failed: {e}")
         return
 
+    # Foothold exists, but if the user list came ONLY from a RESTRICTED anonymous
+    # bind (RestrictAnonymous=1: bind allowed, full user search denied), it is
+    # known-incomplete — the few CN-inferred users are not the whole picture.
+    # Expand it via Kerberos username enumeration BEFORE the follow-ups, so the
+    # AS-REP/spray steps operate on the full user set. This reuses the SAME
+    # escalation the zero-foothold path uses (ask_for_kerberos_user_enum), so the
+    # interactive/non-interactive behavior is identical to that path — no new
+    # auto-spray decision is introduced.
+    if ldap_anon_open and ldap_users_status in ("denied", "skipped") and unauth_users_count > 0:
+        print_info(
+            f"User list for {mark_sensitive(domain, 'domain')} came from a restricted "
+            f"anonymous bind (RestrictAnonymous) — only {unauth_users_count} disclosed; "
+            "more users likely exist. Expanding via Kerberos username enumeration."
+        )
+        print_operation_header(
+            "Kerberos User Enumeration",
+            details={
+                "Domain": domain,
+                "PDC": pdc,
+                "Tool": "kerbrute",
+                "Reason": "anon bind restricted",
+            },
+            icon="🔑",
+        )
+        try:
+            self.ask_for_kerberos_user_enum(domain)
+        except Exception as e:  # noqa: BLE001
+            telemetry.capture_exception(e)
+            print_error(f"Kerberos user enumeration failed: {e}")
+        # Refresh the count so the follow-up menu reflects the expanded user set.
+        unauth_users_count = domain_data.get("unauth_users_count", unauth_users_count)
+
     # ── Surface briefing panel ────────────────────────────────────────────
     _render_attack_surface_panel(probe_results, domain=domain, domain_data=domain_data)
 
@@ -1683,7 +1715,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
 
         try:
-            from adscan_internal.services.report_service import (
+            from adscan_core.reporting.technical_report import (
                 record_technical_finding,
             )
 
@@ -1756,7 +1788,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
 
         try:
-            from adscan_internal.services.report_service import (
+            from adscan_core.reporting.technical_report import (
                 record_technical_finding,
             )
 
@@ -1806,7 +1838,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             )
 
         try:
-            from adscan_internal.services.report_service import (
+            from adscan_core.reporting.technical_report import (
                 record_technical_finding,
             )
 

@@ -65,10 +65,8 @@ def _emit(renderable: Any, *, level: int = logging.INFO) -> None:
     components in this module respect the global "always log + telemetry" rule.
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
     console.print(renderable)
-    if telemetry_console is not None:
-        telemetry_console.print(renderable)
     plain = _renderable_to_plain_text(renderable)
     if plain:
         _log_to_file(level, plain)
@@ -77,10 +75,8 @@ def _emit(renderable: Any, *, level: int = logging.INFO) -> None:
 def _emit_blank() -> None:
     """Print a blank line to console and telemetry console (not log file)."""
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
     console.print()
-    if telemetry_console is not None:
-        telemetry_console.print()
 
 
 _DIM = "dim"
@@ -93,7 +89,17 @@ _DIM = "dim"
 
 @dataclass
 class SessionHeader:
-    """Context shown at scan start: workspace, target, credential, mode."""
+    """Context shown at scan start: workspace, target, credential, mode.
+
+    The ``experimental`` flag is the TUI-level signal that the active
+    command is in BETA — autonomous flow, behaviour may change between
+    releases. When set, the Mode row is annotated with a visible
+    ``⚡ EXPERIMENTAL · AUTONOMOUS`` badge using the amber accent so
+    operators see at a glance that the run is unattended and not yet a
+    stable contract. The information is duplicated in a dedicated
+    callout panel (:func:`print_ci_autonomous_callout`) for first-run
+    discoverability.
+    """
 
     workspace: str
     target_domain: str
@@ -101,13 +107,17 @@ class SessionHeader:
     credential_label: str = ""
     scan_mode: str = "ci"
     version: str = ""
+    experimental: bool = False
 
 
 def print_session_header(header: SessionHeader) -> None:
     """Print the branded session header at the start of a scan.
 
-    Shows the ASCII gradient logo, a tagline line, then a compact info bar
-    with workspace, target domain, DC IP, credential, and mode.
+    Shows the ASCII gradient logo, a tagline line, then a compact info
+    bar with workspace, target domain, DC IP, credential, and mode.
+    When ``header.experimental`` is set the Mode row carries an inline
+    BETA badge so the experimental status is always visible — never
+    hidden behind a help flag.
     """
     from adscan_core.branding import build_gradient_ascii, ADSCAN_TAGLINE
 
@@ -134,7 +144,19 @@ def print_session_header(header: SessionHeader) -> None:
     if header.credential_label:
         grid.add_row("Credential", f"[{_STEEL}]{header.credential_label}[/]")
     mode_style = _AMBER if header.scan_mode == "ci" else _SAGE
-    grid.add_row("Mode", f"[{mode_style}]{header.scan_mode.upper()}[/]")
+    mode_cell = f"[{mode_style}]{header.scan_mode.upper()}[/]"
+    if header.experimental:
+        # Inline badge — always visible, no chrome. The ⚡ glyph and the
+        # explicit word "EXPERIMENTAL" mean the indicator is legible even
+        # under NO_COLOR. The "AUTONOMOUS" qualifier disambiguates what
+        # makes this mode different (no prompts, defaults applied).
+        mode_cell = (
+            f"{mode_cell}   "
+            f"[bold {_AMBER}]⚡ EXPERIMENTAL[/] "
+            f"[{_MUTED}]·[/] "
+            f"[bold {_STEEL}]AUTONOMOUS[/]"
+        )
+    grid.add_row("Mode", mode_cell)
 
     _emit(
         Panel(
@@ -144,6 +166,76 @@ def print_session_header(header: SessionHeader) -> None:
             padding=(0, 2),
         )
     )
+    _emit_blank()
+
+
+# ---------------------------------------------------------------------------
+# Autonomous / experimental mode callout
+# ---------------------------------------------------------------------------
+
+
+def print_ci_autonomous_callout() -> None:
+    """Print the one-shot educational callout for autonomous (ci) mode.
+
+    Rendered immediately after the session header on every ``adscan ci``
+    run. Frames operator expectations before the scan starts:
+
+    * ``adscan ci`` is a thin wrapper that drives the same engine the
+      interactive ``adscan start`` shell drives, with all confirmation
+      prompts skipped and defaults applied automatically.
+    * The mode is **experimental / beta** — defaults are calibrated for
+      common lab and CI flows; behaviour may change between releases as
+      heuristics improve.
+    * Concrete recovery paths if a run looks wrong: ``--debug``, the
+      docs link, and re-running in interactive mode for the same
+      target.
+
+    Visual contract — pure TUI design system:
+
+    * Border: amber (warn accent) so the panel reads as a status banner
+      and not as a hard error.
+    * Title: ⚡ glyph + plain words so the signal carries through
+      NO_COLOR terminals.
+    * Body: three concise rows; no walls of text. Cyan accents for
+      actionable verbs (re-run, switch), muted dim for metadata.
+    """
+    body = Table.grid(padding=(0, 2))
+    body.add_column(style=_DIM, justify="right", min_width=10)
+    body.add_column(justify="left")
+
+    body.add_row(
+        f"[bold {_STEEL}]What[/]",
+        (
+            f"[bold]Autonomous scan[/] — no prompts, defaults applied. "
+            f"Same engine as [{_STEEL}]adscan start[/], hands-off control flow."
+        ),
+    )
+    body.add_row(
+        f"[bold {_AMBER}]Status[/]",
+        (
+            f"[bold {_AMBER}]BETA · EXPERIMENTAL[/]  "
+            f"[{_MUTED}]Heuristic defaults may change between releases.[/]"
+        ),
+    )
+    body.add_row(
+        f"[bold {_STEEL}]If wrong[/]",
+        (
+            f"Re-run with [bold]--debug[/] for verbose telemetry, then "
+            f"open an issue at [{_STEEL}]https://adscanpro.com/docs[/]. "
+            f"For operator-in-the-loop control switch to "
+            f"[{_STEEL}]adscan start[/]."
+        ),
+    )
+
+    panel = Panel(
+        body,
+        title=f"[bold {_AMBER}]⚡ Autonomous Mode (Experimental)[/]",
+        title_align="left",
+        border_style=f"bold {_AMBER}",
+        box=ROUNDED,
+        padding=(1, 2),
+    )
+    _emit(panel)
     _emit_blank()
 
 

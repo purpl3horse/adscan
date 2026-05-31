@@ -269,11 +269,18 @@ def handle_validated_domain_hits_followup(
             flags = risk_flags_by_user.get(user.strip().lower(), UserRiskFlags())
             if flags.is_tier0:
                 # ▲ glyph + text so the badge does not depend on red color.
+                # CLI syntax — domain is positional #1, `owned` is the user
+                # scope; tier-0 filtering happens via the `--tier0-only`
+                # flag (not a second positional, which the parser would
+                # reject as an unknown username).
                 priv_badge = Text("▲ TIER-0 / DA", style=f"bold {COLOR_CRIMSON}")
-                action_hint = f"attack_paths owned tier0  ·  enum {user}"
+                action_hint = (
+                    f"attack_paths {domain} owned --tier0-only  ·  enum {user}"
+                )
             else:
                 priv_badge = Text("◆ HIGH VALUE", style=f"bold {COLOR_AMBER}")
-                action_hint = f"attack_paths owned highvalue  ·  enum {user}"
+                # Default scope is high-value targets, so no extra flag needed.
+                action_hint = f"attack_paths {domain} owned  ·  enum {user}"
             privileged_table.add_row(
                 str(idx),
                 priv_badge,
@@ -1136,6 +1143,7 @@ def _render_valid_spray_hits_panel(
     spray_type: str | None,
     risk_flags: dict[str, object] | None = None,
     lockout_context: dict[str, object] | None = None,
+    domain: str | None = None,
 ) -> None:
     """Render a concise, action-oriented panel listing the discovered spray hits.
 
@@ -1151,6 +1159,11 @@ def _render_valid_spray_hits_panel(
             inline as a status-bar-style reminder under the hits table. Keys:
             ``threshold`` (int|None), ``minimum_remaining`` (int|None),
             ``safe_reserve`` (int|None), ``no_lockout`` (bool).
+        domain: Domain the spray was executed against. Interpolated into the
+            ``attack_paths {domain} owned`` follow-up hint so the operator can
+            copy-paste it verbatim. When ``None``, the literal ``<domain>``
+            placeholder is shown — never the bare ``attack_paths owned`` form,
+            which the CLI would parse as ``domain=owned`` and fail.
     """
     from adscan_core.theme import COLOR_AMBER, COLOR_CRIMSON, COLOR_SAGE
     from adscan_internal.rich_output import print_panel
@@ -1339,24 +1352,32 @@ def _render_valid_spray_hits_panel(
     # The operator's next move depends on what was captured. A static
     # "attack_paths or enum" line treats all outcomes equally and wastes
     # the highest-leverage moment of the run.
+    #
+    # IMPORTANT — CLI syntax: `attack_paths` requires the domain as the
+    # FIRST positional argument. The previous strings here used invented
+    # second positionals ("tier0", "highvalue") that the CLI would parse
+    # as a username and reject. Real flags are `--tier0-only` (for Tier-0
+    # targets) and the default (high-value targets). For "lateral / pivot
+    # without escalation" use `--lowpriv`.
+    domain_token = (domain or "").strip() or "<domain>"
     if top_class == "tier0":
         footer_lines.append(
             f"[bold {COLOR_CRIMSON}]▶ Next:[/bold {COLOR_CRIMSON}] "
             "[dim]Tier-0 credential captured — pivot immediately with "
-            "[bold]attack_paths owned tier0[/bold] or run "
+            f"[bold]attack_paths {domain_token} owned --tier0-only[/bold] or run "
             "[bold]enum[/bold] on the Tier-0 user to confirm DA rights.[/dim]"
         )
     elif top_class == "high_value":
         footer_lines.append(
             f"[bold {COLOR_AMBER}]▶ Next:[/bold {COLOR_AMBER}] "
             "[dim]High-value account captured — review "
-            "[bold]attack_paths owned highvalue[/bold] for escalation routes.[/dim]"
+            f"[bold]attack_paths {domain_token} owned[/bold] for escalation routes.[/dim]"
         )
     elif show_privilege_col:
         footer_lines.append(
             f"[{COLOR_SAGE}]▶ Next:[/{COLOR_SAGE}] "
             "[dim]Standard accounts captured — run "
-            "[bold]attack_paths owned[/bold] to look for derived control, "
+            f"[bold]attack_paths {domain_token} owned[/bold] to look for derived control, "
             "or [bold]enum[/bold] to expand reach.[/dim]"
         )
     else:
@@ -4422,6 +4443,7 @@ def _execute_single_password_spraying(
                     base_hits,
                     spray_type="Custom Password",
                     lockout_context=_spray_lockout_ctx,
+                    domain=domain,
                 )
                 _persist_and_record_spray_hits(
                     shell,
@@ -4450,6 +4472,7 @@ def _execute_single_password_spraying(
                     base_hits,
                     spray_type="Custom Password",
                     lockout_context=_spray_lockout_ctx,
+                    domain=domain,
                 )
                 _persist_and_record_spray_hits(
                     shell,
@@ -4507,6 +4530,7 @@ def _execute_single_password_spraying(
                     base_hits,
                     spray_type="Custom Password",
                     lockout_context=_spray_lockout_ctx,
+                    domain=domain,
                 )
                 _persist_and_record_spray_hits(
                     shell,
@@ -4546,6 +4570,7 @@ def _execute_single_password_spraying(
                 combined_hits,
                 spray_type="Combined Password Spray",
                 lockout_context=_spray_lockout_ctx,
+                domain=domain,
             )
             print_panel(
                 "\n".join(
@@ -6551,6 +6576,7 @@ def execute_spraying_command(
                     hits,
                     spray_type=spray_type,
                     lockout_context=lockout_context,
+                    domain=domain,
                 )
             if persist_hits:
                 _persist_and_record_spray_hits(
@@ -6668,7 +6694,10 @@ def execute_netexec_spraying_command(
 
         if hits:
             _render_valid_spray_hits_panel(
-                hits, spray_type=spray_type, lockout_context=lockout_context
+                hits,
+                spray_type=spray_type,
+                lockout_context=lockout_context,
+                domain=domain,
             )
             _persist_and_record_spray_hits(
                 shell,

@@ -47,11 +47,24 @@ WRITE_PROPERTY_GUID_TO_RELATION: dict[str, str] = {
     "msDS-KeyCredentialLink": "AddKeyCredentialLink",
 }
 
+# READ_PROP grants on these LAPS attributes ARE the real read authority — the DC
+# returns the cleartext/encrypted local-admin password to any principal the DACL
+# grants READ_PROP on the attribute, so these mappings are correct and load-bearing.
+#
+# Deliberately EXCLUDED: "msDS-ManagedPassword" (gMSA). A DACL READ_PROP grant on
+# the gMSA managed-password attribute is INERT — the DC returns the confidential
+# managed password ONLY to principals listed in msDS-GroupMSAMembership
+# (PrincipalsAllowedToRetrieveManagedPassword), regardless of the DACL. Mapping it
+# here produced a phantom "Everyone (S-1-1-0) --ReadGMSAPassword--> <gMSA>" edge
+# (the gMSA DACL grants S-1-1-0 READ_PROP on the attribute, but Everyone can never
+# actually read it). The genuine ReadGMSAPassword edge is parsed from the
+# msDS-GroupMSAMembership security descriptor in
+# ldap_collector._parse_gmsa_membership_sd, so this exclusion loses no real edge.
+# Do NOT re-add msDS-ManagedPassword here.
 READ_PROPERTY_GUID_TO_RELATION: dict[str, str] = {
     "ms-Mcs-AdmPwd": "ReadLAPSPassword",
     "msLAPS-Password": "ReadLAPSPassword",
     "msLAPS-EncryptedPassword": "ReadLAPSPassword",
-    "msDS-ManagedPassword": "ReadGMSAPassword",
 }
 
 # Well-known property-set GUIDs. Granted via DS_WRITE_PROP on the property set.

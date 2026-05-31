@@ -64,7 +64,11 @@ BONUSES: dict[str, dict[str, Any]] = {
         "value":    497,
         "subtitle": "30-day playbook for the six tactics that cause 80% of AD breaches.",
         "template": "playbook/playbook.html",
-        "theme":    "premium_dark",
+        # Warm editorial skin — the flagship report theme. ``editorial`` bridges
+        # the bonus token scheme (--paper/--ink/--sev-*) onto its warm-bone + teal
+        # palette, so the playbook reads as the same document family as the
+        # editorial Security Assessment Report.
+        "theme":    "editorial",
     },
     "cheatsheet": {
         "filename": "Quick_Start_Cheatsheet.pdf",
@@ -72,7 +76,18 @@ BONUSES: dict[str, dict[str, Any]] = {
         "value":    197,
         "subtitle": "Two-page desk reference: 15 commands, 14 key bindings, 5 fast fixes.",
         "template": "cheatsheet/cheatsheet.html",
-        "theme":    "premium_dark",
+        # Themeless ON PURPOSE. The cheatsheet ships a complete, self-contained
+        # DARK operator palette in its own ``:root`` (``--bg-0:#070b14``, cyan
+        # accent). Injecting any shared theme is actively harmful: the light
+        # ``premium_dark`` theme defines ``--surface``/``--accent``/``--line``
+        # with the SAME names, lands AFTER the template's ``:root`` in the
+        # cascade, and would override the cards to cream + the accent to ember
+        # while the page background (``--bg-0``, not defined by the theme)
+        # stays dark — a broken mixed render. An empty theme makes the
+        # template's own palette authoritative and immune to theme changes.
+        # (The cheatsheet is a standalone LITE lead magnet — it is NOT part of
+        # the ``adscan deliver`` kit, so no ``--theme`` is ever forced on it.)
+        "theme":    "",
     },
     "checklist": {
         "filename": "MITRE_Remediation_Checklist.pdf",
@@ -80,7 +95,8 @@ BONUSES: dict[str, dict[str, Any]] = {
         "value":    297,
         "subtitle": "Auditor-grade remediation worksheet for every tracked ATT&CK technique.",
         "template": "checklist/checklist.html",
-        "theme":    "premium_dark",
+        # Unified editorial skin — see the playbook entry above.
+        "theme":    "editorial",
     },
     "coverage-matrix": {
         "filename":   "Coverage_Matrix.pdf",
@@ -88,7 +104,7 @@ BONUSES: dict[str, dict[str, Any]] = {
         "value":      0,  # Procurement utility — no value-stack tag.
         "subtitle":   "Active Directory checks mapped to ATT&CK and compliance frameworks.",
         "template":   "coverage_matrix/coverage_matrix.html",
-        "theme":      "corporate_light",
+        "theme":      "editorial",
         "is_bonus":   False,
     },
 }
@@ -170,6 +186,105 @@ def _load_theme(theme_name: str) -> str:
         return load_theme_css(theme_name)
     except Exception:
         return ""
+
+
+# Cached base64 data-URIs for the ADscan wordmark. The asset lives in the
+# canonical logos home ``adscan_internal/assets/logos/`` (same place
+# ``report_service._find_adscan_logo`` reads, bundled in BOTH the PRO
+# PyInstaller binary and the LITE image via the ``--add-data
+# adscan_internal/assets/logos`` line in build_adscan.sh / adscan.spec):
+#   * ``logo-wordmark-dark.png``  — charcoal ink, for the LIGHT paper
+#     deliverable themes (the default; correct for every current bonus).
+#   * ``logo-wordmark.png``       — original white ink, for a dark band.
+# We embed as a data-URI (not a file path) because that is the only
+# render-time-robust option across the LITE cheatsheet bake, the PRO
+# binary's ``_MEIPASS`` tree, and source mode — the bytes travel inside
+# the HTML so there is no path to resolve when WeasyPrint/chromium runs.
+_BRAND_LOGO_CACHE: dict[str, str] = {}
+_BRAND_LOGO_FILENAMES: dict[str, str] = {
+    "dark": "logo-wordmark-dark.png",
+    "light": "logo-wordmark.png",
+}
+
+
+def _brand_logo_data_uri(variant: str = "dark") -> str:
+    """Return a base64 PNG data-URI for the ADscan wordmark.
+
+    Reads from the canonical ``adscan_internal/assets/logos/`` home using
+    the same search roots as ``report_service._find_adscan_logo``: the
+    module-relative path (source mode + PyInstaller, since the binary
+    unpacks ``assets/logos`` into its tree) and the ``_MEIPASS`` bundle
+    root as a defensive fallback.
+
+    Args:
+        variant: ``"dark"`` (charcoal ink — light themes, the default) or
+            ``"light"`` (white ink — dark band).
+
+    Returns:
+        ``data:image/png;base64,...`` string, or ``""`` if the asset
+        cannot be read (never raises — the logo is cosmetic, and every
+        template keeps a text-wordmark ``{% else %}`` fallback).
+    """
+    if variant in _BRAND_LOGO_CACHE:
+        return _BRAND_LOGO_CACHE[variant]
+
+    filename = _BRAND_LOGO_FILENAMES.get(variant, _BRAND_LOGO_FILENAMES["dark"])
+    data_uri = ""
+    try:
+        import base64
+        import sys
+
+        raw: bytes | None = None
+        # 1. Module-relative: bonuses.py → cli/ → adscan_internal/ → assets/logos/.
+        #    Works in source mode and in the PyInstaller-unpacked tree.
+        try:
+            candidate = (
+                Path(__file__).parent.parent / "assets" / "logos" / filename
+            )
+            if candidate.is_file():
+                raw = candidate.read_bytes()
+        except OSError:
+            raw = None
+        # 2. PyInstaller _MEIPASS bundle root (defensive — mirrors
+        #    _find_adscan_logo's second search root).
+        if raw is None:
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                mp = Path(meipass) / "adscan_internal" / "assets" / "logos" / filename
+                try:
+                    if mp.is_file():
+                        raw = mp.read_bytes()
+                except OSError:
+                    raw = None
+        if raw is not None:
+            encoded = base64.b64encode(raw).decode("ascii")
+            data_uri = f"data:image/png;base64,{encoded}"
+    except Exception as exc:  # noqa: BLE001 — logo is cosmetic; never break render
+        telemetry.capture_exception(exc)
+        data_uri = ""
+
+    _BRAND_LOGO_CACHE[variant] = data_uri
+    return data_uri
+
+
+def _wordmark_variant_for_theme(theme: str | None) -> str:
+    """Pick the wordmark ink that contrasts with ``theme``'s page background.
+
+    Thin delegate to the single source of truth in the themes package so the
+    report and the bonus kit can never disagree on the wordmark ink for a
+    given theme.
+
+    Args:
+        theme: Resolved theme name (e.g. ``"premium_dark"``,
+            ``"corporate_light"``), or ``None`` to assume the light default.
+
+    Returns:
+        ``"light"`` (white ink — for a dark page background) or ``"dark"``
+        (charcoal ink — for a light page background, the default).
+    """
+    from adscan_internal.pro.reporting.themes import wordmark_variant_for_theme
+
+    return wordmark_variant_for_theme(theme)
 
 
 def _render_html(template_source: str, context: dict[str, Any], theme_css: str) -> str:
@@ -323,13 +438,26 @@ def _ctx_playbook(
     *,
     observed: set[str] | None = None,
     has_workspace_signal: bool = False,
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for the AD Hardening Playbook.
 
-    When the caller has observed-technique signal from the workspace,
-    each chapter is annotated with an ``observed_count`` and the list of
-    chapters is re-ordered so tactics with the most observed techniques
-    surface first. Without signal, the static chapter order is preserved.
+    Tier-3 behaviour: when ``workspace_dir`` yields a readable
+    ``technical_report.json`` with findings, the playbook LEADS with the
+    client's own data — an environment-specific executive opening, a
+    severity/CVSS-ranked findings section (hosts + remediation + compliance
+    controls closed), a prioritised 30-day roadmap seeded from those
+    findings, and a compliance-gap summary. The curated six-tactic
+    methodology and 30-day calendar remain as the subordinate "how"
+    reference. The heavy lifting lives in
+    :mod:`adscan_internal.pro.reporting.playbook_databinding` so this
+    builder stays thin.
+
+    Tier-1/2 fallback: when there is observed-technique signal but no
+    readable findings payload, each chapter is still annotated with an
+    ``observed_count`` and chapters re-order so observed tactics surface
+    first. With no signal at all, the static chapter order is preserved and
+    the generic narrative renders unchanged.
     """
     from adscan_internal.pro.reporting.playbook_content import PLAYBOOK
 
@@ -362,6 +490,18 @@ def _ctx_playbook(
             )
         )
 
+    # Tier-3 client-specific payload (None when no readable findings).
+    client: dict[str, Any] | None = None
+    try:
+        from adscan_internal.pro.reporting.playbook_databinding import (
+            build_playbook_databinding,
+        )
+
+        client = build_playbook_databinding(workspace_dir)
+    except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
+        telemetry.capture_exception(exc)
+        client = None
+
     return {
         "title":                PLAYBOOK["title"],
         "subtitle":             PLAYBOOK["subtitle"],
@@ -371,6 +511,9 @@ def _ctx_playbook(
         "report_date":          time.strftime("%B %d, %Y"),
         "has_workspace_signal": has_workspace_signal,
         "observed_count_total": sum(c["observed_count"] for c in tactics),
+        # Tier-3 sections — present only when the workspace yielded findings.
+        "client":               client,
+        "has_client_data":      client is not None,
     }
 
 
@@ -423,6 +566,7 @@ def _ctx_checklist(
     *,
     observed: set[str] | None = None,
     has_workspace_signal: bool = False,
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for the MITRE Remediation Checklist.
 
@@ -431,6 +575,13 @@ def _ctx_checklist(
     the catalog, for procurement / audit completeness). When no workspace
     signal is available, ``observed_groups`` is empty and the template
     falls back to rendering ``reference_groups`` only.
+
+    When ``workspace_dir`` is supplied, the per-finding **remediation
+    tracker** (the actionable client-specific section that distinguishes
+    this deliverable from the Coverage Matrix) is bound via
+    ``checklist_databinding.build_checklist_databinding``. ``client`` is
+    ``None`` and ``has_client_data`` is ``False`` when no usable findings
+    exist — the template then renders the generic reference checklist.
     """
     from adscan_internal.pro.reporting.checklist_content import (
         TECHNIQUE_MITIGATIONS,
@@ -485,6 +636,20 @@ def _ctx_checklist(
     # for the same reason.
     tactic_groups = observed_groups if has_workspace_signal else reference_groups
 
+    # Bind the per-finding remediation tracker (Tier-2/3 client section).
+    # Best-effort: a binding failure must never break the reference
+    # checklist render — mirror the playbook's defensive pattern.
+    client: dict[str, Any] | None = None
+    try:
+        from adscan_internal.pro.reporting.checklist_databinding import (
+            build_checklist_databinding,
+        )
+
+        client = build_checklist_databinding(workspace_dir)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        client = None
+
     return {
         "tactic_groups":        tactic_groups,
         "observed_groups":      observed_groups,
@@ -494,6 +659,8 @@ def _ctx_checklist(
             len(g["techniques"]) for g in observed_groups
         ),
         "report_date":          time.strftime("%B %d, %Y"),
+        "client":               client,
+        "has_client_data":      client is not None,
     }
 
 
@@ -501,6 +668,7 @@ def _ctx_coverage_matrix(
     *,
     observed: set[str] | None = None,
     has_workspace_signal: bool = False,
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for the ADscan Coverage Matrix.
 
@@ -511,117 +679,27 @@ def _ctx_coverage_matrix(
     * ``reference_rows`` — the rest of the catalog for procurement /
       compliance completeness.
 
-    The legacy ``rows`` field is preserved for backward template
-    compatibility and mirrors ``reference_rows`` when no workspace
-    signal is available, or the concatenation otherwise.
+    The legacy ``rows`` / ``observed_rows`` / ``reference_rows`` /
+    ``frameworks`` / ``coverage_summary`` fields are preserved (strict
+    superset) so existing templates and tests keep working, plus the
+    scope-proof blocks (``scope``, ``framework_view``, ``tactic_groups``,
+    ``legend``) the upgraded "Audit Coverage & Scope Proof" template
+    consumes.
+
+    Delegates to ``coverage_databinding.build_coverage_databinding``,
+    which resolves observed techniques internally (via
+    ``bonus_workspace.get_observed_techniques``) from ``workspace_dir`` —
+    so unlike the playbook/checklist it never needs the pre-resolved
+    ``observed`` set. It ALWAYS returns a full context (never ``None``):
+    the Coverage Matrix is a valid procurement artifact even with no
+    scan (the no-scan case renders the full in-scope reference matrix).
     """
-    from adscan_internal.pro.reporting.compliance_mapping import (
-        FRAMEWORK_ORDER,
-        FRAMEWORKS,
-        controls_for,
+    from adscan_internal.pro.reporting.coverage_databinding import (
+        build_coverage_databinding,
     )
-    from adscan_internal.pro.reporting.mitre_data import (
-        TACTICS_ORDER,
-        TECHNIQUES,
-    )
-
-    observed = observed or set()
-
-    by_tactic_obs: dict[str, list[tuple[str, str]]] = {t: [] for t in TACTICS_ORDER}
-    by_tactic_ref: dict[str, list[tuple[str, str]]] = {t: [] for t in TACTICS_ORDER}
-    for tid, meta in TECHNIQUES.items():
-        tactic = meta["tactic"]
-        if tactic not in by_tactic_obs:
-            continue
-        if _is_observed(tid, observed):
-            by_tactic_obs[tactic].append((tid, meta["name"]))
-        else:
-            by_tactic_ref[tactic].append((tid, meta["name"]))
-    for items in by_tactic_obs.values():
-        items.sort(key=lambda it: it[0])
-    for items in by_tactic_ref.values():
-        items.sort(key=lambda it: it[0])
-
-    def _build_rows(
-        by_tactic: dict[str, list[tuple[str, str]]],
-        is_observed_block: bool,
-    ) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for tactic in TACTICS_ORDER:
-            items = by_tactic.get(tactic) or []
-            for index, (tid, name) in enumerate(items):
-                cells: list[str] = []
-                for fw_key in FRAMEWORK_ORDER:
-                    ids = controls_for(tid, fw_key)
-                    cells.append(", ".join(ids))
-                out.append({
-                    "tactic":          tactic,
-                    "first_in_tactic": index == 0,
-                    "id":              tid,
-                    "name":            name,
-                    "cells":           cells,
-                    "observed":        is_observed_block,
-                })
-        return out
-
-    observed_rows = _build_rows(by_tactic_obs, True) if has_workspace_signal else []
-    reference_rows = _build_rows(by_tactic_ref, False)
-
-    # Legacy single-list ``rows`` for any template that has not been
-    # updated yet. With workspace signal we concatenate observed first.
-    rows = observed_rows + reference_rows if has_workspace_signal else reference_rows
-
-    frameworks = [
-        {
-            "key":       k,
-            "label":     FRAMEWORKS[k]["label"],
-            "long_name": FRAMEWORKS[k]["long_name"],
-            "reference": FRAMEWORKS[k]["reference"],
-        }
-        for k in FRAMEWORK_ORDER
-    ]
-
-    # Coverage summary: per-framework count of techniques that have at
-    # least one mapped control. Used by the matrix header strip to give
-    # procurement / RFP readers an at-a-glance compliance signal before
-    # they read a single row.
-    total_techniques = sum(
-        1
-        for tid, meta in TECHNIQUES.items()
-        if meta["tactic"] in TACTICS_ORDER
-    )
-    per_framework_summary: list[dict[str, Any]] = []
-    for fw_key in FRAMEWORK_ORDER:
-        covered = sum(
-            1
-            for tid, meta in TECHNIQUES.items()
-            if meta["tactic"] in TACTICS_ORDER and controls_for(tid, fw_key)
-        )
-        pct = round((covered / total_techniques) * 100) if total_techniques else 0
-        per_framework_summary.append({
-            "key":     fw_key,
-            "label":   FRAMEWORKS[fw_key]["label"],
-            "covered": covered,
-            "total":   total_techniques,
-            "pct":     pct,
-        })
-    coverage_summary = {
-        "total_techniques": total_techniques,
-        "per_framework":    per_framework_summary,
-    }
 
     version = os.environ.get("ADSCAN_VERSION", "").strip() or "1.0"
-    return {
-        "rows":                 rows,
-        "observed_rows":        observed_rows,
-        "reference_rows":       reference_rows,
-        "frameworks":           frameworks,
-        "coverage_summary":     coverage_summary,
-        "version":              version,
-        "report_date":          time.strftime("%B %d, %Y"),
-        "has_workspace_signal": has_workspace_signal,
-        "observed_count_total": len(observed_rows),
-    }
+    return build_coverage_databinding(workspace_dir, version=version)
 
 
 # Builders that consume workspace signal share a uniform signature
@@ -643,6 +721,7 @@ _CONTEXT_BUILDERS_DYNAMIC: dict[
 def _build_context(
     bonus_key: str,
     workspace_dir: Path | None,
+    theme: str | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for ``bonus_key``, threading workspace data.
 
@@ -651,9 +730,44 @@ def _build_context(
     flag indicating whether the workspace produced any usable signal —
     they use the flag to decide whether to render the "observed in this
     scan" sections.
+
+    Args:
+        bonus_key: One of the ``BONUSES`` keys.
+        workspace_dir: Optional workspace to data-bind dynamic bonuses.
+        theme: The resolved theme the deliverable will render with. Drives
+            the theme-aware ``brand_logo`` ink so the wordmark always
+            contrasts with the page background — no template guesses.
     """
+    def _with_brand(ctx: dict[str, Any]) -> dict[str, Any]:
+        """Inject the ADscan wordmark data-URIs into every context.
+
+        Three template-facing variables, so a template author never has to
+        reason about ink-vs-background:
+
+        * ``{{ brand_logo }}`` — THEME-AWARE. Charcoal on a light theme,
+          white on a dark theme. Use this on any band that inherits the
+          deliverable theme (the report and the three themed bonuses).
+        * ``{{ brand_logo_white }}`` — always white ink. Use only on a band
+          with a FIXED dark background that does NOT follow the theme
+          (the cheatsheet masthead).
+        * ``{{ brand_logo_charcoal }}`` — always charcoal ink, for a fixed
+          light band.
+
+        ``brand_logo_light`` is kept as a deprecated alias of
+        ``brand_logo_white`` so older templates do not silently lose the
+        mark. Templates fall back to their text wordmark when a value is
+        empty. Done here so all builders — static and dynamic — get the
+        brand consistently without each one importing the helper.
+        """
+        theme_aware = _brand_logo_data_uri(_wordmark_variant_for_theme(theme))
+        ctx.setdefault("brand_logo", theme_aware)
+        ctx.setdefault("brand_logo_white", _brand_logo_data_uri("light"))
+        ctx.setdefault("brand_logo_charcoal", _brand_logo_data_uri("dark"))
+        ctx.setdefault("brand_logo_light", _brand_logo_data_uri("light"))
+        return ctx
+
     if bonus_key in _CONTEXT_BUILDERS_STATIC:
-        return _CONTEXT_BUILDERS_STATIC[bonus_key]()
+        return _with_brand(_CONTEXT_BUILDERS_STATIC[bonus_key]())
 
     builder = _CONTEXT_BUILDERS_DYNAMIC.get(bonus_key)
     if builder is None:
@@ -669,7 +783,20 @@ def _build_context(
             f"Bonus '{bonus_key}': no observed techniques in {workspace_dir} — "
             "rendering the static reference catalog as fallback."
         )
-    return builder(observed=observed, has_workspace_signal=has_signal)
+    # All three dynamic bonuses now consume the raw workspace to bind
+    # client-specific sections: the playbook binds Tier-3 findings /
+    # roadmap / compliance gaps, the checklist binds the per-finding
+    # remediation tracker, and the coverage matrix binds the observed /
+    # checked-clean / in-scope three-state view. They share the
+    # extraction helpers in ``finding_databinding`` so hosts /
+    # remediation / compliance render identically across the kit.
+    kwargs: dict[str, Any] = {
+        "observed": observed,
+        "has_workspace_signal": has_signal,
+    }
+    if bonus_key in ("playbook", "checklist", "coverage-matrix"):
+        kwargs["workspace_dir"] = workspace_dir
+    return _with_brand(builder(**kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +848,7 @@ def render_bonus(
     resolved_theme = _THEME_ALIASES.get(theme or "", theme or "") or meta["theme"]
     template_source = _load_template(meta["template"])
     theme_css = _load_theme(resolved_theme)
-    context = _build_context(bonus_key, workspace_dir)
+    context = _build_context(bonus_key, workspace_dir, theme=resolved_theme)
     if bonus_key == "playbook":
         context["truncate"] = bool(truncate)
     html_str = _render_html(template_source, context, theme_css)
@@ -799,7 +926,7 @@ def _run_one(args: argparse.Namespace, bonus_key: str) -> int:
         try:
             meta = BONUSES[bonus_key]
             tpl = _load_template(meta["template"])
-            ctx = _build_context(bonus_key, None)
+            ctx = _build_context(bonus_key, None, theme=meta["theme"])
             _render_html(tpl, ctx, _load_theme(meta["theme"]))
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)

@@ -27,6 +27,7 @@ from rich.table import Table
 from rich.text import Text
 
 from adscan_internal import (
+    get_console,
     print_error,
     print_exception,
     print_info,
@@ -2887,6 +2888,81 @@ def _resolve_default_domain_controller(
     return pdc_ip or None
 
 
+def _resolve_smb_spn_target(
+    shell: Any,
+    *,
+    target_host: str,
+    domain: str,
+    domain_data: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Resolve the Kerberos SPN host + KDC IP for an SMB-backed execution step.
+
+    ``target_host`` may be a raw IP (lateral target reached by address only).
+    Kerberos service tickets cannot bind to ``cifs/<ip>`` — route the host
+    through the centralized :func:`resolve_spn_or_decide_ntlm` helper so the SPN
+    host is an FQDN whenever one is recoverable. The KDC is ALWAYS the target
+    domain's DC (``resolve_dc_ip``), NEVER the target host: pointing Kerberos at
+    the member server makes it try to reach a KDC on port 88 of a non-KDC.
+
+    Returns:
+        ``(spn_host, kdc_ip)``. ``spn_host`` is the FQDN when resolvable, else
+        the original ``target_host`` (the caller stays on NTLM in that case).
+        ``kdc_ip`` is the domain DC IP, or ``None`` when unknown.
+    """
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.domain_posture import get_posture
+    from adscan_internal.services.kerberos_spn_resolution import (
+        resolve_spn_or_decide_ntlm,
+    )
+
+    domains_data = getattr(shell, "domains_data", None) or {}
+    kdc_ip = None
+    try:
+        kdc_ip = resolve_dc_ip(domain_data or {})
+    except Exception:  # noqa: BLE001
+        kdc_ip = None
+
+    inventory: dict | None = None
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    domains_dir = getattr(shell, "domains_dir", None) or ""
+    if workspace_dir and domains_dir:
+        try:
+            from adscan_internal.services.kerberos_hostname_inventory import (
+                load_workspace_ip_hostname_inventory,
+            )
+
+            inventory = (
+                load_workspace_ip_hostname_inventory(
+                    workspace_dir=workspace_dir,
+                    domains_dir=domains_dir,
+                    domain=domain,
+                )
+                or None
+            )
+        except Exception:  # noqa: BLE001 - inventory is best-effort
+            inventory = None
+
+    try:
+        posture_snapshot = get_posture(domains_data, domain=domain)
+    except Exception:  # noqa: BLE001
+        posture_snapshot = None
+
+    is_dc_target = bool(
+        target_host and kdc_ip and str(target_host).strip() == str(kdc_ip).strip()
+    )
+    resolution = resolve_spn_or_decide_ntlm(
+        target_host=target_host,
+        domain=domain,
+        domains_data=domains_data,
+        ip_hostname_inventory=inventory,
+        resolver_ip=kdc_ip,
+        posture_snapshot=posture_snapshot,
+        is_dc_target=is_dc_target,
+    )
+    spn_host = resolution.spn_host if resolution.kerberos_viable else target_host
+    return spn_host, kdc_ip
+
+
 def _prepare_kerberos_for_smb_execution(
     shell: Any,
     *,
@@ -3033,6 +3109,9 @@ def _execute_writelogonscript_precheck(
         credential=password,
         domain_data=domain_data,
     )
+    spn_host, spn_kdc_ip = _resolve_smb_spn_target(
+        shell, target_host=target_host, domain=domain, domain_data=domain_data
+    )
 
     probe_service = SMBPathAccessService()
     candidate_map = {
@@ -3087,7 +3166,8 @@ def _execute_writelogonscript_precheck(
             filename_suffix=".bat",
             delete_after=True,
             use_kerberos=use_kerberos,
-            kdc_host=target_host if use_kerberos else None,
+            kdc_host=spn_kdc_ip if use_kerberos else None,
+            spn_host=spn_host,
         )
         attempted_candidates.append(
             {
@@ -3288,6 +3368,9 @@ def _execute_writelogonscript_force_change_password_strategy(
         credential=password,
         domain_data=domain_data,
     )
+    spn_host, spn_kdc_ip = _resolve_smb_spn_target(
+        shell, target_host=target_host, domain=domain, domain_data=domain_data
+    )
 
     from adscan_internal.cli.exploits import _resolve_impacket_executor_ccache
 
@@ -3411,7 +3494,8 @@ def _execute_writelogonscript_force_change_password_strategy(
             password=password,
             auth_domain=str(domain),
             use_kerberos=use_kerberos,
-            kdc_host=target_host if use_kerberos else None,
+            kdc_host=spn_kdc_ip if use_kerberos else None,
+            spn_host=spn_host,
         )
         stale_managed_script_deleted = bool(stale_delete_result.success)
         stale_managed_script_delete_error = str(
@@ -3439,7 +3523,8 @@ def _execute_writelogonscript_force_change_password_strategy(
         remote_filename=payload.filename,
         delete_after=False,
         use_kerberos=use_kerberos,
-        kdc_host=target_host if use_kerberos else None,
+        kdc_host=spn_kdc_ip if use_kerberos else None,
+        spn_host=spn_host,
     )
     if not upload_result.success:
         return (
@@ -3798,6 +3883,14 @@ def _attempt_writelogonscript_cleanup_if_ready(
             if isinstance(cleanup_domain_data, dict)
             else {},
         )
+        spn_host, spn_kdc_ip = _resolve_smb_spn_target(
+            shell,
+            target_host=target_host,
+            domain=domain,
+            domain_data=cleanup_domain_data
+            if isinstance(cleanup_domain_data, dict)
+            else {},
+        )
 
         cleanup_notes = dict(details)
         cleanup_notes["cleanup_checked_at"] = datetime.now(UTC).isoformat()
@@ -3846,7 +3939,8 @@ def _attempt_writelogonscript_cleanup_if_ready(
             password=cleanup_password,
             auth_domain=domain,
             use_kerberos=use_kerberos,
-            kdc_host=target_host if use_kerberos else None,
+            kdc_host=spn_kdc_ip if use_kerberos else None,
+            spn_host=spn_host,
         )
         service = ExploitationService()
         revert_success = False
@@ -5193,12 +5287,11 @@ _SERVICE_LABEL: dict[str, str] = {
 
 def _print_probe_result(result: TCPProbeResult) -> None:
     """Print a compact one-line probe result with tactical styling."""
-    from rich.console import Console
 
     status_markup, annotation = _PROBE_STATUS_STYLE.get(
         result.status, (result.status, "")
     )
-    Console(highlight=False).print(
+    get_console().print(
         f"  [dim]◈[/dim]  [cyan]{result.host}[/cyan][dim]:{result.port}[/dim]"
         f"  →  {status_markup}  [dim]{result.elapsed_ms:.0f}ms[/dim]{annotation}"
     )
@@ -5212,7 +5305,6 @@ def _show_stale_snapshot_advisory(
     service_key: str,
 ) -> None:
     """Show the advisory panel when the vantage catalog marks a host as unreachable."""
-    from rich.console import Console
     from rich.panel import Panel
     from rich.text import Text as RichText
 
@@ -5227,7 +5319,7 @@ def _show_stale_snapshot_advisory(
         "  Workstations get powered off, VMs migrate, firewalls change.\n"
         "  A live probe confirms the current state before discarding this step."
     )
-    Console(highlight=False).print(
+    get_console().print(
         Panel(
             RichText.from_markup(body),
             title="[dim]◈[/dim]  Stale Snapshot — Live Connectivity Check",
@@ -5251,7 +5343,6 @@ def _run_stale_snapshot_probe(
       - TCPProbeResult if the operator said yes.
       - None if the operator declined or no port is known for this action.
     """
-    from rich.console import Console
     from rich.prompt import Confirm
 
     ports = action_to_service_ports(action)
@@ -5277,7 +5368,7 @@ def _run_stale_snapshot_probe(
         do_probe = Confirm.ask(
             "  [dim]▸[/dim]  Run live connectivity probe?",
             default=True,
-            console=Console(highlight=False),
+            console=get_console(),
         )
     except (EOFError, KeyboardInterrupt):
         do_probe = False
@@ -5354,11 +5445,10 @@ def _show_verify_failure_panel(
     username: str,
 ) -> None:
     """Display a premium-UX failure panel explaining WHY the verify step failed."""
-    from rich.console import Console
     from rich.panel import Panel
     from rich.text import Text as RichText
 
-    console = Console(highlight=False)
+    console = get_console()
     marked_host = mark_sensitive(host, "hostname")
     marked_user = mark_sensitive(username, "user")
 
@@ -5416,13 +5506,24 @@ def _show_verify_failure_panel(
         border = "orange1"
 
     else:
-        title = f"[bold]{action} — Unexpected Error[/bold]"
+        title = f"[bold yellow]{action} — Could Not Confirm[/bold yellow]"
         body = (
-            f"The native verifier returned an unclassified error against [bold]{marked_host}[/bold].\n\n"
-            "[dim]Check the debug logs for the full detail.[/dim]\n"
+            f"The native verifier could not conclusively confirm or deny "
+            f"[bold]{marked_user}[/bold] against [bold]{marked_host}[/bold].\n\n"
+            "Most common causes:\n"
+            "  · Kerberos authentication infrastructure was unreachable "
+            "(KDC not resolvable from this vantage)\n"
+            "  · NTLM is blocked by GPO and no usable Kerberos ticket was available\n"
+            "  · The service responded ambiguously (transient error or partial session)\n\n"
+            "Suggested next steps:\n"
+            "  · Re-run with a valid Kerberos ccache for this principal "
+            "([bold]adscan kerberos[/bold])\n"
+            "  · Verify KDC reachability from the current vantage\n\n"
+            "[dim]Run with[/dim] [bold]--debug[/bold] [dim]for the full transport detail.[/dim]\n"
+            "[dim]The edge is preserved — not discarded due to an inconclusive probe.[/dim]\n"
             "[dim]Status updated to:[/dim] [yellow]unavailable[/yellow]"
         )
-        border = "dim"
+        border = "yellow"
 
     console.print(
         Panel(
@@ -5445,6 +5546,7 @@ async def _verify_attack_step_native(
     target_host: str,
     target_hostname: str | None = None,
     kdc_ip: str | None = None,
+    workspace_dir: str | None = None,
 ) -> tuple[bool, _VerifyFailReason, str]:
     """Native access verifier for AdminTo / SqlAccess / SqlAdmin / CanRDP / CanPSRemote.
 
@@ -5490,7 +5592,12 @@ async def _verify_attack_step_native(
             return ok, reason, detail
 
         if service == "mssql":
-            backend = ImpacketMSSQLBackend(host=target_host)
+            backend = ImpacketMSSQLBackend(
+                host=target_host,
+                domain=domain,
+                kerberos_target_hostname=target_hostname,
+                kdc_host=kdc_ip,
+            )
             if require_admin:
                 sweep = await asyncio.to_thread(
                     backend.sweep_privileges,
@@ -5544,6 +5651,8 @@ async def _verify_attack_step_native(
                 username=username,
                 password=secret,
                 kerberos_spn_host=target_hostname,
+                kdc_ip=kdc_ip,
+                workspace_dir=workspace_dir,
             )
             detail = f"winrm_avail={availability}"
             ok = availability == "available"
@@ -5730,21 +5839,43 @@ def execute_selected_attack_path(
                 "Downstream steps will not execute."
             )
 
-        def _handle_successful_adcs_step(
+        def _handle_successful_credential_step(
             action: str,
             from_label: str,
             to_label: str,
             *,
             notes: dict[str, Any],
+            captured_principal: str | None = None,
+            captured_credential: str | None = None,
+            credential_type: str = "nt_hash",
         ) -> None:
-            """Mark an ADCS step as success.
+            """Single mandatory success path for every credential-producing step.
 
-            Symmetric counterpart to ``_handle_failed_adcs_step``. ESC handlers
-            set the edge to ``attempted`` before calling ``run_esc_sync``;
-            without this transition on success, the edge would stay at
-            ``attempted`` even after the cert was issued and PKINIT extracted
-            the target NT hash — making the attack-path UI show a green chain
-            with one stuck-yellow node in the middle.
+            Every dispatch branch that authenticates / mints / dumps a new
+            principal's credential (ADCS ESC1..ESC15 PKINIT, GoldenCert,
+            HasSession create-user, DumpLSA / DumpDPAPI, BackupOperator
+            escalation, and the ACE / roasting / spray families) converges
+            here on success so the two things that always have to happen,
+            happen exactly once:
+
+            1. The edge for ``from_label --action--> to_label`` transitions
+               to ``success``. Without this an issued cert / dumped hash would
+               leave the edge stuck on ``attempted`` and the attack-path UI
+               would show a green chain with one stuck-yellow node.
+            2. If a ``captured_principal`` AND a ``captured_credential`` are
+               available, that principal's freshly captured credential is
+               promoted into the in-path execution context via
+               ``_apply_execution_outcome_context_handoff``. Without this the
+               next step (e.g. DCSync) would run as the enroller / executor
+               instead of the impersonated Domain Admin and fail with
+               access-denied / 0 accounts.
+
+            When ``captured_principal`` is given but ``captured_credential`` is
+            empty, the credential is resolved from the store (written by
+            Pass-the-Certificate / the dump executor during the step). When
+            ``captured_principal`` is ``None`` (e.g. ESC13, which only grants a
+            group membership and produces no credential), only the edge-status
+            transition runs — no handoff.
             """
             try:
                 update_edge_status_by_labels(
@@ -5758,6 +5889,68 @@ def execute_selected_attack_path(
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
+
+            normalized_target = _normalize_account(captured_principal or "")
+            if not normalized_target:
+                return
+
+            credential = str(captured_credential or "").strip()
+            if not credential:
+                stored = _get_stored_domain_credential_for_user(
+                    shell, domain=domain, username=normalized_target
+                )
+                credential = str(stored or "").strip()
+            if not credential:
+                print_info_debug(
+                    "[attack_paths] credential step succeeded but no credential "
+                    "was available to hand off for the captured principal "
+                    f"{mark_sensitive(normalized_target, 'user')}; downstream "
+                    "steps will re-resolve from the credential store."
+                )
+                return
+
+            _apply_execution_outcome_context_handoff(
+                {
+                    "key": "user_credential_obtained",
+                    "compromised_user": normalized_target,
+                    "credential": credential,
+                    "credential_type": credential_type or "nt_hash",
+                    "source_action": action,
+                }
+            )
+
+        def _handle_successful_adcs_step(
+            action: str,
+            from_label: str,
+            to_label: str,
+            *,
+            notes: dict[str, Any],
+            impersonated_target: str | None = None,
+            esc_result: Any | None = None,
+        ) -> None:
+            """Mark an ADCS ESC step as success and hand off the captured credential.
+
+            Thin wrapper over :func:`_handle_successful_credential_step` kept for
+            the ``run_esc_sync``-based ESC handlers (ESC1/2/4/6/7/8/9/11/14/15)
+            wired by the prior commit. Behaviour is byte-equivalent: the
+            credential value is taken from ``EscResult.nt_hash`` when the native
+            runner captured it, otherwise resolved from the credential store by
+            the centralised helper.
+            """
+            captured_credential = ""
+            if esc_result is not None:
+                captured_credential = str(
+                    getattr(esc_result, "nt_hash", "") or ""
+                ).strip()
+            _handle_successful_credential_step(
+                action,
+                from_label,
+                to_label,
+                notes=notes,
+                captured_principal=impersonated_target,
+                captured_credential=captured_credential or None,
+                credential_type="nt_hash",
+            )
 
         def _mark_blocked_steps(
             *,
@@ -6655,6 +6848,11 @@ def execute_selected_attack_path(
                             target_host=target_host,
                             target_hostname=target_host,
                             kdc_ip=kdc_ip,
+                            workspace_dir=str(
+                                getattr(shell, "current_workspace_dir", "")
+                                or ""
+                            )
+                            or None,
                         )
                     )
                     print_info_debug(
@@ -8028,16 +8226,14 @@ def execute_selected_attack_path(
 
                     from adscan_internal.cli.adcs_exploitation import adcs_esc1
 
-                    esc1_success = bool(
-                        adcs_esc1(
-                            shell,
-                            domain=domain,
-                            username=exec_username,
-                            password=password,
-                            template=template,
-                        )
+                    esc1_result = adcs_esc1(
+                        shell,
+                        domain=domain,
+                        username=exec_username,
+                        password=password,
+                        template=template,
                     )
-                    if not esc1_success:
+                    if not esc1_result.success:
                         _handle_failed_adcs_step(
                             "ADCSESC1",
                             from_label,
@@ -8048,6 +8244,21 @@ def execute_selected_attack_path(
                             },
                         )
                         return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC1",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                        impersonated_target=str(
+                            esc1_result.evidence.get("impersonated_target")
+                            if isinstance(esc1_result.evidence, dict)
+                            else ""
+                        ),
+                        esc_result=esc1_result,
+                    )
                 continue
 
             if key == "adcsesc3":
@@ -8261,6 +8472,24 @@ def execute_selected_attack_path(
                             },
                         )
                         return execution_started
+                    esc3_outcome = get_last_ace_execution_outcome(shell) or {}
+                    _handle_successful_credential_step(
+                        "ADCSESC3",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": agent_template,
+                            "client_auth_template": client_auth_template,
+                        },
+                        captured_principal=(
+                            str(esc3_outcome.get("compromised_user") or "")
+                            or _attack_path_label_to_name(to_label)
+                        ),
+                        credential_type=str(
+                            esc3_outcome.get("credential_type") or "nt_hash"
+                        ),
+                    )
                 continue
 
             if key == "adcsesc4":
@@ -8453,16 +8682,14 @@ def execute_selected_attack_path(
 
                     from adscan_internal.cli.adcs_exploitation import adcs_esc4
 
-                    esc4_success = bool(
-                        adcs_esc4(
-                            shell,
-                            domain=domain,
-                            username=exec_username,
-                            password=password,
-                            template=template,
-                        )
+                    esc4_result = adcs_esc4(
+                        shell,
+                        domain=domain,
+                        username=exec_username,
+                        password=password,
+                        template=template,
                     )
-                    if not esc4_success:
+                    if not esc4_result.success:
                         _handle_failed_adcs_step(
                             "ADCSESC4",
                             from_label,
@@ -8473,6 +8700,22 @@ def execute_selected_attack_path(
                             },
                         )
                         return execution_started
+                    _handle_successful_adcs_step(
+                        "ADCSESC4",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                        },
+                        impersonated_target=str(
+                            esc4_result.evidence.get("impersonated_target")
+                            if isinstance(esc4_result.evidence, dict)
+                            else ""
+                        )
+                        or f"administrator@{domain}",
+                        esc_result=esc4_result,
+                    )
                 continue
 
             if key == "adcsesc13":
@@ -8650,6 +8893,25 @@ def execute_selected_attack_path(
                             },
                         )
                         return execution_started
+                    # ESC13 grants a privileged group membership rather than a
+                    # standalone credential, so there is no captured principal to
+                    # promote; route through the centralised helper for the
+                    # edge-status -> success transition only.
+                    _handle_successful_credential_step(
+                        "ADCSESC13",
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "template_used_for_run": template,
+                            **(
+                                {"effective_group": effective_group}
+                                if effective_group
+                                else {}
+                            ),
+                        },
+                        captured_principal=None,
+                    )
                 continue
 
             if key == "adcsesc2":
@@ -8806,6 +9068,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=esc2_target_upn,
+                        esc_result=esc2_result,
                     )
                 continue
 
@@ -8963,6 +9227,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=esc6_target_upn,
+                        esc_result=esc6_result,
                     )
                 continue
 
@@ -9093,6 +9359,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=esc7_target_upn,
+                        esc_result=esc7_result,
                     )
                 continue
 
@@ -9231,6 +9499,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=_resolve_target_upn(to_label, domain),
+                        esc_result=esc8_result,
                     )
                     if esc8_result.pfx_path and hasattr(shell, "ptc_certipy"):
                         shell.ptc_certipy(domain, esc8_result.pfx_path)
@@ -9415,6 +9685,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=esc9_target_upn,
+                        esc_result=esc9_result,
                     )
                 continue
 
@@ -9569,6 +9841,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=_resolve_target_upn(to_label, domain),
+                        esc_result=esc14_result,
                     )
                 continue
 
@@ -9726,6 +10000,8 @@ def execute_selected_attack_path(
                             "username": exec_username,
                             "template_used_for_run": template,
                         },
+                        impersonated_target=esc15_target_upn,
+                        esc_result=esc15_result,
                     )
                 continue
 
@@ -9840,6 +10116,29 @@ def execute_selected_attack_path(
                             username=exec_username,
                             password=password,
                             ca_target_host=ca_target_host,
+                        )
+                    # GoldenCert returns no status flag; a captured-principal
+                    # outcome emitted by adcs_golden_cert on Pass-the-Certificate
+                    # success is the signal that the forged DA credential landed
+                    # in the store. Promote it through the centralised helper so
+                    # the next step runs as the impersonated DA, not the executor.
+                    gold_outcome = get_last_ace_execution_outcome(shell) or {}
+                    gold_principal = str(
+                        gold_outcome.get("compromised_user") or ""
+                    ).strip()
+                    if gold_principal:
+                        _handle_successful_credential_step(
+                            "GoldenCert",
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "ca_host": ca_target_host,
+                            },
+                            captured_principal=gold_principal,
+                            credential_type=str(
+                                gold_outcome.get("credential_type") or "nt_hash"
+                            ),
                         )
                 continue
 
@@ -10247,26 +10546,31 @@ def execute_selected_attack_path(
                         verified_da = membership is True
 
                     if verified_da:
-                        try:
-                            update_edge_status_by_labels(
-                                shell,
-                                domain,
-                                from_label=from_label,
-                                relation=action,
-                                to_label=to_label,
-                                status="success",
-                                notes={
-                                    "username": exec_username,
-                                    "target_host": target_host,
-                                    "session_user": session_user,
-                                    "target_user": target_user,
-                                    "mode": mode_label,
-                                    "group": selected_group or "RID-512",
-                                    "exec_context_source": exec_context_source,
-                                },
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            telemetry.capture_exception(exc)
+                        # Centralised success transition + credential handoff.
+                        # The generated account is promoted into the in-path
+                        # execution context (so a downstream step in the same
+                        # run executes as the new DA). NOTE: the rollback below
+                        # deletes this account on every run, so the promotion is
+                        # only usable by steps executed before rollback; the
+                        # handoff is still routed here so the invariant holds and
+                        # the edge-status transition is centralised.
+                        _handle_successful_credential_step(
+                            action,
+                            from_label,
+                            to_label,
+                            notes={
+                                "username": exec_username,
+                                "target_host": target_host,
+                                "session_user": session_user,
+                                "target_user": target_user,
+                                "mode": mode_label,
+                                "group": selected_group or "RID-512",
+                                "exec_context_source": exec_context_source,
+                            },
+                            captured_principal=target_user,
+                            captured_credential=target_password,
+                            credential_type="password",
+                        )
 
                         print_info(
                             "HasSession escalation confirmed: "
@@ -10537,14 +10841,33 @@ def execute_selected_attack_path(
                     )
 
                 target_user = _normalize_account(to_label)
-                if target_user and not _resolve_domain_password(
-                    shell, domain, target_user
-                ):
+                recovered_credential = (
+                    _resolve_domain_password(shell, domain, target_user)
+                    if target_user
+                    else None
+                )
+                if target_user and not recovered_credential:
                     marked_user = mark_sensitive(target_user, "user")
                     print_warning(
                         f"{action} did not recover a credential for {marked_user}. Stopping this path."
                     )
                     return True
+                # Centralised success transition + credential handoff: the dump
+                # executor wrote the to_label principal's credential into the
+                # store, so promote it into the in-path execution context (the
+                # next step runs as the dumped principal, not the executor).
+                if target_user and recovered_credential:
+                    _handle_successful_credential_step(
+                        action,
+                        from_label,
+                        to_label,
+                        notes={
+                            "username": exec_username,
+                            "target_host": source_host,
+                        },
+                        captured_principal=target_user,
+                        captured_credential=recovered_credential,
+                    )
                 continue
 
             if key == "backupoperatorescalation":
@@ -10589,6 +10912,12 @@ def execute_selected_attack_path(
                         status="success",
                         notes={"user": bo_username},
                     )
+                    # Promote the recovered DC machine-account credential
+                    # (emitted by offer_backup_operators_escalation) into the
+                    # in-path execution context so the next step runs as that
+                    # principal instead of the Backup Operator.
+                    bo_outcome = get_last_ace_execution_outcome(shell) or {}
+                    _apply_execution_outcome_context_handoff(bo_outcome)
                     execution_started = True
                 continue
 

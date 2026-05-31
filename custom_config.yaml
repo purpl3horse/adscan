@@ -95,6 +95,16 @@
     # English only. ML model handles English values well; non-English keywords
     # are covered by the STRONG-tier rules below (use_ml: false).
     # Catches: "password to VALUE", "set password to VALUE", etc.
+    #
+    # NO complexity lookahead here — this is intentional and was a
+    # validated decision (see BACKLOG). Domain password policies vary:
+    # legacy AD environments and service accounts can hold real
+    # all-lowercase passwords (``welcome``, ``monkey``, ``letmein``).
+    # Adding a complexity gate would silently drop those TPs. The
+    # downstream filter responsible for English-prose FPs like
+    # ``password mentioned above`` or ``password to something secure``
+    # is the spray gate / ML-confidence layer (see BACKLOG entry
+    # "Plausibility Tier 2.5"), not this regex.
     - (?i:(?:set|reset|change|changed|update|updated|assign|assigned|use|using|initial|temporary|temp|default|new|login|logon|first)\b[\w\s,/-]{0,40})?\bpassw?o?r?d\b[\w\s,/-]{0,20}\bto\b\s*(?P<quote>["'`]{0,3})(?P<value>[^\s"'{}\[\]<>]{8,80})(?(quote)(?P=quote))
   filter_type: GeneralKeyword
   use_ml: true
@@ -114,6 +124,16 @@
     # English only. ML model handles English values well; non-English keywords
     # are covered by the STRONG-tier rules below (use_ml: false).
     # Catches: "password VALUE", "and password VALUE" in natural language prose.
+    #
+    # NO complexity lookahead here — same recall-first reasoning as
+    # `DOC Password To` above. Legacy AD with relaxed policies, service
+    # accounts, and inherited credentials can hold all-lowercase TPs
+    # (``welcome``, ``monkey``, ``letmein``). Adding ``(?=\S*[A-Z0-9_!@#$%^&*-])``
+    # would drop them. The downstream filter for the English-prose FP
+    # class (``password mentioned``, ``password something``) belongs in
+    # the ML-confidence-aware spray gate — see BACKLOG entry
+    # "Plausibility Tier 2.5". DO NOT reintroduce a complexity gate here
+    # without revisiting that decision.
     - (?i:(?:and|or)\s+)?\bpassw?o?r?d\b\s+(?P<quote>["'`]{0,3})(?P<value>[^\s"'{}\[\]<>]{8,80})(?(quote)(?P=quote))
   filter_type: GeneralKeyword
   use_ml: true

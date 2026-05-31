@@ -566,7 +566,7 @@ def execute_generate_relay_list(self, command: str, domain: str) -> None:
 
                     if comps:
                         try:
-                            from adscan_internal.services.report_service import (
+                            from adscan_core.reporting.technical_report import (
                                 record_technical_finding,
                             )
 
@@ -665,6 +665,41 @@ def execute_generate_relay_list(self, command: str, domain: str) -> None:
         print_exception(show_locals=False, exception=e)
 
 
+def _cve_scope_summary(*, has_credentials: bool) -> str:
+    """Return the operator-facing CVE list for the DC-scoped confirmation panel.
+
+    Data-driven from the native CVE catalog so the panel can never drift
+    from what the scan actually runs (same principle as the
+    cheatsheet-drift protection). The DC scope runs every DC-scoped check
+    PLUS the all-hosts checks (coercion, PrintNightmare, ...) that also
+    apply to a domain controller — exactly :func:`cve_akas_for_target`
+    with ``is_dc=True``. When no credential is configured, checks that
+    require authentication are dropped so the panel matches the
+    unauthenticated reality.
+
+    Args:
+        has_credentials: Whether a domain credential is available for the
+            scan (drops auth-only checks from the displayed list when
+            ``False``).
+
+    Returns:
+        A comma-separated, human-readable CVE list (e.g.
+        ``"PetitPotam, PrinterBug, Zerologon, NoPac, ..."``).
+    """
+
+    from adscan_internal.services.cve_scanner.catalog import cves_for_target
+
+    akas: list[str] = []
+    seen: set[str] = set()
+    for cve in cves_for_target(is_dc=True):
+        if cve.requires_auth and not has_credentials:
+            continue
+        if cve.aka not in seen:
+            seen.add(cve.aka)
+            akas.append(cve.aka)
+    return ", ".join(akas) if akas else "—"
+
+
 def ask_for_enum_cve(self, target_domain: str) -> None:
     """Prompt user to enumerate CVE vulnerabilities."""
     if self.auto:
@@ -674,11 +709,14 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
     else:
         pdc = self.domains_data.get(target_domain, {}).get("pdc", "N/A")
         username = self.domains_data.get(target_domain, {}).get("username", "N/A")
-        cves_to_check = "Zerologon, NoPac" if username != "N/A" else "Zerologon"
+        cves_to_check = _cve_scope_summary(has_credentials=username != "N/A")
 
         if confirm_operation(
             operation_name="CVE Enumeration",
-            description="Scans for known vulnerabilities (Zerologon, NoPac) on domain controllers",
+            description=(
+                "Scans domain controllers for known vulnerabilities "
+                "(read-only detection, no exploitation)"
+            ),
             context={
                 "Domain": target_domain,
                 "PDC": pdc,
@@ -730,7 +768,7 @@ def ask_for_enum_cve_takeover(self, target_domain: str) -> None:
     username = domain_credentials.get("username")
     password = domain_credentials.get("password")
 
-    cves_to_check = "Zerologon, NoPac" if username and password else "Zerologon"
+    cves_to_check = _cve_scope_summary(has_credentials=bool(username and password))
     pdc = self.domains_data.get(target_domain, {}).get("pdc", "N/A")
 
     if self.auto:
@@ -741,7 +779,7 @@ def ask_for_enum_cve_takeover(self, target_domain: str) -> None:
         operation_name="CVE Takeover Scan",
         description=(
             "Scans domain controllers for high-impact takeover CVEs "
-            "(Zerologon, and NoPac when credentials exist)"
+            "(read-only detection, no exploitation)"
         ),
         context={
             "Domain": target_domain,

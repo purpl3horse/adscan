@@ -10,7 +10,6 @@ or relay backends.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -20,9 +19,9 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_info_verbose,
     print_success_debug,
+    print_warning_debug,
 )
 
-logger = logging.getLogger("adscan")
 
 CoercionAuthType = Literal["smb", "http"]
 RpcTransport = Literal["ncan_np", "ncacn_ip_tcp"]
@@ -364,18 +363,22 @@ class CoercionEngine:
                     duration_seconds=time.monotonic() - started,
                 )
 
-            # Protocol-level failures (DCERPCSessionError, SMB errors, etc.) are
-            # expected during coercion enumeration — log a compact one-liner.
-            # Only include the full traceback for unexpected Python exceptions (bugs).
-            is_protocol_error = _is_protocol_level_error(exc)
-            logger.debug(
-                "Native coercion attempt failed target=%s method=%s endpoint=%s\n         %s",
-                self.target.label,
-                method.name,
-                endpoint.label,
-                _compact_error(exc),
-                exc_info=not is_protocol_error,
+            # Protocol-level failures (DCERPCSessionError, SMB errors,
+            # connection-closed transients, etc.) are expected during coercion
+            # enumeration — log a compact, masked one-liner. Only the genuinely
+            # unexpected case (a real Python bug) gets the full traceback.
+            masked_target = mark_sensitive(self.target.label, "hostname")
+            masked_method = mark_sensitive(method.name, "text")
+            masked_endpoint = mark_sensitive(endpoint.label, "text")
+            failure_line = (
+                "[coercion] attempt failed "
+                f"target={masked_target} method={masked_method} "
+                f"endpoint={masked_endpoint} {_compact_error(exc)}"
             )
+            if _is_protocol_level_error(exc):
+                print_info_debug(failure_line)
+            else:
+                print_warning_debug(failure_line)
             return CoercionMethodResult(
                 target=self.target,
                 method_name=method.name,
@@ -390,14 +393,50 @@ class CoercionEngine:
             )
 
 
+def _walk_exception_chain(exc: BaseException) -> list[BaseException]:
+    """Return the exception with its ``__cause__`` / ``__context__`` chain."""
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _is_connection_closed_error(exc: BaseException) -> bool:
+    """Return True for expected connection-closed / reset transients.
+
+    A pipe or connection closing mid-coercion is an expected transient: the DC
+    routinely tears down the named pipe after a probe. It surfaces from the
+    aiosmb stack as a bare ``Exception("Connection closed")`` (module
+    ``builtins``) so it dodges the type-name / module checks below — yet it is
+    never a Python bug and must not trigger a full traceback. Mirrors the
+    connect-time ``ConnectionError`` handling in ``is_ldaps_transport_failure``.
+    Kept targeted (no blanket ``OSError``) to avoid masking real bugs.
+    """
+    indicators = ("connection closed", "connection reset", "broken pipe")
+    for candidate in _walk_exception_chain(exc):
+        if isinstance(candidate, (ConnectionError, BrokenPipeError, EOFError)):
+            return True
+        message = str(candidate or "").lower()
+        if any(indicator in message for indicator in indicators):
+            return True
+    return False
+
+
 def _is_protocol_level_error(exc: BaseException) -> bool:
     """Return True for expected protocol-layer errors during coercion attempts.
 
     These failures (DCERPC error codes, SMB transport errors, EFSR rejections,
-    RPC binding failures, etc.) are normal outcomes when enumerating coercion
-    methods against a target — not bugs. They get a compact one-liner in the
-    debug log instead of a full traceback so the terminal doesn't flood.
+    RPC binding failures, connection-closed transients, etc.) are normal
+    outcomes when enumerating coercion methods against a target — not bugs.
+    They get a compact one-liner in the debug log instead of a full traceback
+    so the terminal doesn't flood.
     """
+    if _is_connection_closed_error(exc):
+        return True
     type_name = type(exc).__name__
     module = type(exc).__module__ or ""
     # DCERPC/SMB/RPC layer errors from impacket or aiosmb
@@ -426,10 +465,27 @@ def _is_protocol_level_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_benign_event_loop_teardown(exc: BaseException | None) -> bool:
+    """Return True for the benign post-loop teardown ``RuntimeError``.
+
+    asysocks/aiosmb transport cleanup callbacks fire during GC *after* the
+    ``asyncio.run`` loop has already closed, raising ``RuntimeError: no running
+    event loop``. It rides on the real coercion exception via ``__context__``
+    but did not break the call - the same predicate is already used by
+    :func:`_is_protocol_level_error`. Reused here so the misleading
+    "(caused by RuntimeError: no running event loop)" suffix is suppressed.
+    """
+    return isinstance(exc, RuntimeError) and "event loop" in str(exc).lower()
+
+
 def _compact_error(exc: BaseException) -> str:
     """Return a short one-line description of a coercion failure."""
     cause = exc.__cause__ or exc.__context__
-    if cause is not None and type(cause).__name__ != type(exc).__name__:
+    if (
+        cause is not None
+        and type(cause).__name__ != type(exc).__name__
+        and not _is_benign_event_loop_teardown(cause)
+    ):
         return f"{type(exc).__name__}: {exc} (caused by {type(cause).__name__}: {cause})"
     return f"{type(exc).__name__}: {exc}"
 

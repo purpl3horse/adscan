@@ -8977,6 +8977,8 @@ def _resolve_netexec_target_fqdn(
     target_hostname: str | None = None,
 ) -> str | None:
     """Resolve NetExec target IP/hostname into an FQDN suitable for BloodHound lookup."""
+    from adscan_internal.models.domain import qualify_host_fqdn  # noqa: PLC0415
+
     domain_clean = str(domain or "").strip()
     ip_clean = str(target_ip or "").strip()
     if not domain_clean or not ip_clean:
@@ -8997,7 +8999,12 @@ def _resolve_netexec_target_fqdn(
         fqdn = None
 
     if not fqdn and target_hostname:
-        candidate = f"{str(target_hostname).strip().rstrip('.')}.{domain_clean}".lower()
+        # ``target_hostname`` may arrive as a short NetBIOS name (netexec parse)
+        # or as an already-qualified FQDN (native aiosmb sweep). The centralised
+        # qualifier appends the domain only to a short label and self-heals an
+        # accidental ``host.domain.domain`` double suffix that otherwise misses
+        # the BloodHound node lookup and silently drops the AdminTo edge.
+        candidate = qualify_host_fqdn(target_hostname, domain_clean)
         fqdn = candidate
         marked_ip = mark_sensitive(ip_clean, "ip")
         marked_fqdn = mark_sensitive(candidate, "host")
@@ -9029,6 +9036,8 @@ def _resolve_netexec_target_computer_node(
     1. Prefer hostname from NetExec output (`target_hostname`) as ``hostname.domain``.
     2. If no node matches that candidate, fallback to DNS reverse resolution by IP.
     """
+    from adscan_internal.models.domain import qualify_host_fqdn  # noqa: PLC0415
+
     domain_clean = str(domain or "").strip()
     ip_clean = str(target_ip or "").strip()
     if not domain_clean or not ip_clean:
@@ -9036,9 +9045,9 @@ def _resolve_netexec_target_computer_node(
 
     candidate_fqdn: str | None = None
     if target_hostname:
-        candidate_fqdn = (
-            f"{str(target_hostname).strip().rstrip('.')}.{domain_clean}".lower()
-        )
+        # Centralised FQDN qualifier: appends the domain only to a short label,
+        # leaves an already-qualified FQDN as-is, and self-heals a double suffix.
+        candidate_fqdn = qualify_host_fqdn(target_hostname, domain_clean)
         node_props = service.get_computer_node_by_name(domain_clean, candidate_fqdn)  # type: ignore[attr-defined]
         if isinstance(node_props, dict):
             marked_ip = mark_sensitive(ip_clean, "ip")

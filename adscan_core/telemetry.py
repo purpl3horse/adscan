@@ -3,6 +3,7 @@
 import base64
 import binascii
 import functools
+import gzip
 import hashlib
 import hmac
 import ipaddress
@@ -16,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from html import unescape
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator, Optional, TYPE_CHECKING
+from typing import Any, Callable, Iterator, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 import site
 import sys
@@ -40,6 +41,7 @@ from adscan_core.embedded_telemetry_config import (
     get_posthog_proxy_url_legacy,
     get_posthog_proxy_url_prod,
     get_sentry_proxy_url,
+    get_vercel_sessions_direct_url,
     get_vercel_sessions_proxy_url,
 )
 from adscan_core.sensitive import (
@@ -1211,6 +1213,78 @@ _KNOWN_NETBIOS_LOADED: bool = False
 _KNOWN_WORKSPACES: list[str] = []
 _KNOWN_WORKSPACES_LOADED: bool = False
 
+# Minimum length a workspace-registered known value must have before it is
+# eligible for substring redaction in the known-value loops.
+#
+# SECURITY POLICY -- under-redaction must NEVER happen:
+#   A short cracked/weak password (e.g. a 4-char value surfaced by spraying or
+#   cracking) and a short sAMAccountName are STILL real secrets and MUST be
+#   redacted from the exported telemetry. The floor therefore exists ONLY to
+#   stop degenerate 1-char / 2-char matches -- a single-character registered
+#   value, even bounded by non-alnum, still hits every standalone "a"/"I" in the
+#   buffer. It is NOT a recall trade-off and must never be raised back to a
+#   "common word length" floor; doing so would let a real short secret leak.
+#
+#   Over-greediness (the old "DEBUG -> gibberish" corruption) is now prevented
+#   purely by the boundaried, case-sensitive known-value matching in the loops
+#   below -- NOT by this floor and NOT by any value-skip-list. A 4-char password
+#   such as "Ab1!" is registered, redacted as a bounded standalone token, and
+#   does not corrupt surrounding prose (proven by the redaction tests).
+#
+# Floor = 3 for both: a 3+ char registered value is specific enough that the
+# boundaried match only hits the intended token. 1-2 char values are dropped
+# because no boundary logic makes a single/double character safe to
+# substring-redact across a whole export buffer.
+_MIN_KNOWN_PASSWORD_LEN: int = 3
+_MIN_KNOWN_USER_LEN: int = 3
+
+# Structural tokens that must NEVER be pseudonymized, regardless of what ends
+# up in the known-value sets. Defense-in-depth backstop checked inside
+# ``_record_pseudonym`` so that even a future over-greedy known-value loop (or
+# a registered secret that happens to equal one of these) cannot corrupt the
+# scaffolding of the recording. Kept deliberately small: only log-level tokens
+# and a handful of structural words that recur in prompt labels / panel copy.
+# Matched case-insensitively (see ``_is_reserved_structural_token``).
+_RESERVED_STRUCTURAL_TOKENS: frozenset[str] = frozenset(
+    {
+        # Log levels only. These are the unambiguously-structural tokens that
+        # are NEVER a legitimate sensitive value, so blocking their
+        # pseudonymization can only fix corruption, never cause under-redaction.
+        #
+        # NOTE on scope: prompt-label words ("Enter", "the", "new", ...) are
+        # deliberately NOT listed here. They are protected by Layers 1+2 (the
+        # registration length floor and the boundaried, case-sensitive
+        # known-value matching), which is the correct mechanism. Putting common
+        # words like "user"/"domain"/"password"/"target" in this backstop would
+        # block their LEGITIMATE redaction when they appear as actual values in
+        # structured credential tables / USER@DOMAIN:PASSWORD strings -> an
+        # under-redaction regression. Keep this set to structural tokens that
+        # cannot be a real secret.
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "critical",
+        "success",
+        "verbose",
+        "trace",
+        "notice",
+        "fatal",
+    }
+)
+
+
+def _is_reserved_structural_token(value: str) -> bool:
+    """Return True if ``value`` is a structural token that must never be pseudonymized.
+
+    Case-insensitive: log levels and prompt-label words appear in mixed case
+    across the export buffer (``DEBUG`` vs ``Debug``, ``Enter`` vs ``enter``).
+    """
+    if not value:
+        return False
+    return value.strip().casefold() in _RESERVED_STRUCTURAL_TOKENS
+
 
 def set_workspace_domains(
     domains: Optional[list[str]] | tuple[str, ...] | set[str] | None,
@@ -1291,6 +1365,11 @@ def set_workspace_users(
         cleaned = user.strip()
         if not cleaned:
             continue
+        # Skip trivially-short / word-like values: substring-redacting a value
+        # shorter than the floor corrupts ordinary words and structural tokens
+        # across the export buffer. See _MIN_KNOWN_USER_LEN rationale.
+        if len(cleaned) < _MIN_KNOWN_USER_LEN:
+            continue
         normalized.append(cleaned)
     seen: set[str] = set()
     deduped: list[str] = []
@@ -1319,6 +1398,12 @@ def set_workspace_passwords(
             continue
         cleaned = password.strip()
         if not cleaned:
+            continue
+        # Skip trivially-short passwords: a 1-5 char registered value gets
+        # substring-matched everywhere and corrupts log levels / prose. Real
+        # passwords and hashes are well above the floor. See
+        # _MIN_KNOWN_PASSWORD_LEN rationale.
+        if len(cleaned) < _MIN_KNOWN_PASSWORD_LEN:
             continue
         normalized.append(cleaned)
     seen: set[str] = set()
@@ -2325,19 +2410,237 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
     return "".join(result)
 
 
-def _record_pseudonym(value: str, data_type: str) -> str:
-    """Return a pseudonym and remember it to avoid double-sanitization."""
+# ─────────────────────────────────────────────────────────────────────
+# Sanitizer trace (development-only diagnostic)
+# ─────────────────────────────────────────────────────────────────────
+#
+# When active, every call into `_record_pseudonym` writes a structured
+# entry to ``~/.adscan/logs/sanitizer-trace.log`` showing:
+#   * the input value (repr, so zero-width markers are visible)
+#   * the declared data_type
+#   * the resulting pseudonym
+#   * an abbreviated stack trace identifying which sanitizer pattern
+#     fired the call
+#
+# At session start (each call to `_sanitize_rich_output`) the helper
+# also dumps the loaded ``known_*`` lists (workspaces, domains, hosts,
+# users, passwords). That surface is the most likely culprit for
+# over-sanitization — a workspace literally named "Enter" or "test"
+# turns into a regex that rewrites those words anywhere they appear.
+#
+# Activation policy (no env var knob — keep one source of truth):
+#   * Active iff ``_determine_environment() == "dev"``. The launcher's
+#     ``--dev`` flag is what flips that environment label by registering
+#     the host machine-id as a dev machine, so this trace fires for the
+#     ADscan author / contributors and never on a customer install.
+#   * Customer (prod) and CI runs never write this file, even if
+#     verbose / debug modes are on. The trace contains pre-redaction
+#     content and must never reach untrusted disks.
+#
+# The trace file is capped (entries + size) so it cannot grow unbounded
+# during long sessions.
+
+_SANITIZER_TRACE_FH: Optional[Any] = None
+_SANITIZER_TRACE_COUNT: int = 0
+_SANITIZER_TRACE_LIMIT: int = 5000
+_SANITIZER_TRACE_RESOLVED: Optional[bool] = None
+
+
+def _sanitizer_trace_enabled() -> bool:
+    """Return whether the sanitizer trace should write to disk.
+
+    Single rule: trace fires only when the resolved telemetry environment
+    is ``"dev"`` (i.e. the launcher detected a registered dev machine,
+    typically via ``adscan --dev``). No env-var override — production /
+    CI must never write this file because it contains pre-redaction text.
+    The decision is cached for the process lifetime; ``--dev`` is set
+    once at launcher startup and does not change mid-session.
+    """
+    global _SANITIZER_TRACE_RESOLVED
+    if _SANITIZER_TRACE_RESOLVED is not None:
+        return _SANITIZER_TRACE_RESOLVED
+    try:
+        _SANITIZER_TRACE_RESOLVED = _determine_environment() == "dev"
+    except Exception:
+        _SANITIZER_TRACE_RESOLVED = False
+    return _SANITIZER_TRACE_RESOLVED
+
+
+def _sanitizer_trace_path() -> Path:
+    home = Path(os.getenv("ADSCAN_HOME") or (Path.home() / ".adscan"))
+    return home / "logs" / "sanitizer-trace.log"
+
+
+def _sanitizer_trace_fh() -> Optional[Any]:
+    """Lazily open the trace log file. Returns None on any I/O error."""
+    global _SANITIZER_TRACE_FH
+    if _SANITIZER_TRACE_FH is not None:
+        return _SANITIZER_TRACE_FH
+    try:
+        path = _sanitizer_trace_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Rotate if file exceeds 4 MiB so we always have a fresh tail
+        # to read after reproducing the bug.
+        try:
+            if path.exists() and path.stat().st_size > 4 * 1024 * 1024:
+                rotated = path.with_suffix(".log.prev")
+                try:
+                    rotated.unlink()
+                except FileNotFoundError:
+                    pass
+                path.rename(rotated)
+        except OSError:
+            pass
+        _SANITIZER_TRACE_FH = path.open("a", encoding="utf-8")
+        _SANITIZER_TRACE_FH.write(
+            f"\n\n=== sanitizer-trace session opened "
+            f"pid={os.getpid()} at {datetime.now(timezone.utc).isoformat()} ===\n"
+        )
+        _SANITIZER_TRACE_FH.flush()
+    except Exception:
+        _SANITIZER_TRACE_FH = None
+    return _SANITIZER_TRACE_FH
+
+
+def _sanitizer_trace_session_open(content: str) -> None:
+    """Dump the configuration state at the start of a sanitize pass."""
+    global _SANITIZER_TRACE_COUNT
+    if not _sanitizer_trace_enabled():
+        return
+    fh = _sanitizer_trace_fh()
+    if fh is None:
+        return
+    _SANITIZER_TRACE_COUNT = 0
+    try:
+        known_workspaces = _get_known_workspaces()
+    except Exception as exc:
+        known_workspaces = [f"<error: {exc}>"]
+    try:
+        known_domains = _get_known_domains() if "_get_known_domains" in globals() else []
+    except Exception:
+        known_domains = []
+    try:
+        known_hosts = _get_known_hostnames() if "_get_known_hostnames" in globals() else []
+    except Exception:
+        known_hosts = []
+    try:
+        known_users = _get_known_users() if "_get_known_users" in globals() else []
+    except Exception:
+        known_users = []
+    try:
+        known_pw_count = len(_get_known_passwords()) if "_get_known_passwords" in globals() else 0
+    except Exception:
+        known_pw_count = -1
+    try:
+        fh.write(
+            f"\n--- sanitize pass: content_len={len(content)} chars ---\n"
+            f"known_workspaces ({len(known_workspaces)}): {known_workspaces!r}\n"
+            f"known_domains    ({len(known_domains)}): {known_domains!r}\n"
+            f"known_hosts      ({len(known_hosts)}): {known_hosts!r}\n"
+            f"known_users      ({len(known_users)}): {known_users!r}\n"
+            f"known_passwords  count={known_pw_count}\n"
+        )
+        # First and last 800 chars of the pre-sanitize content, so the
+        # reader can see WHAT is going in (still pre-redaction — only
+        # written to a local file, never uploaded).
+        head = content[:800]
+        tail = content[-800:] if len(content) > 1600 else ""
+        fh.write(f"content_head={head!r}\n")
+        if tail:
+            fh.write(f"content_tail={tail!r}\n")
+        fh.flush()
+    except Exception:
+        pass
+
+
+def _sanitizer_trace_event(
+    *,
+    kind: str,
+    value: str,
+    data_type: str,
+    result: str,
+) -> None:
+    """Record a single pseudonymization call with its caller context."""
+    global _SANITIZER_TRACE_COUNT
+    if not _sanitizer_trace_enabled():
+        return
+    if _SANITIZER_TRACE_COUNT >= _SANITIZER_TRACE_LIMIT:
+        return
+    fh = _sanitizer_trace_fh()
+    if fh is None:
+        return
+    _SANITIZER_TRACE_COUNT += 1
+    # Extract caller frames inside this module so we know which regex /
+    # pattern triggered the call. Skip the current frame + the
+    # _record_pseudonym frame itself.
+    try:
+        stack = traceback.extract_stack(limit=12)[:-2]
+        # Trim to last ~6 frames for readability.
+        recent = stack[-6:]
+        frames = [
+            f"  {frame.filename.rsplit('/', 1)[-1]}:{frame.lineno} in {frame.name}"
+            for frame in recent
+        ]
+        stack_str = "\n".join(frames)
+    except Exception:
+        stack_str = "  <stack unavailable>"
+    try:
+        fh.write(
+            f"\n[{_SANITIZER_TRACE_COUNT:04d}] {kind} "
+            f"type={data_type!r} value={value!r} -> {result!r}\n"
+            f"{stack_str}\n"
+        )
+        fh.flush()
+    except Exception:
+        pass
+
+
+def _record_pseudonym(value: str, data_type: str, *, force: bool = False) -> str:
+    """Return a pseudonym and remember it to avoid double-sanitization.
+
+    Args:
+        value: The token to pseudonymize.
+        data_type: Logical kind ("user", "password", "domain", ...).
+        force: When True, bypass the well-known-principal passthrough so an
+            explicitly-MARKED sensitive value (a value the call site declared
+            sensitive via the marker system) is redacted even if it equals a
+            built-in name like "administrator" or "Domain Admins". A marker is
+            an explicit sensitivity declaration; honouring it cannot leak. The
+            log-level structural backstop is NEVER bypassed -- a log level can
+            never be a real secret.
+    """
     if value in _SANITIZED_VALUES:
         return value
-    # Preserve generic built-in AD principals (useful for telemetry debugging).
-    # We only allow this for "user" tokens because groups are usually treated as users in output.
+    # Defense-in-depth: never pseudonymize a structural log-level token, even if
+    # a short/word-like secret slipped into the known set or a future loop
+    # over-matches. This keeps the recording's scaffolding readable
+    # (DEBUG/WARNING/INFO) regardless of what is registered. Applies on every
+    # path, including force=True: a log level is structurally never a secret.
     if (
-        data_type.lower() == "user"
+        data_type.lower() in ("user", "password", "workspace", "domain")
+        and _is_reserved_structural_token(value)
+    ):
+        return value
+    # Preserve generic built-in AD principals (useful for telemetry debugging)
+    # ONLY on the heuristic/structured shape-detection paths (force=False),
+    # where a name like "administrator" was detected by SHAPE in prose/tables
+    # and was not declared sensitive. The marker path passes force=True because
+    # a marker IS an explicit "this value is sensitive" declaration -- so a
+    # marked built-in name is redacted, never passed through (no leak).
+    if (
+        not force
+        and data_type.lower() == "user"
         and _preserve_well_known_principals_enabled()
         and _is_well_known_principal(value)
     ):
         return value
     replacement = _pseudonymize_value(value, data_type)
+    _sanitizer_trace_event(
+        kind="pseudonym",
+        value=value,
+        data_type=data_type,
+        result=replacement,
+    )
     if replacement and replacement != value:
         _SANITIZED_VALUES.add(replacement)
         # Heuristic regex sanitizers often operate on non-whitespace tokens.
@@ -2433,7 +2736,11 @@ def _sanitize_by_markers(
                 return value
             if data_type == "ip" and _is_ip_passthrough(value):
                 return value
-            return _record_pseudonym(value, data_type)
+            # A marker is an explicit declaration that this value is sensitive,
+            # so it overrides the well-known-principal passthrough: a MARKED
+            # "administrator" / "Domain Admins" is a registered secret here and
+            # must be redacted. force=True keeps only the log-level backstop.
+            return _record_pseudonym(value, data_type, force=True)
 
         content = re.sub(pattern, _replace, content, flags=re.DOTALL)
 
@@ -2457,6 +2764,7 @@ def _sanitize_rich_output(content: str) -> str:
     content = _prepare_rich_content_for_processing(content)
     content, passthrough_mapping = _extract_passthrough_segments(content)
     _SANITIZED_VALUES.clear()
+    _sanitizer_trace_session_open(content)
 
     # Placeholder tokens used only for pattern matching of pre-sanitized text.
     placeholder_domain = "[DOMAIN]"
@@ -3136,11 +3444,25 @@ def _sanitize_rich_output(content: str) -> str:
             user_clean = user.strip()
             if not user_clean:
                 continue
+            # Boundaried, case-insensitive match. A registered username is
+            # redacted ONLY as a standalone token; the boundaries stop it from
+            # rewriting occurrences inside unrelated words (the over-greediness
+            # fix). There is NO value-skip-list: a username that equals a common
+            # word (e.g. "admin") is a registered secret and MUST be redacted
+            # everywhere it appears as that bounded token -- leaking it is the
+            # legal risk; corrupting the prose word is the acceptable lesser evil.
+            #
+            # force=True: a value registered in the workspace known-user set is an
+            # explicit "this is the operation's account" declaration, so it
+            # overrides the well-known-principal debugging passthrough. Otherwise
+            # an engagement whose actual account is literally "administrator"
+            # would leak in cleartext. (The well-known passthrough still applies
+            # to UNREGISTERED, shape-detected names elsewhere in this function.)
             user_pattern = re.compile(
                 rf"(?i)(?<![A-Za-z0-9._-])({re.escape(user_clean)})(?![A-Za-z0-9._-])"
             )
             content = user_pattern.sub(
-                lambda m: _record_pseudonym(m.group(1), "user"),
+                lambda m: _record_pseudonym(m.group(1), "user", force=True),
                 content,
             )
 
@@ -3192,9 +3514,18 @@ def _sanitize_rich_output(content: str) -> str:
             password_clean = password.strip()
             if not password_clean:
                 continue
-            password_pattern = re.compile(re.escape(password_clean))
+            # Boundaried, CASE-SENSITIVE match. Mirrors the known-user loop's
+            # alnum/credential-char boundaries so a registered password no
+            # longer rewrites occurrences inside unrelated words or log-level
+            # tokens (e.g. a password "Inform" must not match inside
+            # "Information"). Case is preserved deliberately: password casing is
+            # significant, and case-folding here is what let a value match a
+            # differently-cased ordinary word.
+            password_pattern = re.compile(
+                rf"(?<![A-Za-z0-9._@/-])({re.escape(password_clean)})(?![A-Za-z0-9._@/-])"
+            )
             content = password_pattern.sub(
-                lambda m: _record_pseudonym(m.group(0), "password"),
+                lambda m: _record_pseudonym(m.group(1), "password"),
                 content,
             )
 
@@ -3349,6 +3680,81 @@ def _sanitize_cli_domain_flag(content: str, flag: str, data_type: str) -> str:
     return content
 
 
+# Hard upper bound for any single keyword=value match. Legitimate secrets
+# (passwords, tokens, FQDNs, paths, lab names, workspace names) are well
+# under this — anything bigger is, in practice, a regex over-capture that
+# escaped past the intended single-quoted/unquoted value. Used by the
+# sanity guard below to reject runaway matches outright.
+_KEYWORD_VALUE_MAX_LEN = 512
+
+# Characters that should never appear inside a real keyword value but
+# routinely appear in Rich panels, log lines, and prompt echoes the
+# regex might accidentally capture. Box-drawing, vertical bars used as
+# table separators, and the warning glyph are all strong signals that
+# the regex jumped out of the intended quoted span.
+_KEYWORD_VALUE_REJECT_CHARS = frozenset("│─╭╮╰╯┌┐└┘├┤┬┴┼━┃┏┓┗┛⚠")
+
+# Substrings that strongly suggest the captured "value" is a multi-line
+# escape into the surrounding log/UI text rather than a real secret.
+# Any Rich-emitted log level prefix or panel marker collapses many
+# false positives in one check.
+_KEYWORD_VALUE_REJECT_SUBSTRINGS = (
+    "\nDEBUG",
+    "\nINFO",
+    "\nWARNING",
+    "\nERROR",
+    "\nCRITICAL",
+    "\n⚠",
+    "\nℹ",
+    "\n✓",
+    "Workspace creation",
+    "Workspace Required",
+    " » ",
+    "Prompt:",
+    "Answer for",
+)
+
+
+def _looks_like_keyword_value(value: str) -> bool:
+    """Sanity-check a regex-captured keyword value before pseudonymizing.
+
+    The keyword-value regex is intentionally permissive — it has to cope
+    with the noisy formats real secrets appear in (CLI flags, table cells,
+    log key=value pairs, panel rows). That permissiveness lets it
+    occasionally capture a runaway span that escapes its intended quoted
+    region (see the historical Workspace Required regression: a stray
+    closing quote in ``Answer for 'Enter name for a new workspace: ':``
+    let the regex devour the entire follow-up panel before finding the
+    next isolated ``'`` further down the buffer).
+
+    This guard rejects captures that cannot plausibly be a real secret:
+
+    * empty / whitespace-only — nothing to sanitize.
+    * longer than ``_KEYWORD_VALUE_MAX_LEN`` — secrets are short.
+    * contain newlines / carriage returns — keyword values are single
+      line; multiline captures are escapes.
+    * contain box-drawing characters or panel glyphs — those mark
+      captured UI surfaces, not secrets.
+    * contain canonical multi-line escape signatures (log level prefixes
+      after a newline, recognizable UI substrings).
+
+    Returning ``False`` makes the caller skip the substitution for that
+    match without touching the rest of the sanitizer pipeline.
+    """
+    if not value:
+        return False
+    if len(value) > _KEYWORD_VALUE_MAX_LEN:
+        return False
+    if "\n" in value or "\r" in value:
+        return False
+    if any(ch in _KEYWORD_VALUE_REJECT_CHARS for ch in value):
+        return False
+    for marker in _KEYWORD_VALUE_REJECT_SUBSTRINGS:
+        if marker in value:
+            return False
+    return True
+
+
 def _sanitize_keyword_value(
     content: str,
     keywords: list[str],
@@ -3356,7 +3762,13 @@ def _sanitize_keyword_value(
     separator_pattern: str = r"(?:\s*[:=]\s*|\s*[│|]\s*|[ \t]+)",
     value_pattern: str = r"[A-Za-z0-9._@!%^&*+=\\/-]+",
 ) -> str:
-    """Sanitize values that follow specific keywords (user/password/source/etc.)."""
+    """Sanitize values that follow specific keywords (user/password/source/etc.).
+
+    Two regexes run in sequence — quoted (``keyword: 'value'``) and
+    unquoted (``keyword: value``). Both are defended by the
+    ``_looks_like_keyword_value`` guard in the callback so any over-capture
+    is silently rejected without polluting the surrounding text.
+    """
     if not keywords:
         return content
 
@@ -3364,10 +3776,20 @@ def _sanitize_keyword_value(
     base_pattern = rf"(?i)(?<!\{{|\[)(\b(?:{keyword_pattern})\b{separator_pattern})"
 
     def _build_quoted_regex() -> re.Pattern[str]:
+        # The value char-class explicitly excludes newlines / carriage
+        # returns. A legitimate quoted keyword value is always single line;
+        # allowing the regex to cross line boundaries lets it bridge an
+        # unmatched quote in one line with an unrelated quote many lines
+        # later (the historical Workspace Required regression).
+        # The bounded ``{1,N}?`` quantifier caps backtracking blast radius
+        # and keeps a runaway match from spanning the whole buffer even
+        # under pathological inputs.
         return re.compile(
             base_pattern
             + r"(?:<[^>]+>)*(?P<quote>['\"])"
-            + r"(?:<[^>]+>)*(?P<value>[^\"'<]+?)"
+            + r"(?:<[^>]+>)*(?P<value>[^\"'<\n\r]{1,"
+            + str(_KEYWORD_VALUE_MAX_LEN)
+            + r"}?)"
             + r"(?:<[^>]+>)*(?P=quote)",
             re.IGNORECASE,
         )
@@ -3386,10 +3808,26 @@ def _sanitize_keyword_value(
             line_end = len(text)
         return text[line_start:line_end]
 
+    def _match_crosses_newline(match: re.Match[str]) -> bool:
+        """True if the full match spans a line break.
+
+        The default separator pattern uses ``\\s*`` which matches newlines
+        too, so an unquoted regex can pick up a keyword on one line and
+        latch onto the first alphanumeric token of the next line as the
+        "value" (e.g. ``workspace:\\n  DEBUG     ...`` → value=``DEBUG``).
+        Real keyword=value pairs are always single-line, so reject any
+        match whose span includes a newline character.
+        """
+        span = match.string[match.start() : match.end()]
+        return "\n" in span or "\r" in span
+
     def _replace_if_not_placeholder(match: re.Match[str]) -> str:
         """Replace value only if it's not already a placeholder."""
         value = match.group("value")
         if "user descriptions" in _line_for_match(match).lower():
+            return match.group(0)
+        if _match_crosses_newline(match):
+            # Keyword on line N, "value" on line N+1 — pure regex artifact.
             return match.group(0)
         # Strip whitespace and check if it starts with a placeholder
         # This handles cases like "[IP]    │" where trailing spaces/chars are captured
@@ -3399,6 +3837,10 @@ def _sanitize_keyword_value(
             return match.group(0)
         if _is_already_sanitized(value_stripped):
             return match.group(0)
+        if not _looks_like_keyword_value(value_stripped):
+            # Regex over-captured into surrounding UI/log text — bail out
+            # without pseudonymizing. See `_looks_like_keyword_value`.
+            return match.group(0)
         replacement = _record_pseudonym(value_stripped, data_type)
         return match.group(1) + _fit_to_length(replacement, len(value))
 
@@ -3406,10 +3848,14 @@ def _sanitize_keyword_value(
         value = match.group("value")
         if "user descriptions" in _line_for_match(match).lower():
             return match.group(0)
+        if _match_crosses_newline(match):
+            return match.group(0)
         value_stripped = value.strip()
         if value_stripped.startswith("[") and value_stripped.endswith("]"):
             return match.group(0)
         if _is_already_sanitized(value_stripped):
+            return match.group(0)
+        if not _looks_like_keyword_value(value_stripped):
             return match.group(0)
         replacement = _record_pseudonym(value_stripped, data_type)
         raw = f"{match.group('quote')}{value}{match.group('quote')}"
@@ -4300,6 +4746,140 @@ def _summarize_vercel_payload_context(payload: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+# Defaults for the gzipped upload path. The server-side hard limit
+# is the Next.js bodyParser `sizeLimit: '10mb'` on the decompressed
+# body — gzip on the wire shrinks transport cost but cannot raise
+# that ceiling. We refuse to attempt an upload above
+# ``_SESSION_MAX_HTML_BYTES`` and route the payload to the on-disk
+# queue instead, where it survives until the next CLI invocation has
+# more network luck (or never, if the session is genuinely too large).
+# Margin under the 10 MB server cap to leave headroom for the JSON
+# envelope keys, version fields, metadata, and timestamps.
+_SESSION_MAX_HTML_BYTES: int = 9 * 1024 * 1024  # 9 MiB
+# Below this size the network savings from gzip are marginal; above it
+# the cost is dominated by the HTML blob, where gzip yields 8-12×.
+# We compress unconditionally — the CPU cost is microseconds — but
+# this constant is the line where the comment in the code points out
+# the saving actually matters.
+_SESSION_GZIP_THRESHOLD_BYTES: int = 4 * 1024  # 4 KiB
+
+
+def _resolve_session_ingest_target() -> tuple[str | None, str]:
+    """Return ``(url, label)`` for the active session ingest endpoint.
+
+    Preference order (single source of truth so live uploads and queue
+    drains pick the same target):
+
+    1. ``get_vercel_sessions_direct_url()`` — direct POST to
+       ``sessions.adscanpro.com/api/sessions``. New path. The server
+       endpoint accepts ``X-CLI-Token`` natively, gzip is decompressed
+       by Next.js bodyParser before its size check, and there is no
+       intermediate JSON re-serialisation.
+    2. ``get_vercel_sessions_proxy_url()`` — legacy n8n webhook. Kept
+       for graceful fallback in case the direct URL is unset in the
+       embedded config (kill-switch) or while the rollout cohort
+       still includes 9.0.0 deployments.
+
+    Returns ``(None, "no-target")`` when neither URL is configured —
+    the caller treats that as "telemetry disabled by config".
+    """
+    direct = get_vercel_sessions_direct_url()
+    if direct:
+        return direct, "direct"
+    proxy = get_vercel_sessions_proxy_url()
+    if proxy:
+        return proxy, "n8n-proxy"
+    return None, "no-target"
+
+
+def _upload_session_payload(payload: dict[str, Any]) -> Optional[str]:
+    """POST a fully-built session payload to the active ingest endpoint.
+
+    Single source of truth for the wire format:
+
+    * Body is JSON, then gzipped, then sent with
+      ``Content-Encoding: gzip``. Next.js bodyParser decompresses
+      transparently before applying its 10 MB size limit. On the
+      direct path the request never touches n8n; on the fallback
+      proxy path n8n needs the Code-node decompression patch to read
+      the body (kept available behind ``get_vercel_sessions_proxy_url``
+      until the rollout is complete).
+    * Plain JSON fallback (no gzip) is used as defence-in-depth if the
+      compression step itself fails — that path keeps behaviour identical
+      to the legacy uploader.
+    * On success returns the session viewer URL (``sessions.adscanpro.com/sessions/<id>``).
+    * On failure returns ``None``; the caller decides whether to enqueue
+      for retry.
+
+    Used both by the live ``_send_session_to_vercel`` and by the
+    background drain in ``telemetry_queue`` — same wire shape both ways.
+    """
+    target_url, target_label = _resolve_session_ingest_target()
+    token = get_cli_shared_token()
+    if not target_url or not token:
+        return None
+
+    session_id = str(payload.get("session_id") or "")
+
+    headers: dict[str, str] = {
+        "X-CLI-Token": token,
+        "Content-Type": "application/json",
+    }
+
+    body_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request_body: bytes | str
+    try:
+        request_body = gzip.compress(body_json)
+        headers["Content-Encoding"] = "gzip"
+        # ``Content-Length`` is set by ``requests`` automatically; we
+        # rely on that rather than pre-computing it.
+    except (OSError, OverflowError):
+        # Compression should never fail for in-memory bytes but guard
+        # defensively — fall back to uncompressed JSON.
+        request_body = body_json
+
+    _configure_ssl_certificates_for_requests()
+    print_info_debug(
+        f"[telemetry] sessions ingest target={target_label} url={target_url}"
+    )
+    try:
+        response = requests.post(
+            target_url,
+            data=request_body,
+            headers=headers,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        print_warning_debug(
+            f"Failed to send session via {target_label} ingest: {e}"
+        )
+        print_info_debug(
+            f"Session ingest error details: {type(e).__name__} - {str(e)}"
+        )
+        return None
+
+    print_info_debug(
+        f"Session ingest ({target_label}) response status: {response.status_code}"
+    )
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print_warning_debug(f"Session ingest ({target_label}) HTTP error: {e}")
+        return None
+
+    try:
+        result = response.json()
+        stored_session_id = result.get("session_id") or session_id
+        session_url = result.get("session_url") or (
+            f"https://sessions.adscanpro.com/sessions/{stored_session_id}"
+        )
+        return session_url
+    except (ValueError, json.JSONDecodeError):
+        if response.status_code in (200, 201) and session_id:
+            return f"https://sessions.adscanpro.com/sessions/{session_id}"
+        return None
+
+
 def _send_session_to_vercel(
     session_id: str,
     html_content: str,
@@ -4307,12 +4887,29 @@ def _send_session_to_vercel(
     started_at: Optional[datetime] = None,
     finished_at: Optional[datetime] = None,
 ) -> Optional[str]:
-    """Send terminal session recording to Vercel API via n8n proxy."""
-    vercel_proxy_url = get_vercel_sessions_proxy_url()
+    """Send terminal session recording to Vercel API via n8n proxy.
+
+    Four-step pipeline (each step degrades gracefully into the next):
+
+    1. Build the canonical session payload.
+    2. If the HTML body exceeds the server's decompressed-body limit,
+       short-circuit and enqueue for later retry — uploading would only
+       waste bandwidth on a guaranteed-413 response.
+    3. Attempt the live upload (gzipped via ``_upload_session_payload``).
+    4. On any failure mode, enqueue the same payload to the on-disk queue
+       so the next CLI invocation can retry without operator action.
+
+    Returns the viewer URL on success, ``None`` if the session was
+    enqueued for later or could not be delivered at all.
+    """
+    target_url, target_label = _resolve_session_ingest_target()
     token = get_cli_shared_token()
 
-    if not vercel_proxy_url or not token:
-        print_info_debug("Skipping Vercel session storage: missing proxy URL or token")
+    if not target_url or not token:
+        print_info_debug(
+            "Skipping Vercel session storage: "
+            f"no ingest target configured (label={target_label}) or missing token"
+        )
         return None
 
     try:
@@ -4330,68 +4927,316 @@ def _send_session_to_vercel(
         payload.update(_vercel_metadata_fields(metadata))
         payload.update(_vercel_timestamp_fields(started_at, finished_at))
 
-        # print_info_debug(
-        #     f"Sending session recording to Vercel via n8n proxy (session_id={session_id})",
-        # )
-        # print_info_debug(f"Vercel proxy URL: {vercel_proxy_url}")
-        print_info_debug(f"Payload size: HTML={len(html_content)} bytes")
+        html_size = len(html_content)
+        print_info_debug(f"Payload size: HTML={html_size} bytes")
         print_info_debug(
             f"Vercel payload context: {_summarize_vercel_payload_context(payload)}",
         )
 
-        # Configure SSL certificates before making request
-        _configure_ssl_certificates_for_requests()
-
-        response = requests.post(
-            vercel_proxy_url,
-            json=payload,
-            headers={
-                "X-CLI-Token": token,
-                "Content-Type": "application/json",
-            },
-            timeout=10,
-        )
-
-        print_info_debug(f"Vercel proxy response status: {response.status_code}")
-        response.raise_for_status()
-
-        # Parse response
-        try:
-            result = response.json()
-            # print_info_debug(f"Vercel proxy response: {result}")
-
-            # Extract session ID from response
-            stored_session_id = result.get("session_id") or session_id
-            # Construct public URL (proxy should return this)
-            session_url = result.get("session_url")
-            if not session_url:
-                # Fallback: construct from known pattern
-                session_url = (
-                    f"https://sessions.adscanpro.com/sessions/{stored_session_id}"
-                )
-
-            # print_info_debug(f"Session stored successfully via n8n: {session_url}")
-            return session_url
-        except (ValueError, json.JSONDecodeError) as e:
-            print_warning_debug(f"Vercel proxy response is not valid JSON: {e}")
-            # Construct URL anyway if status was successful
-            if response.status_code in (200, 201):
-                session_url = f"https://sessions.adscanpro.com/sessions/{session_id}"
-                print_info_debug(
-                    "Session stored successfully via n8n "
-                    f"(non-JSON response): {session_url}",
-                )
-                return session_url
+        # Skip-too-big: refuse to POST when the HTML alone exceeds the
+        # server's decompressed-body cap. Enqueue so the session is not
+        # silently lost — an operator can inspect the file in
+        # ``~/.adscan/telemetry-queue/`` and decide whether to bisect
+        # the recording or just accept the loss.
+        if html_size > _SESSION_MAX_HTML_BYTES:
+            print_warning_debug(
+                f"Session HTML exceeds upload ceiling "
+                f"({html_size} > {_SESSION_MAX_HTML_BYTES} bytes); "
+                "enqueued for offline review."
+            )
+            _enqueue_oversize_session(payload, html_size=html_size)
             return None
 
-    except requests.exceptions.RequestException as e:
-        print_warning_debug(f"Failed to send session via n8n proxy: {e}")
-        print_info_debug(f"Vercel proxy error details: {type(e).__name__} - {str(e)}")
+        session_url = _upload_session_payload(payload)
+        if session_url is not None:
+            return session_url
+
+        # Upload failed for some recoverable reason (network blip, proxy
+        # 5xx, n8n hiccup). Enqueue so the next CLI run retries.
+        _enqueue_failed_session(payload, reason="upload_failed")
         return None
+
     except (ValueError, TypeError, AttributeError, OSError) as exc:
-        print_warning_debug(f"Unexpected error sending session via n8n proxy: {exc}")
-        print_info_debug(f"Vercel proxy error details: {type(exc).__name__} - {exc}")
+        print_warning_debug(f"Unexpected error preparing session payload: {exc}")
+        print_info_debug(f"Payload preparation error: {type(exc).__name__} - {exc}")
         return None
+
+
+def _enqueue_failed_session(payload: dict[str, Any], *, reason: str) -> None:
+    """Persist a failed upload to the local queue for next-run retry."""
+    try:
+        from adscan_core import telemetry_queue
+    except ImportError:
+        # Queue module unavailable (extremely unlikely) — accept the loss.
+        return
+    queued_path = telemetry_queue.enqueue_session(payload)
+    if queued_path is not None:
+        print_info_debug(
+            f"(telemetry-queue) enqueued failed session "
+            f"reason={reason} path={queued_path}"
+        )
+
+
+def _enqueue_oversize_session(payload: dict[str, Any], *, html_size: int) -> None:
+    """Persist an oversize session that cannot be POSTed live.
+
+    Same disk path as a failed upload, but tagged so a future drain can
+    decide to skip these unless the server cap is raised.
+    """
+    try:
+        from adscan_core import telemetry_queue
+    except ImportError:
+        return
+    payload = dict(payload)  # shallow copy so we don't mutate caller
+    payload["_oversize_html_bytes"] = int(html_size)
+    queued_path = telemetry_queue.enqueue_session(payload)
+    if queued_path is not None:
+        print_info_debug(
+            f"(telemetry-queue) enqueued oversize session "
+            f"html_bytes={html_size} path={queued_path}"
+        )
+
+
+def _drain_queue_upload_fn(payload: dict[str, Any]) -> bool:
+    """Bridge between the disk queue and the wire uploader.
+
+    Drops oversize-tagged payloads silently — they were too big when
+    captured and the server cap has not changed since enqueue. Keeping
+    them on disk forever serves no purpose; the helper returns True so
+    ``drain_queue`` deletes them.
+    """
+    if payload.get("_oversize_html_bytes"):
+        print_info_debug(
+            "(telemetry-queue) discarding oversize queued session "
+            f"(html_bytes={payload.get('_oversize_html_bytes')!s}); "
+            "server body cap has not changed."
+        )
+        return True
+    return _upload_session_payload(payload) is not None
+
+
+def start_telemetry_queue_drain() -> None:
+    """Kick off a background drain of the on-disk telemetry queue.
+
+    Idempotent — safe to call multiple times per process (subsequent
+    calls just spawn a new daemon thread that finds an empty queue and
+    exits). Designed to be invoked once during early CLI startup, after
+    logging is initialised but before the first user-visible output, so
+    a failed delivery from a previous run gets retried without delaying
+    the foreground command.
+    """
+    if not _is_telemetry_enabled():
+        return
+    try:
+        from adscan_core import telemetry_queue
+    except ImportError:
+        return
+    try:
+        telemetry_queue.start_background_drain(_drain_queue_upload_fn)
+    except Exception as exc:  # noqa: BLE001
+        # Background drain is best-effort: any startup error must never
+        # bubble into the foreground CLI.
+        print_info_debug(
+            f"(telemetry-queue) background drain failed to start: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 2 — chunked streaming uploads
+# ─────────────────────────────────────────────────────────────────────
+
+
+def compute_workspace_id_hash(workspace_name: Optional[str]) -> Optional[str]:
+    """Return the stable 12-char workspace identifier for telemetry.
+
+    Mirrors the algorithm used by PostHog event capture in
+    ``adscan_internal/cli/common.py``: ``sha256(TELEMETRY_ID + ':' +
+    workspace_name)[:12]``. Same workspace under the same user always
+    yields the same hash, across sessions, without ever exposing the
+    raw workspace name to the dashboard's identity column.
+
+    Returns ``None`` for empty workspace names so callers can include
+    the field unconditionally without populating a misleading hash on
+    rows that have no workspace context.
+    """
+    if not workspace_name:
+        return None
+    raw = f"{TELEMETRY_ID}:{workspace_name}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _chunk_endpoint_url(trace_id: str) -> Optional[str]:
+    """Return the per-trace chunk endpoint URL, or ``None`` if disabled.
+
+    Built from the direct sessions URL — Tier 2 only runs on the
+    direct path; it doesn't go through n8n. If only the proxy URL is
+    embedded (kill-switch), the streamer is silently disabled.
+    """
+    direct = get_vercel_sessions_direct_url()
+    if not direct:
+        return None
+    base = direct.rstrip("/")
+    # ``direct`` is ``https://sessions.adscanpro.com/api/sessions``;
+    # the chunk endpoint lives at ``/api/sessions/<trace_id>/chunk``.
+    safe = "".join(ch for ch in trace_id if ch.isalnum() or ch in "._:-")[:128]
+    if not safe:
+        return None
+    return f"{base}/{safe}/chunk"
+
+
+def _upload_chunk(trace_id: str, payload: dict[str, Any]) -> bool:
+    """POST a single chunk to ``/api/sessions/<trace_id>/chunk``.
+
+    Returns ``True`` on 2xx, ``False`` on any error. Mirrors the
+    transport contract of ``_upload_session_payload`` (gzip + JSON +
+    X-CLI-Token) so the server's ingest pipeline handles both
+    interchangeably.
+    """
+    endpoint = _chunk_endpoint_url(trace_id)
+    token = get_cli_shared_token()
+    if not endpoint or not token:
+        return False
+    headers: dict[str, str] = {
+        "X-CLI-Token": token,
+        "Content-Type": "application/json",
+    }
+    body_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request_body: bytes | str
+    try:
+        request_body = gzip.compress(body_json)
+        headers["Content-Encoding"] = "gzip"
+    except (OSError, OverflowError):
+        request_body = body_json
+
+    _configure_ssl_certificates_for_requests()
+    try:
+        response = requests.post(
+            endpoint,
+            data=request_body,
+            headers=headers,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as exc:
+        print_info_debug(
+            f"(telemetry-streamer) chunk upload failed: "
+            f"trace={trace_id} seq={payload.get('seq')} error={exc}"
+        )
+        return False
+    if response.status_code in (200, 201, 202):
+        return True
+    print_info_debug(
+        f"(telemetry-streamer) chunk upload non-2xx: "
+        f"trace={trace_id} seq={payload.get('seq')} status={response.status_code}"
+    )
+    return False
+
+
+def _enqueue_chunk_failure(payload: dict[str, Any]) -> None:
+    """Persist a failed chunk for next-run drain. Reuses Tier 1 queue.
+
+    Tagged with ``_chunk_trace_id`` so the queue drainer can route it
+    back to the chunk endpoint instead of the single-shot endpoint.
+    """
+    try:
+        from adscan_core import telemetry_queue
+    except ImportError:
+        return
+    queued = telemetry_queue.enqueue_session(payload)
+    if queued is not None:
+        print_info_debug(
+            f"(telemetry-streamer) enqueued failed chunk "
+            f"seq={payload.get('seq')} path={queued}"
+        )
+
+
+def make_session_streamer(
+    *,
+    trace_id: str,
+    user_id_hash: str,
+    command_type: str,
+    session_scope: str,
+    environment: str,
+    started_at: datetime,
+    export_html_fn: Callable[[], str],
+    version_payload_fn: Callable[[], dict[str, Any]],
+) -> Optional[Any]:
+    """Build and return a started SessionStreamer, or ``None`` when
+    streaming is not applicable (telemetry disabled, command not in
+    the stream-eligible set, direct sessions URL missing, etc.).
+
+    The caller is responsible for emitting lifecycle events
+    (``scan_started`` / ``scan_finished``) at the right hook points
+    and calling ``streamer.finalise(...)`` exactly once on session
+    exit.
+    """
+    try:
+        from adscan_core.telemetry_streamer import (
+            SessionStreamer,
+            StreamerConfig,
+            should_stream_for_command,
+        )
+    except ImportError as exc:
+        print_info_debug(
+            f"(telemetry-streamer) skipped: streamer module import failed ({exc})"
+        )
+        return None
+
+    # Single-source diagnostic — every eligibility gate emits the same
+    # ``(telemetry-streamer) skipped: <reason>`` line so ``--debug``
+    # always shows exactly why streaming did not start (instead of
+    # the previous silent ``return None`` cascade).
+    if not _is_telemetry_enabled():
+        print_info_debug(
+            "(telemetry-streamer) skipped: telemetry disabled "
+            "(ADSCAN_TELEMETRY/_is_telemetry_enabled)"
+        )
+        return None
+    if not _is_session_capture_enabled():
+        print_info_debug(
+            "(telemetry-streamer) skipped: session capture disabled"
+        )
+        return None
+    if not should_stream_for_command(command_type):
+        print_info_debug(
+            f"(telemetry-streamer) skipped: command_type={command_type!r} "
+            "not in stream-eligible set (start/ci/tui)"
+        )
+        return None
+    if not _chunk_endpoint_url(trace_id):
+        print_info_debug(
+            "(telemetry-streamer) skipped: no direct chunk endpoint URL "
+            "(get_vercel_sessions_direct_url returned empty — embedded "
+            "telemetry config missing 'vd' key, or build stripped it)"
+        )
+        return None
+    if not get_cli_shared_token():
+        print_info_debug(
+            "(telemetry-streamer) skipped: CLI shared token unavailable "
+            "(get_cli_shared_token returned empty — embedded config "
+            "missing CLI_SHARED_TOKEN)"
+        )
+        return None
+
+    config = StreamerConfig(
+        trace_id=trace_id,
+        user_id_hash=user_id_hash,
+        command_type=command_type,
+        session_scope=session_scope,
+        environment=environment,
+        started_at=started_at,
+        upload_fn=lambda payload: _upload_chunk(trace_id, payload),
+        enqueue_fn=_enqueue_chunk_failure,
+        sanitize_fn=_sanitize_rich_output,
+        export_html_fn=export_html_fn,
+        version_payload_fn=version_payload_fn,
+    )
+    streamer = SessionStreamer(config)
+    streamer.start()
+    print_info_debug(
+        f"(telemetry-streamer) started: trace={trace_id} command={command_type}"
+    )
+    return streamer
 
 
 def _build_session_metadata(shell=None) -> Optional[dict]:
@@ -4445,7 +5290,24 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
         metadata["lab_confirmation_state"] = str(confirmation_state)
     metadata.update(build_session_compromise_metadata(shell))
 
-    # Note: workspace_name is intentionally NOT included to avoid revealing internal information
+    # Workspace identity — privacy hard rule:
+    #
+    # The raw workspace name (e.g. "Active", "essos.local",
+    # "acme-corp-prod") is **customer-sensitive** and MUST NEVER leave
+    # the host. We only transmit ``workspace_id_hash`` — the same
+    # anonymised 12-char SHA-256 derivative PostHog uses
+    # (``sha256(TELEMETRY_ID + ":" + workspace_name)[:12]``).
+    #
+    # The hash is stable across sessions for the same operator, so the
+    # dashboard can still group "all sessions in workspace X" without
+    # ever knowing what X is named. The operator recognises their own
+    # hashes from the CLI banner; an outsider sees only opaque ids.
+    current_workspace = getattr(shell, "current_workspace", None)
+    if current_workspace:
+        ws_hash = compute_workspace_id_hash(current_workspace)
+        if ws_hash:
+            metadata["workspace_id_hash"] = ws_hash
+
     return metadata or None
 
 

@@ -171,7 +171,7 @@ def _resolve_workspace(args: argparse.Namespace) -> Path | None:
         return None
 
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-    if _is_non_interactive():
+    if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
         # Non-interactive: fall back to the most recently modified one.
         return max(candidates, key=lambda p: p.stat().st_mtime)
 
@@ -202,7 +202,7 @@ def _resolve_client_meta(args: argparse.Namespace) -> tuple[str, str]:
         return client, engagement
 
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-    if _is_non_interactive():
+    if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
         return "", ""
 
     try:
@@ -304,7 +304,7 @@ def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
         return parsed
 
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-    if _is_non_interactive():
+    if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
         return list(_DEFAULT_FRAMEWORKS)
 
     try:
@@ -353,14 +353,24 @@ async def _render_bonus_async(
     )
 
 
-_VALID_REPORT_THEMES: tuple[str, ...] = ("corporate_light", "premium_dark")
-_DEFAULT_REPORT_THEME: str = "premium_dark"
+_VALID_REPORT_THEMES: tuple[str, ...] = ("corporate_light", "premium_dark", "editorial")
+# Audit-grade light by default. The Security Assessment Report is the client's
+# status instrument toward their board and DORA auditors — it must read as a
+# serious, print-clean compliance document, not a dark terminal artefact. The
+# report template is built on the ``--bg-0``/``--text`` variable scheme, which
+# only ``corporate_light`` re-skins (``premium_dark`` is built on
+# ``--paper``/``--ink`` for the editorial bonuses and would leave the report on
+# its own DARK ``:root``). So ``corporate_light`` is both the strategy-correct
+# AND the technically-correct default for the report. Bonuses keep their own
+# editorial catalog theme (see ``bonus_theme`` in ``_render_kit``).
+_DEFAULT_REPORT_THEME: str = "corporate_light"
 
 # Short aliases for --theme: operators can pass "dark" or "light" instead of
 # the full canonical names. Empty string means "not set — use env var or default".
 _THEME_ALIASES: dict[str, str] = {
     "dark": "premium_dark",
     "light": "corporate_light",
+    "warm": "editorial",
     "": "",
 }
 
@@ -368,8 +378,8 @@ _THEME_ALIASES: dict[str, str] = {
 # (default for screen demos), light second (auditor / board print). Keep
 # this map in lockstep with :data:`_VALID_REPORT_THEMES`.
 _THEME_PICKER_MAP: dict[str, str] = {
-    "Premium Dark — navy/cyan palette (screen, default)": "premium_dark",
-    "Corporate Light — white/navy, print-safe (auditor / board)": "corporate_light",
+    "Editorial — warm bone, ember accent (premium, McKinsey-grade)": "editorial",
+    "Corporate — white/navy, print-safe (Big-4 / auditor)": "corporate_light",
 }
 
 
@@ -399,7 +409,7 @@ def _resolve_theme(args: argparse.Namespace) -> str:
         return chosen if chosen in _VALID_REPORT_THEMES else _DEFAULT_REPORT_THEME
 
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-    if _is_non_interactive():
+    if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
         return _DEFAULT_REPORT_THEME
 
     try:
@@ -456,6 +466,13 @@ async def _render_assessment_async(
         import json as _json
 
         from adscan_internal.pro.reporting.orchestrator import generate_report_pdf
+        from adscan_internal.pro.reporting.report_builder import (
+            build_report_data_from_raw,
+        )
+        from adscan_internal.pro.services.report_service import (
+            _find_adscan_logo,
+            ensure_report_attack_paths,
+        )
 
         report_json = workspace_dir / "technical_report.json"
         if not report_json.is_file():
@@ -464,19 +481,25 @@ async def _render_assessment_async(
                 f"Run 'start_auth' or 'report' first to populate the workspace."
             )
         raw = _json.loads(report_json.read_text(encoding="utf-8"))
-        if (
-            isinstance(raw, dict)
-            and "domains" in raw
-            and isinstance(raw["domains"], dict)
-        ):
-            report_data = raw["domains"]
-        else:
-            report_data = raw
+        # Normalize the raw technical report into the renderer mapping via
+        # the single source of truth shared with ``generate_report``. The
+        # raw JSON stores ``domains[*].vulnerabilities`` empty (the vuln
+        # map is derived on demand from ``findings``); feeding it raw made
+        # the compliance engine see zero findings per requirement and
+        # falsely report ~100% conformant for every framework.
+        report_data = build_report_data_from_raw(raw) if isinstance(raw, dict) else {}
+        # Compute + inject attack paths the same way ``generate_report`` does.
+        # The renderer expects them already present; the workspace JSON stores
+        # them empty (computed on demand), so without this the kit report
+        # shipped with ZERO attack paths -- the "deliver is suspiciously fast"
+        # symptom. Single source of truth shared with report_service.
+        ensure_report_attack_paths(report_data, workspace_dir)
         pdf_bytes = generate_report_pdf(
             report_data,
             metadata=metadata,
             report_profile="full",
             frameworks=fw,
+            logo_path=_find_adscan_logo(report_theme),
             engine="chromium",
             renderer="cytoscape",
             template="premium",
@@ -495,6 +518,7 @@ async def _render_kit(
     metadata: dict[str, str],
     items: tuple[_KitItem, ...],
     report_theme: str = _DEFAULT_REPORT_THEME,
+    bonus_theme: str = "",
     frameworks: list[str] | None = None,
 ) -> dict[str, int]:
     """Render the selected kit artefacts in parallel.
@@ -504,8 +528,13 @@ async def _render_kit(
         workspace_dir: Source workspace (for ``technical_report.json``).
         metadata: Report metadata threaded into the executive PDF.
         items: Subset of ``_KIT`` to render (canonical order preserved).
-        report_theme: Visual theme for the Executive Assessment Report.
-            Bonus PDFs use their own renderers and ignore this flag for now.
+        report_theme: Visual theme for the Security Assessment Report.
+        bonus_theme: Visual theme for the bonus PDFs. Empty string means each
+            bonus renders with its OWN catalog theme (the warm-bone editorial
+            for playbook/checklist, white for coverage) — the decoupled
+            default. A non-empty value (set only when the operator passes an
+            explicit ``--theme``/``--report-theme``) overrides every bonus so
+            the whole kit shares one skin.
 
     Returns:
         Mapping ``{filename: byte_size}`` for the rendered artefacts.
@@ -525,7 +554,11 @@ async def _render_kit(
                 )
             )
         else:
-            tasks.append(_render_bonus_async(item.bonus_key, out_path, workspace_dir, theme=report_theme))
+            tasks.append(
+                _render_bonus_async(
+                    item.bonus_key, out_path, workspace_dir, theme=bonus_theme
+                )
+            )
     sizes = await asyncio.gather(*tasks)
     return {item.filename: size for item, size in zip(items, sizes)}
 
@@ -674,6 +707,9 @@ def _generate_navigator_extras(
     from adscan_internal.pro.reporting.mitre_navigator_html import (
         build_interactive_html,
     )
+    from adscan_internal.pro.reporting.report_builder import (
+        build_report_data_from_raw,
+    )
     from adscan_internal.services.mitre_navigator import (
         WATERMARK_PRO,
         build_diff_layer,
@@ -695,14 +731,28 @@ def _generate_navigator_extras(
         print_warning(f"MITRE navigator artefacts skipped: {exc}")
         return ()
 
-    domain: str | None = next(
-        (
-            k
-            for k, v in report.items()
-            if isinstance(v, dict) and v.get("vulnerabilities") is not None
-        ),
-        None,
+    # Normalize the raw report so the navigator sees synthesized
+    # ``vulnerabilities`` maps (the raw JSON stores them empty -- the same
+    # root cause that made the compliance section render ~100% conformant).
+    # Without this the navigator layer was always empty of techniques.
+    report_data = build_report_data_from_raw(report) if isinstance(report, dict) else {}
+
+    # Pick the domain with the MOST findings rather than the first non-empty
+    # one, so a multi-domain kit targets the domain that actually carries the
+    # exposure (e.g. essos.local over a near-clean child domain).
+    def _vuln_count(value: object) -> int:
+        if not isinstance(value, dict):
+            return 0
+        vulns = value.get("vulnerabilities")
+        return len(vulns) if isinstance(vulns, dict) else 0
+
+    domain: str | None = (
+        max(report_data, key=lambda k: _vuln_count(report_data[k]), default=None)
+        if report_data
+        else None
     )
+    if domain is not None and _vuln_count(report_data.get(domain)) == 0:
+        domain = None
 
     extra_meta: dict[str, str] = {
         "assessment_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
@@ -714,7 +764,7 @@ def _generate_navigator_extras(
 
     try:
         layer = build_navigator_layer(
-            report,
+            report_data,
             domain=domain,
             watermark=WATERMARK_PRO,
             extra_metadata=extra_meta,
@@ -943,6 +993,25 @@ async def run_deliver(args: argparse.Namespace) -> int:
     # operator one place to look when the kit ships with the wrong skin.
     report_theme = _resolve_theme(args)
 
+    # Decouple the bonus skin from the report skin. By default the bonuses
+    # render with their OWN editorial catalog theme (warm-bone playbook /
+    # checklist, white coverage) — passing an empty ``bonus_theme`` tells
+    # ``render_bonus`` to fall back to ``BONUSES[key]["theme"]``. Only when the
+    # operator explicitly chose a theme (``--theme`` / ``--report-theme`` /
+    # ``ADSCAN_PDF_THEME``) do we force that one skin across the whole kit.
+    # ``_prefill_interactive_inputs`` stashes this before folding the resolved
+    # theme back into ``args.theme`` (which would otherwise make the inline
+    # check always true). Fall back to the inline computation when prefill did
+    # not run (defensive — every real path goes through ``run_deliver_sync``).
+    explicit_theme_set = getattr(args, "_explicit_theme_set", None)
+    if explicit_theme_set is None:
+        explicit_theme_set = bool(
+            (getattr(args, "theme", "") or "").strip()
+            or (getattr(args, "report_theme", "") or "").strip()
+            or os.environ.get("ADSCAN_PDF_THEME", "").strip()
+        )
+    bonus_theme = report_theme if explicit_theme_set else ""
+
     print_info(
         f"Rendering Client Deliverable Kit for {workspace_dir.name} "
         f"(frameworks: {', '.join(frameworks)})…"
@@ -954,6 +1023,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
             metadata=metadata,
             items=items,
             report_theme=report_theme,
+            bonus_theme=bonus_theme,
             frameworks=frameworks,
         )
     except Exception as exc:
@@ -999,14 +1069,14 @@ async def run_deliver(args: argparse.Namespace) -> int:
     )
     print_success(f"Kit packaged at {zip_path}")
 
-    # Offer to open the headline artefact (the Security Assessment Report
-    # — full profile: executive + technical + attack paths). The prompt
-    # auto-skips in non-interactive contexts (e.g. `adscan ci`).
-    from adscan_internal.services.host_open import prompt_and_open
-
+    # Stash the headline artefact (the Security Assessment Report — full
+    # profile). The "open it now?" prompt is fired by ``run_deliver_sync``
+    # AFTER the event loop exits: ``prompt_and_open`` spins a
+    # prompt_toolkit Application that leaks a coroutine if run inside
+    # ``asyncio.run``'s running loop.
     headline_pdf = staging_dir / "Security_Assessment_Report.pdf"
     if headline_pdf.is_file():
-        prompt_and_open(headline_pdf, prompt="Open the security assessment report now?")
+        setattr(args, "_headline_pdf", str(headline_pdf))
 
     return 0
 
@@ -1079,38 +1149,125 @@ def add_deliver_subparser(
             "interactive HTML + diff). Default: included in every kit."
         ),
     )
+    # NOTE on theme validation: we deliberately do NOT use argparse
+    # ``choices=`` here. Only the two SUPPORTED, homogeneous kit themes
+    # (``editorial`` / ``corporate_light``) are advertised via ``metavar`` and
+    # the help text. ``premium_dark`` (and its ``dark`` alias) remain ACCEPTED
+    # for internal preview/testing — they render a mixed kit (dark report +
+    # light bonuses), so we don't surface them to customers, but a developer
+    # can still pass ``--theme dark``. Unknown/typo'd values degrade to the
+    # default inside :func:`_resolve_theme` (it never raises).
     parser.add_argument(
         "--report-theme",
         dest="report_theme",
-        choices=list(_VALID_REPORT_THEMES),
+        metavar="{editorial,corporate_light}",
         default="",
         help=(
-            "Visual theme for the Executive Assessment Report. "
-            f"Default: {_DEFAULT_REPORT_THEME}. "
-            "Use 'corporate_light' for board / auditor deliverables."
+            "Visual theme for the whole kit. 'editorial' = premium warm-bone "
+            "(McKinsey-grade); 'corporate_light' = white Big-4/auditor. "
+            f"Default: {_DEFAULT_REPORT_THEME}."
         ),
     )
     parser.add_argument(
         "--theme",
         dest="theme",
         default="",
-        choices=["", "dark", "premium_dark", "light", "corporate_light"],
+        metavar="{editorial,corporate_light}",
         help=(
-            "Report theme shorthand. 'dark'/'premium_dark' = operator dark mode. "
-            "'light'/'corporate_light' = corporate white (for printing/board). "
+            "Kit theme. 'editorial' = premium warm-bone editorial "
+            "(McKinsey-grade). 'corporate_light' = white Big-4/auditor. "
             f"Default: env var ADSCAN_PDF_THEME or '{_DEFAULT_REPORT_THEME}'."
         ),
     )
+    # Mirrors the per-subcommand --debug on start/ci/install/check. The host
+    # launcher forwards --debug to the container subcommand, so deliver must
+    # accept it (argparse rejects unknown flags). Activation into DEBUG_MODE
+    # happens in the top-level dispatcher's debug block (adscan.py), which
+    # lists "deliver" alongside the other debug-aware commands.
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug mode.",
+    )
     return parser
+
+
+def _prefill_interactive_inputs(args: argparse.Namespace) -> None:
+    """Resolve every interactive input in the SYNC context, before the loop.
+
+    ``questionary.ask()`` spins its own prompt_toolkit ``Application``
+    synchronously; invoked inside ``asyncio.run``'s running loop it leaks the
+    coroutine ("Application.run_async was never awaited") and the prompt never
+    displays — so the kit silently fell back to defaults (e.g. it never asked
+    which compliance frameworks to include). Resolving here, where no event
+    loop runs, lets the prompts actually work. Results are written back to
+    ``args`` and the ``_prompts_prefilled`` sentinel makes the async resolvers
+    trust them instead of re-prompting (and re-leaking).
+    """
+    # Capture "did the operator explicitly choose a theme?" BEFORE we fold the
+    # resolved value into ``args.theme`` — the report/bonus theme decouple
+    # depends on distinguishing an explicit choice from the resolved default.
+    setattr(
+        args,
+        "_explicit_theme_set",
+        bool(
+            (getattr(args, "theme", "") or "").strip()
+            or (getattr(args, "report_theme", "") or "").strip()
+            or os.environ.get("ADSCAN_PDF_THEME", "").strip()
+        ),
+    )
+
+    workspace = _resolve_workspace(args)
+    if workspace is not None:
+        args.workspace = str(workspace)
+    client, engagement = _resolve_client_meta(args)
+    args.client = client
+    args.engagement = engagement
+    try:
+        args.frameworks = ",".join(_resolve_frameworks(args))
+    except ValueError:
+        # Invalid --frameworks value: leave it for run_deliver to re-validate
+        # and surface a clean error (exit 2) instead of swallowing it here.
+        pass
+    args.theme = _resolve_theme(args)
+    args.report_theme = ""  # folded into args.theme above; avoid double-resolution
+
+    setattr(args, "_prompts_prefilled", True)
+
+
+def _maybe_open_headline(args: argparse.Namespace) -> None:
+    """Offer to open the Security Assessment Report once the kit is built.
+
+    Runs in the SYNC wrapper, after the event loop has exited — the
+    ``prompt_and_open`` confirm prompt is yet another prompt_toolkit
+    Application that must not run inside ``asyncio.run``'s loop. Auto-skips
+    in non-interactive contexts (handled inside ``prompt_and_open``).
+    """
+    headline = getattr(args, "_headline_pdf", "") or ""
+    if not headline:
+        return
+    path = Path(headline)
+    if not path.is_file():
+        return
+    from adscan_internal.services.host_open import prompt_and_open
+
+    prompt_and_open(path, prompt="Open the security assessment report now?")
 
 
 def run_deliver_sync(args: argparse.Namespace) -> int:
     """Synchronous wrapper for the top-level CLI dispatcher."""
     try:
-        return asyncio.run(run_deliver(args))
+        # All interactive prompts run HERE, outside the event loop. See
+        # _prefill_interactive_inputs for why (questionary + asyncio.run).
+        _prefill_interactive_inputs(args)
+        rc = asyncio.run(run_deliver(args))
     except KeyboardInterrupt:
         print_warning("Deliver cancelled.")
         return 130
+    if rc == 0:
+        _maybe_open_headline(args)
+    return rc
 
 
 __all__ = (

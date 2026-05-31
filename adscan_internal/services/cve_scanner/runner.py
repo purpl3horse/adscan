@@ -14,7 +14,10 @@ from typing import Any
 from adscan_core import telemetry
 from adscan_core.rich_output import print_error, print_info_verbose
 from adscan_internal.core.events import Event, EventBus, EventType
-from adscan_internal.services.cve_scanner.catalog import CVEDefinition, TargetScope
+from adscan_internal.services.cve_scanner.catalog import (
+    CVEDefinition,
+    scope_applies_to_target,
+)
 from adscan_internal.services.cve_scanner.checks.coercion import CoercionCVECheck
 from adscan_internal.services.cve_scanner.result import (
     CVEResult,
@@ -316,13 +319,14 @@ class CVEScanRunner:
 
 
 def _applies(cve: CVEDefinition, target: ScanTarget) -> bool:
-    if cve.target_scope is TargetScope.ALL_HOSTS:
-        return True
-    if cve.target_scope is TargetScope.DCS_ONLY:
-        return target.is_dc
-    if cve.target_scope is TargetScope.DOMAIN_LDAP:
-        return target.is_dc
-    return False
+    """Return whether ``cve`` runs against ``target``.
+
+    Delegates to :func:`scope_applies_to_target` (the catalog's canonical
+    scope→target gate) so the scheduler and any pre-scan display derived
+    from the catalog can never disagree about which checks execute.
+    """
+
+    return scope_applies_to_target(cve.target_scope, is_dc=target.is_dc)
 
 
 def _skipped_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:

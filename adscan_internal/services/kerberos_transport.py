@@ -24,10 +24,10 @@ etypes note:
 
 from __future__ import annotations
 
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import NoReturn, Optional, TYPE_CHECKING
-import urllib.parse
 
 from adscan_internal import telemetry
 from adscan_core.rich_output import print_info_debug
@@ -155,6 +155,13 @@ class KerberosConfig:
     timeout: int = 30
     posture_sink: Optional[PostureSink] = None
     posture_snapshot: Optional["DomainPosture"] = None
+    disable_self_heal: bool = False
+    """When True, ``get_tgt`` will NOT retry with a healed etype list on
+    ``KDC_ERR_ETYPE_NOTSUPP`` — the raw failure propagates so the caller
+    can classify it. Set by failure-eliciting consumers (the
+    ``KERBEROS_RC4`` posture probe is the canonical example). See
+    ``ADscanLDAPConfig.disable_self_heal`` for the full rationale.
+    """
 
     def __post_init__(self) -> None:
         # Auto-route an NT hash that landed in the password field. Centralised
@@ -510,6 +517,60 @@ async def _probe_and_set_etype_info2_salt(
 # ---------------------------------------------------------------------------
 
 
+def _classify_recoverable_kerberos_failure(
+    exc: BaseException,
+    *,
+    attempted_etypes: Optional[list[int]],
+) -> Optional[list[int]]:
+    """Identify a Kerberos failure whose fix is a posture-driven etype flip.
+
+    Mirror of ``_classify_recoverable_bind_failure`` in the LDAP transport.
+    Returns a new etype list to retry with, or ``None`` if the failure is
+    not posture-recoverable / we already had the right etypes.
+
+    Recovery rules (only one is triggered per call):
+
+      * KDC rejected with ``KDC_ERR_ETYPE_NOTSUPP`` after we offered RC4
+        (etype 23) → retry with AES (18 then 17). Signature confirmed
+        against ``vendor/kerbad/protocol/errors.py``
+        (``KDC_ERR_ETYPE_NOTSUPP = 0xE``).
+      * Same error after we offered AES → retry with RC4 (legacy DCs that
+        still require RC4 are rare but exist; emit a DISABLED signal for
+        ``KERBEROS_AES_ONLY`` so the planner won't push AES blindly next
+        run).
+
+    Failures with no ``errorcode`` or any code other than
+    ``KDC_ERR_ETYPE_NOTSUPP`` are NOT recoverable here — they are real
+    auth / network / clock-skew issues and must surface to the caller.
+    """
+    try:
+        from kerbad.protocol.errors import KerberosErrorCode  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+
+    code = getattr(exc, "errorcode", None)
+    if code != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP:
+        return None
+
+    # The set we actually sent to the KDC. ``None`` means "library
+    # default" which is usually [18, 17, 23] (AES first, then RC4).
+    sent = list(attempted_etypes or [])
+
+    # Heuristic: classify the attempt by the FIRST etype offered.
+    # KDC_ERR_ETYPE_NOTSUPP is returned when the intersection of our set
+    # and the KDC's allowed set is empty — flipping to the complement
+    # captures the recovery in one round-trip.
+    if 23 in sent and 18 not in sent and 17 not in sent:
+        # RC4-only attempt → DC is AES-only. Retry AES.
+        return [18, 17]
+    if (18 in sent or 17 in sent) and 23 not in sent:
+        # AES-only attempt → DC is RC4-only (rare, legacy). Retry RC4.
+        return [23]
+    # Sent both and KDC still rejected — there is no recovery, the KDC
+    # supports neither family we offer.
+    return None
+
+
 async def get_tgt(config: KerberosConfig) -> bytes:
     """Obtain a TGT and return it as ccache bytes.
 
@@ -575,7 +636,38 @@ async def get_tgt(config: KerberosConfig) -> bytes:
             )
 
         override_etype = effective_etypes if effective_etypes else None
-        await client.with_clock_skew(client.get_TGT, override_etype=override_etype)
+
+        # Self-healing retry budget: KDC rejection on etype is the one
+        # failure mode where a single posture-driven flip lets the
+        # session recover in place. We try once with the active config,
+        # and if the KDC returns KDC_ERR_ETYPE_NOTSUPP we ask
+        # ``_classify_recoverable_kerberos_failure`` for a complementary
+        # etype list and retry once. Anything else (clock skew, wrong
+        # password, principal-unknown) is NOT retried — those are real
+        # errors and must surface to the caller.
+        try:
+            await client.with_clock_skew(client.get_TGT, override_etype=override_etype)
+        except Exception as krb_exc:
+            if config.disable_self_heal:
+                # Caller wants the raw failure (probe context). Skip the
+                # etype recovery entirely and let the exception propagate
+                # untouched so the probe can classify it.
+                raise
+            recovery_etypes = _classify_recoverable_kerberos_failure(
+                krb_exc, attempted_etypes=override_etype
+            )
+            if recovery_etypes is None:
+                raise
+            # Posture-emit BEFORE retry so the planner learns even if
+            # the retry also fails.
+            _emit_kerberos_failure_posture(config, krb_exc)
+            print_info_debug(
+                f"[kerberos_transport] self-heal: KDC_ERR_ETYPE_NOTSUPP on "
+                f"etypes={override_etype} → retry with {recovery_etypes}"
+            )
+            await client.with_clock_skew(
+                client.get_TGT, override_etype=recovery_etypes
+            )
 
         # Bug #1 fix: CCACHE.to_file() only accepts a path string.
         # Use CCACHE.to_bytes() directly — no tempfile needed.

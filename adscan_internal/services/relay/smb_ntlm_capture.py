@@ -50,7 +50,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 from adscan_internal.rich_output import print_info_debug
@@ -71,6 +72,118 @@ class NtlmCaptureResult:
 
 
 # ---------------------------------------------------------------------------
+# Inbound-connection observability
+# ---------------------------------------------------------------------------
+#
+# The capture queue only records *completed* NTLM authentications. That makes
+# a "no capture" result ambiguous: it cannot tell "the target never reached our
+# listener" (a reachability artifact) apart from "the target reached us but did
+# not NTLM-auth" (a real auth-type signal). ``InboundConnectionObserver``
+# records every inbound TCP connection during the capture window - count,
+# distinct source IPs, and the furthest NTLM handshake stage each connection
+# reached - so the no-capture verdict can state which of the two it was.
+
+
+@dataclass(frozen=True)
+class InboundConnectionStats:
+    """Immutable snapshot of inbound activity during a capture window.
+
+    ``handshake_stages`` maps the furthest stage label
+    (``"connected"`` / ``"negotiate"`` / ``"challenge"`` / ``"authenticate"``)
+    to the number of connections that reached it. ``ntlm_seen`` is True if any
+    inbound connection advanced to at least the NTLM Negotiate stage.
+    """
+
+    total_connections: int = 0
+    source_ips: tuple[str, ...] = ()
+    handshake_stages: dict[str, int] = field(default_factory=dict)
+    ntlm_seen: bool = False
+
+
+# Stage ordering - used to keep only the *furthest* stage a connection reached.
+_STAGE_ORDER: dict[str, int] = {
+    "connected": 0,
+    "negotiate": 1,
+    "challenge": 2,
+    "authenticate": 3,
+}
+
+
+class InboundConnectionObserver:
+    """Thread-safe tally of inbound connections seen by the capture listener.
+
+    A single observer instance is shared across every per-connection
+    ``_SPNEGOCaptureAdapter``. The adapter calls :meth:`record_connection` when
+    the transport hands it a connection and :meth:`record_stage` as the SPNEGO
+    handshake advances. The listener runs on its own event loop in a background
+    thread, so all mutation is guarded by a lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._connection_ids: set[int] = set()
+        self._source_ips: list[str] = []
+        self._stage_by_connection: dict[int, str] = {}
+
+    def record_connection(self, connection: Any) -> None:
+        """Record a new inbound connection and its source IP, if available."""
+        conn_id = id(connection)
+        source_ip = _extract_peer_ip(connection)
+        with self._lock:
+            if conn_id not in self._connection_ids:
+                self._connection_ids.add(conn_id)
+                self._stage_by_connection[conn_id] = "connected"
+            if source_ip and source_ip not in self._source_ips:
+                self._source_ips.append(source_ip)
+
+    def record_stage(self, connection: Any, stage: str) -> None:
+        """Record the furthest SPNEGO/NTLM handshake stage for a connection."""
+        if stage not in _STAGE_ORDER:
+            return
+        conn_id = id(connection)
+        with self._lock:
+            self._connection_ids.add(conn_id)
+            current = self._stage_by_connection.get(conn_id, "connected")
+            if _STAGE_ORDER[stage] > _STAGE_ORDER.get(current, -1):
+                self._stage_by_connection[conn_id] = stage
+
+    def snapshot(self) -> InboundConnectionStats:
+        """Return an immutable snapshot of the observed inbound activity."""
+        with self._lock:
+            stage_counts: dict[str, int] = {}
+            for stage in self._stage_by_connection.values():
+                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+            ntlm_seen = any(
+                _STAGE_ORDER.get(stage, -1) >= _STAGE_ORDER["negotiate"]
+                for stage in self._stage_by_connection.values()
+            )
+            return InboundConnectionStats(
+                total_connections=len(self._connection_ids),
+                source_ips=tuple(self._source_ips),
+                handshake_stages=dict(stage_counts),
+                ntlm_seen=ntlm_seen,
+            )
+
+
+def _extract_peer_ip(connection: Any) -> str | None:
+    """Best-effort extraction of the peer IP from a UniConnection-like object."""
+    getter = getattr(connection, "get_extra_info", None)
+    if callable(getter):
+        try:
+            peername = getter("peername")
+        except Exception:  # noqa: BLE001 - never let observability break capture
+            peername = None
+        if isinstance(peername, (tuple, list)) and peername:
+            return str(peername[0])
+        if isinstance(peername, str) and peername:
+            return peername
+    peer_ip = getattr(connection, "peer_ip", None)
+    if peer_ip:
+        return str(peer_ip)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # GSSAPI adapter — bridges relay server API to standalone SPNEGOserver
 # ---------------------------------------------------------------------------
 
@@ -83,11 +196,26 @@ class _SPNEGOCaptureAdapter:
     GSSAPI context into ``_capture_queue`` once ``to_continue`` is ``False``.
     """
 
-    def __init__(self, capture_queue: asyncio.Queue[object], inner: object) -> None:
+    def __init__(
+        self,
+        capture_queue: asyncio.Queue[object],
+        inner: object,
+        observer: InboundConnectionObserver | None = None,
+    ) -> None:
         self._inner = inner
         self._capture_queue = capture_queue
+        self._observer = observer
+        self._connection: Any = None
+        # Each call to ``authenticate_relay_server`` advances the SPNEGO/NTLM
+        # handshake one round. Track the round so we can label the stage the
+        # connection reached (negotiate -> challenge -> authenticate) even when
+        # the auth never completes (Kerberos client, abort, refusal).
+        self._round = 0
 
     def set_connection_info(self, connection: Any) -> None:
+        self._connection = connection
+        if self._observer is not None:
+            self._observer.record_connection(connection)
         self._inner.set_connection_info(connection)
 
     def get_mechtypes_list(self) -> bytes:
@@ -99,9 +227,18 @@ class _SPNEGOCaptureAdapter:
         *args: object,
         **kwargs: object,
     ) -> tuple[bytes | None, bool, Exception | None]:
+        self._round += 1
+        if self._observer is not None:
+            # Round 1 carries the NTLM Negotiate token; round 2 is the client
+            # Authenticate. The server emits its Challenge between the two.
+            stage = "negotiate" if self._round == 1 else "authenticate"
+            self._observer.record_stage(self._connection, stage)
         result, to_continue, err = await self._inner.authenticate_server(
             token, *args, **kwargs
         )
+        if self._observer is not None and to_continue and err is None:
+            # We produced a Challenge and are waiting for the Authenticate.
+            self._observer.record_stage(self._connection, "challenge")
         if not to_continue and err is None:
             await self._capture_queue.put(self._inner)
         return result, to_continue, err
@@ -208,6 +345,17 @@ class SMBNtlmCaptureSource:
         self._capture_queue = capture_queue
         self._server_task: asyncio.Task[object] | None = None
         self._server: object = None
+        self._observer = InboundConnectionObserver()
+
+    @property
+    def connection_stats(self) -> InboundConnectionStats:
+        """Return the inbound-connection tally observed so far.
+
+        Lets a caller distinguish "0 inbound connections - the target never
+        reached us" (reachability artifact) from ">0 inbound, no NTLM" (a real
+        auth-type / refusal signal) when no hash was captured.
+        """
+        return self._observer.snapshot()
 
     async def start(self) -> None:
         """Start the SMB capture listener.  Raises on bind failure."""
@@ -221,6 +369,7 @@ class SMBNtlmCaptureSource:
         from aiosmb.wintypes.dtyp.constrcuted_security.guid import GUID  # noqa: PLC0415
 
         capture_queue = self._capture_queue
+        observer = self._observer
 
         def _make_gssapi() -> _SPNEGOCaptureAdapter:
             cred = NTLMCredential(
@@ -234,7 +383,7 @@ class SMBNtlmCaptureSource:
             inner.add_auth_context(
                 "NTLMSSP - Microsoft NTLM Security Support Provider", ntlm_server
             )
-            return _SPNEGOCaptureAdapter(capture_queue, inner)
+            return _SPNEGOCaptureAdapter(capture_queue, inner, observer)
 
         target = UniTarget(
             self._config.listen_host, self._config.listen_port, UniProto.SERVER_TCP

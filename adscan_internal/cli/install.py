@@ -1653,7 +1653,6 @@ class InstallDeps:
     get_free_disk_space_bytes: Callable[[str], int | None]
     is_docker_env: Callable[[], bool]
     is_docker_official_installed: Callable[[], tuple[bool, str]]
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
 
     # Installation helpers
     install_docker_prerequisites: Callable[[], bool]
@@ -1744,8 +1743,10 @@ def run_install(
         if config.install_args
         else False
     )
+    from adscan_core.host_resource_thresholds import MIN_DOCKER_INSTALL_FREE_GB  # noqa: PLC0415
+
     free_bytes = deps.get_free_disk_space_bytes("/")
-    min_free_bytes = 10 * 1024**3  # 10GB
+    min_free_bytes = MIN_DOCKER_INSTALL_FREE_GB * 1024**3
     if free_bytes is not None and free_bytes < min_free_bytes and not allow_low_disk:
         free_gb = free_bytes / (1024**3)
         deps.telemetry_capture_user_property_event(
@@ -1757,7 +1758,7 @@ def run_install(
             f"Not enough free disk space to run a full installation ({free_gb:.2f} GB available)."
         )
         deps.print_instruction(
-            "Free up disk space and retry (recommended minimum: 10 GB)."
+            f"Free up disk space and retry (recommended minimum: {MIN_DOCKER_INSTALL_FREE_GB} GB)."
         )
         deps.print_instruction(
             "Override this check (not recommended): adscan install --allow-low-disk"
@@ -1767,7 +1768,6 @@ def run_install(
     # Environment detection
     in_container = deps.is_docker_env()
     docker_installed, docker_version = deps.is_docker_official_installed()
-    compose_available, compose_version = deps.is_docker_compose_plugin_available()
 
     # Check if only specific components should be installed (for QA testing)
     only_components = []
@@ -1884,7 +1884,8 @@ def run_install(
         deps.log_free_disk_space_debug("after installation (apt-get update failed)")
         return False
 
-    # Docker prerequisites (install early: docker engine + compose)
+    # Docker prerequisites (install early: docker engine only — docker
+    # compose is no longer a runtime dependency as of v9.0.0).
     if in_container:
         deps.print_info_verbose(
             "Skipping Docker installation: running inside container (Docker-in-Docker not supported)"

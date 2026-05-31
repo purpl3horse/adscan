@@ -17,7 +17,8 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_error
+from adscan_core.rich_output import print_error, print_info
+from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.coercion import (
     CoercionMethod,
     CoercionMethodResult,
@@ -82,6 +83,12 @@ class CoercionCVECheck:
             ]
 
         duration = time.monotonic() - started
+        # Compact, always-on per-target digest so the operator learns
+        # "coercible or not" without reading the ~75-line debug firehose
+        # (which stays debug-gated in services/coercion/core.py). The
+        # per-attempt debug lines and all coercion behaviour are
+        # unchanged — this is purely additive.
+        print_info(_coercion_summary_line(target_host=target.host, run_result=run_result))
         return _group_by_technique(
             target_host=target.host,
             methods=self._methods,
@@ -126,6 +133,56 @@ def _all_techniques(methods: tuple[CoercionMethod, ...]) -> tuple[str, ...]:
         if method.technique and method.technique not in seen:
             seen.append(method.technique)
     return tuple(seen)
+
+
+def _coercion_summary_line(
+    *,
+    target_host: str,
+    run_result: CoercionRunResult,
+) -> str:
+    """Build a one-line coercion digest for the normal (non-debug) output.
+
+    Aggregates the per-attempt results into a single masked verdict line
+    so the operator sees ``coercible or not`` at a glance. The shape is::
+
+        [coercion] target=<masked>: N probes (M methods x P pipes),
+        K probable auth triggers -> <verdict>
+
+    where the verdict is either ``not coercible`` or
+    ``VULNERABLE: <method> via <pipe>`` naming the first successful
+    method/endpoint. All host/method/endpoint values are masked via
+    :func:`mark_sensitive`.
+
+    Args:
+        target_host: The coerced target host (masked in the output).
+        run_result: The :class:`CoercionRunResult` from the engine.
+
+    Returns:
+        A single human-readable summary line.
+    """
+
+    results = run_result.results
+    probes = len(results)
+    methods = len({r.method_name for r in results})
+    pipes = len({r.endpoint.label for r in results if r.endpoint is not None})
+    triggers = run_result.successful_results
+    masked_target = mark_sensitive(target_host, "hostname")
+
+    if triggers:
+        first = triggers[0]
+        endpoint_label = first.endpoint.label if first.endpoint else first.protocol
+        verdict = (
+            f"VULNERABLE: {mark_sensitive(first.method_name, 'text')} "
+            f"via {mark_sensitive(endpoint_label, 'text')}"
+        )
+    else:
+        verdict = "not coercible"
+
+    return (
+        f"[coercion] target={masked_target}: {probes} probes "
+        f"({methods} methods x {pipes} pipes), {len(triggers)} probable "
+        f"auth triggers -> {verdict}"
+    )
 
 
 def _group_by_technique(

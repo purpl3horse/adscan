@@ -53,13 +53,13 @@ def print_scan_status(
         >>> print_scan_status("SMB", "completed", "15 hosts discovered")
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
     from rich.text import Text
 
     # Status styling
     status_styles = {
         "starting": ("⚡", "bold yellow"),
-        "running": ("⏳", "bold cyan"),
+        "running": ("⏳", f"bold {ADSCAN_PRIMARY}"),
         "completed": ("✓", "bold green"),
         "failed": ("✗", "bold red"),
         "pending": ("○", "dim"),
@@ -79,12 +79,8 @@ def print_scan_status(
     spacing_before = _handle_spacing("info", False, "auto")
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     console.print(text)
-    if telemetry_console is not None:
-        telemetry_console.print(text)
 
 
 def print_results_summary(
@@ -106,7 +102,7 @@ def print_results_summary(
         ... )
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
     from rich.text import Text
     from rich.panel import Panel
     from rich.table import Table
@@ -143,22 +139,14 @@ def print_results_summary(
         spacing_before = _handle_spacing("success", True, "auto")
         if spacing_before:
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
         console.print(panel)
-        if telemetry_console is not None:
-            telemetry_console.print(panel)
     else:
         spacing_before = _handle_spacing("info", False, "auto")
         if spacing_before:
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
         console.print(results_table)
-        if telemetry_console is not None:
-            telemetry_console.print(results_table)
 
 
 def print_domain_info(
@@ -183,7 +171,7 @@ def print_domain_info(
         ... )
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
     from rich.text import Text
     from rich.panel import Panel
     from rich.table import Table
@@ -241,12 +229,8 @@ def print_domain_info(
     spacing_before = _handle_spacing("info", True, "auto")
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
 
 def create_domains_table(
@@ -405,7 +389,7 @@ def print_workflow_summary(
         )
     """
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Build header
     header_text = Text()
@@ -502,22 +486,14 @@ def print_workflow_summary(
         spacing_before = _handle_spacing("success", True, "auto")
         if spacing_before:
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
         console.print(panel)
-        if telemetry_console is not None:
-            telemetry_console.print(panel)
     else:
         spacing_before = _handle_spacing("info", False, "auto")
         if spacing_before:
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
         console.print(content)
-        if telemetry_console is not None:
-            telemetry_console.print(content)
 
 
 def print_delegations_summary(

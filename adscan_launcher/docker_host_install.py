@@ -18,10 +18,7 @@ from typing import Dict
 from adscan_core.subprocess_env import get_clean_env_for_compilation
 from adscan_launcher import telemetry
 from adscan_launcher.docker_runtime import is_docker_env
-from adscan_launcher.docker_status import (
-    is_docker_compose_plugin_available,
-    is_official_docker_installed,
-)
+from adscan_launcher.docker_status import is_official_docker_installed
 from adscan_launcher.output import (
     print_error,
     print_exception,
@@ -326,45 +323,23 @@ def install_docker_prerequisites() -> bool:
                 "(Docker-in-Docker not supported)"
             )
             docker_installed, docker_version = is_official_docker_installed()
-            compose_available, compose_version = is_docker_compose_plugin_available()
-            if docker_installed and compose_available:
+            if docker_installed:
                 print_info_verbose(
-                    "Docker and Compose available via host: "
-                    f"Docker {docker_version}, Compose {compose_version}"
+                    f"Docker available via host: Docker {docker_version}"
                 )
-                return True
             return True
 
         docker_installed, docker_version = is_official_docker_installed()
-        compose_available, compose_version = is_docker_compose_plugin_available()
 
-        if docker_installed and compose_available:
+        if docker_installed:
             print_success(
-                "[bold]Docker and Docker Compose[/bold] already present",
-                items=[
-                    f"[cyan]Docker:[/cyan] {docker_version}",
-                    f"[cyan]Docker Compose:[/cyan] {compose_version}",
-                ],
+                "[bold]Docker[/bold] already present",
+                items=[f"[cyan]Docker:[/cyan] {docker_version}"],
                 panel=True,
             )
             return True
-        if docker_installed and not compose_available:
-            print_warning(
-                f"Official Docker found ({docker_version}) but Docker Compose plugin missing."
-            )
-            print_info("Will install Docker Compose plugin...")
-        elif not docker_installed and compose_available:
-            print_warning(
-                f"Docker Compose plugin found ({compose_version}) but official Docker missing."
-            )
-            print_info("Will install official Docker Engine...")
-        else:
-            print_info("Neither official Docker nor Docker Compose plugin found.")
-            print_info("Will install both from official repositories...")
-
-        print_info(
-            "Installing Docker engine and Docker Compose from official repositories..."
-        )
+        print_info("Official Docker not found.")
+        print_info("Will install Docker Engine from official repositories...")
 
         if not _remove_old_docker_packages():
             print_warning("Failed to remove old Docker packages, continuing anyway...")
@@ -384,13 +359,18 @@ def install_docker_prerequisites() -> bool:
         subprocess.run(["apt-get", "update"], check=True, env=clean_env)
         print_success("[bold]Package list[/bold] updated successfully", panel=True)
 
-        print_info("[bold]Installing Docker Engine and Docker Compose plugin[/bold]...")
+        # docker-compose-plugin is intentionally NOT in this list since
+        # ADscan 9.0.0 — the runtime no longer depends on docker compose
+        # (BloodHound CE container management migrated to the native
+        # graph collector). docker-compose-plugin is still in the
+        # cleanup list above so users coming from older releases get
+        # the obsolete package removed; we simply do not reinstall it.
+        print_info("[bold]Installing Docker Engine[/bold]...")
         docker_packages = [
             "docker-ce",
             "docker-ce-cli",
             "containerd.io",
             "docker-buildx-plugin",
-            "docker-compose-plugin",
         ]
         docker_install_result = subprocess.run(
             ["apt-get", "install", "-y"] + docker_packages,
@@ -400,34 +380,28 @@ def install_docker_prerequisites() -> bool:
             env=clean_env,
         )
         if docker_install_result.returncode != 0:
-            print_error("Failed to install Docker Engine and Docker Compose plugin.")
+            print_error("Failed to install Docker Engine.")
             stderr = docker_install_result.stderr or docker_install_result.stdout or ""
             if stderr:
                 print_info_verbose(f"Docker install output:\n{stderr}")
             return False
 
         print_success(
-            "[bold]Docker Engine and Docker Compose plugin[/bold] installed successfully.",
+            "[bold]Docker Engine[/bold] installed successfully.",
             items=[f"[dim]{pkg}[/dim]" for pkg in docker_packages],
             panel=True,
         )
 
         docker_installed, docker_version = is_official_docker_installed()
-        compose_available, compose_version = is_docker_compose_plugin_available()
-        if docker_installed and compose_available:
+        if docker_installed:
             print_success(
                 "[bold]Docker installation verification[/bold] successful",
-                items=[
-                    f"[cyan]Docker:[/cyan] {docker_version}",
-                    f"[cyan]Docker Compose:[/cyan] {compose_version}",
-                ],
+                items=[f"[cyan]Docker:[/cyan] {docker_version}"],
                 panel=True,
             )
             return True
 
-        print_warning(
-            "Docker or Docker Compose plugin verification failed after installation."
-        )
+        print_warning("Docker verification failed after installation.")
         return False
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

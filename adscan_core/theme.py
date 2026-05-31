@@ -17,10 +17,13 @@ from rich.theme import Theme
 # Brand Colors
 # ============================================================================
 
-# Primary brand colors (cyan/blue from logo)
-ADSCAN_PRIMARY = "#00D4FF"  # Bright cyan - main brand color
-ADSCAN_PRIMARY_DIM = "#00A8CC"  # Dimmed version for subtle elements
-ADSCAN_PRIMARY_BRIGHT = "#00E5FF"  # Brighter version for highlights
+# Primary brand colors — ADscan teal. Anchor is deep teal #0E6E78 (light surfaces).
+# On dark terminals the deep teal is too low-contrast, so the CLI uses the brand's
+# on-dark accent (#1AA0AE) — the exact token the website ships as --brand-accent
+# (AA ~6:1 on dark). bright/dim mirror the site's --brand-bright family.
+ADSCAN_PRIMARY = "#1AA0AE"  # On-dark brand teal - main CLI brand color (site --brand-accent)
+ADSCAN_PRIMARY_DIM = "#157E8A"  # Dimmed version for subtle elements
+ADSCAN_PRIMARY_BRIGHT = "#3CC5D3"  # Brighter version for highlights (site --brand-bright)
 
 # Secondary brand colors (dark gray from logo)
 ADSCAN_SECONDARY = "#2A2A2A"  # Dark metallic gray

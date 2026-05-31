@@ -44,6 +44,7 @@ from adscan_launcher.docker_runtime import (
     ensure_image_pulled,
     image_exists,
     is_docker_env,
+    register_pre_container_exec_hook,
     run_docker,
 )
 from adscan_launcher.output import (
@@ -104,10 +105,14 @@ _KNOWN_LAUNCHER_COMMANDS = {
 
 # Deliverable subcommands handled as host-side passthrough (Pass C). Each is
 # routed through the PRO upsell gate (`_run_pro_passthrough_with_upsell_gate`)
-# so LITE installs render the canonical upsell panel on exit-42.
+# so PRO-only deliverables render the canonical upsell panel on exit-42.
+# LITE deliverables (``cheatsheet``, ``mitre-navigator``) run to completion
+# in the container and return 0 — the gate is a no-op for them because they
+# are not in ``PRO_ONLY_COMMANDS``.
 _DELIVERABLE_PASSTHROUGH_COMMANDS = {
     "deliver",
     "cheatsheet",
+    "mitre-navigator",
 }
 
 
@@ -168,13 +173,15 @@ def _cleanup_legacy_sudo_alias() -> None:
 
 
 class _DeliverablesAwareParser(argparse.ArgumentParser):
-    """Argparse parser that appends a "Client Deliverables" section to --help.
+    """Argparse parser that appends a tiered Deliverables section to --help.
 
-    The deliverable subcommands (``deliver``, ``cheatsheet``) already
-    register their own ``help`` strings with ``[PRO]`` / ``[LITE]`` badges,
-    but argparse renders all subcommands as a single flat block. This
-    override appends a clearly titled section after the default help so
-    operators can see the deliverables family at a glance.
+    The deliverable subcommands (``deliver``, ``cheatsheet``,
+    ``mitre-navigator``) already register their own ``help`` strings with
+    ``[PRO]`` / ``[LITE]`` badges, but argparse renders all subcommands as a
+    single flat block. This override appends a clearly titled section after
+    the default help, split into two groups — LITE (free) first, then PRO —
+    so operators can see the deliverables family at a glance and the free
+    offers are never undersold.
     """
 
     def format_help(self) -> str:  # type: ignore[override]
@@ -188,14 +195,35 @@ class _DeliverablesAwareParser(argparse.ArgumentParser):
             return base
 
         descriptions: dict[str, str] = {
-            "deliver":    "Generate full Client Deliverable Kit (4 PDFs + ZIP)",
-            "cheatsheet": "Pentester Cheatsheet PDF",
+            "deliver":         "Full Client Deliverable Kit (4 PDFs + ZIP)",
+            "cheatsheet":      "Pentester Cheatsheet PDF",
+            "mitre-navigator": "MITRE ATT&CK Navigator layer (JSON)",
         }
-        lines = ["", "Client Deliverables (PRO)"]
+
+        # Bucket each deliverable by its tier (driven by the catalog, never
+        # hardcoded) while preserving the stable display order.
+        buckets: dict[str, list[str]] = {"LITE": [], "PRO": []}
         for name in _DELIV_ORDER:
-            badge = f"[{_tier_for_command(name)}]"
-            desc = descriptions.get(name, name)
-            lines.append(f"  {name:<20} {desc:<55} {badge}")
+            buckets.setdefault(_tier_for_command(name), []).append(name)
+
+        groups = (
+            ("LITE", "Deliverables — LITE (free)"),
+            ("PRO", "Deliverables — PRO"),
+        )
+
+        lines: list[str] = []
+        for tier_key, header in groups:
+            names = buckets.get(tier_key) or []
+            if not names:
+                continue
+            lines.append("")
+            lines.append(header)
+            for name in names:
+                badge = f"[{_tier_for_command(name)}]"
+                desc = descriptions.get(name, name)
+                lines.append(f"  {name:<18} {desc:<43} {badge}")
+        if not lines:
+            return base
         return base + "\n".join(lines) + "\n"
 
 
@@ -254,7 +282,42 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    check = sub.add_parser("check", help="Check Docker-mode prerequisites")
+    # Shared update-check flag. Used by every subcommand whose dispatch
+    # path runs ``offer_updates_for_command``. Defined once on a parent
+    # parser instead of duplicated three times so the help text stays in
+    # one place. The intent:
+    #
+    # --no-update-check  user-facing escape hatch. Skips the launcher
+    #                    + image version probe entirely (no PyPI / Docker
+    #                    Hub call). Reserved for mid-engagement, airgapped
+    #                    runs, or version-pinning by procurement. Tier 3
+    #                    "critical" detection still emits a non-blocking
+    #                    note so the operator does not forget they are
+    #                    running an unsupported combination.
+    #
+    # The complementary ``--dev`` flag already exists at the top-level
+    # parser (it sets ``ADSCAN_DOCKER_CHANNEL=dev``). Dev-mode launches
+    # skip update checks via ``is_dev_update_context`` automatically — no
+    # additional flag at this layer is needed, and adding one would create
+    # a confusing dual `--dev` (one before the subcommand, one after).
+    update_check_parent = argparse.ArgumentParser(add_help=False)
+    update_check_parent.add_argument(
+        "--no-update-check",
+        action="store_true",
+        dest="no_update_check",
+        help=(
+            "Skip the launcher/runtime version probe and update prompts for "
+            "this run. Use only when you intentionally want to stay on the "
+            "current version (mid-engagement, airgapped, pinned for a "
+            "customer requirement)."
+        ),
+    )
+
+    check = sub.add_parser(
+        "check",
+        help="Check Docker-mode prerequisites",
+        parents=[update_check_parent],
+    )
     check.add_argument(
         "--allow-low-memory",
         action="store_true",
@@ -264,7 +327,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    start = sub.add_parser("start", help="Start ADscan interactive session")
+    start = sub.add_parser(
+        "start",
+        help="Start ADscan interactive session",
+        parents=[update_check_parent],
+    )
     start.add_argument(
         "--pull-timeout",
         type=int,
@@ -317,7 +384,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Boot the workbench on top of the deterministic demo workspace.",
     )
 
-    ci = sub.add_parser("ci", help="Run `adscan ci` inside the container")
+    ci = sub.add_parser(
+        "ci",
+        help="[EXPERIMENTAL] Run ADscan in autonomous mode (no prompts, end-to-end automated scan)",
+        parents=[update_check_parent],
+        description=(
+            "EXPERIMENTAL · BETA — Autonomous scan mode.\n\n"
+            "`adscan ci` launches ADscan in fully non-interactive mode: sensible "
+            "defaults are applied, every confirmation prompt is skipped, and the "
+            "complete scan pipeline (preflight → recon → enumeration → "
+            "exploitation → reporting) runs end-to-end without operator input.\n\n"
+            "Intended for CI/CD pipelines, automated lab validation (HTB/GOAD), "
+            "and unattended engagements where a human is not available to drive "
+            "the interactive shell.\n\n"
+            "STATUS — Beta. Behaviour, defaults, and output format may change "
+            "between releases. The interactive `adscan start` shell is the "
+            "supported production path; `adscan ci` is the automation companion "
+            "and is graduating from experimental as confidence in the autonomous "
+            "decisions accumulates.\n\n"
+            "If autonomous decisions look wrong on your engagement, re-run with "
+            "`--debug` and report the trace at https://adscanpro.com/docs."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ci.add_argument(
         "--pull-timeout",
         type=int,
@@ -374,14 +463,60 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     _DELIVERABLE_HELP: dict[str, str] = {
-        "deliver":    "Generate full Client Deliverable Kit (4 PDFs + ZIP)",
-        "cheatsheet": "Pentester Cheatsheet PDF",
+        "deliver":         "Generate full Client Deliverable Kit (4 PDFs + ZIP)",
+        "cheatsheet":      "Pentester Cheatsheet PDF",
+        "mitre-navigator": "MITRE ATT&CK Navigator layer (JSON)",
     }
 
     for _deliv_name in _DELIV_ORDER:
         _badge = f"[{_tier_for_command(_deliv_name)}]"
         _deliv_help = f"{_DELIVERABLE_HELP[_deliv_name]}  {_badge}"
         _deliv_p = sub.add_parser(_deliv_name, help=_deliv_help)
+        if _deliv_name == "mitre-navigator":
+            # The MITRE ATT&CK Navigator export (LITE deliverable) has a
+            # distinct flag surface from the PDF deliverables: ``--output`` is
+            # a directory (not a PDF path) and there is no --no-open/--no-render.
+            # The launcher only needs to (a) recognise the flags so
+            # ``adscan mitre-navigator --help`` lists them and (b) forward them
+            # verbatim through the passthrough block below. Mirror this set with
+            # the container subparser in ``adscan_internal/cli/mitre_navigator``.
+            _deliv_p.add_argument(
+                "--workspace", dest="nav_workspace", default=None,
+                metavar="NAME",
+                help="Workspace name or path (default: most recent).",
+            )
+            _deliv_p.add_argument(
+                "--output", dest="nav_output", default=None,
+                metavar="DIR",
+                help="Output directory (default: <workspace>/mitre/).",
+            )
+            _deliv_p.add_argument(
+                "--client", dest="nav_client", default=None,
+                metavar="NAME",
+                help="Client name embedded in the report header (PRO).",
+            )
+            _deliv_p.add_argument(
+                "--engagement", dest="nav_engagement", default=None,
+                metavar="CODE",
+                help="Engagement code embedded as layer metadata (PRO).",
+            )
+            _deliv_p.add_argument(
+                "--web", dest="nav_web", action="store_true",
+                help="Open the generated interactive HTML in the browser (PRO).",
+            )
+            _deliv_p.add_argument(
+                "--no-html", dest="nav_no_html", action="store_true",
+                help="Skip the interactive HTML bundle, JSON only (PRO).",
+            )
+            _deliv_p.add_argument(
+                "--no-history", dest="nav_no_history", action="store_true",
+                help="Do not snapshot the layer into the workspace history (PRO).",
+            )
+            _deliv_p.add_argument(
+                "-v", "--verbose", dest="nav_verbose", action="store_true",
+                help="Enable verbose mode for detailed informational output.",
+            )
+            continue
         _deliv_p.add_argument("--output", dest="output_path", default=None,
                               help="Override the output PDF path.")
         _deliv_p.add_argument("--no-open", action="store_true",
@@ -466,8 +601,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # Internal-only command used by the host launcher to run the privileged
-    # helper process required by container runtime features (e.g. BH compose up,
-    # host clock sync). Hidden from end users.
+    # helper process required by container runtime features (notably host
+    # clock sync — Kerberos AS-REQ rejects requests outside a 5-minute skew
+    # window). Hidden from end users.
     host_helper = sub.add_parser("host-helper", help=argparse.SUPPRESS)
     host_helper.add_argument(
         "--socket",
@@ -977,8 +1113,43 @@ def _run_host_command_with_session_capture(
     extra: dict[str, Any] | None = None,
     allowed_commands: set[str] | None = None,
 ) -> int:
-    """Execute a launcher-owned command and always finalize session capture."""
+    """Execute a launcher-owned command and always finalize session capture.
+
+    Session-capture timing — read this before changing the flow:
+
+    * The launcher runs preflight (privilege check, daemon check, image
+      pull, network checks) and THEN execs ``docker run`` to hand the
+      terminal over to the container. The container runs for the rest
+      of the session — minutes for ``install/check``, hours for ``start/ci``.
+    * If we waited until ``runner()`` returns to flush the launcher
+      session, the upload arrives only when the container exits, often
+      hours after the launcher work was relevant.
+    * The fix: register a one-shot hook with ``docker_runtime`` that
+      fires at the EXACT moment Docker is about to take over (right
+      before the container subprocess starts). The hook flushes the
+      launcher session at the handoff, capturing all preflight +
+      pull diagnostics, while keeping the container session
+      independent.
+    * ``_capture_launcher_command_session`` is internally idempotent
+      via ``_SESSION_CAPTURE_FINALIZED``, so the ``finally`` block
+      below remains as the safety net for code paths that never reach
+      ``docker run`` (early errors, EOFs, KeyboardInterrupt) — it
+      becomes a no-op when the hook already fired.
+    """
     success = False
+
+    def _handoff_flush() -> None:
+        # No success signal available at handoff (container still
+        # hasn't run); keep ``success=None`` for the metadata.
+        _capture_launcher_command_session(
+            command_type=command_type,
+            telemetry_console=telemetry_console,
+            success=None,
+            extra=extra,
+            allowed_commands=allowed_commands,
+        )
+
+    register_pre_container_exec_hook(_handoff_flush)
     try:
         result = runner()
         if isinstance(result, bool):
@@ -1000,6 +1171,11 @@ def _run_host_command_with_session_capture(
         )
         return 130
     finally:
+        # Ensure the hook is cleared even if it never fired (early
+        # error path before ``docker run``). Idempotent if already
+        # consumed by the hook itself.
+        register_pre_container_exec_hook(None)
+        # Safety-net flush — no-op if the handoff hook already ran.
         _capture_launcher_command_session(
             command_type=command_type,
             telemetry_console=telemetry_console,
@@ -1277,16 +1453,39 @@ def main(argv: list[str] | None = None) -> None:
     _seed_session_trace_id()
     _emit_launcher_system_context(cmd)
 
+    # Best-effort drain of any telemetry sessions that failed to upload
+    # in previous CLI invocations (network blip, crash mid-flight,
+    # oversize payload, etc.). Runs on a background thread; the launcher
+    # foreground command never waits for it. Safe to no-op if telemetry
+    # is disabled or the queue module is unavailable.
+    try:
+        from adscan_core.telemetry import start_telemetry_queue_drain
+
+        start_telemetry_queue_drain()
+    except Exception:
+        # Telemetry queue drain must never break the launcher CLI.
+        pass
+
     # Offer upgrades early for relevant subcommands (interactive only).
     cmd_for_update_offer = cmd or "start"
     pull_timeout_raw = getattr(ns, "pull_timeout", 3600)
     pull_timeout_norm = normalize_pull_timeout_seconds(int(pull_timeout_raw))
+    # ``--no-update-check`` is the explicit user opt-out. ``--dev`` is the
+    # existing top-level launcher flag (defined ~line 230). Either signal
+    # routes through to ``offer_updates_for_command`` as a skip; the dev
+    # variant additionally suppresses the "dev channel detected" debug
+    # noise via the canonical ``is_dev_update_context`` env-var path that
+    # the top-level flag already populates.
+    no_update_check = bool(getattr(ns, "no_update_check", False))
+    dev_mode = bool(getattr(ns, "dev", False))
     try:
         offer_updates_for_command(
             _build_update_context_for_launcher(
                 docker_pull_timeout_seconds=pull_timeout_norm
             ),
             cmd_for_update_offer,
+            skip_update_check=no_update_check or dev_mode,
+            dev_mode=dev_mode,
         )
     except KeyboardInterrupt:
         _log_launcher_interrupt(
@@ -1444,6 +1643,33 @@ def main(argv: list[str] | None = None) -> None:
             ws_report_theme = getattr(ns, "ws_report_theme", "") or ""
             if ws_report_theme:
                 deliv_args.extend(["--report-theme", str(ws_report_theme)])
+        # ``mitre-navigator``-specific flags. Distinct ``nav_*`` dests so the
+        # navigator's directory ``--output`` and boolean flags never clash
+        # with the PDF deliverables' ``output_path``/``no_open``/``no_render``.
+        # Forwarded verbatim into the container, where the navigator subparser
+        # interprets them. New navigator flags need a one-line entry both at
+        # registration above and in this forwarding block.
+        if cmd == "mitre-navigator":
+            nav_workspace = getattr(ns, "nav_workspace", None)
+            if nav_workspace:
+                deliv_args.extend(["--workspace", str(nav_workspace)])
+            nav_output = getattr(ns, "nav_output", None)
+            if nav_output:
+                deliv_args.extend(["--output", str(nav_output)])
+            nav_client = getattr(ns, "nav_client", None)
+            if nav_client:
+                deliv_args.extend(["--client", str(nav_client)])
+            nav_engagement = getattr(ns, "nav_engagement", None)
+            if nav_engagement:
+                deliv_args.extend(["--engagement", str(nav_engagement)])
+            if bool(getattr(ns, "nav_web", False)):
+                deliv_args.append("--web")
+            if bool(getattr(ns, "nav_no_html", False)):
+                deliv_args.append("--no-html")
+            if bool(getattr(ns, "nav_no_history", False)):
+                deliv_args.append("--no-history")
+            if bool(getattr(ns, "nav_verbose", False)):
+                deliv_args.append("--verbose")
         raise SystemExit(
             _run_pro_passthrough_with_upsell_gate(
                 cmd=str(cmd),

@@ -10,6 +10,7 @@ from rich.text import Text
 from rich.table import Table
 
 import adscan_core.output._state as _state
+from adscan_core.theme import ADSCAN_PRIMARY
 from adscan_core.output._state import mark_sensitive
 from adscan_core.output._log import (
     BRAND_COLORS,
@@ -140,6 +141,21 @@ def _format_share_access_set(access_values: set[str]) -> str:
     if "Read" in access_values:
         return "Read"
     return "Unknown"
+
+
+def _path_reaches_domain_object(nodes: list, domain: str) -> bool:
+    """Return True when the path's terminal node IS the domain object.
+
+    The domain object is labelled with the domain FQDN (e.g. ``ESSOS.LOCAL``),
+    optionally suffixed with ``@<realm>``. Used to decide whether a
+    Domain-Compromised path already terminates at the domain object or needs
+    the ``⇒ Domain Compromised`` closure marker because the depth budget
+    truncated the structural DCSync closure.
+    """
+    if not nodes:
+        return False
+    terminal = str(nodes[-1]).split("@", 1)[0].strip().lower()
+    return bool(terminal) and terminal == str(domain or "").strip().lower()
 
 
 def _path_has_excluded_share_access_step(path: Dict[str, object]) -> bool:
@@ -339,7 +355,7 @@ def _render_share_resources_panel(rows: list[dict[str, object]]) -> None:
             line.append("  ▸ ", style=f"bold {label_style}")
             line.append(label, style=f"bold {label_style}")
             line.append("  ", style="")
-            line.append(mark_sensitive(host, "hostname"), style="bold cyan")
+            line.append(mark_sensitive(host, "hostname"), style=f"bold {ADSCAN_PRIMARY}")
             line.append("  /  ", style="dim")
             line.append(share, style="bold white")
             line.append("\n")
@@ -788,10 +804,13 @@ def print_attack_paths_summary(
     from rich.table import Table
     from adscan_internal.services.adcs_path_display import resolve_adcs_display_target
     from adscan_internal.services.attack_step_support_registry import (
-        TARGET_OUTCOME_SECTION_ORDER,
-        TARGET_OUTCOME_SECTION_STYLES,
+        DISPLAY_TIER_COMPROMISE_ENABLER,
+        DISPLAY_TIER_DOMAIN_COMPROMISE,
+        DISPLAY_TIER_LATERAL_PIVOT,
+        DISPLAY_TIER_ORDER,
+        DISPLAY_TIER_STYLES,
         describe_path_target_outcome,
-        get_path_target_outcome_class,
+        get_path_display_tier,
     )
 
     if not paths and not share_rows:
@@ -829,39 +848,33 @@ def print_attack_paths_summary(
 
     total_by_class = (
         {
-            outcome: sum(
-                1 for p in ordered_paths if get_path_target_outcome_class(p) == outcome
-            )
-            for outcome in TARGET_OUTCOME_SECTION_ORDER
+            tier: sum(1 for p in ordered_paths if get_path_display_tier(p) == tier)
+            for tier in DISPLAY_TIER_ORDER
         }
         if show_sections
-        else {outcome: 0 for outcome in TARGET_OUTCOME_SECTION_ORDER}
+        else {tier: 0 for tier in DISPLAY_TIER_ORDER}
     )
     visible_by_class = (
         {
-            outcome: sum(
-                1 for p in visible if get_path_target_outcome_class(p) == outcome
-            )
-            for outcome in TARGET_OUTCOME_SECTION_ORDER
+            tier: sum(1 for p in visible if get_path_display_tier(p) == tier)
+            for tier in DISPLAY_TIER_ORDER
         }
         if show_sections
-        else {outcome: 0 for outcome in TARGET_OUTCOME_SECTION_ORDER}
+        else {tier: 0 for tier in DISPLAY_TIER_ORDER}
     )
     visible_classes = [
-        outcome
-        for outcome in TARGET_OUTCOME_SECTION_ORDER
-        if visible_by_class[outcome] > 0
+        tier for tier in DISPLAY_TIER_ORDER if visible_by_class[tier] > 0
     ]
 
     summary_text = Text()
     if show_sections:
-        for idx, outcome in enumerate(TARGET_OUTCOME_SECTION_ORDER):
-            label, icon, style_key = TARGET_OUTCOME_SECTION_STYLES[outcome]
+        for idx, tier in enumerate(DISPLAY_TIER_ORDER):
+            label, icon, style_key = DISPLAY_TIER_STYLES[tier]
             if idx > 0:
                 summary_text.append("   ", style="dim")
             summary_text.append(f"{icon} {label}: ", style="bold white")
-            visible_count = visible_by_class[outcome]
-            total_count = total_by_class[outcome]
+            visible_count = visible_by_class[tier]
+            total_count = total_by_class[tier]
             count_label = (
                 f"{visible_count}/{total_count}"
                 if 0 < visible_count < total_count
@@ -1170,11 +1183,30 @@ def print_attack_paths_summary(
         if not isinstance(steps, list):
             steps = []
 
+        display_tier = get_path_display_tier(path)
         path_str = _format_inline_chain(nodes, rels, steps)
-        basis_primary, _ = _format_effective_target_basis_compact(path)
-        if basis_primary:
-            path_str.append("\n", style="dim")
-            path_str.append(basis_primary, style="dim")
+        # Domain-compromise closure marker. A path classified as Domain
+        # Compromised whose visible chain stops at a Tier-0 principal (e.g.
+        # DOMAIN ADMINS) or asset rather than the Domain object — typically
+        # because the depth budget truncated the structural DCSync closure —
+        # would otherwise dead-end ambiguously and violate the nomenclature
+        # rule "attack paths terminate at Domain Compromised, never at Domain
+        # Admins". We append the canonical closure marker so the terminus is
+        # unambiguous without fabricating graph edges in the cached record.
+        if (
+            display_tier == DISPLAY_TIER_DOMAIN_COMPROMISE
+            and nodes
+            and not _path_reaches_domain_object(nodes, domain)
+        ):
+            path_str.append("  ⇒ ", style="dim")
+            path_str.append("Domain Compromised", style=f"bold {BRAND_COLORS['error']}")
+        # Diagnostic provenance; the detail view surfaces it labelled, so keep
+        # it out of the default compact table.
+        if _state.is_debug_mode():
+            basis_primary, _ = _format_effective_target_basis_compact(path)
+            if basis_primary:
+                path_str.append("\n", style="dim")
+                path_str.append(basis_primary, style="dim")
         choke_points = _collect_path_choke_points(steps)
         if choke_points:
             path_str.append("\n", style="dim")
@@ -1246,13 +1278,12 @@ def print_attack_paths_summary(
             state_cell = _format_target_state_cell(meta)
         exec_cell = _format_exec_cell(meta if isinstance(meta, dict) else None)
 
-        outcome_class = get_path_target_outcome_class(path)
-        row_style = "dim" if outcome_class == "pivot" else ""
+        row_style = "dim" if display_tier == DISPLAY_TIER_LATERAL_PIVOT else ""
         idx_style = (
             BRAND_COLORS["error"]
-            if outcome_class == "direct_compromise"
+            if display_tier == DISPLAY_TIER_DOMAIN_COMPROMISE
             else BRAND_COLORS["warning"]
-            if outcome_class in {"tier0_foothold", "followup_terminal"}
+            if display_tier == DISPLAY_TIER_COMPROMISE_ENABLER
             else None
         )
         idx_cell: str | Text = (
@@ -1272,8 +1303,8 @@ def print_attack_paths_summary(
         end_section = (
             show_sections
             and idx < show_count
-            and outcome_class != get_path_target_outcome_class(visible[idx])
-            and outcome_class in visible_classes
+            and display_tier != get_path_display_tier(visible[idx])
+            and display_tier in visible_classes
         )
         table.add_row(*row, style=row_style, end_section=end_section)
 

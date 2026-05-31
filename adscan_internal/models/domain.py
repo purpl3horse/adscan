@@ -267,6 +267,54 @@ def resolve_dc_ip(domain_data: dict) -> str | None:
     return None
 
 
+def qualify_host_fqdn(hostname: str | None, domain: str | None) -> str | None:
+    """Return a single-suffixed FQDN for a host, robust against double-suffixing.
+
+    Centralised guard for the ``host.domain.domain`` class of bug: any call site
+    that unconditionally does ``f"{hostname}.{domain}"`` produces a double suffix
+    when ``hostname`` is already qualified (e.g. the native sweep resolves the
+    SPN FQDN up front, then an edge-recorder re-appends the realm). The resulting
+    name misses the BloodHound node lookup and silently drops the attack-graph
+    edge. Routing every FQDN qualification through this one helper keeps that
+    impossible, now and at future call sites.
+
+    Behaviour:
+        - empty hostname → ``None``
+        - empty domain → hostname as-is (lowercased, de-dotted)
+        - collapses any accidental repeated trailing ``.domain`` suffix
+          (``host.domain.domain`` → ``host.domain``) and logs the correction so
+          the offending caller can be traced
+        - short label (no dot after collapse) → ``"<host>.<domain>"``
+        - already-dotted name (incl. IPs, cross-forest FQDNs whose suffix differs
+          from ``domain``) → returned as-is
+    """
+    h = str(hostname or "").strip().rstrip(".").lower()
+    d = str(domain or "").strip().rstrip(".").lower()
+    if not h:
+        return None
+    if not d:
+        return h
+    suffix = f".{d}"
+    collapsed = h
+    while collapsed.endswith(suffix + suffix):
+        collapsed = collapsed[: -len(suffix)]
+    if collapsed != h:
+        # Auto-detected + corrected a double suffix — log so the source caller
+        # can be found and fixed (lazy import keeps this module startup-light).
+        try:
+            from adscan_core.rich_output import print_info_debug  # noqa: PLC0415
+
+            print_info_debug(
+                f"[qualify_host_fqdn] collapsed repeated domain suffix: "
+                f"{h!r} -> {collapsed!r}"
+            )
+        except Exception:
+            pass
+    if "." in collapsed:
+        return collapsed
+    return f"{collapsed}{suffix}"
+
+
 def resolve_dc_fqdn(
     domain_data: dict,
     *,
@@ -302,19 +350,64 @@ def resolve_dc_fqdn(
     """
     from adscan_internal.services._kerberos_spn import is_ip_address  # noqa: PLC0415
 
+    # Local debug printer — imported lazily to avoid pulling rich_output at
+    # module import time (this module is imported very early in startup).
+    def _debug(msg: str) -> None:
+        try:
+            from adscan_core.rich_output import print_info_debug  # noqa: PLC0415
+
+            print_info_debug(f"[resolve_dc_fqdn] {msg}")
+        except Exception:
+            pass
+
     target_domain_clean = str(target_domain or "").strip().rstrip(".")
 
     for key in ("pdc_hostname_fqdn", "pdc_fqdn", "dc_fqdn"):
         candidate = str(domain_data.get(key) or "").strip().rstrip(".")
         if candidate and not is_ip_address(candidate):
+            # Provenance log — surfaces *which* key answered. When this
+            # comes back with a key holding a value that doesn't share
+            # suffix with ``target_domain``, it's worth checking the
+            # workspace for stale data from a previous ADscan version
+            # (see BACKLOG entry on v8→v9 workspace migration). The
+            # function still returns the value because multi-forest AD
+            # legitimately has DCs in DNS namespaces unrelated to the
+            # AD realm name — this is a hint, not a guard.
+            _debug(
+                f"realm={target_domain_clean!r} resolved via "
+                f"domain_data[{key!r}]={candidate!r}"
+            )
+            if (
+                target_domain_clean
+                and "." in candidate
+                and not candidate.lower().endswith(
+                    "." + target_domain_clean.lower()
+                )
+            ):
+                _debug(
+                    f"NOTE: candidate suffix does not match realm "
+                    f"({candidate!r} vs realm {target_domain_clean!r}). "
+                    "Legitimate for cross-forest AD, but also the "
+                    "signature of stale workspace state from v8 → v9 "
+                    "migration. Verify with the DNS validation log."
+                )
             return candidate
 
     pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip().rstrip(".")
     if pdc_hostname and not is_ip_address(pdc_hostname):
         if "." in pdc_hostname:
+            _debug(
+                f"realm={target_domain_clean!r} resolved via "
+                f"domain_data['pdc_hostname']={pdc_hostname!r} (already FQDN)"
+            )
             return pdc_hostname
         if target_domain_clean:
-            return f"{pdc_hostname}.{target_domain_clean}"
+            promoted = f"{pdc_hostname}.{target_domain_clean}"
+            _debug(
+                f"realm={target_domain_clean!r} resolved via short-hostname "
+                f"promotion: {pdc_hostname!r} → {promoted!r}"
+            )
+            return promoted
 
     if ip_hostname_inventory:
         from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
@@ -329,6 +422,15 @@ def resolve_dc_fqdn(
                 inventory=ip_hostname_inventory,
             )
             if chosen and not is_ip_address(chosen):
+                _debug(
+                    f"realm={target_domain_clean!r} resolved via "
+                    f"ip_hostname_inventory[{dc_ip!r}]={chosen!r}"
+                )
                 return chosen
 
+    _debug(
+        f"realm={target_domain_clean!r} — no FQDN candidate available "
+        "(all fallback steps returned empty). Downstream Kerberos auth "
+        "will likely fail with SEC_E_LOGON_DENIED or PREAUTH_FAILED."
+    )
     return None

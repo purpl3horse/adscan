@@ -27,7 +27,11 @@ from adscan_internal import (
     print_panel,
     print_success,
 )
-from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.rich_output import (
+    confirm_ask,
+    mark_sensitive,
+    questionary_select_index,
+)
 from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.cli.session_preflight import (
     SessionPreflightConfig,
@@ -56,6 +60,7 @@ from adscan_internal.cli.dns import (
     prompt_known_domain_and_pdc_interactive,
 )
 from adscan_internal.services.network_preflight_service import (
+    RouteAssessment,
     assess_target_reachability,
     get_interface_ipv4_addresses,
 )
@@ -1556,6 +1561,202 @@ def _build_network_preflight_panel_body(
     return "\n".join(lines)
 
 
+def _list_local_interfaces_with_ipv4() -> list[tuple[str, list[str]]]:
+    """Return local interfaces and their IPv4 addresses, route-relevant first.
+
+    Loopback is excluded. Each entry is ``(interface_name, [ipv4, ...])``;
+    interfaces without an IPv4 address are kept (shown as ``no IPv4``) so the
+    operator still sees the full picture.
+    """
+    interfaces: list[tuple[str, list[str]]] = []
+    try:
+        import netifaces
+
+        for iface in netifaces.interfaces():
+            if str(iface).strip().lower() in {"lo", "lo0"}:
+                continue
+            interfaces.append((str(iface), get_interface_ipv4_addresses(str(iface))))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+    return interfaces
+
+
+def _apply_interface_switch(shell: Any, *, interface: str) -> str | None:
+    """Switch the active interface and refresh the derived source IP.
+
+    Updates the single source of truth (``shell.interface`` + ``shell.myip``)
+    used downstream for source-IP/listener binding (coercion, relay, myip
+    substitution). Non-destructive: it only rebinds the local source vantage.
+
+    Returns:
+        The refreshed source IP, or ``None`` when it could not be resolved.
+    """
+    shell.interface = interface
+    setter = getattr(shell, "set_interface_ip", None)
+    new_ip: str | None = None
+    if callable(setter):
+        new_ip = setter(interface)
+    else:  # pragma: no cover - shells always expose set_interface_ip
+        addrs = get_interface_ipv4_addresses(interface)
+        if addrs:
+            new_ip = addrs[0]
+            shell.myip = new_ip
+    saver = getattr(shell, "save_workspace_data", None)
+    if callable(saver):
+        try:
+            saver()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[network-preflight] failed to persist interface switch: {exc}"
+            )
+    return new_ip
+
+
+def _maybe_offer_interface_switch_on_route_mismatch(
+    shell: Any,
+    *,
+    mode_label: str,
+    configured_interface: str | None,
+    mismatch_route: RouteAssessment,
+    target_ip: str | None,
+    hosts_expression: str | None,
+    require_dc_ports: bool,
+    interactive: bool,
+) -> bool | None:
+    """Offer to switch to the interface that actually routes to the target.
+
+    Fires only on a route/interface MISMATCH (the kernel route uses a different
+    interface than the configured one) and never when the SELECTED operating
+    interface (``configured_interface``) is a Ligolo TUN — that is a name-based
+    property of the configured interface, independent of tunnel alive/active
+    state and of the route-actual interface (a Ligolo TUN intentionally has no
+    normal source IP / default route, so a route mismatch against it is
+    meaningless).
+
+    The confirm defaults to NO (keep current) and the interface select defaults
+    to the interface the route actually uses, so a single Enter does the right
+    thing. In non-interactive runs both helpers auto-resolve to those
+    conservative defaults — keep current, never switch, never hang.
+
+    Returns:
+        ``None`` when no switch happened (caller keeps its normal flow), or the
+        bool result of re-running the preflight after the switch was applied.
+    """
+    route_interface = str(mismatch_route.route_interface or "").strip()
+    if not route_interface:
+        return None
+
+    # Skip entirely when the SELECTED operating interface is a Ligolo TUN. This is
+    # a property of the configured interface BY ITS NATURE (name), independent of
+    # whether the tunnel is currently live and independent of the route-actual
+    # interface: a Ligolo TUN intentionally has no normal source IP / default
+    # route, so a route "mismatch" against it is meaningless.
+    try:
+        from adscan_internal.services.pivot_runtime_state_service import is_ligolo_interface
+
+        if is_ligolo_interface(configured_interface):
+            print_info_debug(
+                "[network-preflight] interface-switch offer skipped: "
+                "configured interface is a Ligolo TUN."
+            )
+            return None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    marked_route_src = (
+        mark_sensitive(mismatch_route.source_ip, "ip")
+        if mismatch_route.source_ip
+        else "[unknown]"
+    )
+    prompt = (
+        f"Route to the target goes via '{route_interface}' (source {marked_route_src}), "
+        f"not the configured '{configured_interface or '[unset]'}'. "
+        "Switch to the interface that actually routes to the target?"
+    )
+
+    from adscan_internal.interaction import is_non_interactive
+
+    if is_non_interactive(shell):
+        # Conservative default: keep the configured interface, never switch.
+        print_info_debug(
+            "[network-preflight] non-interactive; keeping configured interface "
+            f"'{configured_interface or '[unset]'}' despite route mismatch."
+        )
+        return None
+
+    if not interactive:
+        return None
+
+    if not confirm_ask(prompt, default=False):
+        return None
+
+    interfaces = _list_local_interfaces_with_ipv4()
+    if not interfaces:
+        print_warning(
+            "Could not enumerate local network interfaces; keeping current interface."
+        )
+        return None
+
+    options: list[str] = []
+    default_idx = 0
+    for idx, (iface_name, ipv4_addrs) in enumerate(interfaces):
+        if ipv4_addrs:
+            marked = ", ".join(mark_sensitive(addr, "ip") for addr in ipv4_addrs)
+            options.append(f"{iface_name}  ({marked})")
+        else:
+            options.append(f"{iface_name}  (no IPv4)")
+        if iface_name == route_interface:
+            default_idx = idx
+
+    selected_idx = questionary_select_index(
+        title="Select the interface to use for this scan:",
+        options=options,
+        default_idx=default_idx,
+        shell=shell,
+    )
+    if selected_idx is None:
+        print_info("Keeping the current interface.")
+        return None
+
+    chosen_interface = interfaces[selected_idx][0]
+    if chosen_interface == (configured_interface or ""):
+        print_info(f"Interface unchanged ('{chosen_interface}').")
+        return None
+
+    new_ip = _apply_interface_switch(shell, interface=chosen_interface)
+    if new_ip:
+        print_success(
+            f"Interface switched to '{chosen_interface}' "
+            f"(source {mark_sensitive(new_ip, 'ip')}). Re-validating route…"
+        )
+    else:
+        print_warning(
+            f"Switched to '{chosen_interface}', but it has no IPv4 address. "
+            "Re-validating route…"
+        )
+
+    telemetry.capture(
+        "start_network_preflight_interface_switch",
+        properties={
+            "mode": mode_label,
+            "route_interface": route_interface,
+            "switched": True,
+        },
+    )
+
+    # Re-validate so the warning reconciles with the new interface.
+    return _run_start_network_preflight(
+        shell,
+        mode_label=mode_label,
+        interface=chosen_interface,
+        interactive=interactive,
+        target_ip=target_ip,
+        hosts_expression=hosts_expression,
+        require_dc_ports=require_dc_ports,
+    )
+
+
 def _run_start_network_preflight(
     shell: Any,
     *,
@@ -1599,6 +1800,7 @@ def _run_start_network_preflight(
                 )
             )
 
+    mismatch_route: RouteAssessment | None = None
     probe_target = target_ip or _extract_probe_ip_from_hosts_expression(
         hosts_expression
     )
@@ -1620,6 +1822,7 @@ def _run_start_network_preflight(
                 )
             )
         elif route_assessment.reason == "route_interface_mismatch":
+            mismatch_route = route_assessment
             marked_src = (
                 mark_sensitive(route_assessment.source_ip, "ip")
                 if route_assessment.source_ip
@@ -1726,6 +1929,21 @@ def _run_start_network_preflight(
             "hosts_expression_provided": bool(hosts_expression),
         },
     )
+
+    if not failures and mismatch_route is not None:
+        switched = _maybe_offer_interface_switch_on_route_mismatch(
+            shell,
+            mode_label=mode_label,
+            configured_interface=iface or None,
+            mismatch_route=mismatch_route,
+            target_ip=target_ip,
+            hosts_expression=hosts_expression,
+            require_dc_ports=require_dc_ports,
+            interactive=interactive,
+        )
+        if switched is not None:
+            # Interface was switched and the route check re-ran with it.
+            return switched
 
     if not failures:
         emit_phase("network_preflight")

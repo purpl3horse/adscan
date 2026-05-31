@@ -22,6 +22,7 @@ from adscan_internal.integrations.netexec.parsers import (
 from adscan_internal.integrations.netexec.shares import (
     list_share_directory,
 )
+from adscan_internal.cli.ace_step_execution import set_last_execution_outcome
 from adscan_internal.services.attack_graph_runtime_service import (
     update_active_step_status,
 )
@@ -665,6 +666,23 @@ def offer_backup_operators_escalation(
             prompt_for_user_privs_after=True,
             credential_origin="backup_operators",
         )
+
+        # Promote the recovered DC machine-account credential into the
+        # attack-path execution context so the dispatch can hand it off to the
+        # next step (e.g. DCSync runs as the DC machine account). Mirrors the
+        # roasting / ACE handlers: the source records the outcome, the dispatch
+        # calls _apply_execution_outcome_context_handoff on it.
+        if machine_nt_hash:
+            set_last_execution_outcome(
+                shell,
+                {
+                    "key": "user_credential_obtained",
+                    "compromised_user": machine_account,
+                    "credential": machine_nt_hash,
+                    "credential_type": "nt_hash",
+                    "source_action": "BackupOperatorEscalation",
+                },
+            )
 
         return True
 

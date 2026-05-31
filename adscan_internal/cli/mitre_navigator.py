@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
+from adscan_core.reporting.finding_vuln_map import build_vuln_map_from_findings
 from adscan_core.rich_output import (
     print_error,
     print_info,
@@ -136,12 +137,83 @@ def _save_history_snapshot(history_dir: Path, layer: dict[str, Any]) -> Path:
     return snapshot
 
 
+def _domain_entries(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return the per-domain entries from a ``technical_report.json`` payload.
+
+    The on-disk report nests domains under a ``domains`` wrapper:
+    ``{"domains": {"<fqdn>": {"findings": [...], ...}}}``. Older flat layouts
+    stored ``{"<fqdn>": {...}}`` at the top level — both are tolerated so a
+    pre-existing report does not silently render zero techniques.
+    """
+    domains_raw = report.get("domains")
+    if isinstance(domains_raw, dict):
+        return {
+            name: entry
+            for name, entry in domains_raw.items()
+            if isinstance(name, str) and name and isinstance(entry, dict)
+        }
+    # Flat fallback: top-level domain dicts carrying a ``findings`` list.
+    flat: dict[str, dict[str, Any]] = {}
+    for name, entry in report.items():
+        if (
+            isinstance(name, str)
+            and name
+            and isinstance(entry, dict)
+            and isinstance(entry.get("findings"), list)
+        ):
+            flat[name] = entry
+    return flat
+
+
 def _domain_from_report(report: dict[str, Any]) -> str | None:
-    """Best-effort extraction of the AD domain name from a report payload."""
-    for key, value in report.items():
-        if isinstance(value, dict) and value.get("vulnerabilities") is not None:
-            return key
-    return None
+    """Return the in-scope AD domain — the one carrying the most findings.
+
+    The ``domains`` wrapper holds every domain seen during the engagement, but
+    only the authenticated/enumerated one carries findings (the others are
+    trust stubs with empty lists). Selecting the domain with the most findings
+    targets the layer at the assessment the operator actually ran.
+    """
+    entries = _domain_entries(report)
+    if not entries:
+        return None
+
+    def _finding_count(entry: dict[str, Any]) -> int:
+        findings = entry.get("findings")
+        return len(findings) if isinstance(findings, list) else 0
+
+    # Stable ordering: most findings first, then name for determinism.
+    best = max(entries.items(), key=lambda kv: (_finding_count(kv[1]), kv[0]))
+    name, entry = best
+    if _finding_count(entry) == 0:
+        # No domain has findings — still return a name so the layer is labelled.
+        return name
+    return name
+
+
+def _normalized_findings_payload(
+    report: dict[str, Any], domain: str | None
+) -> dict[str, dict[str, Any]]:
+    """Build a ``{domain: {"vulnerabilities": <map>}}`` payload for the builder.
+
+    ``build_navigator_layer`` expects either a finding iterable or a
+    ``technical_report.json``-shaped mapping where each domain exposes a
+    ``vulnerabilities`` map. The on-disk report leaves ``vulnerabilities``
+    ``null`` (the map is derived on demand from ``findings``), so we synthesize
+    it here via the LITE-safe core normalizer — which also attaches the ATT&CK
+    ``mitre`` list onto each entry so the technique aggregation has data to work
+    with.
+    """
+    entries = _domain_entries(report)
+    payload: dict[str, dict[str, Any]] = {}
+    for name, entry in entries.items():
+        if domain is not None and name != domain:
+            continue
+        findings = entry.get("findings")
+        vuln_map = build_vuln_map_from_findings(
+            findings if isinstance(findings, list) else []
+        )
+        payload[name] = {"vulnerabilities": vuln_map}
+    return payload
 
 
 def _open_browser_safe(path: Path) -> None:
@@ -201,6 +273,10 @@ def add_mitre_navigator_subparser(
         "-v", "--verbose", action="store_true",
         help="Enable verbose mode for detailed informational output.",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug output (detailed diagnostics).",
+    )
     return parser
 
 
@@ -223,6 +299,7 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
 
     is_pro = tier.is_pro()
     domain = _domain_from_report(report)
+    findings_payload = _normalized_findings_payload(report, domain)
     out_dir = Path(args.output).expanduser() if args.output else (workspace_dir / "mitre")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,7 +311,7 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
     extra_meta["assessment_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     layer = build_navigator_layer(
-        report,
+        findings_payload,
         domain=domain,
         watermark=(WATERMARK_PRO if is_pro else WATERMARK_COMMUNITY),
         extra_metadata=extra_meta,
@@ -251,6 +328,11 @@ def run_mitre_navigator(args: argparse.Namespace) -> int:
         f"  techniques={len(layer['techniques'])}  domain={domain}  "
         f"watermark={'PRO' if is_pro else 'Community'}"
     )
+    if not layer["techniques"]:
+        print_warning(
+            "  No ATT&CK techniques mapped — the report has no findings that "
+            "match the technique catalog. Run a scan first (`adscan ci`)."
+        )
 
     if not is_pro:
         # LITE stops here. Emphasize the upgrade hook without nagging.

@@ -15,9 +15,11 @@ Channel 1 — stdlib ``logging`` (rogue StreamHandler at import time)
 Native-stack libs install their own ``StreamHandler`` and write raw lines like
 ``2026-05-02 08:07:36,863 aiosmb ERROR ...`` straight to stderr, bypassing
 Rich. :func:`tame_native_stack_loggers` strips those handlers, forces
-``propagate=True`` so records reach ADscan's root :class:`RichHandler`, and
-attaches :class:`BenignNativeNoiseFilter` to drop known-benign post-teardown
-chatter (SMB ``CONNECTION_ABORTED``, SPNEGO/NEGOEX cleanup, late callbacks).
+``propagate=True``, attaches :class:`BenignNativeNoiseFilter` to drop
+known-benign post-teardown chatter (SMB ``CONNECTION_ABORTED``, SPNEGO/NEGOEX
+cleanup, late callbacks), and attaches the :class:`_NativeStackBridgeHandler`
+so the surviving records reach ADscan's centralized output (see "Native-stack
+logging bridge" below).
 
 ================================================================================
 Channel 2 — stdlib ``logging`` (handler-less vendor loggers)
@@ -48,6 +50,44 @@ directly** — silence the print, replace the traceback with ``pass``, or route
 through the available callback if one exists. See git history for examples in
 ``vendor/aiosmb/aiosmb/relay/serverconnection.py`` and
 ``vendor/asyauth/asyauth/protocols/spnego/server/native.py``.
+
+================================================================================
+Native-stack logging bridge (Channel 1 routing)
+================================================================================
+The native-stack vendor loggers (``aiosmb``, ``badldap``, ``kerbad``,
+``winacl``, ``pypykatz``, …) are NOT children of the ``adscan`` logger — they
+propagate to the *root* logger, which carries none of ADscan's RichHandlers
+(those attach to the ``adscan`` logger, which itself has ``propagate=False``).
+Consequently their records reach neither the session telemetry recording nor
+the visible console; they only ever surfaced through Python's ``lastResort``
+fallback to stderr.
+
+:class:`_NativeStackBridgeHandler` closes that gap WITHOUT touching the vendor
+source (the whole point — the fix survives ``scripts/refresh_vendor.sh``). A
+single shared instance is attached directly to each
+:data:`_NATIVE_STACK_LOGGER_NAMES` logger and forwards every surviving record
+to:
+
+* **Telemetry — always (DEBUG+).** The record is rendered to the telemetry
+  console (``record=True`` buffer) resolved via
+  ``adscan_core.output._state._get_telemetry_console``. Sanitization is
+  EXPORT-TIME and source-agnostic (``telemetry.py`` exports the buffer, then
+  sanitizes fail-closed before upload), so anything routed into the buffer is
+  scrubbed for free — no parallel sanitizer here.
+* **Visible console — only under ``--debug``.** When
+  ``adscan_core.output._state.is_debug_mode()`` is ``True`` the record is also
+  rendered to the shared ``_TeeConsole`` (``get_console()``). The default run
+  stays clean, preserving the premium-panel invariant. During a ``LiveSession``
+  the deferred-flush captures it automatically because it goes through
+  ``_TeeConsole.print``.
+
+The handler keeps ``propagate=True`` on the vendor loggers untouched: it is a
+purely *additive* sink, so the existing/legacy propagation contract (and any
+future root handler) is preserved. Because the handler lives only on the
+vendor loggers — never on ``adscan`` or root — ADscan's own records are never
+double-recorded by it. The handler is best-effort: it never raises, mirroring
+the ``_TeeConsole.print`` try/except discipline, so a broken telemetry buffer
+can never break the visible flow.
 
 ================================================================================
 Lifecycle
@@ -166,7 +206,98 @@ class BenignNativeNoiseFilter(logging.Filter):
         return not is_benign_native_noise(message)
 
 
+# ---------------------------------------------------------------------------
+# Native-stack logging bridge
+# ---------------------------------------------------------------------------
+
+
+def _format_native_record(record: logging.LogRecord) -> str:
+    """Render a vendor log record as a single readable line.
+
+    Deliberately simple — ``logger name | LEVEL | message`` (plus a formatted
+    traceback when ``exc_info`` is present). We do not pull in
+    :class:`rich.logging.RichHandler`: the goal is a faithful, low-noise text
+    line for the telemetry recording and the ``--debug`` console, not a
+    second styled rendering pipeline.
+    """
+
+    try:
+        message = record.getMessage()
+    except Exception:  # noqa: BLE001 — never break on a malformed record
+        message = str(getattr(record, "msg", ""))
+    line = f"{record.name} | {record.levelname} | {message}"
+    if record.exc_info:
+        try:
+            exc_type, exc_value, exc_tb = record.exc_info
+            line = (
+                f"{line}\n"
+                f"{''.join(traceback.format_exception(exc_type, exc_value, exc_tb))}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return line
+
+
+class _NativeStackBridgeHandler(logging.Handler):
+    """Forward native-stack vendor records into ADscan's centralized output.
+
+    A single shared instance is attached to each
+    :data:`_NATIVE_STACK_LOGGER_NAMES` logger. It mirrors the
+    ``_TeeConsole.print`` discipline: telemetry is ALWAYS fed (DEBUG+,
+    sanitized for free at export time), the visible console is fed ONLY under
+    ADscan debug mode, and every sink is best-effort so a broken buffer can
+    never break the user-visible flow.
+
+    See the "Native-stack logging bridge" section of the module docstring for
+    the full rationale (why these loggers never reached telemetry / the console
+    before, and why this is the refresh-proof fix that touches zero vendor
+    source).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        # Defence in depth: the same benign-noise filter the loggers already
+        # carry. Cheap, and keeps the bridge correct even if a future caller
+        # attaches this handler somewhere the logger-level filter is absent.
+        self.addFilter(BenignNativeNoiseFilter())
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = _format_native_record(record)
+        except Exception:  # noqa: BLE001
+            return
+
+        # Telemetry sink — ALWAYS (DEBUG+). The export-time sanitizer in
+        # ``telemetry.py`` scrubs the buffer fail-closed before upload, so no
+        # parallel sanitization is needed here.
+        try:
+            from adscan_core.output._state import _get_telemetry_console
+
+            telemetry_console = _get_telemetry_console()
+            if telemetry_console is not None:
+                telemetry_console.print(line)
+        except Exception:  # noqa: BLE001
+            # Best-effort: a broken record buffer must never break the flow.
+            pass
+
+        # Visible sink — ONLY under ADscan debug mode, so the default run
+        # stays clean (premium-panel invariant). Under a LiveSession this goes
+        # through ``_TeeConsole.print`` and is captured by the deferred flush.
+        try:
+            from adscan_core.output._state import get_console, is_debug_mode
+
+            if is_debug_mode():
+                get_console().print(line)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 _taming_installed = False
+
+# Single shared bridge instance, created lazily on first install so the module
+# import stays side-effect free. Reused across idempotent re-installs so we
+# never attach a duplicate handler to a vendor logger.
+_bridge_handler: _NativeStackBridgeHandler | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +356,7 @@ def make_relay_log_callback(context: str) -> Callable:
 
 
 def tame_native_stack_loggers() -> None:
-    """Strip rogue handlers and install the benign-noise filter once.
+    """Strip rogue handlers, install the benign-noise filter and the bridge.
 
     Idempotent — subsequent calls are no-ops. Safe to invoke before any of the
     native libraries are imported: loggers that do not yet exist are created
@@ -234,13 +365,23 @@ def tame_native_stack_loggers() -> None:
     later. Once the library imports and adds its own handler, that handler is
     not retroactively stripped — call this function after ``init_logging``
     and *before* any native-stack import to guarantee a clean console.
+
+    On top of stripping rogue handlers and filtering benign noise, this also
+    attaches a single shared :class:`_NativeStackBridgeHandler` to every
+    native-stack logger so their surviving records reach the telemetry
+    recording (always) and the visible console (only under ``--debug``). The
+    bridge is purely additive; ``propagate`` is left ``True`` so the existing
+    propagation contract is untouched.
     """
 
-    global _taming_installed
+    global _taming_installed, _bridge_handler
     if _taming_installed:
         return
 
     noise_filter = BenignNativeNoiseFilter()
+    if _bridge_handler is None:
+        _bridge_handler = _NativeStackBridgeHandler()
+    bridge_handler = _bridge_handler
 
     for name in _NATIVE_STACK_LOGGER_NAMES:
         logger = logging.getLogger(name)
@@ -248,6 +389,10 @@ def tame_native_stack_loggers() -> None:
             logger.removeHandler(handler)
         logger.propagate = True
         logger.addFilter(noise_filter)
+        # Attach the bridge once per logger. Guarded by identity so a manual
+        # re-invocation (e.g. in tests or a re-import) never stacks duplicates.
+        if bridge_handler not in logger.handlers:
+            logger.addHandler(bridge_handler)
 
     logging.getLogger().addFilter(noise_filter)
 

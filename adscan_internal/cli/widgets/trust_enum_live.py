@@ -85,9 +85,16 @@ class TrustEnumLiveView:
         self._partner_count = 0
         self._started = time.monotonic()
         self._console = get_console()
-        # alt_screen=False: the trust panel is intentionally inline so
-        # the BFS progress stays in the operator's scrollback alongside
-        # the post-run summary printed below it.
+        # alt_screen=True is required here because the panel's row count
+        # grows during the BFS (one row per discovered partner domain)
+        # and the domain count is not knowable upfront — so the
+        # pre-allocate-rows pattern that fixes posture_probe_live is not
+        # applicable. Alt-screen contains the growth inside an isolated
+        # buffer (no ghost frames in scrollback). The ``summary``
+        # callback below re-prints the final panel to the operator's
+        # scrollback once the alt-screen pops, so the post-run state is
+        # still reviewable. See CLAUDE.md § "Rich Live UX — Stable
+        # line-count rule" for the rationale.
         self._session: LiveSession | None = None
         self._is_tty = sys.stdout.isatty() and os.environ.get("ADSCAN_NO_LIVE") != "1"
 
@@ -97,10 +104,25 @@ class TrustEnumLiveView:
         if self._is_tty:
             self._session = LiveSession(
                 self._render(),
-                config=LiveSessionConfig(refresh_per_second=8, alt_screen=False),
+                config=LiveSessionConfig(refresh_per_second=8, alt_screen=True),
+                summary=self._print_final_panel,
             )
             self._session.__enter__()
         return self
+
+    def _print_final_panel(self, console: Any) -> None:
+        """Re-print the final BFS panel to the operator's scrollback.
+
+        Called by ``LiveSession`` after the alt-screen pops. Without this
+        callback the operator would only see the panel during the live
+        run; switching to ``alt_screen=True`` (required to avoid ghost
+        frames from the dynamically-growing renderable) would otherwise
+        wipe the panel from scrollback on exit.
+        """
+        try:
+            console.print(self._render())
+        except Exception:  # noqa: BLE001
+            pass
 
     def __exit__(self, *_args: Any) -> None:
         if self._session is not None:

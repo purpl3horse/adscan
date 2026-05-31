@@ -99,12 +99,50 @@ _RELATION_REQUIRES: dict[str, str] = {
 }
 _MEMBEROF_KEY = "memberof"
 _LOCAL_REUSE_KEY = "localadminpassreuse"
+# Access-capability edges that do NOT change which OS credentials the attacker
+# holds and do NOT grant OS local admin on their own:
+#   * CanRDP / CanPSRemote — user-level RDP/WinRM session: execution on a new
+#     host as the SAME user, no admin guarantee.
+#   * SQLAdmin / SQLAccess — MSSQL sysadmin/access: a *service* capability.
+# The catalog annotates all of them ``access_capability_only`` (→ provides
+# ``local_admin_session``) so they sort alongside AdminTo for ranking, but for
+# the credential-context DFS guard they must be transparent — exactly like
+# MemberOf / LocalAdminPassReuse: a pivot that does not change held credentials.
+# Without this, a dump-type edge (DumpLSA / DumpLSASS / DumpSAM, which requires
+# ``local_admin_session``) chains directly after them — e.g. the false paths
+# ``User -> CanRDP -> Computer -> DumpLSA`` or ``User -> SQLAdmin -> Computer ->
+# DumpLSA`` — even though RDP/WinRM/SQL access does NOT grant the registry /
+# LSA-secrets read DumpLSA needs. Transparency forces the guard to evaluate the
+# dump against the context held BEFORE the capability, so a dump only chains
+# when a genuine local-admin edge (AdminTo / ReadLAPSPassword) preceded it.
+#
+# NOTE (SQLAdmin, deferred): SQLAdmin CAN legitimately reach a dump via the
+# separate ``mssql_seimpersonate_escalation`` edge (SQL sysadmin -> SeImpersonate
+# -> SYSTEM -> dump). Modelling that bridge correctly (so the escalation grants
+# ``local_admin_session``) is more complex and intentionally left for later; for
+# now SQLAdmin is treated like the other capability pivots and the direct
+# ``SQLAdmin -> DumpLSA`` is suppressed. The SeImpersonate/token-theft escalation
+# edges themselves still chain — they require only ``user_credentials``, which
+# the look-back satisfies — so the proper fix is additive.
+_CANRDP_KEY = "canrdp"
+_CANPSREMOTE_KEY = "canpsremote"
+_SQLADMIN_KEY = "sqladmin"
+_SQLACCESS_KEY = "sqlaccess"
 # Relations that are transparent to credential context — they change the
 # principal identity (or lateral-pivot the attacker to a new host) but do NOT
 # change which credentials the attacker holds.  Any edge that follows one of
 # these is evaluated against the context of the *previous* non-transparent edge
 # (or the implicit start-of-path user_credentials when the path is empty).
-_CONTEXT_TRANSPARENT_KEYS: frozenset[str] = frozenset({_MEMBEROF_KEY, _LOCAL_REUSE_KEY})
+_CONTEXT_TRANSPARENT_KEYS: frozenset[str] = frozenset(
+    {
+        _MEMBEROF_KEY,
+        _LOCAL_REUSE_KEY,
+        _CANRDP_KEY,
+        _CANPSREMOTE_KEY,
+        _SQLADMIN_KEY,
+        _SQLACCESS_KEY,
+    }
+)
 
 
 def _edges_chain_ok(

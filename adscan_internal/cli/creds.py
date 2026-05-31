@@ -1948,7 +1948,7 @@ def _classify_credential_jackpot(
         "CREDENTIAL STORED",
         GLYPH_VERIFIED,
         COLOR_SAGE,
-        "run `attack_paths owned` to spray and pivot from this principal",
+        f"run `attack_paths {domain} owned` to spray and pivot from this principal",
     )
 
 
@@ -3781,7 +3781,7 @@ def process_cpassword_text(
             report_updated = True
         if not report_recorded:
             try:
-                from adscan_internal.services.report_service import (
+                from adscan_core.reporting.technical_report import (
                     record_technical_finding,
                 )
 
@@ -5118,7 +5118,7 @@ def handle_found_credentials(
     display_local_credential_review_paths(shell, aggregated_credentials)
 
     try:
-        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_core.reporting.technical_report import record_technical_finding
 
         total_found = sum(len(creds_list) for creds_list in credentials.values())
         evidence_entries = [

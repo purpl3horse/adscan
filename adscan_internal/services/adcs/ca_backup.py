@@ -576,10 +576,11 @@ async def _smb_delete_path(conn, share: str, unc_subpath: str) -> None:
     """Best-effort SMB delete of the temp PFX file.  Silently ignores misses."""
     from aiosmb.commons.interfaces.file import SMBFile
 
+    # SMBFile.delete(self) takes no args; delete_unc(connection, uncpath) is the
+    # correct one-shot static API. The previous ``file_obj.delete(conn)`` raised
+    # TypeError on every call, leaving the temp PFX on the CA host.
     unc = f"\\\\{conn.target.get_hostname_or_ip()}\\{share}\\{unc_subpath}"
-    file_obj = SMBFile.from_uncpath(unc)
-    if hasattr(file_obj, "delete"):
-        await file_obj.delete(conn)  # pylint: disable=too-many-function-args
+    await SMBFile.delete_unc(conn, unc)
 
 
 async def _scm_change_binpath(scm, service_name: str, new_bin_path: str) -> None:

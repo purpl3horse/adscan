@@ -34,22 +34,16 @@ def print_table(
         spacing: Spacing control ("auto", "none", "before", "after", "both"). Default: "auto"
     """
     console = _state._get_console()
-    telemetry_console = _state._get_telemetry_console()
+    _state._get_telemetry_console()
 
     spacing_before = _handle_spacing("info", False, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     console.print(table)
-    if telemetry_console is not None:
-        telemetry_console.print(table)
 
     if spacing in ("after", "both"):
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
 
 def print_table_debug(table: "Table", *, title: str | None = None) -> None:
@@ -73,7 +67,7 @@ def print_info_table(
         title: Optional table title
     """
     table = Table(
-        title=title, show_header=True, header_style="bold magenta", box=ROUNDED
+        title=title, show_header=True, header_style=f"bold {ADSCAN_PRIMARY}", box=ROUNDED
     )
 
     for col in columns:
@@ -96,7 +90,7 @@ def print_info_list(
         icon: Icon to use for list items
     """
     console = _state._get_console()
-    telemetry_console = _state._get_telemetry_console()
+    _state._get_telemetry_console()
 
     content = Text()
     for item in items:
@@ -116,8 +110,6 @@ def print_info_list(
         )
 
     console.print(panel_renderable)
-    if telemetry_console is not None:
-        telemetry_console.print(panel_renderable)
 
 
 def print_adaptive_table_or_summary(
@@ -257,7 +249,7 @@ def create_status_table(
             )
         elif status == "running":
             status_text = (
-                "[cyan]◉ Running[/cyan]" if show_icons else "[cyan]Running[/cyan]"
+                f"[{ADSCAN_PRIMARY}]◉ Running[/]" if show_icons else f"[{ADSCAN_PRIMARY}]Running[/]"
             )
         else:
             status_text = "[dim]? Unknown[/dim]" if show_icons else "[dim]Unknown[/dim]"
@@ -277,7 +269,7 @@ def print_code(
 ) -> None:
     """Print code with syntax highlighting."""
     console = _state._get_console()
-    telemetry_console = _state._get_telemetry_console()
+    _state._get_telemetry_console()
 
     syntax = Syntax(
         code,
@@ -298,8 +290,6 @@ def print_code(
         renderable = syntax
 
     console.print(renderable)
-    if telemetry_console is not None:
-        telemetry_console.print(renderable)
 
 
 def print_command(
@@ -309,7 +299,7 @@ def print_command(
 ) -> None:
     """Print a command with bash syntax highlighting."""
     console = _state._get_console()
-    telemetry_console = _state._get_telemetry_console()
+    _state._get_telemetry_console()
 
     if title is None:
         title = f"[bold {ADSCAN_PRIMARY}]Command[/bold {ADSCAN_PRIMARY}]"
@@ -336,8 +326,6 @@ def print_command(
     )
 
     console.print(panel)
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
 
 
 def _get_secret_mode() -> bool:
@@ -421,9 +409,7 @@ def print_error_context(
     )
 
     console.print(panel)
-    telemetry_console = _state._get_telemetry_console()
-    if telemetry_console is not None:
-        telemetry_console.print(panel)
+    _state._get_telemetry_console()
 
 
 __all__ = [

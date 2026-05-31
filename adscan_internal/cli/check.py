@@ -83,6 +83,11 @@ _RUNTIME_PYTHON_DEPENDENCIES = (
     ("magic", "python-magic", "used for runtime file type detection"),
     ("rustworkx", "rustworkx", "used for runtime attack-graph processing"),
     ("redis", "redis", "used for web service interactive prompt delegation"),
+    (
+        "credsweeper",
+        "credsweeper",
+        "used for share-spidering credential extraction with the multilang ruleset",
+    ),
 )
 _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "netifaces": "netifaces",
@@ -103,7 +108,56 @@ _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "magic": "python-magic",
     "rustworkx": "rustworkx",
     "redis": "redis",
+    "credsweeper": "credsweeper",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Build-tier discrimination (LITE vs PRO)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _runtime_license_mode() -> str:
+    """Return the active build tier — ``"PRO"`` or ``"LITE"``.
+
+    PRO is the PyArmor + PyInstaller ``--onefile`` binary; LITE runs from
+    Python source inside the runtime container. Several runtime checks
+    (notably the bundled-asset integrity probes for CredSweeper, weasyprint,
+    and other packages with non-Python data files) behave differently
+    between the two tiers and surface different remediation paths.
+
+    Resolution order:
+    1. ``ADSCAN_RUNTIME_LICENSE_MODE`` env var — set by the entrypoint when
+       the launcher picks a PRO or LITE image.
+    2. ``sys.frozen`` — implicit signal that we are inside a PyInstaller
+       bundle, i.e. the PRO build.
+    3. Default to ``"LITE"`` for safety (LITE error messages are a strict
+       subset of PRO messages, so a mislabel does not hide a real
+       diagnostic).
+    """
+    explicit = os.environ.get("ADSCAN_RUNTIME_LICENSE_MODE", "").strip().upper()
+    if explicit in {"LITE", "PRO"}:
+        return explicit
+    if getattr(sys, "frozen", False):
+        return "PRO"
+    return "LITE"
+
+
+def _bundled_asset_remediation_hint(package_name: str) -> str:
+    """Operator-facing hint when a bundled-asset import fails in PRO.
+
+    The fix path for missing data files in the PRO ``--onefile`` bundle is
+    always the same: a PyInstaller hook under ``pyinstaller_hooks/`` must
+    declare the package's data files via ``collect_all`` (or
+    ``collect_data_files``). Surface that path directly so operators do
+    not have to ask whether their PRO image was built correctly.
+    """
+    return (
+        f"PRO build: verify pyinstaller_hooks/hook-{package_name}.py exists "
+        f"and declares ``collect_all('{package_name}')`` (or "
+        f"``collect_data_files('{package_name}')``). Rebuild the PRO image "
+        "afterwards."
+    )
 
 
 @dataclass(frozen=True)
@@ -1815,6 +1869,74 @@ def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) 
     return True
 
 
+# Bundled-asset paths CredSweeper resolves relative to its own package
+# directory. Eager loads happen at import time (``keyword_checklist.txt``,
+# rule catalogue); lazy loads happen on first inference (the ONNX model).
+# Listing both classes here lets ``adscan check`` surface a clean report
+# before any scan touches them.
+_CREDSWEEPER_BUNDLED_ASSETS: tuple[tuple[str, str, str], ...] = (
+    ("common", "keyword_checklist.txt", "import-time keyword dictionary"),
+    ("rules", "config.yaml", "default rule catalogue"),
+    ("ml_model", "ml_model.onnx", "BiLSTM scorer used for English ML triage"),
+    ("ml_model", "ml_config.json", "ML model configuration metadata"),
+)
+
+
+def _verify_credsweeper_bundled_assets(deps: Any) -> bool:
+    """Verify CredSweeper's non-Python data files survived the PRO bundle.
+
+    The PyInstaller ``--onefile`` bundle extracts itself to ``/tmp/_MEI*``
+    at runtime. PyInstaller only collects files it can reach via static
+    ``import`` analysis; sibling data files (``.txt``/``.yaml``/``.onnx``)
+    require an explicit hook declaration under ``pyinstaller_hooks/``.
+
+    A regression in the build (missing hook, refactored ``--collect-data``
+    flag) leaves the ``.py`` modules in the bundle but strips the data
+    files. The first symptom is a runtime ``FileNotFoundError`` deep in
+    CredSweeper's import chain. This check raises it to the surface so
+    operators see the problem before a scan starts.
+
+    Returns ``True`` when every expected asset is present, ``False``
+    otherwise. The function never raises — diagnostics go through the
+    provided ``deps`` reporter so the broader ``check`` flow continues
+    to evaluate other dependencies.
+    """
+    try:
+        credsweeper_pkg = importlib.import_module("credsweeper")
+    except Exception as exc:  # noqa: BLE001 — diagnostics path must not crash
+        deps.print_info_verbose(
+            f"CredSweeper package could not be imported for asset audit: {exc}"
+        )
+        # If the import failed, the upstream import-loop already reported
+        # the failure with full remediation guidance. Don't double-report.
+        return True
+
+    package_root = getattr(credsweeper_pkg, "__file__", None)
+    if not package_root:
+        deps.print_warning(
+            "CredSweeper package imported but has no resolvable file path; "
+            "skipping bundled-asset audit."
+        )
+        return True
+
+    package_dir = os.path.dirname(package_root)
+    all_ok = True
+    for subdir, filename, usage in _CREDSWEEPER_BUNDLED_ASSETS:
+        asset_path = os.path.join(package_dir, subdir, filename)
+        if os.path.isfile(asset_path):
+            deps.print_success(
+                f"CredSweeper bundled asset present: {subdir}/{filename} ({usage})."
+            )
+            continue
+        deps.print_error(
+            f"CredSweeper bundled asset missing: {subdir}/{filename} ({usage})."
+        )
+        deps.print_info_verbose(f"Expected at: {asset_path}")
+        deps.print_instruction(_bundled_asset_remediation_hint("credsweeper"))
+        all_ok = False
+    return all_ok
+
+
 def check_runtime_python_dependencies(
     *, full_container_runtime: bool, deps: Any
 ) -> bool:
@@ -1833,13 +1955,35 @@ def check_runtime_python_dependencies(
     deps.print_info("Checking runtime Python dependencies...")
 
     if getattr(sys, "frozen", False):
+        license_mode = _runtime_license_mode()
         deps.print_info_verbose(
-            "PyInstaller runtime detected; verifying runtime Python dependencies inside the current bundled interpreter."
+            f"PyInstaller runtime detected ({license_mode} tier); verifying "
+            "runtime Python dependencies inside the current bundled interpreter."
         )
         all_ok = True
         for import_name, display_name, usage in _RUNTIME_PYTHON_DEPENDENCIES:
             try:
                 importlib.import_module(import_name)
+            except FileNotFoundError as exc:
+                # Bundled-asset failure: the .py imported but a sibling
+                # data file (.txt/.yaml/.onnx/...) was not collected into
+                # the PyInstaller --onefile bundle. This is a PRO-build
+                # regression with a specific remediation path — surface
+                # the hook name to the operator directly rather than the
+                # generic "rebuild the runtime image".
+                deps.print_error(
+                    f"Runtime Python dependency '{display_name}' is not "
+                    f"importable ({usage})."
+                )
+                missing_path = getattr(exc, "filename", "") or str(exc)
+                deps.print_info_verbose(
+                    f"{display_name} bundled-asset path missing: {missing_path}"
+                )
+                deps.print_instruction(
+                    _bundled_asset_remediation_hint(import_name)
+                )
+                all_ok = False
+                continue
             except Exception as exc:  # noqa: BLE001 - import diagnostics must not crash check
                 deps.print_error(
                     f"Runtime Python dependency '{display_name}' is not importable ({usage})."
@@ -1860,6 +2004,16 @@ def check_runtime_python_dependencies(
             deps.print_success(
                 f"Runtime Python dependency '{display_name}' is importable{version_suffix}."
             )
+
+        # PRO-specific bundled-asset integrity: even when the import-time
+        # eager loads (e.g. credsweeper/common/keyword_checklist.txt)
+        # succeed, lazily-loaded assets (the BiLSTM ONNX model, the rules
+        # YAML catalogue) may still be missing from the --onefile bundle
+        # and would only crash later, mid-engagement. Verify their
+        # presence eagerly here so an operator running ``adscan check``
+        # gets the full picture before any scan starts.
+        if license_mode == "PRO" and not _verify_credsweeper_bundled_assets(deps):
+            all_ok = False
         return all_ok
 
     runtime_python_candidates = [
@@ -2761,7 +2915,6 @@ class CheckDeps:
     preflight_install_dns: Callable[[], bool]
     setup_external_tool: Callable[..., bool]
     is_docker_official_installed: Callable[[], tuple[bool, str]]
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
     is_docker_env: Callable[[], bool]
     is_rustup_available: Callable[[], tuple[bool, str]]
     get_rusthound_verification_status: Callable[[], Dict[str, Any]]
@@ -3470,7 +3623,6 @@ def build_check_config_deps(
     preflight_install_dns: Callable[[], bool],
     setup_external_tool: Callable[..., bool],
     is_docker_official_installed: Callable[[], tuple[bool, str]],
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]],
     is_docker_env: Callable[[], bool],
     is_rustup_available: Callable[[], tuple[bool, str]],
     get_rusthound_verification_status: Callable[[], Dict[str, Any]],
@@ -3579,7 +3731,6 @@ def build_check_config_deps(
         preflight_install_dns=preflight_install_dns,
         setup_external_tool=setup_external_tool,
         is_docker_official_installed=is_docker_official_installed,
-        is_docker_compose_plugin_available=is_docker_compose_plugin_available,
         is_docker_env=is_docker_env,
         is_rustup_available=is_rustup_available,
         get_rusthound_verification_status=get_rusthound_verification_status,
@@ -3690,7 +3841,6 @@ class AdscanCheckContext:
     preflight_install_dns: Callable[[], bool]
     setup_external_tool: Callable[..., bool]
     is_docker_official_installed: Callable[[], tuple[bool, str]]
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
     is_docker_env: Callable[[], bool]
     is_rustup_available: Callable[[], tuple[bool, str]]
     get_rusthound_verification_status: Callable[[], Dict[str, Any]]
@@ -3789,7 +3939,6 @@ def build_adscan_check_context(
     preflight_install_dns: Callable[[], bool],
     setup_external_tool: Callable[..., bool],
     is_docker_official_installed: Callable[[], tuple[bool, str]],
-    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]],
     is_docker_env: Callable[[], bool],
     is_rustup_available: Callable[[], tuple[bool, str]],
     get_rusthound_verification_status: Callable[[], Dict[str, Any]],
@@ -3894,7 +4043,6 @@ def build_adscan_check_context(
         preflight_install_dns=preflight_install_dns,
         setup_external_tool=setup_external_tool,
         is_docker_official_installed=is_docker_official_installed,
-        is_docker_compose_plugin_available=is_docker_compose_plugin_available,
         is_docker_env=is_docker_env,
         is_rustup_available=is_rustup_available,
         get_rusthound_verification_status=get_rusthound_verification_status,
@@ -4012,7 +4160,6 @@ def build_check_from_adscan_context(
         preflight_install_dns=context.preflight_install_dns,
         setup_external_tool=context.setup_external_tool,
         is_docker_official_installed=context.is_docker_official_installed,
-        is_docker_compose_plugin_available=context.is_docker_compose_plugin_available,
         is_docker_env=context.is_docker_env,
         is_rustup_available=context.is_rustup_available,
         get_rusthound_verification_status=context.get_rusthound_verification_status,

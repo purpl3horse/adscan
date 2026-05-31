@@ -20,6 +20,18 @@ from __future__ import annotations
 import ipaddress
 
 
+class KerberosSpnUnresolvedError(ValueError):
+    """Raised when a Kerberos SPN host cannot be built (IP with no FQDN).
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` call sites
+    keep catching it, but the distinct type lets transports recognise *this*
+    specific failure (an IP was passed where an FQDN is required) and degrade to
+    NTLM — instead of treating it as an unrecoverable crash. See
+    ``smb_machine_with_fallback``: the SMB Kerberos branch catches this and
+    retries with NTLM when posture allows the fallback.
+    """
+
+
 def is_ip_address(value: str | None) -> bool:
     """Return ``True`` when *value* is an IPv4 or IPv6 address."""
     try:
@@ -69,13 +81,13 @@ def require_kerberos_target_hostname(
     """
     value = str(host or "").strip().rstrip(".")
     if not value:
-        raise ValueError(
+        raise KerberosSpnUnresolvedError(
             f"{protocol} Kerberos requires a DC FQDN for the service SPN; "
             "pass kerberos_target_hostname/target_hostname from domain_data "
             "instead of falling back to the DC IP."
         )
     if is_ip_address(value):
-        raise ValueError(
+        raise KerberosSpnUnresolvedError(
             f"{protocol} Kerberos cannot use IP address {value!r} as the "
             "service SPN host; pass the DC FQDN from domain_data."
         )

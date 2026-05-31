@@ -283,7 +283,7 @@ def _print_logger_format_fallback(
     from rich.text import Text
 
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Extract plain text if needed
     if isinstance(message, Text):
@@ -312,8 +312,6 @@ def _print_logger_format_fallback(
         output.append(plain_text)
 
     console.print(output)
-    if telemetry_console is not None:
-        telemetry_console.print(output)
 
 
 # --- Basic Print Functions with Enhanced Styling ---
@@ -349,14 +347,12 @@ def print_info(
     items = _translate_items_for_display(items)
 
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Handle spacing
     spacing_before = _handle_spacing("info", panel, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     # Format icon
     icon_text = Text(f"{icon} ", style=BRAND_COLORS["info"])
@@ -396,13 +392,9 @@ def print_info(
             content, border_style=BRAND_COLORS["info"], box=ROUNDED, padding=(0, 1)
         )
         console.print(panel_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(panel_renderable)
         # Panels always get space after
         if spacing != "none":
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
     else:
         # Simple output: icon + message (Rich will handle markup)
         output = Text()
@@ -412,14 +404,10 @@ def print_info(
             console.print(output)
         except Exception:
             raise
-        if telemetry_console is not None:
-            telemetry_console.print(output)
 
         # Handle spacing after if requested
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
     _log_to_file(logging.INFO, _build_persisted_message(message, items))
 
@@ -844,14 +832,12 @@ def print_success(
     items = _translate_items_for_display(items)
 
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Handle spacing
     spacing_before = _handle_spacing("success", panel, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     # Format icon
     icon_text = Text(f"{icon} ", style="green")
@@ -891,27 +877,19 @@ def print_success(
             content, border_style="green", box=ROUNDED, padding=(0, 1)
         )
         console.print(panel_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(panel_renderable)
         # Panels always get space after
         if spacing != "none":
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
     else:
         # Simple output: icon + message
         output = Text()
         output.append(icon_text)
         output.append(message_text)
         console.print(output)
-        if telemetry_console is not None:
-            telemetry_console.print(output)
 
         # Handle spacing after if requested
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
     _log_to_file(logging.INFO, _build_persisted_message(message, items))
 
@@ -1071,14 +1049,12 @@ def print_warning(
     items = _translate_items_for_display(items)
 
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Handle spacing
     spacing_before = _handle_spacing("warning", panel, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     # Format icon
     icon_text = Text(f"{icon} ", style="yellow")
@@ -1118,27 +1094,19 @@ def print_warning(
             content, border_style="yellow", box=ROUNDED, padding=(0, 1)
         )
         console.print(panel_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(panel_renderable)
         # Panels always get space after
         if spacing != "none":
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
     else:
         # Simple output: icon + message
         output = Text()
         output.append(icon_text)
         output.append(message_text)
         console.print(output)
-        if telemetry_console is not None:
-            telemetry_console.print(output)
 
         # Handle spacing after if requested
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
     _log_to_file(logging.WARNING, _build_persisted_message(message, items))
 
@@ -1280,14 +1248,12 @@ def print_error(
     items = _translate_items_for_display(items)
 
     console = _get_console()
-    telemetry_console = _get_telemetry_console()
+    _get_telemetry_console()
 
     # Handle spacing
     spacing_before = _handle_spacing("error", panel, spacing)
     if spacing_before:
         console.print()
-        if telemetry_console is not None:
-            telemetry_console.print()
 
     # Format icon
     icon_text = Text(f"{icon} ", style="bold red")
@@ -1327,27 +1293,19 @@ def print_error(
             content, border_style="red", box=ROUNDED, padding=(0, 1)
         )
         console.print(panel_renderable)
-        if telemetry_console is not None:
-            telemetry_console.print(panel_renderable)
         # Panels always get space after
         if spacing != "none":
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
     else:
         # Simple output: icon + message
         output = Text()
         output.append(icon_text)
         output.append(message_text)
         console.print(output)
-        if telemetry_console is not None:
-            telemetry_console.print(output)
 
         # Handle spacing after if requested
         if spacing in ("after", "both"):
             console.print()
-            if telemetry_console is not None:
-                telemetry_console.print()
 
     _log_to_file(logging.ERROR, _build_persisted_message(message, items))
 
@@ -1472,6 +1430,67 @@ def _format_exception_context(context: Optional[Dict[str, Any]]) -> str:
     return " ".join(context_items)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic context provider (pluggable hook for global observability)
+# ---------------------------------------------------------------------------
+#
+# Higher-level layers (the CLI command dispatcher, the REPL shell, the CI
+# orchestrator) can register a zero-argument callable here. When an exception
+# is logged via ``print_exception`` and the caller did not supply its own
+# ``context`` dict, the registered provider is consulted to attach the active
+# workspace / domain snapshot to the file log.
+#
+# The provider returns a dict (already mark_sensitive-applied where needed)
+# that gets formatted alongside the exception. This turns every exception
+# trace into a self-contained diagnostic — operator does not have to ask the
+# user "what was the active domain at that moment?" because it is already in
+# the trace context.
+#
+# The hook is intentionally pluggable rather than a hard import: ``_log.py``
+# lives at the bottom of the layer stack and must not import shell / CLI
+# code. The CLI registers itself by calling ``register_exception_context_provider``
+# during startup; if nothing registers, the previous behaviour (empty context)
+# applies.
+
+_exception_context_provider: Optional[Any] = None
+
+
+def register_exception_context_provider(provider: Optional[Any]) -> None:
+    """Install (or clear) a callable that returns diagnostic context.
+
+    The provider is called by :func:`_log_exception_to_file` when the caller
+    did not supply an explicit ``context`` dict. The callable must:
+
+    * Accept no arguments.
+    * Return ``None`` or a ``dict`` whose values are already safe for the
+      file log (sensitive values pre-masked with ``mark_sensitive``).
+    * Never raise — any exception is swallowed and the file log proceeds
+      without the context.
+
+    Pass ``None`` to clear the provider (returns to no-context behaviour).
+    """
+    global _exception_context_provider
+    _exception_context_provider = provider
+
+
+def _resolve_default_exception_context() -> Optional[Dict[str, Any]]:
+    """Pull the diagnostic context from the registered provider, if any.
+
+    Defensive: any error in the provider is swallowed so that exception
+    logging never fails because the diagnostic plumbing failed.
+    """
+    provider = _exception_context_provider
+    if provider is None:
+        return None
+    try:
+        result = provider()
+    except Exception:
+        return None
+    if isinstance(result, dict):
+        return result
+    return None
+
+
 def _log_exception_to_file(
     *,
     message: str,
@@ -1482,7 +1501,18 @@ def _log_exception_to_file(
     import logging
 
     plain_text = str(message or "Unhandled exception").strip() or "Unhandled exception"
-    context_text = _format_exception_context(context)
+
+    # Fall back to the registered diagnostic context provider when the caller
+    # did not supply explicit context. This is how every print_exception
+    # called from deep services / async stacks inherits the active workspace
+    # + domain snapshot for free — the CLI command hook registers a provider
+    # on startup and every traceback that hits this codepath carries the
+    # workspace state with it.
+    effective_context = context
+    if not effective_context:
+        effective_context = _resolve_default_exception_context()
+
+    context_text = _format_exception_context(effective_context)
     if context_text:
         plain_text = f"{plain_text}: {context_text}"
 
@@ -1621,8 +1651,6 @@ def print_exception(
                 show_locals=show_locals,
             )
             console.print(traceback_renderable)
-            if telemetry_console is not None:
-                telemetry_console.print(traceback_renderable)
         else:
             console.print_exception(show_locals=show_locals)
             if telemetry_console is not None:

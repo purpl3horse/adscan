@@ -35,6 +35,226 @@ _UPDATE_HEALTH_FILENAME = "update_health.json"
 _STALE_UPDATE_WARNING_DAYS = 14
 
 
+# ---------------------------------------------------------------------------
+# Update severity tiers + release-highlights catalogue
+# ---------------------------------------------------------------------------
+#
+# Why three tiers exist (TUI-design Principle 6, "semantic color encodes
+# meaning"): a generic "Recommended" prompt does not move the user who
+# does not see the value. Telemetry from 2026-05-21 confirmed the
+# pattern — a v8.0.0 user declined the launcher update, pulled the
+# v9.0.0 image anyway, and ended up in a mismatched state. The fix is
+# to escalate visual urgency *and* surface concrete value when the
+# version delta crosses a major boundary.
+#
+# Severity rules (computed by ``compute_update_severity``):
+#
+#   ``tier_info``     — same major, newer minor/patch available
+#   ``tier_warn``     — exactly 1 major behind
+#   ``tier_critical`` — 2+ majors behind, OR launcher/image major
+#                       mismatch detected (the "broken combination"
+#                       case that surfaces as inexplicable bug reports
+#                       from users in an unsupported launcher+image
+#                       combination)
+
+_TIER_INFO = "info"
+_TIER_WARN = "warn"
+_TIER_CRITICAL = "critical"
+
+
+# Panel copy strategy — read this before touching the strings below.
+#
+# We deliberately do NOT link to per-version release notes here. Two
+# reasons: (1) maintaining per-release prose is human-expensive and the
+# release docs are often sparse for minor/patch bumps, (2) pointing at a
+# thin changelog page actively hurts conversion — the operator clicks,
+# sees "minor improvements", and decides not to update.
+#
+# Instead we use loss-aversion framing: every release fixes bugs and
+# adds coverage; running stale means hitting bugs already fixed and
+# missing techniques already shipped. That copy is true for every
+# version transition the product will ever see, so it never goes
+# stale, and it answers the question the operator actually asks at
+# the prompt ("what do I lose by skipping?") rather than the one we
+# can't reliably answer ("what's specifically new in v9.1.0?").
+
+
+def _parse_major(value_str: str) -> int | None:
+    """Best-effort major-version parser. Returns ``None`` if unparsable."""
+    if not value_str:
+        return None
+    try:
+        return version.parse(str(value_str)).major  # type: ignore[union-attr]
+    except Exception:
+        return None
+
+
+def _build_version_delta_summary(
+    *,
+    current: str,
+    latest: str | None,
+    majors_behind: int | None,
+) -> tuple[str, str]:
+    """Return ``(delta_line, motivation_line)`` for the update panel.
+
+    ``delta_line`` states the objective version gap ("8.0.0 → 9.0.0",
+    "2 majors behind"). It is factual and short.
+
+    ``motivation_line`` is loss-aversion framing tuned to the tier.
+    Each line is version-agnostic and stays true for any release
+    delta the product will ever see — so the launcher never needs
+    per-release prose to keep its CTA compelling.
+
+    Both lines are empty strings when no update is available.
+    """
+    if not latest or not current or current == latest:
+        return ("", "")
+
+    if majors_behind is not None and majors_behind >= 2:
+        delta = (
+            f"You are {majors_behind} major versions behind "
+            f"(running {current}, latest is {latest})."
+        )
+        motivation = (
+            "Each major release ships material improvements: new attack "
+            "coverage, fixes to core AD flows, and posture handling for "
+            "modern Active Directory configurations. Running this many "
+            "majors behind means hitting bugs that have been fixed for a "
+            "long time and missing techniques that already exist."
+        )
+        return (delta, motivation)
+
+    if majors_behind is not None and majors_behind == 1:
+        delta = f"A new major version is available ({current} → {latest})."
+        motivation = (
+            "Major releases of ADscan ship material improvements — "
+            "expanded attack coverage, refactored core flows, fixes that "
+            "do not get backported. Staying on the previous major means "
+            "hitting bugs that are already resolved upstream and missing "
+            "techniques that already shipped."
+        )
+        return (delta, motivation)
+
+    # Minor / patch bump: keep it short and motivating.
+    delta = f"Update available: {current} → {latest}."
+    motivation = (
+        "Every release of ADscan fixes real bugs and ships small "
+        "improvements. Staying on a stale version means hitting issues "
+        "that other operators have already had fixed for them."
+    )
+    return (delta, motivation)
+
+
+def get_image_baked_version(ctx: "UpdateContext", image: str) -> str | None:
+    """Read the ADscan version baked into the runtime image.
+
+    Inspects the image's ``Config.Labels`` for the OCI standard
+    ``org.opencontainers.image.version`` label. Returns ``None`` if the
+    label is absent or Docker is not reachable.
+
+    The label is written at build time by ``Dockerfile.runtime`` so the
+    runtime container can be asked "what version are you?" without
+    running it. Parsing the tag is unreliable (people pin ``latest``,
+    ``edge``, custom partner tags) — the label is the authoritative
+    source.
+    """
+    if shutil.which("docker") is None:
+        return None
+    try:
+        proc = ctx.run_docker(
+            [
+                "docker",
+                "image",
+                "inspect",
+                image,
+                "--format",
+                '{{ index .Config.Labels "org.opencontainers.image.version" }}',
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            return None
+        baked = str(proc.stdout or "").strip()
+        return baked or None
+    except Exception as exc:  # noqa: BLE001
+        ctx.telemetry_capture_exception(exc)
+        return None
+
+
+def compute_update_severity(
+    *,
+    launcher_current: str,
+    launcher_latest: str | None,
+    image_present: bool,
+    image_needs_update: bool,
+    image_baked_version: str | None,
+) -> dict[str, object]:
+    """Classify the update situation into a severity tier.
+
+    Returns a dict with keys:
+        ``tier``: one of ``info`` / ``warn`` / ``critical`` / ``none``.
+        ``mismatch``: True iff launcher and image are on different
+            majors (the unsupported combination).
+        ``majors_behind``: how many majors the launcher is behind the
+            latest PyPI release. ``None`` if unknown.
+        ``highlights``: list of strings to surface in the panel for
+            value framing. Empty for ``tier_info``.
+
+    The tier governs panel chrome (color, glyph, copy density) and the
+    update flow (countdown duration, whether skip is allowed).
+    """
+    current_major = _parse_major(launcher_current)
+    latest_major = _parse_major(launcher_latest) if launcher_latest else None
+    image_major = _parse_major(image_baked_version)
+
+    mismatch = (
+        current_major is not None
+        and image_major is not None
+        and current_major != image_major
+    )
+
+    majors_behind: int | None = None
+    if current_major is not None and latest_major is not None:
+        majors_behind = max(0, latest_major - current_major)
+
+    needs_attention = (
+        (launcher_latest is not None and launcher_latest != launcher_current)
+        or image_needs_update
+        or not image_present
+        or mismatch
+    )
+    if not needs_attention:
+        return {
+            "tier": "none",
+            "mismatch": False,
+            "majors_behind": majors_behind,
+            "delta": "",
+            "motivation": "",
+        }
+
+    if mismatch or (majors_behind is not None and majors_behind >= 2):
+        tier = _TIER_CRITICAL
+    elif majors_behind is not None and majors_behind >= 1:
+        tier = _TIER_WARN
+    else:
+        tier = _TIER_INFO
+
+    delta, motivation = _build_version_delta_summary(
+        current=launcher_current,
+        latest=launcher_latest,
+        majors_behind=majors_behind,
+    )
+
+    return {
+        "tier": tier,
+        "mismatch": mismatch,
+        "majors_behind": majors_behind,
+        "delta": delta,
+        "motivation": motivation,
+    }
+
+
 @dataclass(frozen=True)
 class UpdateContext:
     """Dependency injection container for update operations."""
@@ -284,32 +504,122 @@ def _get_local_image_digest(ctx: UpdateContext, image: str) -> dict:
     return info
 
 
+def _extract_index_digest_from_buildx(stdout: str) -> str | None:
+    """Parse the index digest from ``buildx imagetools inspect --format {{json .Manifest}}``.
+
+    The ``.Manifest`` object is the top-level descriptor the registry serves for
+    the tag. Its ``.digest`` is the index/manifest digest — the SAME hash kind a
+    locally pulled image records in ``.RepoDigests`` (``name@sha256:<index>``).
+    This is the only value that is type-consistent with the local RepoDigest for
+    the multi-arch manifest-list images ADscan publishes.
+    """
+    payload = json.loads(stdout)
+    if isinstance(payload, dict):
+        digest = payload.get("digest")
+        if isinstance(digest, str) and digest:
+            return digest
+    return None
+
+
+def _extract_index_digest_from_verbose(stdout: str) -> str | None:
+    """Parse the index digest from ``docker manifest inspect --verbose``.
+
+    The ``--verbose`` output wraps the contents in a top-level ``Descriptor``
+    whose ``digest`` is the index/manifest digest (matches the local
+    RepoDigest). The non-verbose form does NOT expose this — it emits the
+    CONTENTS (a ``config`` digest for a single manifest, or per-platform child
+    ``manifests[]`` digests for a manifest list), neither of which is comparable
+    to the local RepoDigest. So the fallback must use ``--verbose``.
+    """
+    payload = json.loads(stdout)
+    # `--verbose` on a single-arch tag returns one object; on a manifest list it
+    # returns a JSON array of per-platform objects. Every entry carries the SAME
+    # index digest in its `Descriptor`, so the first match wins.
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+    if isinstance(payload, dict):
+        descriptor = payload.get("Descriptor") or {}
+        digest = descriptor.get("digest")
+        if isinstance(digest, str) and digest:
+            return digest
+    return None
+
+
 def _get_remote_image_digest(ctx: UpdateContext, image: str) -> dict:
-    """Return remote image digest from docker manifest inspect (best-effort)."""
+    """Return the remote INDEX digest for a tag (best-effort).
+
+    The comparison that determines ``needs_update`` must be type-consistent:
+    local ``.RepoDigests`` holds the index/manifest digest
+    (``name@sha256:<index>``), so the remote side must yield the SAME hash kind.
+    Plain ``docker manifest inspect`` is structurally incapable of producing it —
+    it emits the manifest CONTENTS (``config.digest`` for a single manifest, or
+    per-platform child ``manifests[].digest`` for a manifest list), none of which
+    equal the local RepoDigest. For multi-arch images (what ADscan publishes)
+    that mismatch made ``needs_update`` permanently True and re-prompted on every
+    ``adscan start``.
+
+    Resolution order, each best-effort:
+      1. ``docker buildx imagetools inspect --format '{{json .Manifest}}'`` →
+         ``.digest`` (the index digest). Preferred.
+      2. ``docker manifest inspect --verbose`` → ``.Descriptor.digest`` (also the
+         index digest). Fallback when buildx is unavailable.
+
+    When neither yields an index digest (buildx missing AND verbose
+    unsupported/unreachable), ``digest`` stays ``None`` — the caller must treat
+    that as "undeterminable" and NOT flag an update, never default to True.
+    """
     info: dict[str, object] = {"digest": None, "error": None}
+    # Preferred: buildx imagetools exposes the index digest directly.
     try:
         proc = ctx.run_docker(
-            ["docker", "manifest", "inspect", image],
+            [
+                "docker",
+                "buildx",
+                "imagetools",
+                "inspect",
+                image,
+                "--format",
+                "{{json .Manifest}}",
+            ],
             check=False,
             capture_output=True,
         )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            info["error"] = proc.stderr.strip() or "manifest inspect failed"
-            return info
-        payload = json.loads(proc.stdout)
-        if isinstance(payload, dict):
-            config = payload.get("config") or {}
-            digest = config.get("digest")
+        if proc.returncode == 0 and proc.stdout.strip():
+            digest = _extract_index_digest_from_buildx(proc.stdout.strip())
             if digest:
                 info["digest"] = digest
                 return info
-            manifests = payload.get("manifests") or []
-            if manifests:
-                info["digest"] = manifests[0].get("digest")
-        return info
+        elif proc.stderr:
+            info["error"] = proc.stderr.strip()
     except Exception as exc:
+        ctx.telemetry_capture_exception(exc)
         info["error"] = str(exc)
-        return info
+
+    # Fallback: `manifest inspect --verbose` carries the index digest in
+    # `.Descriptor.digest`. (The non-verbose form does NOT — never use it here.)
+    try:
+        proc = ctx.run_docker(
+            ["docker", "manifest", "inspect", "--verbose", image],
+            check=False,
+            capture_output=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            digest = _extract_index_digest_from_verbose(proc.stdout.strip())
+            if digest:
+                info["digest"] = digest
+                info["error"] = None
+                return info
+            if not info.get("error"):
+                info["error"] = "no index digest in manifest inspect --verbose"
+        elif proc.stderr and not info.get("error"):
+            info["error"] = proc.stderr.strip()
+        elif not info.get("error"):
+            info["error"] = "manifest inspect --verbose failed"
+    except Exception as exc:
+        ctx.telemetry_capture_exception(exc)
+        if not info.get("error"):
+            info["error"] = str(exc)
+    return info
 
 
 def get_docker_update_info(ctx: UpdateContext) -> dict:
@@ -362,19 +672,46 @@ def get_docker_update_info(ctx: UpdateContext) -> dict:
                 f"[update] Remote image digest: {info['remote_digest']}"
             )
 
-        # Docker may expose two different digest kinds:
-        # - local RepoDigest: manifest digest (from .RepoDigests)
-        # - local image Id: config/content digest (from .Id)
-        # `docker manifest inspect` commonly returns config digest first.
-        if info["remote_digest"]:
-            compare_target = info["local_image_id"] or info["local_digest"]
-            if compare_target:
-                info["needs_update"] = info["remote_digest"] != compare_target
-                ctx.print_info_debug(
-                    "[update] Digest comparison: "
-                    f"remote={info['remote_digest']} vs local={compare_target} "
-                    f"=> needs_update={info['needs_update']}"
-                )
+        # Type-consistent comparison: BOTH sides must be the index/manifest
+        # digest (the `@sha256:` value the image was pulled by).
+        #   - local: RepoDigest from `.RepoDigests` (NOT `.Id`, which is the
+        #     config-blob digest and a different hash kind).
+        #   - remote: index digest from buildx imagetools / manifest inspect
+        #     --verbose (see `_get_remote_image_digest`).
+        # `.Id` is kept for diagnostics only — comparing it against the remote
+        # index digest is what caused the permanent-update loop on multi-arch
+        # images.
+        local_repo_digest = info["local_digest"]
+        remote_index_digest = info["remote_digest"]
+        ctx.print_info_debug(
+            "[update] Digest comparison inputs: "
+            f"local_repo_digest={local_repo_digest} "
+            f"local_image_id={info['local_image_id']} "
+            f"remote_index_digest={remote_index_digest}"
+        )
+        if not local_repo_digest:
+            # Locally-built image (no RepoDigest) or inspect failure: there is no
+            # comparable manifest digest. Do NOT nag — uncertainty must never
+            # flag an update.
+            ctx.print_info_debug(
+                "[update] Local RepoDigest unavailable (locally-built image or "
+                "inspect failure); treating as undeterminable, needs_update=False."
+            )
+        elif not remote_index_digest:
+            # Registry unreachable, buildx + verbose both failed, or no index
+            # digest exposed. Undeterminable — never flag an update.
+            ctx.print_info_debug(
+                "[update] Remote index digest unavailable; treating as "
+                "undeterminable, needs_update=False."
+            )
+        else:
+            info["needs_update"] = local_repo_digest != remote_index_digest
+            ctx.print_info_debug(
+                "[update] Digest comparison: "
+                f"remote_index={remote_index_digest} vs "
+                f"local_repo={local_repo_digest} "
+                f"=> needs_update={info['needs_update']}"
+            )
         return info
     except Exception as exc:
         ctx.telemetry_capture_exception(exc)
@@ -466,23 +803,70 @@ def _update_docker_image(
     return True
 
 
+_TIER_CHROME: dict[str, dict[str, str]] = {
+    _TIER_INFO: {
+        "glyph": "ⓘ",
+        "border": "cyan",
+        "header_style": "bold cyan",
+        "title_prefix": "ADscan update available",
+    },
+    _TIER_WARN: {
+        "glyph": "⚠",
+        "border": "yellow",
+        "header_style": "bold yellow",
+        "title_prefix": "MAJOR version behind",
+    },
+    _TIER_CRITICAL: {
+        "glyph": "🚨",
+        "border": "red",
+        "header_style": "bold red",
+        "title_prefix": "VERSION DEPRECATED — update required",
+    },
+}
+
+
 def _render_update_panel(
-    ctx: UpdateContext, launcher_info: dict, docker_info: dict
+    ctx: UpdateContext,
+    launcher_info: dict,
+    docker_info: dict,
+    *,
+    severity: dict[str, object] | None = None,
 ) -> None:
-    """Render an update summary panel with clear operational guidance."""
+    """Render an update summary panel with tiered urgency.
+
+    Tier rules:
+
+    * Tier 1 (``info``)  — minor/patch behind. Cyan border. Single
+      line delta. Operator can skip with one prompt.
+    * Tier 2 (``warn``)  — one major behind. Amber border. Lists
+      concrete release highlights (value framing). Skip requires
+      explicit confirmation.
+    * Tier 3 (``critical``) — two+ majors behind OR launcher/image
+      majors mismatched. Red border. EOL framing. Skip is gated
+      behind ``--no-update-check`` only — the double-prompt no longer
+      offers a soft escape.
+
+    The severity payload is computed once in ``offer_updates_for_command``
+    and threaded here so the panel and the prompt flow stay in lockstep.
+    """
+    tier = str((severity or {}).get("tier") or "none")
+    update_needed = tier != "none"
+    chrome = _TIER_CHROME.get(tier) if update_needed else None
+
     lines: list[Text] = []
     current = launcher_info.get("current") or "unknown"
     latest = launcher_info.get("latest") or "unknown"
-    update_needed = bool(
-        launcher_info.get("is_newer") or docker_info.get("needs_update")
-    )
+
+    # ── Header row: version delta, no chrome on Tier 1 ──────────────
     if launcher_info.get("is_newer"):
+        header_style = chrome["header_style"] if chrome else "bold yellow"
         lines.append(
             Text(
-                f"Launcher update available: {current} → {latest}", style="bold yellow"
+                f"Launcher: {current}  →  {latest}",
+                style=header_style,
             )
         )
-    else:
+    elif tier == "none":
         lines.append(Text(f"Launcher: {current} (up-to-date)", style="green"))
 
     image = docker_info.get("image") or "unknown"
@@ -490,39 +874,65 @@ def _render_update_panel(
         lines.append(Text(f"Docker image missing locally: {image}", style="yellow"))
     elif docker_info.get("needs_update"):
         lines.append(
-            Text(f"Docker image update available: {image}", style="bold yellow")
+            Text(
+                f"Docker image update available: {image}",
+                style=chrome["header_style"] if chrome else "bold yellow",
+            )
         )
-    elif docker_info.get("image_present"):
+    elif docker_info.get("image_present") and tier == "none":
         lines.append(Text(f"Docker image: {image} (up-to-date)", style="green"))
 
-    if update_needed:
-        if launcher_info.get("is_newer") and docker_info.get("needs_update"):
-            action_text = (
-                "Action: refresh both the launcher and runtime image together."
-            )
-        elif launcher_info.get("is_newer"):
-            action_text = "Action: refresh the launcher from the host."
-        else:
-            action_text = "Action: refresh the runtime image from the host."
+    # ── Tier 3: mismatch is the smoking gun — surface it first ─────
+    # Stays version-agnostic: states the policy ("different majors is
+    # not supported"), not specific symptoms that go stale.
+    if tier == _TIER_CRITICAL and bool((severity or {}).get("mismatch")):
+        lines.append(Text(""))
         lines.append(
             Text(
-                "Recommended: keep both launcher and runtime updated for bug fixes, "
-                "new attack coverage, and escalation improvements.",
-                style="cyan",
+                "INCOMPATIBLE COMBINATION DETECTED",
+                style="bold red",
             )
         )
         lines.append(
             Text(
-                action_text,
+                "Your launcher and runtime image are on DIFFERENT major versions. "
+                "This combination is NOT supported — commands can fail with errors "
+                "that look like new bugs but are version-skew artefacts (CLI "
+                "grammar drift, workspace schema mismatches, env-var contract "
+                "drift).",
                 style="white",
             )
         )
+
+    # ── Tier 1/2/3: factual version delta + loss-aversion motivation ──
+    # We do NOT link to per-release notes. Maintaining curated prose
+    # per version is a tax that the release process does not pay
+    # reliably; pointing at a thin changelog page actively damages
+    # conversion ("oh, only minor improvements"). Loss-aversion framing
+    # is version-agnostic and works for every release the product will
+    # ever ship — see the design comment near the top of this module.
+    delta = str((severity or {}).get("delta") or "").strip()
+    motivation = str((severity or {}).get("motivation") or "").strip()
+    if update_needed and delta:
+        lines.append(Text(""))
+        lines.append(Text(delta, style="bold white"))
+    if update_needed and motivation:
+        lines.append(Text(motivation, style="white"))
+
+    # ── Action: a single, unambiguous CTA. One command, copy-pasteable.
+    # Per TUI design principle 3 (Progressive Disclosure) the prompt
+    # below the panel handles the "yes/no" — the panel itself does not
+    # ask, it tells. Per Hormozi: one action, not a menu.
+    if update_needed:
+        lines.append(Text(""))
         lines.append(
             Text(
-                "Run on the host: adscan update",
-                style="bold white",
+                "Run on the host:  adscan update",
+                style=chrome["header_style"] if chrome else "bold white",
             )
         )
+
+    # ── Recency tail (kept as is — useful "you've been on this for X days" signal) ──
     recency = get_local_update_recency_summary(ctx.adscan_base_dir)
     recency_message = str(recency.get("message") or "").strip()
     if recency_message:
@@ -532,7 +942,8 @@ def _render_update_panel(
                 style="yellow" if bool(recency.get("is_stale")) else "dim",
             )
         )
-    if bool(recency.get("is_stale")):
+    if bool(recency.get("is_stale")) and tier != _TIER_CRITICAL:
+        # Critical tier already conveys "update now" loudly; do not pile on.
         lines.append(
             Text(
                 f"Recommendation: update at least every {_STALE_UPDATE_WARNING_DAYS} days.",
@@ -540,10 +951,18 @@ def _render_update_panel(
             )
         )
 
+    # ── Title + border, tier-aware ──────────────────────────────────
+    if chrome:
+        title = f"{chrome['glyph']}  {chrome['title_prefix']}"
+        border_style = chrome["border"]
+    else:
+        title = "Updates"
+        border_style = None
+
     ctx.print_panel(
         Group(*lines),
-        title="Updates Required" if update_needed else "Updates",
-        border_style="yellow" if update_needed else None,
+        title=title,
+        border_style=border_style,
         padding=(1, 2),
     )
 
@@ -560,8 +979,29 @@ def _confirm_skip_update(ctx: UpdateContext, *, component_label: str) -> bool:
     )
 
 
-def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
-    """Check for launcher/docker updates and offer upgrades (interactive only)."""
+def offer_updates_for_command(
+    ctx: UpdateContext,
+    command: str,
+    *,
+    skip_update_check: bool = False,
+    dev_mode: bool = False,
+) -> None:
+    """Check for launcher/docker updates and offer upgrades (interactive only).
+
+    Args:
+        ctx: Update context (host helpers).
+        command: The launcher subcommand being executed (``start``, ``ci``, …).
+        skip_update_check: When True (set by the user via
+            ``--no-update-check``), bypass detection and prompts entirely.
+            Reserved for power users with a real reason (mid-engagement,
+            airgapped, version pinning). Tier 3 ``critical`` still emits
+            a brief reminder so the operator does not forget they are
+            running unsupported.
+        dev_mode: When True (set by the user via ``--dev`` or by
+            existing env-var detection), skip update prompts because the
+            local launcher version is intentionally not aligned with
+            the published one. Internal development workflows.
+    """
     if ctx.is_container_runtime():
         return
     if command in {"update", "upgrade"}:
@@ -569,9 +1009,21 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
     if command not in {"start", "ci", "check"}:
         return
 
+    # Explicit user opt-out (--no-update-check). Bypass detection entirely
+    # so we don't even hit PyPI/Docker Hub — useful when offline.
+    if skip_update_check:
+        ctx.print_info_debug(
+            "[update] --no-update-check active; skipping detection and prompts."
+        )
+        return
+
     # Maintainer dev channel should not show update checks/prompts.
+    # CLI `--dev` and env-driven detection are unified here: either path
+    # leads to the same skip.
     docker_image = str(ctx.get_docker_image_name() or "").strip().lower()
-    if is_dev_update_context(os_getenv=ctx.os_getenv, image_name=docker_image):
+    if dev_mode or is_dev_update_context(
+        os_getenv=ctx.os_getenv, image_name=docker_image
+    ):
         ctx.print_info_debug(
             "[update] Dev channel detected; skipping launcher/docker update checks."
         )
@@ -586,33 +1038,81 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
 
     launcher_info = get_launcher_update_info(ctx)
     docker_info = get_docker_update_info(ctx)
-    if not launcher_info.get("is_newer") and not docker_info.get("needs_update"):
+
+    # Read the version baked into the local image (when present). Used
+    # by the severity computation to detect launcher/image major-skew —
+    # the v8-launcher-with-v9-image state that the 2026-05-21 telemetry
+    # surfaced as the root cause of "unknown" bug reports.
+    image_baked_version: str | None = None
+    if docker_info.get("image_present"):
+        image_baked_version = get_image_baked_version(
+            ctx, str(docker_info.get("image") or "")
+        )
+
+    severity = compute_update_severity(
+        launcher_current=str(launcher_info.get("current") or ""),
+        launcher_latest=launcher_info.get("latest"),
+        image_present=bool(docker_info.get("image_present")),
+        image_needs_update=bool(docker_info.get("needs_update")),
+        image_baked_version=image_baked_version,
+    )
+
+    if severity["tier"] == "none":
         return
 
-    _render_update_panel(ctx, launcher_info, docker_info)
+    _render_update_panel(ctx, launcher_info, docker_info, severity=severity)
 
-    if (
+    is_non_interactive = bool(
         ctx.os_getenv("CI", None)
         or ctx.os_getenv("GITHUB_ACTIONS", None)
         or ctx.os_getenv("CONTINUOUS_INTEGRATION", None)
         or not ctx.sys_stdin_isatty()
-    ):
+    )
+    if is_non_interactive:
         ctx.print_info("Non-interactive environment detected; skipping update prompts.")
         recency = get_local_update_recency_summary(ctx.adscan_base_dir)
         if bool(recency.get("is_stale")):
-            ctx.print_warning(str(recency.get("message") or "Local update cadence looks stale."))
-        ctx.print_info(
-            "Running with a stale launcher or runtime image can produce incorrect checks, "
-            "missed fixes, and older attack coverage."
-        )
+            ctx.print_warning(
+                str(recency.get("message") or "Local update cadence looks stale.")
+            )
+        if severity["tier"] == _TIER_CRITICAL:
+            ctx.print_error(
+                "Running an unsupported launcher/image combination. Re-run "
+                "interactively or run `adscan update` before scanning customer "
+                "environments."
+            )
+        else:
+            ctx.print_info(
+                "Running with a stale launcher or runtime image can produce "
+                "incorrect checks, missed fixes, and older attack coverage."
+            )
         ctx.print_instruction("Run: adscan update")
         return
 
+    # ── Interactive update flow ─────────────────────────────────────
+    # On Tier 3 (critical / mismatched), the "are you sure?" soft-skip
+    # path is disabled — saying No to the prompt now exits the launcher
+    # with a clear error rather than continuing into the broken state.
+    # The escape hatch is the explicit `--no-update-check` flag, which
+    # is the user signalling they understand the risk.
+    critical = severity["tier"] == _TIER_CRITICAL
+
     if launcher_info.get("is_newer"):
-        if ctx.confirm_ask("Update the launcher now?", True):
+        prompt = (
+            "Update the launcher now? (REQUIRED — broken combination detected)"
+            if critical
+            else "Update the launcher now?"
+        )
+        if ctx.confirm_ask(prompt, True):
             if _update_launcher(ctx, str(launcher_info.get("latest") or "")):
                 ctx.print_success("Launcher update completed, restarting...")
                 os.execv(sys.executable, [sys.executable] + sys.argv)
+        elif critical:
+            ctx.print_error(
+                "Refused to continue with a launcher/image major-version mismatch. "
+                "Run `adscan update` or pass `--no-update-check` if you accept the risk."
+            )
+            raise SystemExit(2)
         elif not _confirm_skip_update(ctx, component_label="launcher"):
             if _update_launcher(ctx, str(launcher_info.get("latest") or "")):
                 ctx.print_success("Launcher update completed, restarting...")
@@ -639,6 +1139,13 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
                     "Resolve Docker/image pull issues first, then retry the same command."
                 )
                 raise SystemExit(1)
+        elif critical:
+            ctx.print_error(
+                "Refused to continue with a stale runtime image while a "
+                "launcher/image mismatch is active. Run `adscan update` or "
+                "pass `--no-update-check`."
+            )
+            raise SystemExit(2)
         elif not _confirm_skip_update(ctx, component_label="runtime image"):
             _update_docker_image(
                 ctx,

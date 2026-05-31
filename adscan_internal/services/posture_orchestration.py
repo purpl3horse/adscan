@@ -52,6 +52,10 @@ _UNAUTH_CATEGORIES: frozenset[ConstraintCategory] = frozenset(
     {
         ConstraintCategory.LDAPS_AVAILABLE,
         ConstraintCategory.LDAP_SIGNING,
+        # CBT lives in UNAUTH because the bogus-credential technique used
+        # by U3 does not require a real principal — see ``probe_unauth``
+        # docstring for the rationale.
+        ConstraintCategory.LDAP_CHANNEL_BINDING,
     }
 )
 _AUTH_CATEGORIES: frozenset[ConstraintCategory] = frozenset(
@@ -126,12 +130,32 @@ async def _get_lock(key: tuple[str, ProbePhase]) -> asyncio.Lock:
 
 
 def _is_category_fresh(state) -> bool:  # type: ignore[no-untyped-def]
-    """Return True when a ``ConstraintState`` is fresh + HIGH + non-stale."""
+    """Return True when a ``ConstraintState`` is fresh + HIGH + non-stale + non-obsolete.
+
+    A constraint is considered fresh enough to short-circuit re-probing
+    when ALL of the following hold:
+      * Known state (non-UNKNOWN).
+      * HIGH confidence.
+      * Not stale (within TTL).
+      * Not produced by an obsolete probe-code version (see
+        ``adscan_internal.services.posture_probe._PROBE_SCHEMA_VERSION``).
+        Records emitted before schema-version tracking, or by an earlier
+        version of the probe, are treated as obsolete so the new code
+        runs at least once and stamps the current version into the
+        cache.
+    """
     if state.state == TriState.UNKNOWN:
         return False
     if state.confidence != SignalConfidence.HIGH:
         return False
     if state.is_stale:
+        return False
+    # Local import avoids a posture_probe → posture_orchestration cycle
+    # at module-import time (posture_probe imports orchestration types
+    # indirectly via ProbePhase). The const lookup is cheap.
+    from adscan_internal.services.posture_probe import _PROBE_SCHEMA_VERSION
+
+    if state.is_schema_outdated(_PROBE_SCHEMA_VERSION):
         return False
     return True
 

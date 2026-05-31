@@ -48,6 +48,7 @@ from adscan_internal.services.exploitation.remote_windows_execution import (
     RemoteWindowsAuth,
 )
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
+from adscan_internal import get_console
 
 
 # ---------------------------------------------------------------------------
@@ -512,12 +513,11 @@ def _execute_deploy(
     )
 
     if result.stdout:
-        from rich.console import Console
         from rich.syntax import Syntax
 
         print_info("[bold]Output:[/bold]")
         try:
-            Console().print(Syntax(result.stdout, "text", theme="monokai", word_wrap=True))
+            get_console().print(Syntax(result.stdout, "text", theme="monokai", word_wrap=True))
         except Exception:  # noqa: BLE001
             print_info(result.stdout)
 

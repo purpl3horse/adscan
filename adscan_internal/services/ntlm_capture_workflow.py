@@ -15,7 +15,7 @@ are not running on an asyncio event loop.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import subprocess
 import time
 from typing import Callable, Iterable
@@ -61,6 +61,23 @@ class NtlmCaptureObservation:
 
 
 @dataclass(frozen=True)
+class InboundConnectionSummary:
+    """Inbound-connection tally observed by the listener during the window.
+
+    This is the diagnostic that splits a "no capture" outcome into a
+    reachability problem (``total_connections == 0`` - the target never routed
+    back to the listener) versus a real auth-type signal (``> 0`` inbound but
+    no NTLM completed from the PDC). ``source_ips`` is stored raw here; callers
+    must apply :func:`mark_sensitive` before rendering it.
+    """
+
+    total_connections: int = 0
+    source_ips: tuple[str, ...] = ()
+    handshake_stages: tuple[tuple[str, int], ...] = ()
+    ntlm_seen: bool = False
+
+
+@dataclass(frozen=True)
 class NtlmCaptureProbeResult:
     """Result of a single coercion-to-capture workflow run."""
 
@@ -78,6 +95,7 @@ class NtlmCaptureProbeResult:
     trigger_error_detail: str | None
     listener_returncode: int | None
     listener_expected_stop: bool
+    inbound: InboundConnectionSummary = field(default_factory=InboundConnectionSummary)
 
 
 @dataclass(frozen=True)
@@ -183,6 +201,22 @@ def _normalize_expected_usernames(values: Iterable[str]) -> set[str]:
         if candidate:
             normalized.add(candidate.casefold())
     return normalized
+
+
+def _to_inbound_summary(stats: object) -> InboundConnectionSummary:
+    """Convert a listener ``InboundConnectionStats`` to the workflow summary.
+
+    Duck-typed on purpose so the workflow layer does not import the relay
+    module's dataclass at module scope (the relay imports are kept lazy).
+    """
+
+    handshake_stages = getattr(stats, "handshake_stages", {}) or {}
+    return InboundConnectionSummary(
+        total_connections=int(getattr(stats, "total_connections", 0) or 0),
+        source_ips=tuple(getattr(stats, "source_ips", ()) or ()),
+        handshake_stages=tuple(sorted(handshake_stages.items())),
+        ntlm_seen=bool(getattr(stats, "ntlm_seen", False)),
+    )
 
 
 async def _run_native_coercion_trigger(
@@ -298,6 +332,24 @@ class NativeListenerCapture:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
+        self._source: object | None = None
+        self._inbound: InboundConnectionSummary = InboundConnectionSummary()
+
+    def connection_stats(self) -> InboundConnectionSummary:
+        """Return the inbound-connection tally observed by the listener.
+
+        Safe to call after :meth:`stop`. While the listener runs it returns a
+        live snapshot from the source; once stopped it returns the final
+        snapshot captured in the background loop's teardown.
+        """
+        source = self._source
+        if source is not None:
+            try:
+                stats = source.connection_stats
+                return _to_inbound_summary(stats)
+            except Exception:  # noqa: BLE001 - never let observability raise
+                return self._inbound
+        return self._inbound
 
     def clear_database(self) -> None:
         """No-op — native listener has no persistent state to clear."""
@@ -338,6 +390,7 @@ class NativeListenerCapture:
         config = SMBNtlmCaptureConfig(listen_host=self.listen_host, listen_port=self.listen_port)
         gssapi_queue: asyncio.Queue[object] = asyncio.Queue()
         source = SMBNtlmCaptureSource(config, gssapi_queue)
+        self._source = source
         self._stop_event = asyncio.Event()
 
         try:
@@ -374,6 +427,10 @@ class NativeListenerCapture:
                     )
                 )
         finally:
+            try:
+                self._inbound = _to_inbound_summary(source.connection_stats)
+            except Exception:  # noqa: BLE001 - best-effort observability
+                pass
             await source.stop()
 
     def stop(self) -> None:
@@ -483,6 +540,8 @@ def run_ntlm_capture_probe(
     finally:
         listener.stop()
 
+    inbound = listener.connection_stats()
+
     if observation is not None:
         return NtlmCaptureProbeResult(
             success=True,
@@ -501,6 +560,7 @@ def run_ntlm_capture_probe(
             trigger_error_detail=trigger_error_detail,
             listener_returncode=listener.exit_returncode,
             listener_expected_stop=listener.exit_expected_stop,
+            inbound=inbound,
         )
 
     reason = "capture_not_observed"
@@ -524,4 +584,5 @@ def run_ntlm_capture_probe(
         trigger_error_detail=trigger_error_detail,
         listener_returncode=listener.exit_returncode,
         listener_expected_stop=listener.exit_expected_stop,
+        inbound=inbound,
     )

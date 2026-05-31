@@ -10,7 +10,6 @@ thin wrappers while still preserving legacy behaviour.
 from __future__ import annotations
 
 from typing import Protocol
-import asyncio
 import re
 import secrets
 import shlex
@@ -190,34 +189,27 @@ async def _infer_domain_from_ldap_native(
     fallback for environments where LDAP is firewalled on both 389 and 636.
     """
     try:
-        from badldap.commons.factory import LDAPConnectionFactory
+        from adscan_internal.services.ldap_transport_service import (
+            async_anonymous_ldap_connection,
+        )
     except ImportError:
         return None, None
 
-    last_exc: Exception | None = None
-    for transport, port in (("ldaps", 636), ("ldap", 389)):
-        url = f"{transport}+simple://@{dc_ip}:{port}"
-        try:
-            factory = LDAPConnectionFactory.from_url(url)
-            client = factory.get_client()
-            # Disable signing and channel binding — anonymous binds do not
-            # negotiate either, and asserting them causes connect failures.
-            for flag in ("_disable_signing", "_disable_channel_binding"):
-                if hasattr(client, flag):
-                    setattr(client, flag, True)
-            ok, err = await asyncio.wait_for(client.connect(), timeout=timeout)
-            if not ok:
-                raise err or RuntimeError(f"anonymous {transport.upper()} bind returned ok=False")
-
-            # badldap fetches rootDSE attributes during connect and stores them
-            # in client._serverinfo (also reachable via client.get_server_info()).
+    try:
+        # Centralized anonymous SIMPLE-bind with LDAPS->LDAP fallback. badldap
+        # fetches the rootDSE attributes during connect, so the bound client's
+        # _serverinfo already carries defaultNamingContext + dnsHostName — no
+        # explicit search is needed.
+        async with async_anonymous_ldap_connection(
+            dc_ip, timeout=timeout
+        ) as (client, used_ldaps):
             server_info: dict | None = None
             if hasattr(client, "get_server_info"):
                 server_info = client.get_server_info()
             if not isinstance(server_info, dict):
                 server_info = getattr(client, "_serverinfo", None)
             if not isinstance(server_info, dict):
-                continue
+                return None, None
 
             # defaultNamingContext → "DC=ais,DC=local" → "ais.local"
             raw_nc = server_info.get("defaultNamingContext")
@@ -233,26 +225,17 @@ async def _infer_domain_from_ldap_native(
                 hostname = str(raw_host[0] if isinstance(raw_host, list) else raw_host).strip() or None
 
             if domain:
+                transport = "LDAPS" if used_ldaps else "LDAP"
                 print_info_debug(
-                    f"[ldap_infer] native rootDSE ({transport.upper()} {dc_ip}:{port}): "
+                    f"[ldap_infer] native rootDSE ({transport} {dc_ip}): "
                     f"domain={mark_sensitive(domain, 'domain')} "
                     f"host={mark_sensitive(hostname or 'N/A', 'hostname')}"
                 )
                 return domain, hostname
-
-        except asyncio.TimeoutError:
-            print_info_debug(
-                f"[ldap_infer] native {transport.upper()} anonymous probe timed out "
-                f"after {timeout}s — trying next transport"
-            )
-            continue
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            continue
-
-    if last_exc:
-        print_info_debug(f"[ldap_infer] native LDAP anonymous probe failed: {last_exc}")
-    return None, None
+            return None, None
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[ldap_infer] native LDAP anonymous probe failed: {exc}")
+        return None, None
 
 
 def infer_domain_from_smb_banner(

@@ -310,7 +310,7 @@ def _record_smbv1_finding(
         return
 
     try:
-        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_core.reporting.technical_report import record_technical_finding
 
         artifact_path = domain_relpath(shell.domains_dir, domain, "smb", "smbv1.log")
         record_technical_finding(
@@ -865,7 +865,7 @@ def execute_netexec_shares(
                     guest_host_labels.append(f"{host_name} ({host_ip})")
                 shell.update_report_field(domain, "smb_guest_shares", guest_host_labels)
                 try:
-                    from adscan_internal.services.report_service import (
+                    from adscan_core.reporting.technical_report import (
                         record_technical_finding,
                     )
 
@@ -2278,12 +2278,30 @@ def execute_netexec_smb_descriptions(shell: Any, *, command: str, domain: str) -
                     f"[smb-desc] Saved SMB descriptions to {descriptions_file} for password analysis"
                 )
 
-                # Delegate to shell's analysis helper if available
-                analyze_helper = getattr(
-                    shell, "_analyze_descriptions_for_passwords", None
+                # Analyze the harvested descriptions for embedded credentials.
+                # The analyser lives as a module-level helper in the LDAP CLI;
+                # it expects the per-field map shape used since the descriptions
+                # refactor, so wrap the {sam: description} dict into
+                # {sam: {"description": desc}} exactly like the LDAP path.
+                from adscan_internal.cli.ldap import (
+                    _analyze_descriptions_for_passwords,
                 )
-                if callable(analyze_helper):
-                    analyze_helper(descriptions_file, user_descriptions, domain)
+
+                cred_fields = {
+                    sam: {"description": desc}
+                    for sam, desc in user_descriptions.items()
+                    if desc
+                }
+                if cred_fields:
+                    try:
+                        _analyze_descriptions_for_passwords(
+                            shell, descriptions_file, cred_fields, domain
+                        )
+                    except Exception as analysis_exc:  # noqa: BLE001
+                        telemetry.capture_exception(analysis_exc)
+                        print_warning(
+                            f"SMB description analysis failed: {analysis_exc}"
+                        )
         else:
             print_error("Error listing SMB descriptions.")
             if completed_process.stderr:
@@ -2432,9 +2450,21 @@ def run_smb_descriptions(shell: Any, *, domain: str) -> None:
         print_info_verbose(
             f"[smb-desc] Saved SMB descriptions to {descriptions_file} for password analysis"
         )
-        analyze_helper = getattr(shell, "_analyze_descriptions_for_passwords", None)
-        if callable(analyze_helper):
-            analyze_helper(descriptions_file, user_descriptions, domain)
+        from adscan_internal.cli.ldap import _analyze_descriptions_for_passwords
+
+        cred_fields = {
+            sam: {"description": desc}
+            for sam, desc in user_descriptions.items()
+            if desc
+        }
+        if cred_fields:
+            try:
+                _analyze_descriptions_for_passwords(
+                    shell, descriptions_file, cred_fields, domain
+                )
+            except Exception as analysis_exc:  # noqa: BLE001
+                telemetry.capture_exception(analysis_exc)
+                print_warning(f"SMB description analysis failed: {analysis_exc}")
 
     try:
         log_path_abs = domain_path(
@@ -2594,7 +2624,7 @@ def _record_password_policy_finding(
         return
 
     try:
-        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_core.reporting.technical_report import record_technical_finding
         from adscan_internal.workspaces.subpaths import domain_path
 
         workspace_cwd = shell._get_workspace_cwd()
@@ -3045,6 +3075,33 @@ def _resolve_dc_targets_for_gpp(shell: Any, target_domain: str) -> list[str]:
     return targets
 
 
+def _load_gpp_ip_hostname_inventory(shell: Any, domain: str) -> dict | None:
+    """Load the workspace IP->hostname inventory for one domain, if available.
+
+    Used to promote a raw-IP DC target to its FQDN so Kerberos service tickets
+    bind to ``cifs/<fqdn>`` rather than the rejected ``cifs/<ip>``. Best-effort.
+    """
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    domains_dir = getattr(shell, "domains_dir", None) or ""
+    if not workspace_dir or not domains_dir:
+        return None
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (
+            load_workspace_ip_hostname_inventory,
+        )
+
+        return (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=workspace_dir,
+                domains_dir=domains_dir,
+                domain=domain,
+            )
+            or None
+        )
+    except Exception:  # noqa: BLE001 - inventory is best-effort
+        return None
+
+
 async def _harvest_gpp_for_domain(
     shell: Any, *, target_domain: str, timeout_per_target: int = 60
 ):
@@ -3074,23 +3131,65 @@ async def _harvest_gpp_for_domain(
     targets = _resolve_dc_targets_for_gpp(shell, target_domain)
     base_cfg = _smb_config_for_auth(shell, target_domain)
 
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.domain_posture import get_posture
+    from adscan_internal.services.kerberos_spn_resolution import (
+        resolve_spn_or_decide_ntlm,
+    )
+
+    _domains_data = getattr(shell, "domains_data", None) or {}
+    _domain_entry = _domains_data.get(target_domain) or {}
+    try:
+        _gpp_posture = get_posture(_domains_data, domain=target_domain)
+    except Exception:  # noqa: BLE001 - posture read is best-effort
+        _gpp_posture = None
+    _gpp_inventory = _load_gpp_ip_hostname_inventory(shell, target_domain)
+    _domain_dc_ip = None
+    try:
+        _domain_dc_ip = resolve_dc_ip(_domain_entry)
+    except Exception:  # noqa: BLE001
+        _domain_dc_ip = None
+
     async def _harvest_one(target: str) -> GPPHarvestResult:
         try:
             if base_cfg is not None:
-                # Per-target SMBConfig so we walk SYSVOL on every DC, not
-                # just the PDC. ``smb_machine_with_fallback`` owns NTLM ->
-                # Kerberos retry; the harvester only needs the underlying
-                # raw ``connection`` exposed by the SMBMachine.
+                # Per-target SMBConfig so we walk SYSVOL on every DC, not just
+                # the PDC. ``smb_machine_with_fallback`` owns NTLM -> Kerberos
+                # retry; the harvester only needs the underlying raw
+                # ``connection`` exposed by the SMBMachine.
+                #
+                # ``target`` may be a raw IP. Each target is a DC, so resolve a
+                # per-target FQDN for the SPN (``cifs/<fqdn>``) — ``cifs/<ip>``
+                # is rejected by the KDC. The KDC for THIS DC is itself: set
+                # ``kdc_ip=target`` only because the target IS a domain
+                # controller; never default to the target when it is a member.
+                _res = resolve_spn_or_decide_ntlm(
+                    target_host=target,
+                    domain=target_domain,
+                    domains_data=_domains_data,
+                    ip_hostname_inventory=_gpp_inventory,
+                    resolver_ip=target,
+                    posture_snapshot=_gpp_posture,
+                    is_dc_target=True,
+                )
+                _spn_host = (
+                    _res.spn_host
+                    if _res.kerberos_viable and _res.spn_host
+                    else (base_cfg.target_hostname or target)
+                )
                 cfg = SMBConfig(
                     target_ip=target,
-                    target_hostname=base_cfg.target_hostname,
+                    target_hostname=_spn_host,
                     domain=base_cfg.domain,
                     username=base_cfg.username,
                     password=base_cfg.password,
                     nt_hash=base_cfg.nt_hash,
                     auth_domain=base_cfg.auth_domain,
-                    kdc_ip=base_cfg.kdc_ip or target,
+                    # KDC is this DC (target). resolve_dc_ip is the realm DC and
+                    # only used as a last resort so we never hit a non-KDC.
+                    kdc_ip=target or _domain_dc_ip or base_cfg.kdc_ip,
                     timeout=base_cfg.timeout,
+                    posture_snapshot=_gpp_posture,
                 )
                 async with smb_machine_with_fallback(cfg) as machine:
                     return await harvest_gpp_on_connection(

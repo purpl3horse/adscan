@@ -53,6 +53,7 @@ class ConstraintCategory(str, Enum):
     KERBEROS_AES_ONLY = "kerberos_aes_only"
     KERBEROS_ETYPE_PROBE = "kerberos_etype_probe_needed"
     LDAPS_AVAILABLE = "ldaps_available"
+    LDAP_STARTTLS_AVAILABLE = "ldap_starttls_available"
     LDAP_SIGNING = "ldap_signing"
     LDAP_CHANNEL_BINDING = "ldap_channel_binding"
     SMB_SIGNING = "smb_signing"
@@ -94,6 +95,10 @@ _TTL_BY_CATEGORY: dict[ConstraintCategory, timedelta] = {
     ConstraintCategory.LDAP_CHANNEL_BINDING: timedelta(hours=24),
     ConstraintCategory.SMB_SIGNING: timedelta(hours=24),
     ConstraintCategory.LDAPS_AVAILABLE: timedelta(hours=24),
+    # Same class as LDAPS_AVAILABLE: a per-service availability fact (the DC
+    # may start/stop offering StartTLS on 389 when its cert is rotated), not a
+    # structural crypto-migration fact — 24h, not 7d.
+    ConstraintCategory.LDAP_STARTTLS_AVAILABLE: timedelta(hours=24),
     ConstraintCategory.KERBEROS_RC4: timedelta(days=7),
     ConstraintCategory.KERBEROS_AES_ONLY: timedelta(days=7),
     ConstraintCategory.KERBEROS_ETYPE_PROBE: timedelta(days=7),
@@ -112,6 +117,16 @@ class PostureSignal:
 
     Emitted by transports/integrations, not by users. The posture module
     interprets the signal and decides whether it warrants a finding.
+
+    ``probe_schema_version`` records the version of the probe-code logic
+    that generated this signal. Persisted alongside the constraint so
+    future code can detect when the cached observation was produced by
+    an obsolete version of the probe (see
+    ``adscan_internal.services.posture_probe._PROBE_SCHEMA_VERSION``).
+    Signals emitted by non-probe sources (transport reactive sinks,
+    integration emits) should set this to ``None`` — the freshness
+    check treats ``None`` as "version-agnostic" and trusts the cache
+    until the natural TTL expires.
     """
 
     domain: str
@@ -123,6 +138,7 @@ class PostureSignal:
     message: str | None
     protocol: str | None
     observed_at: datetime
+    probe_schema_version: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +173,40 @@ class ConstraintState:
     updated_at: str | None = None
     age: Optional[timedelta] = None
     ttl_remaining: Optional[timedelta] = None
+    probe_schema_version: Optional[int] = None
+    """Schema version of the probe-code that produced the current
+    ``state`` / ``confidence``. Populated at read time by
+    :func:`get_posture` from the persisted constraint record. Compared
+    against the current ``_PROBE_SCHEMA_VERSION`` by callers to decide
+    whether the cached observation is still trustworthy after a probe
+    refactor — see :meth:`is_schema_outdated`.
+    """
+
+    def is_schema_outdated(self, current_version: int) -> bool:
+        """True when this constraint was produced by an obsolete probe version.
+
+        Compares the persisted ``probe_schema_version`` against the caller's
+        current version (typically
+        ``adscan_internal.services.posture_probe._PROBE_SCHEMA_VERSION``).
+
+        Semantics:
+          * ``None`` persisted version — the record predates schema-version
+            tracking, OR was emitted by a non-probe source (transport
+            reactive sink, integration emit). Treat as outdated when the
+            caller expects probe output; the freshness guard re-probes and
+            stamps a fresh version.
+          * Numeric persisted version < ``current_version`` — explicit
+            obsolescence after a probe-code change. Re-probe.
+          * Numeric persisted version >= ``current_version`` — fresh. The
+            >= covers the (unusual but harmless) case where a workspace was
+            written by a newer build than the one currently reading it.
+
+        Stale state is independent of schema obsolescence; both checks
+        must pass for a probe to be skipped.
+        """
+        if self.probe_schema_version is None:
+            return True
+        return self.probe_schema_version < current_version
 
     @property
     def is_stale(self) -> bool:
@@ -257,6 +307,66 @@ class PasswordPolicySnapshot:
         elif self.detected_at.tzinfo is not None and reference.tzinfo is None:
             reference = reference.replace(tzinfo=timezone.utc)
         return (reference - self.detected_at) > _PASSWORD_POLICY_TTL
+
+
+@dataclass(frozen=True)
+class ResultantPasswordPolicy:
+    """Resultant password policy effective for a principal (or the domain).
+
+    Superset of :class:`PasswordPolicySnapshot`. Where ``PasswordPolicySnapshot``
+    only models the Default Domain Password Policy, this type also carries the
+    fields that matter when a Fine-Grained Password Policy (PSO) governs the
+    target principal and the fields a password-CHANGE (vs admin reset) must
+    respect (``history_length`` + ``min_pwd_age_days``).
+
+    It is the single value type returned by
+    :func:`adscan_internal.services.posture_probe.resolve_resultant_password_policy`
+    and consumed by the policy-driven generator/validator in
+    :mod:`adscan_internal.passwords`.
+
+    Field provenance:
+
+      - ``min_length``            ← ``minPwdLength`` / ``msDS-MinimumPasswordLength``
+      - ``max_length``            ← AD has no maximum; ``None`` unless a quirk sets one
+      - ``require_complexity``    ← ``pwdProperties`` bit 0 / ``msDS-PasswordComplexityEnabled``
+      - ``required_classes``      ← AD complexity rule: 3 of {lower, upper, digit,
+                                    symbol, unicode} when complexity is required
+      - ``history_length``        ← ``pwdHistoryLength`` / ``msDS-PasswordHistoryLength``
+      - ``min_pwd_age_days``      ← ``minPwdAge`` / ``msDS-MinimumPasswordAge``
+      - ``max_pwd_age_days``      ← ``maxPwdAge`` / ``msDS-MaximumPasswordAge``
+      - ``lockout_threshold``     ← ``lockoutThreshold`` / ``msDS-LockoutThreshold``
+      - ``lockout_window_minutes``← ``lockoutObservationWindow`` / ``msDS-LockoutObservationWindow``
+      - ``lockout_duration_minutes``← ``lockoutDuration`` / ``msDS-LockoutDuration``
+      - ``source``                ← provenance of this policy (see below)
+      - ``pso_dn``                ← winning PSO DN when ``source == "live_pso"``
+      - ``detected_at``           ← UTC timestamp the policy was resolved
+
+    ``source`` is one of:
+
+      * ``"live_pso"``            — a PSO governs the target principal (live LDAP)
+      * ``"live_default_domain"`` — Default Domain Policy read live via LDAP
+      * ``"collector"``           — derived from a persisted collector artifact
+      * ``"default_assumed"``     — no policy available; strong safe default
+    """
+
+    min_length: int
+    require_complexity: bool
+    required_classes: int
+    source: str
+    detected_at: datetime
+    max_length: Optional[int] = None
+    history_length: Optional[int] = None
+    min_pwd_age_days: Optional[int] = None
+    max_pwd_age_days: Optional[int] = None
+    lockout_threshold: int = 0
+    lockout_window_minutes: Optional[int] = None
+    lockout_duration_minutes: Optional[int] = None
+    pso_dn: Optional[str] = None
+
+    @property
+    def lockout_enabled(self) -> bool:
+        """True when a finite lockout threshold is enforced."""
+        return self.lockout_threshold > 0
 
 
 @dataclass
@@ -466,12 +576,33 @@ def update_posture(
         if len(prev_evidence) > _MAX_EVIDENCE_PER_CONSTRAINT:
             del prev_evidence[:-_MAX_EVIDENCE_PER_CONSTRAINT]
 
-        constraints_block[signal.category.value] = {
+        # Carry the schema version forward when the incoming signal sets
+        # one. Signals from non-probe sources (transport reactive sinks,
+        # integration emits) pass ``None`` — in that case we PRESERVE
+        # whatever version was already on the persisted record rather
+        # than overwriting it with ``None``. Otherwise a single reactive
+        # emit (e.g. a posture-signal raised by the LDAP transport on an
+        # ``invalidCredentials`` failure mid-scan) would wipe the version
+        # stamped by the most recent probe and force unnecessary
+        # re-probes.
+        if signal.probe_schema_version is not None:
+            persisted_version: Optional[int] = signal.probe_schema_version
+        else:
+            persisted_version = _coerce_schema_version(
+                (prev_raw or {}).get("probe_schema_version")
+                if isinstance(prev_raw, dict)
+                else None
+            )
+
+        constraint_record: dict[str, Any] = {
             "state": resolved_state.value,
             "confidence": resolved_confidence.value,
             "evidence": prev_evidence,
             "updated_at": timestamp,
         }
+        if persisted_version is not None:
+            constraint_record["probe_schema_version"] = persisted_version
+        constraints_block[signal.category.value] = constraint_record
         auth_posture["updated_at"] = timestamp
 
         # Mirror to legacy keys for the two categories that have a legacy block.
@@ -847,7 +978,25 @@ def _deserialize_constraint(
         confidence=_coerce_confidence(raw.get("confidence")),
         evidence=evidence_list,
         updated_at=_coerce_str(raw.get("updated_at")),
+        probe_schema_version=_coerce_schema_version(raw.get("probe_schema_version")),
     )
+
+
+def _coerce_schema_version(value: Any) -> Optional[int]:
+    """Best-effort coercion of the persisted schema-version integer.
+
+    Persisted constraints predating the schema-version field will have no
+    ``probe_schema_version`` key — ``raw.get(...)`` returns ``None`` and
+    we propagate that. A future read can then call
+    ``ConstraintState.is_schema_outdated(_PROBE_SCHEMA_VERSION)`` to
+    detect those legacy records and force a re-probe.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_state(value: Any) -> TriState:

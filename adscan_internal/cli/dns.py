@@ -2370,6 +2370,60 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
         hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
         if hostname:
             setattr(shell, "pdc_hostname", hostname)
+        # Persist the DNS-discovered FQDN/short hostname to the per-domain
+        # workspace state so downstream transport configs (LDAP, SMB,
+        # Kerberos) read fresh values instead of stale fields cached by
+        # an earlier ADscan version. This is the authoritative writer:
+        # any prior value of ``pdc_hostname_fqdn`` / ``pdc_fqdn`` /
+        # ``dc_fqdn`` is INTENTIONALLY overwritten because they may have
+        # been left over from a previous domain or a previous ADscan
+        # release. See BACKLOG entry "v8→v9 workspace migration —
+        # stale Kerberos target hostname". Missing this writer was the
+        # 2026-05-21 cause of the ``Preauth failed`` LDAP-Kerberos
+        # cascade on a workspace migrated from v8.0.0 to v9.0.0.
+        try:
+            domains_data = getattr(shell, "domains_data", None)
+            if domains_data is not None and hostname:
+                if domain not in domains_data or not isinstance(
+                    domains_data.get(domain), dict
+                ):
+                    domains_data[domain] = {}
+                domain_entry = domains_data[domain]
+
+                # Short form: if `hostname` is a FQDN, strip to the first
+                # label; otherwise keep as-is.
+                short_hostname = hostname.split(".", 1)[0] if "." in hostname else hostname
+                # Full FQDN form: only persist when we actually received
+                # a dotted name. When the resolver returned a short name
+                # we leave the FQDN keys untouched rather than fabricate
+                # ``<short>.<realm>`` — that synthesised form is wrong
+                # in multi-forest setups where the DC's DNS namespace is
+                # different from the AD realm.
+                fqdn_to_persist = hostname if "." in hostname else None
+
+                domain_entry["pdc_hostname"] = short_hostname
+                if fqdn_to_persist:
+                    # Overwrite ALL three FQDN-style keys to keep one
+                    # canonical source of truth and invalidate any
+                    # stale legacy values that resolve_dc_fqdn would
+                    # otherwise prefer (steps 1-3 of its fallback).
+                    domain_entry["pdc_hostname_fqdn"] = fqdn_to_persist
+                    domain_entry["pdc_fqdn"] = fqdn_to_persist
+                    domain_entry["dc_fqdn"] = fqdn_to_persist
+
+                print_info_debug(
+                    "[dns] update_resolver_for_domain: persisted "
+                    f"domains_data[{marked_domain}] "
+                    f"pdc_hostname={mark_sensitive(short_hostname, 'hostname')} "
+                    f"pdc_fqdn={mark_sensitive(fqdn_to_persist, 'hostname') if fqdn_to_persist else '<none>'} "
+                    "(overwrote any stale FQDN keys from older sessions)"
+                )
+        except Exception as persist_exc:  # noqa: BLE001
+            telemetry.capture_exception(persist_exc)
+            print_info_debug(
+                "[dns] update_resolver_for_domain: "
+                f"failed to persist hostname to domains_data for {marked_domain}: {persist_exc}"
+            )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_info_debug(

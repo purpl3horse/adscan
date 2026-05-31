@@ -308,10 +308,29 @@ async def _probe_ldap_anonymous(
          returns an entry (or zero entries with no error), classify as
          ``open``.
     """
+    # NOTE(ldap-centralization): this anonymous simple-bind probe owns its own
+    # LDAPS->LDAP fallback loop (allow-listed in
+    # tests/unit/services/test_no_direct_ldap_connection.py).
+    # TODO(ldap-centralization): migrate to
+    # async_connect_anonymous_with_ldap_fallback once that helper lands.
     from badldap.commons.factory import LDAPConnectionFactory
 
+    from adscan_internal.services.ldap_transport_service import (
+        is_ldaps_transport_failure,
+    )
+
     # Try simple-bind on LDAPS first, then plain LDAP.
+    #
+    # A connectivity failure on LDAPS:636 (a TCP timeout when 636 is silently
+    # DROPped, or a ConnectionError when it is RST/REJECTed) is NEVER an auth
+    # failure -- it must fall through to plain LDAP/389 exactly like the
+    # authenticated wrappers do. We therefore capture the exception and try the
+    # next transport instead of short-circuiting; the final state is decided
+    # only AFTER both transports have been exhausted. The historical bug here
+    # returned ``status="timeout"`` on the FIRST transport's TimeoutError,
+    # which reported "timeout" on a 636-filtered host even when 389 was open.
     last_exc: Exception | None = None
+    last_failure_was_timeout = False
     conn = None
     used_ldaps = False
     for transport, port in (("ldaps", 636), ("ldap", 389)):
@@ -331,12 +350,6 @@ async def _probe_ldap_anonymous(
             conn = client
             used_ldaps = transport == "ldaps"
             break
-        except asyncio.TimeoutError:
-            return LDAPAnonResult(
-                target=dc_ip,
-                status="timeout",
-                error=f"LDAP anonymous probe timed out after {timeout}s",
-            )
         except Exception as exc:  # noqa: BLE001
             import traceback as _tb
             print_info_debug(
@@ -344,10 +357,37 @@ async def _probe_ldap_anonymous(
                 + "".join(_tb.format_tb(exc.__traceback__))
             )
             last_exc = exc
+            # Record whether the most recent attempt failed for a timeout
+            # reason so that, once every transport is exhausted, we can report
+            # "timeout" (an inferred-by-absence, non-committal verdict the
+            # posture layer keeps UNKNOWN/LOW and re-probes) rather than a
+            # spurious "error"/"denied". We gate the timeout flag through the
+            # central ``is_ldaps_transport_failure`` classifier -- the same one
+            # the authenticated LDAPS->LDAP fallback uses -- so a TimeoutError
+            # only sets the inferred-by-absence verdict when it is genuinely a
+            # connectivity event.
+            is_timeout = isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+            last_failure_was_timeout = is_timeout and is_ldaps_transport_failure(exc)
+            # Both connectivity failures (timeout / ConnectionError) and
+            # non-connectivity failures fall through to the next transport; we
+            # never short-circuit before trying plain LDAP/389.
             continue
 
     if conn is None:
         telemetry.capture_exception(last_exc) if last_exc else None
+        # Both transports were exhausted. A timeout on the final attempt is an
+        # inferred-by-absence signal (we ran out of time; the DC told us
+        # nothing): report "timeout" so the posture layer never derives a false
+        # HIGH verdict and re-probes on the next contact.
+        if last_failure_was_timeout:
+            return LDAPAnonResult(
+                target=dc_ip,
+                status="timeout",
+                error=(
+                    f"LDAP anonymous probe timed out after {timeout}s on both "
+                    "LDAPS/636 and LDAP/389"
+                ),
+            )
         msg = str(last_exc) if last_exc else "Anonymous LDAP bind failed"
         lower = msg.lower()
         status: ProbeStatus = (

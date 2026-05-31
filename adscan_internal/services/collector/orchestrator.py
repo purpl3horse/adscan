@@ -15,9 +15,6 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_info_verbose,
 )
-from adscan_internal.services.collector.credential_fields_analyzer import (
-    analyze_credential_fields,
-)
 from adscan_internal.services.collector.shadow_credentials_analyzer import (
     analyze_shadow_credentials,
 )
@@ -139,7 +136,6 @@ class CollectionOrchestrator:
         timing.ldap = time.monotonic() - _t - timing.adcs
 
         _t = time.monotonic()
-        result.credential_findings = analyze_credential_fields(result)
         result.shadow_credential_findings = analyze_shadow_credentials(result)
         result.audit_findings = analyze_audit_findings(result, result.domain_policy)
         analyze_group_inferences(result)

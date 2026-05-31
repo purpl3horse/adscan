@@ -494,31 +494,31 @@ class CredentialService(BaseService):
         """Change the user's own expired password via SAMR SamrChangePasswordUser.
 
         This is the native path for STATUS_PASSWORD_MUST_CHANGE: the user
-        authenticates with their old (expired) password and sets a new one.
-        Uses ``SMBMachine.change_user_password`` → ``SamrChangePasswordUser``
-        (MS-SAMR §3.1.5.9.1) which does NOT require LDAPS.
+        authenticates with their old (expired) password and sets a new one via
+        ``hSamrUnicodeChangePasswordUser2`` (MS-SAMR), which takes old+new with
+        NO prior authenticated bind.
 
-        Falls back to LDAP unicodePwd over LDAPS if SAMR fails.
+        SAMR is the ONLY viable mechanism here: a ``MUST_CHANGE`` account cannot
+        perform an authenticated LDAP bind, so no LDAP ``unicodePwd`` rung is
+        possible (an earlier docstring claimed an LDAPS fallback that the code
+        never implemented — there is none, by protocol). SAMR over RPC is itself
+        confidential (PKT_PRIVACY). Two transports are attempted: authenticated
+        ncacn_np, then ncacn_ip_tcp anonymous on a must-change rejection.
         """
         import asyncio as _asyncio
         import concurrent.futures as _cf
-        from adscan_core.rich_output import print_info_debug
-
-        # Both nxc and impacket use hSamrUnicodeChangePasswordUser2 over a NULL
-        # SESSION for STATUS_PASSWORD_MUST_CHANGE. This call does NOT require a
-        # user handle — it takes (server, username, old_pass, new_pass) directly
-        # and can execute over an anonymous/null SMB session.
-        # Reference: nxc change-password.py + impacket changepasswd.py pattern:
-        #   1. Try normal auth → if STATUS_PASSWORD_MUST_CHANGE
-        #   2. Reconnect anonymous, call hSamrUnicodeChangePasswordUser2
-        from adscan_internal.services.smb_transport import SMBConfig, smb_machine_for
+        from adscan_internal.services.smb_transport import SMBConfig
+        from adscan_internal.services.exploitation._samr_backend import (
+            samr_change_password,
+        )
 
         connect_ip = pdc_ip or pdc_host
         sam_user = username.split("@")[0] if "@" in username else username
 
-        from aiosmb.dcerpc.v5.interfaces.samrmgr import samrrpc_from_smb
-        from aiosmb.dcerpc.v5 import samr as _samr
-
+        # Authenticated ncacn_np session built from the operator's old (expired)
+        # password. The shared SAMR backend owns the two-stage transport:
+        # ncacn_np auth first, ncacn_ip_tcp anonymous on a must-change rejection
+        # (which bypasses RestrictNullSessAccess on hardened DCs).
         auth_config = SMBConfig(
             target_ip=connect_ip,
             target_hostname=connect_ip,
@@ -530,129 +530,15 @@ class CredentialService(BaseService):
             kdc_ip=connect_ip,
             timeout=timeout,
         )
-        # Markers that indicate NTLM auth was rejected because of expired password
-        # but null session + hSamrUnicodeChangePasswordUser2 should work.
-        _MUST_CHANGE_MARKERS = (
-            "STATUS_PASSWORD_MUST_CHANGE",
-            "STATUS_PASSWORD_EXPIRED",
-            "PASSWORD_MUST_CHANGE",
-            "PASSWORD_EXPIRED",
-        )
-
-        async def _call_unicode_change(machine_config: SMBConfig, label: str) -> bool:
-            """hSamrUnicodeChangePasswordUser2 over the given SMB session (auth or null)."""
-            try:
-                async with smb_machine_for(machine_config) as machine:
-                    service, err = await samrrpc_from_smb(machine.connection)
-                    if err is not None or service is None:
-                        print_info_debug(
-                            f"[change_password_samr] SAMR bind failed ({label}): {err!r}"
-                        )
-                        return False
-                    async with service:
-                        _, err = await _samr.hSamrUnicodeChangePasswordUser2(
-                            service.dce, "\x00", sam_user, old_password, new_password
-                        )
-                        if err is None:
-                            print_info_debug(
-                                f"[change_password_samr] hSamrUnicodeChangePasswordUser2 succeeded ({label})"
-                            )
-                            return True
-                        print_info_debug(
-                            f"[change_password_samr] hSamrUnicodeChangePasswordUser2 failed ({label}): {err!r}"
-                        )
-                        return False
-            except Exception:
-                raise  # let caller decide on retry
-
-        async def _call_unicode_change_tcp(label: str) -> bool:
-            """hSamrUnicodeChangePasswordUser2 over ncacn_ip_tcp (anonymous TCP RPC).
-
-            nxc uses ncacn_ip_tcp with anonymous credentials when the account's
-            password must change — this bypasses the SMB null-session restriction
-            (RestrictNullSessAccess) that blocks ncacn_np anonymous access on
-            hardened DCs like Baby.vl.
-            """
-            from aiosmb.dcerpc.v5.interfaces.endpointmgr import EPM
-            from aiosmb.dcerpc.v5.connection import DCERPC5Connection
-            from aiosmb.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_NONE
-            from aiosmb.dcerpc.v5 import samr as _samr
-            try:
-                # Discover SAMR's dynamic TCP port via endpoint mapper (port 135).
-                dce_target, err = await EPM.create_target(connect_ip, _samr.MSRPC_UUID_SAMR)
-                if err is not None or not dce_target:
-                    print_info_debug(
-                        f"[change_password_samr] EPM lookup failed ({label}): {err!r}"
-                    )
-                    return False
-
-                # Anonymous DCE/RPC connection — no credentials, no signing.
-                dce = DCERPC5Connection(None, dce_target)
-                dce.set_auth_type(RPC_C_AUTHN_LEVEL_NONE)
-
-                _, err = await dce.connect()
-                if err is not None:
-                    print_info_debug(
-                        f"[change_password_samr] TCP DCE connect failed ({label}): {err!r}"
-                    )
-                    return False
-                try:
-                    _, err = await dce.bind(_samr.MSRPC_UUID_SAMR)
-                    if err is not None:
-                        print_info_debug(
-                            f"[change_password_samr] SAMR bind failed ({label}): {err!r}"
-                        )
-                        return False
-
-                    _, err = await _samr.hSamrUnicodeChangePasswordUser2(
-                        dce, "\x00", sam_user, old_password, new_password
-                    )
-                    if err is None:
-                        print_info_debug(
-                            f"[change_password_samr] hSamrUnicodeChangePasswordUser2 "
-                            f"succeeded ({label})"
-                        )
-                        return True
-                    print_info_debug(
-                        f"[change_password_samr] hSamrUnicodeChangePasswordUser2 "
-                        f"failed ({label}): {err!r}"
-                    )
-                    return False
-                finally:
-                    await dce.disconnect()
-            except Exception as exc:
-                from adscan_core import telemetry
-                telemetry.capture_exception(exc)
-                print_info_debug(
-                    f"[change_password_samr] TCP exception ({label}): "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                return False
 
         async def _do_samr_unicode_change() -> bool:
-            # Exact pattern from nxc change-password.py:
-            # 1. Try hSamrUnicodeChangePasswordUser2 with authenticated session (ncacn_np).
-            # 2. If auth fails with PASSWORD_MUST_CHANGE: switch to ncacn_ip_tcp anonymous.
-            #    ncacn_ip_tcp bypasses SMB null-session restrictions (RestrictNullSessAccess)
-            #    and is the correct approach for expired-password SAMR changes.
-            try:
-                return await _call_unicode_change(auth_config, "auth")
-            except Exception as auth_exc:
-                auth_msg = str(auth_exc).upper()
-                if not any(m in auth_msg for m in _MUST_CHANGE_MARKERS):
-                    from adscan_core import telemetry
-                    telemetry.capture_exception(auth_exc)
-                    print_info_debug(
-                        f"[change_password_samr] auth failed (not must-change): "
-                        f"{type(auth_exc).__name__}: {auth_exc}"
-                    )
-                    return False
-
-                print_info_debug(
-                    "[change_password_samr] auth rejected (password must change) "
-                    "— retrying via ncacn_ip_tcp anonymous"
-                )
-                return await _call_unicode_change_tcp("tcp-anonymous")
+            return await samr_change_password(
+                auth_config=auth_config,
+                connect_ip=connect_ip,
+                sam_user=sam_user,
+                old_password=old_password,
+                new_password=new_password,
+            )
 
         try:
             try:

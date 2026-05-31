@@ -161,6 +161,117 @@ def _summarize_output(text: str, *, max_lines: int = 12) -> str:
     return "\n".join(summary_lines)
 
 
+def _kernel_source_ip_toward(dc_ip: str) -> str | None:
+    """Return the kernel-chosen source IP toward *dc_ip* (UDP-connect trick).
+
+    No packets are sent - ``connect()`` on a UDP socket only resolves the route
+    and binds the local address. Returns ``None`` on any failure.
+    """
+
+    import socket  # noqa: PLC0415
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((dc_ip, 9))
+            return str(sock.getsockname()[0])
+    except Exception:  # noqa: BLE001 - heuristic only, never fatal
+        return None
+
+
+def _dc_listener_reachability_warning(
+    *,
+    listener_ip: str,
+    dc_ip: str,
+    interface: str | None,
+) -> str | None:
+    """Return an advisory string when the DC is unlikely to reach the listener.
+
+    Coercion is the one path where the DC initiates the connection back to us,
+    so a working us->DC route says nothing about the DC->us return path. This
+    flags the high-risk topologies (VPN/pivot interface, the bind IP differing
+    from the kernel's source IP toward the DC, RFC1918/public mismatch) so a
+    no-capture result is read as INCONCLUSIVE rather than a flat negative.
+    Advisory only - never blocks the probe.
+    """
+
+    import ipaddress  # noqa: PLC0415
+
+    reasons: list[str] = []
+
+    iface = str(interface or "").strip().lower()
+    if iface and any(iface.startswith(prefix) for prefix in ("tun", "tap", "ppp")):
+        reasons.append(
+            f"the listener is bound to a VPN/pivot interface ({iface}); the PDC almost "
+            "certainly has no route back to it"
+        )
+
+    kernel_source = _kernel_source_ip_toward(dc_ip)
+    if kernel_source and listener_ip and kernel_source != listener_ip:
+        reasons.append(
+            "the listener bind IP differs from the kernel's source IP toward the DC, so the "
+            "advertised address is not the one the DC would route back to"
+        )
+
+    try:
+        listener_addr = ipaddress.ip_address(listener_ip)
+        dc_addr = ipaddress.ip_address(dc_ip)
+    except ValueError:
+        listener_addr = dc_addr = None
+
+    if listener_addr is not None and dc_addr is not None:
+        if listener_addr.is_private != dc_addr.is_private:
+            reasons.append(
+                "the listener IP and DC IP straddle the private/public boundary, so the DC is "
+                "unlikely to have a return route to the listener"
+            )
+        elif listener_addr.is_private and dc_addr.is_private:
+            net_listener = ipaddress.ip_network(f"{listener_ip}/24", strict=False)
+            if dc_addr not in net_listener:
+                reasons.append(
+                    "the listener IP and DC IP are in different /24 subnets; verify routing "
+                    "before treating a no-capture result as conclusive"
+                )
+
+    if not reasons:
+        return None
+    return (
+        "DC->listener return path may be unreachable: "
+        + "; ".join(reasons)
+        + ". A no-capture result under this condition is INCONCLUSIVE, not evidence that NTLM "
+        "is unavailable - pass an explicit reachable listener IP or establish a pivot."
+    )
+
+
+def _ntlm_disabled_by_posture(shell: NtlmCaptureShell, domain: str) -> bool:
+    """Return True when the posture system knows NTLM is disabled for *domain*.
+
+    Consumes the centralized posture constraint only - it does NOT run its own
+    NTLM-disabled detection (per the AD-constraints single-source-of-truth
+    rule). A no-capture outcome under a known-disabled NTLM posture is a
+    hardening positive, not a failed probe.
+    """
+
+    from adscan_internal.services.domain_posture import (  # noqa: PLC0415
+        ConstraintCategory,
+        SignalConfidence,
+        TriState,
+        get_constraint,
+    )
+
+    try:
+        constraint = get_constraint(
+            shell.domains_data,
+            domain=domain,
+            category=ConstraintCategory.NTLM_AUTHENTICATION,
+        )
+    except Exception:  # noqa: BLE001 - posture read must never break the probe
+        return False
+    return (
+        constraint.effective_state == TriState.DISABLED
+        and constraint.confidence == SignalConfidence.HIGH
+    )
+
+
 def _prepare_ntlm_probe(
     shell: NtlmCaptureShell, domain: str
 ) -> PreparedNtlmProbe | None:
@@ -275,6 +386,20 @@ def _prepare_ntlm_probe(
             )
         )
 
+    advisory = _dc_listener_reachability_warning(
+        listener_ip=str(shell.myip or "").strip(),
+        dc_ip=pdc_ip,
+        interface=getattr(shell, "interface", None),
+    )
+    if advisory:
+        print_warning(f"[~] {advisory}")
+        print_info_debug(
+            "[ntlm-capture] DC->listener reachability heuristic flagged the return path: "
+            f"listener={mark_sensitive(str(shell.myip or ''), 'ip')} "
+            f"dc={mark_sensitive(pdc_ip, 'ip')} "
+            f"interface={mark_sensitive(str(getattr(shell, 'interface', '') or ''), 'text')}"
+        )
+
     class _Prepared:
         pass
 
@@ -315,24 +440,30 @@ def _render_captured_hash_jackpot(
     ]
     if auth_type == "NTLMv1":
         lines.append(
-            "[bold]Posture[/bold]   [red][!][/red] NTLMv1 is downgrade-attack ready (crack.sh, hashcat -m 5500)"
+            "[bold]Posture[/bold]   [red][!][/red] NTLMv1 from DC machine account — NT hash recovery guaranteed via rainbow tables"
         )
     elif auth_type == "NTLMv2":
         lines.append(
-            "[bold]Posture[/bold]   [yellow][~][/yellow] NTLMv2 in use (hashcat -m 5600, offline only)"
+            "[bold]Posture[/bold]   [yellow][~][/yellow] NTLMv2 in use — offline cracking only (hashcat -m 5600)"
         )
 
     next_lines: list[str] = ["", "[bold]Next:[/bold]"]
     if auth_type == "NTLMv1":
         next_lines.append(
-            "  [cyan]>[/cyan] Submit to crack.sh for guaranteed recovery, or run [bold]hashcat -m 5500 hash.txt rockyou.txt[/bold]"
+            "  [cyan]>[/cyan] Extract DES ciphertexts: [bold]ntlmv1.py --ntlmv1 <hash>[/bold]"
+        )
+        next_lines.append(
+            "  [cyan]>[/cyan] Query Mandiant rainbow tables (8.6 TB, public): [bold]crackalack_lookup ~/ntlmv1-tables/ ~/DES[/bold]"
+        )
+        next_lines.append(
+            "  [cyan]>[/cyan] NT hash recovered → DCSync for full domain compromise (guaranteed, <12 h on consumer HW)"
         )
     else:
         next_lines.append(
             "  [cyan]>[/cyan] Crack offline with [bold]hashcat -m 5600 hash.txt wordlist.txt -r rules/best64.rule[/bold]"
         )
     next_lines.append(
-        "  [cyan]>[/cyan] If SMB signing is unenforced on other hosts, relay this auth with [bold]ntlmrelayx[/bold] instead of cracking"
+        "  [cyan]>[/cyan] If SMB signing is unenforced on other hosts, relay with [bold]ntlmrelayx[/bold] instead of cracking"
     )
     next_lines.append(
         "  [cyan]>[/cyan] Inspect the full captured hash in the SMB listener log inside the workspace"
@@ -344,6 +475,57 @@ def _render_captured_hash_jackpot(
         title_align="left",
         border_style="green",
     )
+
+
+def _render_inbound_connection_diagnostic(result: NtlmCaptureProbeResult) -> None:
+    """Render the inbound-connection tally that splits reachability from auth-type.
+
+    This is the diagnostic that makes a "no capture" outcome self-explaining:
+    zero inbound connections means the target never routed back to the listener
+    (a reachability artifact - the verdict is inconclusive, not a negative);
+    one or more inbound connections with no NTLM completed from the PDC is a
+    real auth-type / refusal signal.
+    """
+
+    inbound = result.inbound
+    if inbound.total_connections <= 0:
+        print_warning(
+            "[~] Listener saw 0 inbound connections during the capture window: the target "
+            "never routed back to the listener IP. This no-capture result is INCONCLUSIVE "
+            "(reachability), not evidence that NTLM is unavailable."
+        )
+        print_instruction(
+            "Confirm the target has a route back to the listener IP (different subnet, NAT, or "
+            "VPN/pivot can break the return path), or pass an explicit reachable listener IP."
+        )
+        return
+
+    masked_sources = ", ".join(
+        str(mark_sensitive(ip, "ip")) for ip in inbound.source_ips
+    ) or "unknown source"
+    stage_summary = ", ".join(
+        f"{stage}={count}" for stage, count in inbound.handshake_stages
+    ) or "connected"
+    if inbound.ntlm_seen:
+        print_warning(
+            f"[~] Listener saw {inbound.total_connections} inbound connection(s) "
+            f"from {masked_sources}; NTLM was negotiated but no Authenticate completed "
+            f"from the PDC machine account (handshake stages: {stage_summary})."
+        )
+        print_instruction(
+            "An inbound NTLM negotiation that never completed points at a non-PDC source, a "
+            "Kerberos-preferring client, or auth refusal - not a reachability problem."
+        )
+    else:
+        print_warning(
+            f"[~] Listener saw {inbound.total_connections} inbound connection(s) "
+            f"from {masked_sources}; none advanced to NTLM (handshake stages: {stage_summary}). "
+            "The target reached the listener but did not attempt NTLM."
+        )
+        print_instruction(
+            "The target connected but did not NTLM-auth: the DC may prefer Kerberos or refuse "
+            "NTLM. Cross-check with the domain NTLM posture before concluding."
+        )
 
 
 def _render_failed_ntlm_capture_probe(result: NtlmCaptureProbeResult) -> None:
@@ -358,6 +540,7 @@ def _render_failed_ntlm_capture_probe(result: NtlmCaptureProbeResult) -> None:
             "[!] The SMB listener stopped before the capture window completed, so the NTLM probe "
             "result is inconclusive."
         )
+        _render_inbound_connection_diagnostic(result)
         return
 
     if result.trigger_returncode not in (None, 0):
@@ -369,12 +552,39 @@ def _render_failed_ntlm_capture_probe(result: NtlmCaptureProbeResult) -> None:
                 "The native coercion trigger reported STATUS_NOT_SUPPORTED. Treat this as a "
                 "strong sign that NTLM/SMB auth is disabled or restricted on the target."
             )
+        _render_inbound_connection_diagnostic(result)
         return
 
     print_warning("[-] No NTLM authentication capture was observed from the PDC.")
+    _render_inbound_connection_diagnostic(result)
     print_instruction(
         "If other hosts authenticated to the listener during this window, do not attribute "
         "those captures to the PDC unless the captured username matches the PDC computer account."
+    )
+
+
+def _render_ntlm_disabled_finding(domain: str) -> None:
+    """Render the no-capture outcome as a positive hardening finding.
+
+    When NTLM is known-disabled by posture, the absence of an NTLM hash from
+    the coerced PDC is the expected, secure result - frame it as a hardening
+    finding rather than a failed probe so the operator does not misread it.
+    """
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_panel(
+        (
+            "[bold]Verdict[/bold]   [green][+][/green] No NTLM emitted by the coerced PDC - "
+            "consistent with NTLM authentication being disabled\n"
+            f"[bold]Domain[/bold]    {marked_domain}\n"
+            "[bold]Posture[/bold]   [green][+][/green] NTLM disabled (HIGH confidence) - the DC "
+            "will not hand an NTLM hash to a coercion listener\n\n"
+            "[bold]Interpretation:[/bold] this is a security positive, not a probe failure. "
+            "Pivot to Kerberos-based techniques; NTLM relay/coercion-to-hash is not viable here."
+        ),
+        title="[bold]NTLM Capture[/bold] [green]hardening positive[/green]",
+        title_align="left",
+        border_style="green",
     )
 
 
@@ -439,6 +649,11 @@ def _persist_ntlm_probe_result(
         "method_filter": method_filter,
         "workspace_type": str(getattr(shell, "type", "") or "").strip().lower() or None,
     }
+    if result is not None:
+        inbound = result.inbound
+        probe_state["inbound_connection_count"] = inbound.total_connections
+        probe_state["inbound_source_ip_count"] = len(inbound.source_ips)
+        probe_state["inbound_ntlm_seen"] = inbound.ntlm_seen
     if result and result.observation is not None:
         probe_state["captured_user"] = result.observation.raw_user
         probe_state["capture_version"] = result.observation.ntlm_version
@@ -513,6 +728,15 @@ def _execute_ntlm_capture_probe(
     if prepared is None:
         return None
 
+    ntlm_disabled = _ntlm_disabled_by_posture(shell, domain)
+    if ntlm_disabled:
+        print_warning(
+            f"[~] Domain {mark_sensitive(domain, 'domain')} is known to have NTLM authentication "
+            "disabled (posture: HIGH confidence). The PDC will not emit an NTLM hash to a "
+            "coercion listener by design - a no-capture result here is a hardening positive, "
+            "not a failed probe."
+        )
+
     marked_domain = mark_sensitive(domain, "domain")
     marked_pdc = mark_sensitive(f"{prepared.pdc_hostname}.{domain}", "hostname")
     marked_listener = mark_sensitive(shell.myip, "ip")
@@ -558,12 +782,25 @@ def _execute_ntlm_capture_probe(
         )
         return None
 
+    if result.success:
+        persisted_status = "captured"
+        persisted_reason = result.reason
+    elif ntlm_disabled:
+        # No NTLM emitted from a DC where NTLM is known-disabled is the expected,
+        # positive hardening outcome - record it as a posture finding, not a
+        # failed probe.
+        persisted_status = "ntlm_disabled_posture"
+        persisted_reason = "ntlm_disabled_posture"
+    else:
+        persisted_status = "checked"
+        persisted_reason = result.reason
+
     _persist_ntlm_probe_result(
         shell,
         domain=domain,
         result=result,
-        status="captured" if result.success else "checked",
-        reason=result.reason,
+        status=persisted_status,
+        reason=persisted_reason,
         reachable_ip_count=reachable_ip_count,
         method_filter=method_filter,
     )
@@ -733,6 +970,10 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
         _render_captured_hash_jackpot(result, domain=target_domain)
         return True
 
+    if _ntlm_disabled_by_posture(shell, target_domain):
+        _render_ntlm_disabled_finding(target_domain)
+        return False
+
     _render_failed_ntlm_capture_probe(result)
     _render_no_capture_next_steps(result)
     return False
@@ -765,6 +1006,10 @@ def run_check_dc_ntlm_auth_type(shell: NtlmCaptureShell, args: str) -> None:
             f"[+] Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
         )
         _render_captured_hash_jackpot(result, domain=domain)
+        return
+
+    if _ntlm_disabled_by_posture(shell, domain):
+        _render_ntlm_disabled_finding(domain)
         return
 
     _render_failed_ntlm_capture_probe(result)

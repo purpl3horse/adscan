@@ -9,7 +9,6 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 import asyncio
 import subprocess
-import logging
 
 from adscan_internal.core import AuthMode, requires_auth
 from adscan_internal.command_runner import CommandSpec, default_runner
@@ -22,7 +21,6 @@ from adscan_internal.execution_outcomes import (
 )
 
 
-logger = logging.getLogger(__name__)
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str]]
 
@@ -69,53 +67,20 @@ def _native_anonymous_user_inventory(
     anonymous bind.
     """
     from adscan_internal import telemetry as _telemetry
-    from badldap.commons.factory import LDAPConnectionFactory
+    from adscan_core.rich_output import print_warning_debug
+    from adscan_internal.rich_output import mark_sensitive
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.ldap_transport_service import (
+        anonymous_default_naming_context,
+        async_anonymous_ldap_connection,
+    )
 
     async def _run() -> list[dict[str, object]]:
-        conn = None
-        last_exc: Exception | None = None
-        for transport, port in (("ldaps", 636), ("ldap", 389)):
-            url = f"{transport}+simple://@{pdc}:{port}"
-            try:
-                factory = LDAPConnectionFactory.from_url(url)
-                client = factory.get_client()
-                if hasattr(client, "_disable_signing"):
-                    client._disable_signing = True
-                if hasattr(client, "_disable_channel_binding"):
-                    client._disable_channel_binding = True
-                ok, err = await asyncio.wait_for(client.connect(), timeout=timeout)
-                if not ok:
-                    raise err or RuntimeError(
-                        f"{transport.upper()} connect returned ok=False"
-                    )
-                conn = client
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                continue
-        if conn is None:
-            if last_exc is not None:
-                _telemetry.capture_exception(last_exc)
-                raise last_exc
-            return []
-
-        try:
-            server_info = None
-            if hasattr(conn, "get_server_info"):
-                server_info = conn.get_server_info()
-            if not server_info:
-                server_info = getattr(conn, "_serverinfo", None)
-            base_dn = ""
-            if isinstance(server_info, dict):
-                raw = server_info.get("defaultNamingContext")
-                if isinstance(raw, list):
-                    base_dn = str(raw[0]) if raw else ""
-                elif raw:
-                    base_dn = str(raw)
-                if not base_dn:
-                    ncs = server_info.get("namingContexts")
-                    if isinstance(ncs, list) and ncs:
-                        base_dn = str(ncs[0])
+        # Centralized anonymous SIMPLE-bind with LDAPS->LDAP fallback.
+        async with async_anonymous_ldap_connection(
+            pdc, timeout=timeout
+        ) as (conn, _used_ldaps):
+            base_dn = anonymous_default_naming_context(conn)
             if not base_dn:
                 return []
 
@@ -145,30 +110,14 @@ def _native_anonymous_user_inventory(
                 # what we have (empty) instead of raising "Connected, but
                 # not bound." up the stack.
                 _telemetry.capture_exception(exc)
-                logger.debug(
-                    f"Anonymous LDAP search denied on {pdc}: {exc}"
+                print_warning_debug(
+                    f"[ldap] Anonymous LDAP search denied on "
+                    f"{mark_sensitive(pdc, 'host')}: {exc}"
                 )
-                return []
+                return collected
             return collected
-        finally:
-            try:
-                disconnect = getattr(conn, "disconnect", None)
-                if disconnect is not None:
-                    maybe = disconnect()
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
-            except Exception:  # noqa: BLE001
-                pass
 
-    try:
-        return asyncio.run(_run())
-    except RuntimeError as exc:
-        if "asyncio.run() cannot be called" in str(exc) or "running event loop" in str(exc):
-            # Caller is already inside a loop — run on a fresh loop in a thread.
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(asyncio.run, _run()).result()
-        raise
+    return run_async_sync(_run())
 
 
 @dataclass

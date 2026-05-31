@@ -53,6 +53,14 @@ class MSLDAPClientConnection:
 		self._disable_channel_binding = False # putting it here for scanners to be able to turn it off
 		self._disable_signing = False
 		self._null_channel_binding = False
+		# ADSCAN PATCH (2026-05-29) — when True, ``connect()`` upgrades the plain
+		# TCP/389 session to TLS via StartTLS (RFC 2830) immediately after the
+		# socket is established and BEFORE any bind, so anonymous, SIMPLE, and
+		# authenticated binds all run over a confidential channel without
+		# needing port 636 or channel binding. Wired by ADscan's confidentiality
+		# ladder (services/ldap_transport_service.py). Defaults to False so it
+		# never affects callers that did not opt in.
+		self._use_starttls = False
 
 		if self.credential.protocol == asyauthProtocol.NONE:
 			self.is_anon = True
@@ -225,6 +233,18 @@ class MSLDAPClientConnection:
 
 			self.handle_incoming_task = asyncio.create_task(self.__handle_incoming())
 			self.status = MSLDAPClientStatus.CONNECTED
+			# ADSCAN PATCH (2026-05-29) — opt-in StartTLS upgrade BEFORE bind.
+			# When the confidentiality ladder requests StartTLS on a plain
+			# TCP/389 connection, wrap the transport in TLS now (RFC 2830) so
+			# the subsequent bind (anonymous, SIMPLE, or authenticated) and all
+			# queries travel encrypted. ``starttls()`` leaves the connection in
+			# CONNECTED state, exactly what ``bind()`` expects next. A refused
+			# StartTLS (no DC cert / not supported) surfaces as an error so the
+			# ladder can fall through to the SASL sign+seal rung.
+			if getattr(self, '_use_starttls', False) and self.target.protocol == UniProto.CLIENT_TCP:
+				tls_ok, tls_err = await self.starttls()
+				if tls_err is not None:
+					return False, tls_err
 			logger.debug('Connection succsessful!')
 			return True, None
 		except Exception as e:
@@ -559,7 +579,10 @@ class MSLDAPClientConnection:
 			await asyncio.sleep(0)
 			return True, None
 		except Exception as e:
-			print(e)
+			# ADSCAN PATCH (2026-05-29) — silence the raw ``print(e)`` that leaked
+			# StartTLS failures to stdout and corrupted Rich Live rendering. The
+			# error is returned to the caller; logging it is sufficient.
+			logger.debug('StartTLS failed: %s' % e)
 			return False, e
 
 	async def add(self, entry:str, attributes:Dict[str, object], controls:List[Control] = None):

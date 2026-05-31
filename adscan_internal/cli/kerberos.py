@@ -1878,25 +1878,45 @@ def sync_clock_with_pdc(
                     is_plausible_reading,
                 )
 
-                async def _read_dc_time():
-                    return await get_dc_time(pdc_ip, sock_path=sock_path)
-
+                # When this sync clock-sync helper is invoked from within a
+                # running event loop (e.g. the native async SMB/MSSQL service
+                # sweeps), asyncio.run() cannot nest. Detect the running loop
+                # FIRST and skip straight to the legacy path: merely creating the
+                # coroutine to let asyncio.run reject it leaks an un-awaited
+                # coroutine ("coroutine '_read_dc_time' was never awaited").
                 try:
-                    reading = _asyncio.run(_read_dc_time())
-                except DCTimeUnavailable as exc:
+                    _asyncio.get_running_loop()
+                    _loop_running = True
+                except RuntimeError:
+                    _loop_running = False
+
+                if _loop_running:
                     print_info_debug(
-                        "[clock-sync] all DC-time read channels failed, "
-                        f"falling back to legacy ntpdate/net-time path: {exc}"
+                        "[clock-sync] running inside an active event loop; "
+                        "skipping async DC-time read, using legacy path"
                     )
                     reading = None
-                except RuntimeError as exc:
-                    # ``asyncio.run`` refuses to nest inside a running loop.
-                    telemetry.capture_exception(exc)
-                    print_info_debug(
-                        "[clock-sync] DC-time read could not start a new event loop, "
-                        f"falling back to legacy path: {exc}"
-                    )
-                    reading = None
+                else:
+
+                    async def _read_dc_time():
+                        return await get_dc_time(pdc_ip, sock_path=sock_path)
+
+                    try:
+                        reading = _asyncio.run(_read_dc_time())
+                    except DCTimeUnavailable as exc:
+                        print_info_debug(
+                            "[clock-sync] all DC-time read channels failed, "
+                            f"falling back to legacy ntpdate/net-time path: {exc}"
+                        )
+                        reading = None
+                    except RuntimeError as exc:
+                        # Defense in depth: asyncio.run still refuses to nest.
+                        telemetry.capture_exception(exc)
+                        print_info_debug(
+                            "[clock-sync] DC-time read could not start a new event loop, "
+                            f"falling back to legacy path: {exc}"
+                        )
+                        reading = None
 
                 if reading is not None:
                     # Sanity-check the reading before handing it to the
