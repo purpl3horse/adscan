@@ -107,13 +107,21 @@ class UniProxyTarget:
 	def get_tname(self):
 		return '%s:%s' % (self.endpoint_ip, self.endpoint_port)
 
+	def _safe_dict(self):
+		# DEFENSIVE: never expose proxy auth credential in repr/str output.
+		# The (username, password) tuple must not reach any log/telemetry sink.
+		d = dict(self.__dict__)
+		if d.get('credential') is not None:
+			d['credential'] = '<redacted>'
+		return d
+
 	def __repr__(self):
-		return str(self.__dict__)
+		return str(self._safe_dict())
 
 	def __str__(self):
 		t = '==== UniProxyTarget ====\r\n'
-		for k in self.__dict__:
-			t += '%s: %s\r\n' % (k, self.__dict__[k])
+		for k, v in self._safe_dict().items():
+			t += '%s: %s\r\n' % (k, v)
 			
 		return t
 

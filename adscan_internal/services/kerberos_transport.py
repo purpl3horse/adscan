@@ -412,16 +412,23 @@ async def _probe_and_set_etype_info2_salt(
 ) -> bool:
     """Send an unauthenticated AS-REQ to obtain ETYPE-INFO2 salt from the KDC.
 
-    AES-only KDCs (e.g. hardened AD environments like PingPong) require the
-    AES key to be derived using the exact salt advertised in ETYPE-INFO2.
-    kerbad's ``get_TGT`` sends the first AS-REQ with pre-auth immediately,
-    using a default salt, which produces ``KDC_ERR_PREAUTH_FAILED`` when the
-    KDC uses a non-default salt.
+    Correctness note (post 2026-06 vendor fix): salt-correctness is now
+    guaranteed at the vendor layer. ``kerbad.aioclient.get_TGT`` runs the same
+    ETYPE-INFO2 probe-first itself (gated on password creds with no pre-seeded
+    salt), so EVERY Kerberos consumer derives the right AES key on non-default
+    salt KDCs without this wrapper. This wrapper is therefore a redundant first
+    round-trip for *correctness* — but it is KEPT because it additionally emits
+    the ``KERBEROS_ETYPE_PROBE`` posture signal that the vendor fix cannot (the
+    vendor must not import ADscan or touch the posture bus). Belt-and-suspenders:
+    correctness from the vendor, posture observation from here.
 
-    By sending a bare AS-REQ first (no pre-auth), the KDC replies with
-    ``KDC_ERR_PREAUTH_REQUIRED`` + ETYPE-INFO2.  We parse the salt from that
-    response and store it in ``client.server_salt`` so that ``get_TGT``'s
-    subsequent ``build_asreq_lts`` call derives the correct AES key.
+    AES-only / non-default-salt KDCs (e.g. hardened AD environments like
+    PingPong) require the AES key to be derived using the exact salt advertised
+    in ETYPE-INFO2. By sending a bare AS-REQ first (no pre-auth), the KDC replies
+    with ``KDC_ERR_PREAUTH_REQUIRED`` + ETYPE-INFO2. We parse the salt from that
+    response, store it in ``client.server_salt`` (the vendor probe-first picks
+    up the pre-seeded value and skips its own probe), and emit a posture signal
+    when the advertised AES salt is non-default.
 
     This is a no-op if the credential is not password-based (hash/ccache/kirbi
     credentials do not need salt derivation) or if the initial unauthenticated

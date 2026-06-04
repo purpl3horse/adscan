@@ -68,7 +68,7 @@ class SECURITY:
 			record = cipher.decrypt(data[12:60])
 			self.lsa_key = record[0x10:0x20]
 		
-		logger.debug('[SECURITY] LSA key value: %s' % self.lsa_key.hex())
+		logger.debug('[SECURITY] LSA key decrypted')
 		return self.lsa_key
 			
 		
@@ -129,7 +129,7 @@ class SECURITY:
 		else:
 			self.NKLM_key = self.decrypt_secret(self.lsa_key, value[1])
 		
-		logger.debug('[SECURITY] NL$KM key: %s' % self.NKLM_key.hex())
+		logger.debug('[SECURITY] NL$KM key obtained')
 		return self.NKLM_key
 		
 	def __pad(self, data):
@@ -239,7 +239,7 @@ class SECURITY:
 					continue
 				
 				if v and v[1] != 0:
-					logger.log(1, '[SECURITY] Key %s Value %s' % (key_path, v[1]))
+					logger.log(1, '[SECURITY] Parsed secret at %s' % key_path)
 					if self.lsa_secret_key_vista_type is True:
 						record = LSA_SECRET.from_bytes(v[1])
 						key = SECURITY.sha256_multi(self.lsa_key, record.data[:32])

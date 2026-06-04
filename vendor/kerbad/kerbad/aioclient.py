@@ -322,6 +322,77 @@ class AIOKerberosClient:
 			#so we just return, the asrep can be extracted from this object anyhow
 			return rep
 
+		# --- ADscan vendor fix: ETYPE-INFO2 salt probe (non-default-salt KDCs) ---
+		# On a KDC with a NON-DEFAULT Kerberos salt (e.g. PING.HTBC.Roberts), the
+		# AES PA-ENC-TIMESTAMP key MUST be derived with the salt the KDC advertises
+		# in ETYPE-INFO2. Without probing, build_asreq_lts derives the AES key with
+		# the DEFAULT salt (domain.upper()+username) and the KDC rejects preauth with
+		# KDC_ERR_PREAUTH_FAILED. We send ONE unauthenticated AS-REQ first to elicit
+		# KDC_ERR_PREAUTH_REQUIRED + ETYPE-INFO2 and populate self.server_salt so the
+		# authenticated loop below derives the correct key. This fixes EVERY consumer
+		# (SMB/MSSQL/WinRM/RDP/LDAP/coercion/ADCS) at the vendor layer at once.
+		#
+		# Gate strictly so ccache-reuse (handled above), asreproast (nopreauth,
+		# handled above), PKINIT (certificate), and pre-seeded-salt callers are
+		# untouched:
+		#   - server_salt is None        -> a caller has not already pre-seeded it
+		#   - password is not None       -> AES key derivation uses a salt only for
+		#                                   password creds (hash/aes-key/ccache do not)
+		#   - certificate is None        -> PKINIT is salt-independent (build_asreq_pkinit)
+		#   - not nopreauth              -> asreproast path returns before this block
+		# Best-effort: any probe failure (timeout, unexpected reply) silently falls
+		# through to the authenticated loop, which surfaces the real error. On a
+		# default-salt KDC the probe runs but the advertised salt equals the default,
+		# so it is a transparent no-op.
+		if (
+			self.server_salt is None
+			and self.credential.password is not None
+			and self.credential.certificate is None
+			and not self.credential.nopreauth
+		):
+			try:
+				# Probe with AES256 (etype 18): AES-only KDCs advertise the AES salt
+				# in ETYPE-INFO2; RC4 entries typically carry salt=None. Probing with
+				# RC4 would make select_preferred_encryption_method pick RC4 and leave
+				# server_salt=None, re-introducing KDC_ERR_PREAUTH_FAILED on AES auth.
+				probe_etype = EncryptionType.AES256_CTS_HMAC_SHA1_96
+				probe_req = self.build_asreq_lts(probe_etype, no_preauth=True)
+				logger.debug('Sending ETYPE-INFO2 salt probe (unauthenticated AS-REQ)')
+				probe_rep = await self.ksoc.sendrecv(probe_req.dump())
+				if probe_rep.name == 'KRB_ERROR':
+					probe_err = KerberosError(probe_rep, 'etype-info2 salt probe')
+					if (
+						probe_err.errorcode == KerberosErrorCode.KDC_ERR_PREAUTH_REQUIRED
+						and probe_err.krb_err_msg.get('e-data')
+					):
+						self.select_preferred_encryption_method(probe_err.krb_err_msg)
+						# select_preferred_encryption_method sets server_salt from the
+						# credential's PREFERRED etype, which can be RC4 with salt=None
+						# even when the KDC also advertised an AES salt. Fall back to the
+						# AES256 then AES128 entry so password creds whose preferred etype
+						# is RC4 still get the correct AES salt.
+						if self.server_salt is None:
+							supp = self.server_supp_enc_methods or {}
+							for aes_et in (
+								EncryptionType.AES256_CTS_HMAC_SHA1_96,
+								EncryptionType.AES128_CTS_HMAC_SHA1_96,
+							):
+								aes_salt = supp.get(aes_et)
+								if aes_salt is not None:
+									self.server_salt = (
+										aes_salt.encode()
+										if isinstance(aes_salt, str)
+										else aes_salt
+									)
+									break
+						logger.debug('ETYPE-INFO2 salt probe set server_salt=%s' % (self.server_salt,))
+			except Exception as probe_exc:
+				# Non-fatal: fall through to the authenticated loop, which surfaces
+				# the real error. The probe must never convert a working flow into
+				# a failure.
+				logger.debug('ETYPE-INFO2 salt probe failed (non-fatal): %s' % (probe_exc,))
+		# --- end ADscan vendor fix ---
+
 		logger.debug('Generating initial TGT with authentication data')
 		preauth_rep = None
 		# Try every supported encryption type until one works
@@ -640,11 +711,8 @@ class AIOKerberosClient:
 			S4UByteArray += user_to_impersonate.username.encode()
 			S4UByteArray += user_to_impersonate.domain.encode()
 			S4UByteArray += auth_package_name.encode()
-			logger.debug('[S4U2self] S4UByteArray: %s' % S4UByteArray.hex())
-			logger.debug('[S4U2self] S4UByteArray: %s' % S4UByteArray)
 			
 			chksum_data = _HMACMD5.checksum(self.kerberos_session_key, 17, S4UByteArray)
-			logger.debug('[S4U2self] chksum_data: %s' % chksum_data.hex())
 			
 			
 			chksum = {}
@@ -871,7 +939,27 @@ class AIOKerberosClient:
 		logger.debug('Got referral ticket!')
 
 		for _ in range(10): # 10 is arbitrary, but I fail to imagine a scenario where we would need more than 10 referrals
-			sname = encpart['sname']['name-string'][1].upper()
+			# Bounds-check the referral sname. A cross-realm referral TGS is
+			# expected to carry sname = ['krbtgt', '<NEXT-REALM>'] so index [1] is
+			# the next realm to chase. A malformed / wrong-realm reply (e.g. the
+			# KDC returned a ticket for the wrong realm, which happens when the
+			# request hit the WRONG KDC) can have fewer than 2 name-string
+			# components. Accessing [1] then raised IndexError that escaped this
+			# function uncaught (the try/except below only wraps the recursive
+			# call). Surface a descriptive error instead so the failure reads as a
+			# Kerberos realm mismatch rather than an opaque IndexError.
+			name_string = encpart['sname']['name-string']
+			if name_string is None or len(name_string) < 2:
+				raise Exception(
+					'Malformed cross-realm referral: sname name-string has '
+					'%d component(s), expected >= 2 (krbtgt/<realm>). This usually '
+					'means the referral TGS came from the WRONG KDC for the target '
+					'realm (realm mismatch). Got name-string=%r' % (
+						0 if name_string is None else len(name_string),
+						name_string,
+					)
+				)
+			sname = name_string[1].upper()
 			if prev_sname == sname:
 				# the original domain name was not canonical but we got the same krbtgt, so we can use this ticket
 				break

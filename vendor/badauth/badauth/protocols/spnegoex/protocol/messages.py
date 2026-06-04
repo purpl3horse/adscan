@@ -574,7 +574,4 @@ def negoexts_parse_buffer(buff):
 		
 		resd[hdr.MessageType] = res
 
-	if maxiter == 0:
-		print('SAD')
-
 	return resd

@@ -87,22 +87,21 @@ class MSLDAPClientConnection:
 							message_data, err = await self.auth.decrypt(message_data, 0 )
 							if err is not None:
 								raise err
-							#print('Decrypted %s' % message_data.hex())
-							#print('Decrypted %s' % message_data)
-						except:
-							import traceback
-							traceback.print_exc()
+						except Exception:
+							# ADSCAN log-hygiene: never dump the failing wire/auth state
+							# to stdout (it bypasses telemetry and can carry decrypted/
+							# sealed message bytes). Route a type-only note through the
+							# bridged logger and re-raise to preserve control flow.
+							logger.debug('LDAP message decrypt failed')
 							raise
 						
 					elif self.__sign_messages is True:
-						#print('Signed %s' % message_data)
 						message_data = message_data[4:]
 						try:
 							message_data = await self.auth.unsign(message_data)
-						#	print('Unsinged %s' % message_data)
-						except:
-							import traceback
-							traceback.print_exc()
+						except Exception:
+							# ADSCAN log-hygiene: see decrypt path above.
+							logger.debug('LDAP message unsign failed')
 							raise
 				
 				
@@ -203,8 +202,12 @@ class MSLDAPClientConnection:
 			ntlm_data = self.auth.get_extra_info()
 			if ntlm_data is not None:
 				ntlm_data = ntlm_data.to_dict()
-		except:
-			traceback.print_exc()
+		except Exception:
+			# ADSCAN log-hygiene: the original ``traceback.print_exc()`` here
+			# (a) leaked the NTLM auth context to stdout, bypassing telemetry,
+			# and (b) raised NameError because ``traceback`` is not imported at
+			# module scope. Route a type-only note through the bridged logger.
+			logger.debug('get_extra_info failed to extract NTLM data')
 			ntlm_data = None
 		return {'ntlm_data' : ntlm_data}
 
@@ -308,10 +311,13 @@ class MSLDAPClientConnection:
 					flags = ISC_REQ.CONNECTION
 				
 				logger.debug('SICILY bind with flags: %s' % flags)
-				
+
+				logger.debug('SICILY iter0: calling auth.authenticate(None) to obtain NEGOTIATE (relay handler must produce it)')
 				data, to_continue, err = await self.auth.authenticate(None, spn=self.target.to_target_string(), flags=flags, cb_data = self.cb_data)
 				if err is not None:
+					logger.debug('SICILY iter0: auth.authenticate(None) returned error: %s' % err)
 					return None, err
+				logger.debug('SICILY iter0: NEGOTIATE obtained (%d bytes), to_continue=%s' % (len(data) if data else 0, to_continue))
 
 				auth = {
 					'sicily_disco' : b''
@@ -363,9 +369,12 @@ class MSLDAPClientConnection:
 							res['protocolOp']['diagnosticMessage']
 						)
 
+				logger.debug('SICILY DC returned CHALLENGE (%d bytes); calling auth.authenticate(challenge) to obtain AUTHENTICATE' % (len(res['protocolOp']['matchedDN']) if res['protocolOp']['matchedDN'] else 0))
 				data, to_continue, err = await self.auth.authenticate(res['protocolOp']['matchedDN'], spn=self.target.to_target_string(), cb_data = self.cb_data)
 				if err is not None:
+					logger.debug('SICILY iter1: auth.authenticate(challenge) returned error: %s' % err)
 					return None, err
+				logger.debug('SICILY iter1: AUTHENTICATE obtained (%d bytes), bind handshake complete' % (len(data) if data else 0))
 
 				auth = {
 					'sicily_resp' : data

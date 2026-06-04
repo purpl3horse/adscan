@@ -262,7 +262,6 @@ class SMBConnection:
 			if ntlm_data is not None:
 				ntlm_data = ntlm_data.to_dict()
 		except:
-			traceback.print_exc()
 			ntlm_data = None
 		if self.ServerSecurityMode is not None:
 			return {
@@ -628,7 +627,15 @@ class SMBConnection:
 					
 			self.selected_dialect = rply.command.DialectRevision
 			self.ServerSecurityMode = rply.command.SecurityMode
-			self.signing_required = NegotiateSecurityMode.SMB2_NEGOTIATE_SIGNING_ENABLED in rply.command.SecurityMode
+			# ADscan fix: ``signing_required`` must read the REQUIRED bit, not the
+			# ENABLED bit. SMB2_NEGOTIATE_SIGNING_ENABLED (0x0001) means the server
+			# merely *supports* signing; SMB2_NEGOTIATE_SIGNING_REQUIRED (0x0002)
+			# means it *enforces* it. Reading ENABLED over-reports "required" on
+			# DCs that only enable signing, which poisons posture detection
+			# (SMB_SIGNING=REQUIRED HIGH) and the pre-auth NEGOTIATE signing probe.
+			# The negotiate dict in get_extra_info() already distinguishes the two
+			# bits correctly; this aligns ``signing_required`` with it.
+			self.signing_required = NegotiateSecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED in rply.command.SecurityMode
 			if self.nosign is True:
 				self.signing_required = False
 			
@@ -742,9 +749,31 @@ class SMBConnection:
 					self.signing_required = False
 
 				self.SessionKey = self.gssapi.get_session_key()[:16]
-				
-				# TODO: key calc
-				if self.signing_required and self.selected_dialect in [NegotiateDialects.SMB300 , NegotiateDialects.SMB302 , NegotiateDialects.SMB311]:
+
+				# ADscan fix: SMB3 session-key derivation must NOT be gated on
+				# ``signing_required``. MS-SMB2 §3.2.5.3 derives SigningKey,
+				# ApplicationKey and the C2S/S2C cipher keys unconditionally after a
+				# successful session setup — whether the connection then *signs* or
+				# *encrypts* a given message is a separate per-message decision
+				# (see the send path: ``if self.signing_required`` and
+				# ``if self.encryption_required and self.EncryptionKey is not None``).
+				# The earlier ``signing_required and ...`` gate broke every
+				# RPC-over-SMB operation (coercion, SAMR, LSARPC, DRSUAPI, SCMR,
+				# schtask) against servers that merely *enable* signing without
+				# *requiring* it (typical member servers, SecurityMode=0x0001): the
+				# ADscan posture fix above correctly sets ``signing_required=False``
+				# for those, which then skipped key derivation entirely, leaving the
+				# session unable to sign OR encrypt — so the server rejected the
+				# tree connect with ACCESS_DENIED. Derive keys whenever we have a
+				# real (authenticated, non-guest) session key on a SMB3 dialect.
+				# Guests are excluded: a guest session carries no usable key
+				# material, the server does not expect signed/encrypted traffic
+				# from it, and deriving from the null guest key would make the
+				# encryption send-path seal with a bogus key (server rejects with
+				# ACCESS_DENIED). This preserves the old behaviour for guests, which
+				# the previous ``signing_required``-gated derivation skipped because
+				# the guest branch above forces ``signing_required = False``.
+				if self.SessionKey and self.gssapi.is_guest() is False and self.selected_dialect in [NegotiateDialects.SMB300 , NegotiateDialects.SMB302 , NegotiateDialects.SMB311]:
 					if self.selected_dialect == NegotiateDialects.SMB311:
 						#SMB311 is a special snowflake
 						self.SigningKey      = KDF_CounterMode(self.SessionKey, b"SMBSigningKey\x00", self.PreauthIntegrityHashValue, 128)
@@ -1524,7 +1553,6 @@ class SMBConnection:
 		#self.encryption_required = False
 		self.supress_keepalive = True
 		def compress_callback(msg):
-			print('Callback is here!')
 			msg_data = msg.to_bytes()
 			compressed_data = lznt1_compress(msg_data)
 			comp_hdr = SMB2Header_COMPRESSION_TRANSFORM()
@@ -1535,7 +1563,6 @@ class SMBConnection:
 
 			return SMB2Compression(comp_hdr, compressed_data)
 
-		print('################################### TESTING compression ###################################')
 		await self.echo()
 		#command = ECHO_REQ()
 		#header = SMB2Header_SYNC()
@@ -1545,7 +1572,6 @@ class SMBConnection:
 		#print('Waiting for reply')
 		#rply = await self.recvSMB(message_id)
 		#print(rply)
-		print('################################### SPLOIT SPLOIT SPLOIT ################################')
 
 		
 		command = ECHO_REQ()

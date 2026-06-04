@@ -351,3 +351,81 @@ class CREATE_TIMEWARP_TOKEN(CREATE_CONTEXT):
 		fTime *= 10000000
 		fTime += 116444736000000000
 		return CREATE_TIMEWARP_TOKEN(fTime.to_bytes(8, byteorder='little', signed = False))
+
+# https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/8e5c2ccb-1c08-49ce-b39c-d96ff4cef957
+# SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST (MS-SMB2 2.2.13.2.5)
+# The create-context name/tag is "MxAc". The request data is OPTIONAL and, when
+# present, is an 8-byte FILETIME Timestamp. We send it empty: the server then
+# computes maximal access against the current state of the object. This is the
+# same shape impacket / netexec request and is honoured by all Windows servers.
+class CREATE_QUERY_MAXIMAL_ACCESS_REQUEST(CREATE_CONTEXT):
+	def __init__(self, timestamp: bytes = b''):
+		super().__init__('MxAc', timestamp)
+
+
+# https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/c79f87d9-d3c8-4fb7-9fc6-92a93b0408c3
+# SMB2_CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE (MS-SMB2 2.2.31.2)
+#   QueryStatus   (4 bytes) — NTSTATUS of the maximal-access query
+#   MaximalAccess (4 bytes) — granted access as a FileAccessMask (share ANDed
+#                             with the NTFS DACL evaluated for the caller token)
+class CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE:
+	def __init__(self):
+		self.QueryStatus = None
+		self.MaximalAccess = None
+
+	@staticmethod
+	def from_bytes(data: bytes):
+		# Data is exactly 8 bytes; tolerate trailing padding from the parent
+		# create-context framing by reading only the first 8 bytes.
+		if data is None or len(data) < 8:
+			raise Exception('MxAc response data too short: %s' % (len(data) if data is not None else None))
+		msg = CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE()
+		msg.QueryStatus = int.from_bytes(data[0:4], byteorder='little', signed=False)
+		msg.MaximalAccess = FileAccessMask(int.from_bytes(data[4:8], byteorder='little', signed=False))
+		return msg
+
+	def __repr__(self):
+		t = '==== SMB2 MxAc RESPONSE ====\r\n'
+		t += 'QueryStatus: 0x%08x\r\n' % (self.QueryStatus or 0)
+		t += 'MaximalAccess: %s\r\n' % self.MaximalAccess
+		return t
+
+
+def parse_create_contexts(buff: bytes):
+	"""Parse a CREATE reply create-context chain into a name -> data dict.
+
+	The create-context chain layout (MS-SMB2 2.2.13.2) per element is:
+	  Next (4) | NameOffset (2) | NameLength (2) | Reserved (2) |
+	  DataOffset (2) | DataLength (4) | Buffer (Name + pad + Data)
+	Offsets are relative to the start of each create-context element. ``Next``
+	is the byte offset from the start of the current element to the next one;
+	zero terminates the chain. Returns ``{name_bytes: data_bytes}``.
+	"""
+	contexts = {}
+	if not buff:
+		return contexts
+	offset = 0
+	total = len(buff)
+	while offset + 16 <= total:
+		next_off = int.from_bytes(buff[offset:offset + 4], byteorder='little', signed=False)
+		name_off = int.from_bytes(buff[offset + 4:offset + 6], byteorder='little', signed=False)
+		name_len = int.from_bytes(buff[offset + 6:offset + 8], byteorder='little', signed=False)
+		# Reserved is bytes [offset+8:offset+10]; DataOffset is a 2-byte field at
+		# [offset+10:offset+12] and DataLength is a 4-byte field at [offset+12:offset+16]
+		# (MS-SMB2 2.2.13.2 / matches the to_buffer encoder above).
+		data_off = int.from_bytes(buff[offset + 10:offset + 12], byteorder='little', signed=False)
+		data_len = int.from_bytes(buff[offset + 12:offset + 16], byteorder='little', signed=False)
+
+		name = b''
+		if name_len > 0 and offset + name_off + name_len <= total:
+			name = buff[offset + name_off:offset + name_off + name_len]
+		data = b''
+		if data_len > 0 and offset + data_off + data_len <= total:
+			data = buff[offset + data_off:offset + data_off + data_len]
+		if name:
+			contexts[name] = data
+
+		if next_off == 0:
+			break
+		offset += next_off
+	return contexts

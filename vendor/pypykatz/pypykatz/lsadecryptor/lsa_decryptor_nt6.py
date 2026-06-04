@@ -108,7 +108,4 @@ class LsaDecryptor_NT6(PackageDecryptor):
 		return cleartext
 
 	def dump(self):
-		self.log('Recovered LSA encryption keys\n')
-		self.log('IV ({}): {}'.format(len(self.iv), self.iv.hex()))
-		self.log('DES_KEY ({}): {}'.format(len(self.des_key), self.des_key.hex()))
-		self.log('AES_KEY ({}): {}'.format(len(self.aes_key), self.aes_key.hex()))
+		self.log('Recovered LSA encryption keys')

@@ -159,6 +159,21 @@ async def arun_posture_probe(
     if domains_data is None:
         return []
 
+    # Resolve the DC FQDN once, for the A6 Kerberos-path CBT probe's ldap/ SPN
+    # (CLAUDE.md § Kerberos SPNs — never an IP). resolve_dc_fqdn walks the
+    # collector's canonical alias chain; returns None when only an IP is known,
+    # in which case A6 self-skips.
+    dc_fqdn: Optional[str] = None
+    try:
+        from adscan_internal.models.domain import resolve_dc_fqdn
+
+        dc_fqdn = resolve_dc_fqdn(
+            domains_data.get(domain, {}) or {},
+            target_domain=domain,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
     console = get_console()
     # The probe phase has its own dedicated UX: the 🔍 PostureProbeLiveView
     # panel renders findings as they arrive, and the 🛡️ posture-probe
@@ -218,6 +233,7 @@ async def arun_posture_probe(
                 on_progress=progress_cb,
                 posture=posture_before_auth,
                 force=force,
+                dc_fqdn=dc_fqdn,
             )
             collected.extend(auth)
             # Password policy probe — runs after AUTH phase so it can reuse

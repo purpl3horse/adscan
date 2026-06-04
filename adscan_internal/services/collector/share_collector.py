@@ -12,6 +12,14 @@ Three-tier fallback for share SDs (same logic as ShareHound, ported to aiosmb):
   2. Remote Registry: HKLM\\SYSTEM\\...\\LanmanServer\\Shares\\Security\\<name>
   3. Root folder NTFS SD (connect to share, query root dir SD)
 
+Effective-access verification: the share-level ACL alone over-reports access.
+Real access is share-ACL ∩ NTFS-folder-ACL. When BOTH the share SD and the
+NTFS folder-root SD can be read, the collector captures both raw SDs on the
+``_ShareInfo`` so the host-collector can intersect them per-principal and tag
+the resulting edges ``ntfs_computed``. Otherwise edges keep the
+``share_acl_only`` tier (a real lead, but NTFS-unverified). See
+``share_ntfs_verification.py``.
+
 SID → graph node mapping uses the already-collected LDAP node set plus the
 well-known SIDs injected by well_known_sids.py — no additional LSA RPC needed.
 """
@@ -171,6 +179,12 @@ class _ShareInfo:
     hidden: bool
     aces: list[tuple[str, int]] = field(default_factory=list)
     sd_source: str = "unavailable"
+    # Raw security descriptors retained for NTFS-aware effective-access
+    # verification (share ACL ∩ NTFS folder-root ACL). ``aces`` is derived
+    # from whichever SD was used as the primary lead; these carry the raw
+    # bytes for both layers so the host-collector can intersect them.
+    share_sd_bytes: bytes = b""  # share-level SD (SRVSVC 502 or SMB2 share root)
+    ntfs_sd_bytes: bytes = b""  # NTFS folder-root SD (SMB2 directory QueryInfo)
 
 
 def _sd_object_to_bytes(sd_object: object) -> bytes:
@@ -196,30 +210,33 @@ def _build_unc_path(host: str, share: str, path: str = "") -> str:
     return f"\\\\{host}\\{share}"
 
 
-async def read_share_root_sd(
+async def _read_share_level_sd(
     machine: Any,
     target_host: str,
     share_name: str,
-) -> tuple[bytes, str]:
-    """Read one share/root security descriptor using SMB2 QueryInfo fallbacks."""
-    from aiosmb.commons.interfaces.directory import SMBDirectory
+) -> bytes:
+    """Read the SHARE-level security descriptor (SMB2 share-root QueryInfo)."""
     from aiosmb.commons.interfaces.share import SMBShare
 
-    last_error: Exception | None = None
     share = SMBShare(
         name=share_name,
         fullpath=_build_unc_path(target_host, share_name),
     )
-    try:
-        sd_object, err = await share.get_security_descriptor(machine.connection)
-        if err is not None:
-            raise err
-        sd_bytes = _sd_object_to_bytes(sd_object)
-        if sd_bytes:
-            return sd_bytes, "smb2_share_root"
-    except Exception as exc:
-        last_error = exc
+    sd_object, err = await share.get_security_descriptor(machine.connection)
+    if err is not None:
+        raise err
+    return _sd_object_to_bytes(sd_object)
 
+
+async def _read_ntfs_root_sd(
+    machine: Any,
+    target_host: str,
+    share_name: str,
+) -> bytes:
+    """Read the NTFS folder-root security descriptor (SMB2 directory QueryInfo)."""
+    from aiosmb.commons.interfaces.directory import SMBDirectory
+
+    last_error: Exception | None = None
     for candidate_path in ("", "\\"):
         try:
             directory = SMBDirectory.from_uncpath(
@@ -230,13 +247,78 @@ async def read_share_root_sd(
                 raise err
             sd_bytes = _sd_object_to_bytes(sd_object)
             if sd_bytes:
-                return sd_bytes, "smb2_path_root"
+                return sd_bytes
         except Exception as exc:
             last_error = exc
+    if last_error is not None:
+        raise last_error
+    return b""
+
+
+async def read_share_root_sd(
+    machine: Any,
+    target_host: str,
+    share_name: str,
+) -> tuple[bytes, str]:
+    """Read one share/root security descriptor using SMB2 QueryInfo fallbacks.
+
+    Returns the first SD that could be read (share-level preferred, NTFS
+    folder-root as fallback) together with a ``sd_source`` label. Kept for
+    back-compat with callers that only need a single primary SD;
+    :func:`read_share_and_ntfs_sds` returns both layers for verification.
+    """
+    last_error: Exception | None = None
+    try:
+        sd_bytes = await _read_share_level_sd(machine, target_host, share_name)
+        if sd_bytes:
+            return sd_bytes, "smb2_share_root"
+    except Exception as exc:
+        last_error = exc
+
+    try:
+        sd_bytes = await _read_ntfs_root_sd(machine, target_host, share_name)
+        if sd_bytes:
+            return sd_bytes, "smb2_path_root"
+    except Exception as exc:
+        last_error = exc
 
     if last_error is not None:
         raise last_error
     return b"", "unavailable"
+
+
+async def read_share_and_ntfs_sds(
+    machine: Any,
+    target_host: str,
+    share_name: str,
+) -> tuple[bytes, bytes]:
+    """Read BOTH the share-level SD and the NTFS folder-root SD.
+
+    Either may be empty when its QueryInfo fails — the caller decides the
+    verification tier from which SDs are present. Failures on one layer never
+    suppress the other (a low-priv principal may read the share SD but not the
+    NTFS root, or vice versa).
+
+    Returns:
+        ``(share_sd_bytes, ntfs_sd_bytes)``. Each is ``b""`` when unreadable.
+    """
+    share_sd = b""
+    ntfs_sd = b""
+    try:
+        share_sd = await _read_share_level_sd(machine, target_host, share_name)
+    except Exception as exc:
+        print_info_debug(
+            "[share-collector] share-level SD read failed: "
+            f"host={target_host} share={share_name} error={exc}"
+        )
+    try:
+        ntfs_sd = await _read_ntfs_root_sd(machine, target_host, share_name)
+    except Exception as exc:
+        print_info_debug(
+            "[share-collector] NTFS root SD read failed: "
+            f"host={target_host} share={share_name} error={exc}"
+        )
+    return share_sd, ntfs_sd
 
 
 async def fill_missing_share_sds(
@@ -244,19 +326,25 @@ async def fill_missing_share_sds(
     target_host: str,
     shares: list[_ShareInfo],
 ) -> dict[str, int]:
-    """Populate missing share ACEs through low-privileged SMB2 root SD reads."""
+    """Populate missing share ACEs through low-privileged SMB2 root SD reads.
+
+    Reads both the share-level and NTFS folder-root SDs so downstream
+    effective-access verification can intersect them. The primary ``aces`` are
+    derived from the share-level SD when available, otherwise the NTFS root SD.
+    """
     stats = {
         "attempted": 0,
         "succeeded": 0,
         "failed": 0,
         "aces": 0,
+        "ntfs_sd": 0,
     }
     for share in shares:
         if share.aces:
             continue
         stats["attempted"] += 1
         try:
-            sd_bytes, sd_source = await read_share_root_sd(
+            share_sd_bytes, ntfs_sd_bytes = await read_share_and_ntfs_sds(
                 machine, target_host, share.name
             )
         except Exception as exc:
@@ -266,7 +354,19 @@ async def fill_missing_share_sds(
                 f"host={target_host} share={share.name} error={exc}"
             )
             continue
-        aces = parse_sd_aces(sd_bytes)
+
+        if share_sd_bytes:
+            share.share_sd_bytes = share_sd_bytes
+        if ntfs_sd_bytes:
+            share.ntfs_sd_bytes = ntfs_sd_bytes
+            stats["ntfs_sd"] += 1
+
+        # Primary lead: share SD preferred (it is the share-access boundary);
+        # NTFS root SD as fallback so a share with no readable share SD still
+        # surfaces a lead.
+        primary_bytes = share_sd_bytes or ntfs_sd_bytes
+        sd_source = "smb2_share_root" if share_sd_bytes else "smb2_path_root"
+        aces = parse_sd_aces(primary_bytes) if primary_bytes else []
         if not aces:
             stats["failed"] += 1
             continue
@@ -333,6 +433,8 @@ async def collect_shares_for_host(
                                 hidden=name.endswith("$"),
                                 aces=aces,
                                 sd_source="srvsvc502" if raw_bytes else "unavailable",
+                                # Level 502 returns the SHARE-level SD.
+                                share_sd_bytes=raw_bytes,
                             )
                         )
 
@@ -369,6 +471,12 @@ async def collect_shares_for_host(
     except Exception as exc:
         print_info_debug(f"[share-collector] list_shares failed: {exc}")
 
+    # Always attempt the NTFS folder-root SD read so effective-access
+    # verification can intersect share ∩ NTFS — even when the share-level ACL
+    # already came back from level 502. A share whose ``ntfs_sd_bytes`` is
+    # still empty stays ``share_acl_only``.
+    await _enrich_ntfs_root_sds(machine, target_host, shares)
+
     if shares and any(not share.aces for share in shares):
         stats = await fill_missing_share_sds(machine, target_host, shares)
         if stats["attempted"]:
@@ -376,7 +484,34 @@ async def collect_shares_for_host(
                 "[share-collector] SMB2 root SD fallback: "
                 f"host={target_host} attempted={stats['attempted']} "
                 f"succeeded={stats['succeeded']} failed={stats['failed']} "
-                f"aces={stats['aces']}"
+                f"aces={stats['aces']} ntfs_sd={stats['ntfs_sd']}"
             )
 
     return shares
+
+
+async def _enrich_ntfs_root_sds(
+    machine: Any,
+    target_host: str,
+    shares: list[_ShareInfo],
+) -> None:
+    """Read the NTFS folder-root SD for shares that have a share-level ACL.
+
+    Only attempted for shares that already carry ``aces`` (a real share-access
+    lead) and no NTFS SD yet — this is the second half of the share ∩ NTFS
+    intersection. Best-effort: a failure leaves ``ntfs_sd_bytes`` empty and the
+    edge stays ``share_acl_only``.
+    """
+    for share in shares:
+        if share.ntfs_sd_bytes or not share.aces:
+            continue
+        try:
+            ntfs_sd = await _read_ntfs_root_sd(machine, target_host, share.name)
+        except Exception as exc:
+            print_info_debug(
+                "[share-collector] NTFS root SD enrich failed: "
+                f"host={target_host} share={share.name} error={exc}"
+            )
+            continue
+        if ntfs_sd:
+            share.ntfs_sd_bytes = ntfs_sd

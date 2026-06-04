@@ -64,30 +64,103 @@ fallback to stderr.
 
 :class:`_NativeStackBridgeHandler` closes that gap WITHOUT touching the vendor
 source (the whole point — the fix survives ``scripts/refresh_vendor.sh``). A
-single shared instance is attached directly to each
-:data:`_NATIVE_STACK_LOGGER_NAMES` logger and forwards every surviving record
-to:
+single shared instance is attached ONLY to the top-level prefix loggers in
+:data:`_NATIVE_STACK_LOGGER_PREFIXES` (``aiosmb``, ``badauth``, ``asysocks``,
+…) — never to their children. A record originating on a child logger (e.g.
+``badauth.ntlm``) propagates up to its prefix logger (``badauth``), where the
+shared bridge fires EXACTLY ONCE. Attaching the bridge to both parent AND child
+(as an earlier version did) made every child record emit twice — once on the
+child, once again on the parent via propagation — flooding the recording with
+duplicate lines. The stdlib ``Logger.callHandlers`` contract guarantees the
+single-prefix attach is sufficient: during propagation it walks the parent
+chain and fires each handler gated ONLY by ``record.levelno >= handler.level``
+(it does NOT re-check ancestor logger effective levels), and the bridge
+handler's own level is ``DEBUG`` — so a DEBUG/INFO child record still reaches
+the prefix-attached bridge.
 
-* **Telemetry — always (DEBUG+).** The record is rendered to the telemetry
-  console (``record=True`` buffer) resolved via
-  ``adscan_core.output._state._get_telemetry_console``. Sanitization is
-  EXPORT-TIME and source-agnostic (``telemetry.py`` exports the buffer, then
-  sanitizes fail-closed before upload), so anything routed into the buffer is
-  scrubbed for free — no parallel sanitizer here.
-* **Visible console — only under ``--debug``.** When
+The bridge forwards each surviving record to:
+
+* **Telemetry — WARNING and above only.** The record is rendered to the
+  telemetry console (``record=True`` buffer) resolved via
+  ``adscan_core.output._state._get_telemetry_console`` only when
+  ``record.levelno >= logging.WARNING``. Vendor DEBUG/INFO is extremely chatty
+  (per-NTLM-message granularity: every Flags/sealkey/signkey/negotiate line)
+  and would flood every uploaded recording while needlessly widening the
+  secret-exposure surface; it is therefore kept OUT of the always-on telemetry
+  buffer. What survives (WARNING+ / ERROR) is scrubbed by the export-time,
+  source-agnostic, fail-closed sanitizer in ``telemetry.py`` — plus the
+  LAYER-2 :func:`scrub_native_secrets` applied here before the line is queued.
+* **Visible console — only under ``--debug`` (all levels, DEBUG+).** When
   ``adscan_core.output._state.is_debug_mode()`` is ``True`` the record is also
-  rendered to the shared ``_TeeConsole`` (``get_console()``). The default run
-  stays clean, preserving the premium-panel invariant. During a ``LiveSession``
-  the deferred-flush captures it automatically because it goes through
-  ``_TeeConsole.print``.
+  rendered to the shared ``_TeeConsole`` (``get_console()``) so the operator
+  can follow the full vendor stream live. ``_TeeConsole.print`` auto-mirrors to
+  telemetry, which would re-introduce the DEBUG flood into the recording via
+  the console path — so this print is wrapped in
+  ``adscan_core.output._state._explicit_telemetry_mirror`` to suppress the
+  auto-mirror. The visible ``--debug`` stream therefore does NOT leak vendor
+  DEBUG/INFO back into telemetry. During a ``LiveSession`` the deferred-flush
+  still captures it because the capture path is separate from the telemetry
+  mirror (it appends to the active deferred buffer regardless of the
+  auto-mirror opt-out).
+
+Net result: the telemetry recording holds the operator narrative (``print_*``)
+plus vendor WARNING+/ERROR only; vendor DEBUG/INFO is a ``--debug``-console
+convenience that never reaches the uploaded buffer.
 
 The handler keeps ``propagate=True`` on the vendor loggers untouched: it is a
 purely *additive* sink, so the existing/legacy propagation contract (and any
 future root handler) is preserved. Because the handler lives only on the
-vendor loggers — never on ``adscan`` or root — ADscan's own records are never
-double-recorded by it. The handler is best-effort: it never raises, mirroring
-the ``_TeeConsole.print`` try/except discipline, so a broken telemetry buffer
-can never break the visible flow.
+vendor prefix loggers — never on ``adscan`` or root — ADscan's own records are
+never double-recorded by it. The handler is best-effort: it never raises,
+mirroring the ``_TeeConsole.print`` try/except discipline, so a broken
+telemetry buffer can never break the visible flow.
+
+================================================================================
+NTLM-handshake noise tier (logger-scoped, ``--debug``-only volume control)
+================================================================================
+The ``badauth.ntlm`` logger emits a full per-handshake state-machine trace at
+DEBUG for EVERY authentication attempt (``Negotiate message constructed``,
+``Setting Client sealkey ...``, ``KeyExchangeKey derived``, ``Flags: ...``,
+etc.). The NTLMv1 coercion sweep drives dozens-to-hundreds of handshakes
+(hosts × coercion methods × pipes), so these markers flood the ``--debug``
+console with zero operator-diagnostic value: the NTLMv1/NTLMv2 classification
+is already in the sweep results table, and each attempt's outcome is already in
+the ADscan-level ``attempt`` / ``completed`` / ``attempt failed`` lines.
+
+:data:`_NTLM_HANDSHAKE_NOISE_MARKERS` lists the high-frequency, zero-value
+substrings. :class:`BenignNativeNoiseFilter` drops a record whose
+``record.name`` is the NTLM logger (``badauth.ntlm``) AND whose level is
+``DEBUG`` AND whose message matches a marker. This filtering is deliberately
+SCOPED to ``badauth.ntlm`` and kept SEPARATE from the logger-agnostic
+:data:`BENIGN_NATIVE_NOISE_MARKERS`: the bare ``Flags:`` marker, for instance,
+must drop NTLM flag chatter but NEVER ``badauth.kerberos`` flags (Kerberos
+flags can matter). Because the filter is attached to BOTH the native loggers
+and the bridge handler, a dropped record disappears from the visible console
+AND telemetry — exactly the intended effect.
+
+**Escape hatch — ``ADSCAN_VENDOR_DEBUG=1``.** A developer who genuinely needs
+the raw NTLM handshake trace back can set ``ADSCAN_VENDOR_DEBUG=1`` in the
+environment; the NTLM-handshake drop is then skipped (the global benign-noise
+markers still apply). Default (env unset) drops the chatter. This does NOT
+touch the WARNING+ telemetry gate or the bridge de-dup — only the ``--debug``
+console volume of pure handshake markers.
+
+================================================================================
+Secret scrubbing (LAYER 2 of the no-exfiltration defence)
+================================================================================
+Independent of noise control, every line the bridge forwards is passed through
+:func:`scrub_native_secrets` — re-exported from the dependency-light SSOT
+:mod:`adscan_core.native_secret_scrub` — BEFORE it reaches the telemetry buffer
+or the ``--debug`` console. LAYER 1 is the vendor-source redaction (the
+``# ADSCAN: do not dump ...`` edits in ``vendor/badauth``); LAYER 2 exists
+because ``scripts/refresh_vendor.sh`` can silently re-introduce a raw dump. The
+scrubber redacts protocol-recognizable material with NO label (NTLMSSP messages,
+NetNTLM hashcat lines, challenge byte-reprs) AND label-gated crypto-key /
+Kerberos-ticket blobs — see that module for the detector inventory and the
+false-positive guard. The SAME function is applied whole-buffer, fail-closed at
+telemetry export time (``adscan_core.telemetry``), so material that never
+travelled through the bridge (e.g. ``--debug`` console mirroring of a vendor
+``print()``) is still redacted before upload.
 
 ================================================================================
 Lifecycle
@@ -100,8 +173,18 @@ function is idempotent — subsequent calls are no-ops.
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from collections.abc import Callable
+
+# LAYER 2 secret scrubber — single source of truth in the dependency-light
+# ``adscan_core`` layer so the telemetry export path (also in ``adscan_core``)
+# can share the exact same detectors. Re-exported here under the historical
+# names so existing call sites and tests keep working.
+from adscan_core.native_secret_scrub import (
+    SECRET_LABELS as _SECRET_LABELS,  # noqa: F401 — re-exported for compatibility
+    scrub_native_secrets,
+)
 
 
 _NATIVE_STACK_LOGGER_NAMES: tuple[str, ...] = (
@@ -190,12 +273,98 @@ def is_benign_native_noise(
     return False
 
 
+# ---------------------------------------------------------------------------
+# NTLM-handshake noise tier (logger-scoped to ``badauth.ntlm``, DEBUG-only)
+# ---------------------------------------------------------------------------
+#
+# These are the per-handshake state-machine markers the ``badauth.ntlm`` logger
+# emits at DEBUG for EVERY auth attempt. The NTLMv1 coercion sweep drives
+# dozens-to-hundreds of handshakes, so they flood the ``--debug`` console with
+# zero operator-diagnostic value (the NTLMv1/NTLMv2 result is in the sweep
+# table; each attempt's outcome is in the ADscan-level attempt/completed lines).
+# Kept SEPARATE from the logger-agnostic ``BENIGN_NATIVE_NOISE_MARKERS`` so the
+# filtering is explicitly scoped to ``badauth.ntlm`` — in particular the bare
+# ``Flags:`` marker must NOT drop ``badauth.kerberos`` flag lines.
+_NTLM_HANDSHAKE_NOISE_MARKERS: tuple[str, ...] = (
+    "Negotiate message constructed",
+    "Authenticate message received",
+    "KeyExchangeKey derived",
+    "Setting up crypto",
+    "EncryptedRandomSessionKey computed",
+    "Setting Client sealkey",
+    "Setting Server sealkey",
+    "Setting client signkey",
+    "Setting server signkey",
+    "NTLMAuthenticate constructed",
+    "Loading negotiate message",
+    "Loading challenge message",
+    "Loading authenticate message",
+    # The bare ``Flags:`` line — only ever dropped under the ``badauth.ntlm``
+    # scope below (Kerberos flags can matter, so they are never touched).
+    "Flags:",
+)
+
+
+# Logger names (exact or prefix) whose DEBUG handshake chatter is filtered.
+_NTLM_LOGGER_NAME = "badauth.ntlm"
+
+
+def _vendor_debug_escape_hatch_enabled() -> bool:
+    """Return ``True`` when the operator opted into raw vendor handshake debug.
+
+    Reads ``ADSCAN_VENDOR_DEBUG`` at call time (not import time) so a developer
+    can toggle it per-run. When set to ``"1"`` the NTLM-handshake noise tier is
+    NOT applied, restoring the full ``badauth.ntlm`` DEBUG trace on the
+    ``--debug`` console (the logger-agnostic benign-noise markers still apply).
+    """
+
+    return os.getenv("ADSCAN_VENDOR_DEBUG") == "1"
+
+
+def is_ntlm_handshake_noise(record: logging.LogRecord) -> bool:
+    """Return ``True`` for a ``badauth.ntlm`` DEBUG per-handshake state marker.
+
+    Scoped on three axes so it never swallows anything diagnostic:
+
+    * **Logger scope** — only ``badauth.ntlm`` records (the bare ``Flags:``
+      marker must not touch ``badauth.kerberos``).
+    * **Level scope** — only ``DEBUG``; a future NTLM WARNING/ERROR that happens
+      to contain one of these substrings still surfaces.
+    * **Escape hatch** — disabled entirely when ``ADSCAN_VENDOR_DEBUG=1``.
+    """
+
+    if _vendor_debug_escape_hatch_enabled():
+        return False
+    if record.levelno != logging.DEBUG:
+        return False
+    if record.name != _NTLM_LOGGER_NAME and not record.name.startswith(
+        _NTLM_LOGGER_NAME + "."
+    ):
+        return False
+    try:
+        message = record.getMessage()
+    except Exception:  # noqa: BLE001 — never break the filter on a bad record
+        return False
+    if not message:
+        return False
+    for marker in _NTLM_HANDSHAKE_NOISE_MARKERS:
+        if marker in message:
+            return True
+    return False
+
+
 class BenignNativeNoiseFilter(logging.Filter):
     """Drop benign post-teardown chatter from third-party native loggers."""
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 (stdlib API)
         if not record.name.startswith(_NATIVE_STACK_LOGGER_PREFIXES):
             return True
+        # Logger-scoped tier: drop the high-volume ``badauth.ntlm`` DEBUG
+        # per-handshake state-machine markers (unless ADSCAN_VENDOR_DEBUG=1).
+        # Kept separate from the logger-agnostic global markers below so the
+        # ``Flags:`` marker never touches ``badauth.kerberos``.
+        if is_ntlm_handshake_noise(record):
+            return False
         message = record.getMessage()
         if record.exc_info:
             exc_type, exc_value, exc_tb = record.exc_info
@@ -204,6 +373,24 @@ class BenignNativeNoiseFilter(logging.Filter):
                 f"{''.join(traceback.format_exception(exc_type, exc_value, exc_tb))}"
             )
         return not is_benign_native_noise(message)
+
+
+# ---------------------------------------------------------------------------
+# Secret scrubber (durable, refresh-proof safety net)
+# ---------------------------------------------------------------------------
+#
+# LAYER 1 of the no-exfiltration defence is the vendor-source redaction (the
+# ``# ADSCAN: do not dump ...`` edits in ``vendor/badauth/.../ntlm`` and
+# ``.../kerberos``). LAYER 2 is :func:`scrub_native_secrets`, applied centrally
+# to every line the bridge forwards (see ``_NativeStackBridgeHandler.emit``).
+#
+# The detector implementation now lives in the dependency-light SSOT
+# ``adscan_core.native_secret_scrub`` (imported at the top of this module and
+# re-exported under the historical ``scrub_native_secrets`` / ``_SECRET_LABELS``
+# names) so the telemetry EXPORT path — also in ``adscan_core`` — can share the
+# exact same protocol-recognizable + label-gated detectors. ``adscan_core`` must
+# never import ``adscan_internal`` (the layering rule), so the shared code had to
+# move down into ``adscan_core``; this module consumes it from there.
 
 
 # ---------------------------------------------------------------------------
@@ -241,17 +428,27 @@ def _format_native_record(record: logging.LogRecord) -> str:
 class _NativeStackBridgeHandler(logging.Handler):
     """Forward native-stack vendor records into ADscan's centralized output.
 
-    A single shared instance is attached to each
-    :data:`_NATIVE_STACK_LOGGER_NAMES` logger. It mirrors the
-    ``_TeeConsole.print`` discipline: telemetry is ALWAYS fed (DEBUG+,
-    sanitized for free at export time), the visible console is fed ONLY under
-    ADscan debug mode, and every sink is best-effort so a broken buffer can
-    never break the user-visible flow.
+    A single shared instance is attached ONLY to the top-level prefix loggers
+    in :data:`_NATIVE_STACK_LOGGER_PREFIXES` (never to their children) so a
+    child record fires the bridge exactly once via propagation — see the
+    "Native-stack logging bridge" section of the module docstring for the
+    propagation-contract reasoning and the double-emit bug it prevents.
 
-    See the "Native-stack logging bridge" section of the module docstring for
-    the full rationale (why these loggers never reached telemetry / the console
-    before, and why this is the refresh-proof fix that touches zero vendor
-    source).
+    Routing policy (the inverse of the old "telemetry ALWAYS DEBUG+"):
+
+    * **Telemetry — WARNING and above only.** Vendor DEBUG/INFO is too chatty
+      (per-NTLM-message granularity) to belong in every uploaded recording and
+      needlessly widens the secret-exposure surface, so it is kept out of the
+      always-on telemetry buffer. WARNING+ / ERROR is scrubbed for free at
+      export time, plus the LAYER-2 :func:`scrub_native_secrets` applied here.
+    * **Visible console — only under ``--debug`` (all levels, DEBUG+).** Routed
+      via ``adscan_core.output._state.get_console()`` (a ``_TeeConsole``), but
+      wrapped in ``_explicit_telemetry_mirror`` so the ``_TeeConsole``
+      auto-mirror does NOT re-inject the suppressed DEBUG/INFO flood back into
+      telemetry through the console path.
+
+    Every sink is best-effort so a broken buffer can never break the
+    user-visible flow.
     """
 
     def __init__(self) -> None:
@@ -267,27 +464,51 @@ class _NativeStackBridgeHandler(logging.Handler):
         except Exception:  # noqa: BLE001
             return
 
-        # Telemetry sink — ALWAYS (DEBUG+). The export-time sanitizer in
-        # ``telemetry.py`` scrubs the buffer fail-closed before upload, so no
-        # parallel sanitization is needed here.
-        try:
-            from adscan_core.output._state import _get_telemetry_console
+        # LAYER 2 of the no-exfiltration defence: scrub protocol-recognizable
+        # (NTLMSSP messages, NetNTLM hashcat lines, challenge byte-reprs) AND
+        # label-gated secret material (crypto keys, Kerberos ticket/enc-part
+        # blobs, NTLM/Kerberos response hashes) BEFORE the line reaches the
+        # telemetry buffer or the --debug console, so a future vendor-refresh
+        # that re-introduces a raw-secret dump cannot leak it. Best-effort;
+        # never raises.
+        line = scrub_native_secrets(line)
 
-            telemetry_console = _get_telemetry_console()
-            if telemetry_console is not None:
-                telemetry_console.print(line)
-        except Exception:  # noqa: BLE001
-            # Best-effort: a broken record buffer must never break the flow.
-            pass
+        # Telemetry sink — WARNING and above ONLY. Vendor DEBUG/INFO is
+        # per-NTLM-message chatty and would flood every uploaded recording
+        # while widening the secret-exposure surface, so it never reaches the
+        # always-on telemetry buffer. What survives (WARNING+ / ERROR) is also
+        # scrubbed fail-closed by the export-time sanitizer in ``telemetry.py``.
+        if record.levelno >= logging.WARNING:
+            try:
+                from adscan_core.output._state import _get_telemetry_console
 
-        # Visible sink — ONLY under ADscan debug mode, so the default run
-        # stays clean (premium-panel invariant). Under a LiveSession this goes
-        # through ``_TeeConsole.print`` and is captured by the deferred flush.
+                telemetry_console = _get_telemetry_console()
+                if telemetry_console is not None:
+                    telemetry_console.print(line)
+            except Exception:  # noqa: BLE001
+                # Best-effort: a broken record buffer must never break the flow.
+                pass
+
+        # Visible sink — ONLY under ADscan debug mode (all levels, DEBUG+), so
+        # the default run stays clean (premium-panel invariant). The visible
+        # console is a ``_TeeConsole`` whose ``print`` auto-mirrors to
+        # telemetry; left unguarded, a ``--debug`` run would re-introduce the
+        # vendor DEBUG/INFO flood into the recording via this console path. So
+        # we suppress the auto-mirror with the sanctioned
+        # ``_explicit_telemetry_mirror`` context manager: the line shows on the
+        # operator's ``--debug`` console (and, during a LiveSession, is captured
+        # by the deferred-flush, which is independent of the auto-mirror
+        # opt-out) but does NOT land in the uploaded telemetry buffer.
         try:
-            from adscan_core.output._state import get_console, is_debug_mode
+            from adscan_core.output._state import (
+                _explicit_telemetry_mirror,
+                get_console,
+                is_debug_mode,
+            )
 
             if is_debug_mode():
-                get_console().print(line)
+                with _explicit_telemetry_mirror():
+                    get_console().print(line)
         except Exception:  # noqa: BLE001
             pass
 
@@ -350,7 +571,10 @@ def make_relay_log_callback(context: str) -> Callable:
                 return
         if is_benign_native_noise(msg):
             return
-        print_info_debug(f"[{context}] {msg}")
+        # LAYER 2 secret scrub on the relay path too: relay log_callback lines
+        # can carry serialized NTLM/SPNEGO blobs. Scrub before they reach the
+        # debug sink (which auto-mirrors to telemetry via _TeeConsole).
+        print_info_debug(f"[{context}] {scrub_native_secrets(msg)}")
 
     return _cb
 
@@ -366,12 +590,25 @@ def tame_native_stack_loggers() -> None:
     not retroactively stripped — call this function after ``init_logging``
     and *before* any native-stack import to guarantee a clean console.
 
-    On top of stripping rogue handlers and filtering benign noise, this also
-    attaches a single shared :class:`_NativeStackBridgeHandler` to every
-    native-stack logger so their surviving records reach the telemetry
-    recording (always) and the visible console (only under ``--debug``). The
-    bridge is purely additive; ``propagate`` is left ``True`` so the existing
-    propagation contract is untouched.
+    Two passes:
+
+    1. **Over every name in** :data:`_NATIVE_STACK_LOGGER_NAMES` (parents AND
+       children): strip rogue import-time handlers, force ``propagate=True``,
+       lower the logger to ``DEBUG`` so vendor ``logger.debug()`` /
+       ``logger.info()`` records are actually CREATED (otherwise NOTSET loggers
+       inherit root's effective WARNING level — ``--debug`` only lowers the
+       ``"adscan"`` logger, see ``logging_config.py`` — and the level check
+       inside ``Logger.debug()`` drops the record before any handler sees it),
+       and attach :class:`BenignNativeNoiseFilter`.
+    2. **Over the top-level prefixes in** :data:`_NATIVE_STACK_LOGGER_PREFIXES`
+       ONLY: attach the single shared :class:`_NativeStackBridgeHandler`
+       (identity-guarded). Children deliberately do NOT carry the bridge: a
+       child record propagates up to its prefix logger where the bridge fires
+       exactly once. Attaching to both parent and child would double-emit every
+       child record (see the module docstring's propagation-contract note).
+
+    The bridge is purely additive; ``propagate`` is left ``True`` so the
+    existing propagation contract is untouched.
     """
 
     global _taming_installed, _bridge_handler
@@ -383,14 +620,27 @@ def tame_native_stack_loggers() -> None:
         _bridge_handler = _NativeStackBridgeHandler()
     bridge_handler = _bridge_handler
 
+    # Pass 1 — every name (parents AND children): strip rogue handlers, force
+    # propagation, lower to DEBUG so records are created, install noise filter.
+    # The bridge handler is intentionally NOT attached here (see Pass 2).
     for name in _NATIVE_STACK_LOGGER_NAMES:
         logger = logging.getLogger(name)
         for handler in list(logger.handlers):
             logger.removeHandler(handler)
         logger.propagate = True
+        logger.setLevel(logging.DEBUG)
         logger.addFilter(noise_filter)
-        # Attach the bridge once per logger. Guarded by identity so a manual
-        # re-invocation (e.g. in tests or a re-import) never stacks duplicates.
+
+    # Pass 2 — top-level prefixes ONLY: attach the single shared bridge handler.
+    # A record originating on a child (e.g. ``badauth.ntlm``) propagates up to
+    # its prefix logger (``badauth``), where the bridge fires EXACTLY ONCE.
+    # ``Logger.callHandlers`` gates each handler during propagation solely by
+    # ``record.levelno >= handler.level`` (it does NOT re-check ancestor logger
+    # effective levels), and the bridge level is DEBUG — so DEBUG/INFO child
+    # records still reach the prefix-attached bridge. Identity-guarded so a
+    # manual re-invocation (tests / re-import) never stacks duplicates.
+    for prefix in _NATIVE_STACK_LOGGER_PREFIXES:
+        logger = logging.getLogger(prefix)
         if bridge_handler not in logger.handlers:
             logger.addHandler(bridge_handler)
 

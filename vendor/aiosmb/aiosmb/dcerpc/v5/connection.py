@@ -650,7 +650,6 @@ class DCERPC5Connection:
 					
 			return response_data, None
 		except Exception as e:
-			print(traceback.format_exc())
 			return None, e
 	
 	async def _transport_send(self, rpc_packet, forceWriteAndx = 0, forceRecv = 0):

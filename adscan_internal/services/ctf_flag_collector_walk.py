@@ -14,11 +14,14 @@ from dataclasses import dataclass
 from adscan_internal import print_info_debug, telemetry
 
 from adscan_internal.services.ctf_flag_collector_catalog import (
+    TOP_LEVEL_LIST_TIMEOUT_SECONDS,
     WALK_DEPTH,
     WALK_EXCLUDE_DIRS,
     WALK_MAX_ENTRIES,
+    is_custom_top_level_dir,
     is_flag_candidate_name,
 )
+from adscan_internal.rich_output import mark_sensitive
 
 
 @dataclass(slots=True)
@@ -171,4 +174,77 @@ async def walk_root(
     )
 
 
-__all__ = ["WalkOutcome", "walk_root"]
+async def enumerate_top_level_dirs(
+    connection,
+    *,
+    root_path: str = r"\C$\\",
+    list_timeout_seconds: float = TOP_LEVEL_LIST_TIMEOUT_SECONDS,
+) -> tuple[list[str], str | None]:
+    """List the CUSTOM top-level directories under ``\\C$\\``.
+
+    Runs a single, cheap, non-recursive directory enumeration of the C:
+    drive root via :meth:`SMBDirectory.list`, then filters to the custom
+    operator/box-author directories (excluding Windows system dirs and the
+    dirs already covered by dedicated walk roots). This is the cheap
+    pre-step that replaces the removed unbounded ``\\C$\\`` recursive walk.
+
+    Args:
+        connection: Open ``SMBConnection`` instance.
+        root_path: Share-relative drive root to enumerate (default ``\\C$\\``).
+        list_timeout_seconds: Hard timeout for the single directory listing.
+
+    Returns:
+        ``(custom_dir_names, error_or_None)``. ``custom_dir_names`` are bare
+        top-level basenames (e.g. ``["share", "backup"]``), never paths.
+    """
+    try:
+        directory = _build_smb_directory(connection, root_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return [], f"top-level directory init failed: {exc}"
+
+    try:
+        ok, err = await asyncio.wait_for(
+            directory.list(connection),
+            timeout=list_timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        print_info_debug(
+            f"[ctf-flags] top-level list root={root_path} OUTCOME=timeout "
+            f"(exceeded {list_timeout_seconds:.0f}s)"
+        )
+        return [], f"top-level list timed out after {list_timeout_seconds:.0f}s"
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[ctf-flags] top-level list root={root_path} OUTCOME=error err={exc}"
+        )
+        return [], f"top-level list failed: {exc}"
+
+    if err is not None:
+        print_info_debug(
+            f"[ctf-flags] top-level list root={root_path} OUTCOME=error err={err}"
+        )
+        return [], f"top-level list returned error: {err}"
+    if ok is False:
+        print_info_debug(
+            f"[ctf-flags] top-level list root={root_path} OUTCOME=error "
+            "(listing reported failure)"
+        )
+        return [], "top-level list reported failure"
+
+    subdirs = getattr(directory, "subdirs", {}) or {}
+    all_names = list(subdirs.keys())
+    custom = [name for name in all_names if is_custom_top_level_dir(name)]
+
+    masked = ", ".join(mark_sensitive(n, "path") for n in custom) or "<none>"
+    print_info_debug(
+        f"[ctf-flags] top-level list root={root_path} OUTCOME=ok "
+        f"total_dirs={len(all_names)} custom_dirs={len(custom)}: {masked}"
+    )
+    return custom, None
+
+
+__all__ = ["WalkOutcome", "walk_root", "enumerate_top_level_dirs"]

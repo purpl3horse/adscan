@@ -60,6 +60,7 @@ from adscan_core.version_context import (
     get_telemetry_version_fields,
     resolve_installed_version_info,
 )
+from adscan_core.native_secret_scrub import scrub_native_secrets_buffer
 
 try:
     from adscan_internal.services.session_compromise_state_service import (
@@ -3254,6 +3255,50 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
+    # Redact hostnames carried by dnspython resolution-failure messages.
+    #
+    # dnspython's NXDOMAIN/lookup-failure exceptions (bridged into the telemetry
+    # buffer via the native-stack log handler) embed the queried host in
+    # CLEARTEXT, and single-label / NetBIOS names (no dot) are NOT caught by the
+    # IPv4 or multi-label-FQDN structural nets above. We close the leak the same
+    # way the labeled hostname-context substitutions do (mirroring the
+    # ``hostname:`` / ``name:`` / ``-DC`` passes): match ONLY the specific
+    # labeled dnspython phrasings and pseudonymize the captured token as a
+    # hostname, so the operator still sees the real name on their own --debug
+    # console while the EXPORTED/uploaded buffer is scrubbed. Scoped strictly to
+    # these labels -- no blanket single-label scrub (that would over-redact
+    # ordinary prose). The captured token may be a single label or a dotted
+    # FQDN; ``_record_pseudonym`` deduplicates either form.
+    def _replace_dns_host(match: re.Match[str]) -> str:
+        host = match.group(2)
+        if _is_already_sanitized(host):
+            return match.group(0)
+        return match.group(1) + _record_pseudonym(host, "hostname")
+
+    # "A lookup failed for SRV01:" / "AAAA lookup failed for SRV01:"
+    content = re.sub(
+        r"(?i)(\b(?:A|AAAA)\s+lookup\s+failed\s+for\s+)([A-Za-z0-9._-]+)(?=\s*[:.,;)]|\s|$)",
+        _replace_dns_host,
+        content,
+    )
+
+    # "The DNS query name does not exist: PRODFILE01." (optional trailing dot).
+    # Also matches the shorter "... does not exist: HOST." phrasing that
+    # dnspython appends when the message is concatenated with a lookup-failure
+    # prefix.
+    content = re.sub(
+        r"(?i)((?:The\s+DNS\s+query\s+name\s+)?does\s+not\s+exist:\s+)([A-Za-z0-9._-]+?)\.?(?=[\s)\].,!?:;]|$)",
+        _replace_dns_host,
+        content,
+    )
+
+    # "connecting via aiosmb to FILESERVER:445" (single-label or FQDN host)
+    content = re.sub(
+        r"(?i)(\bconnecting\s+via\s+aiosmb\s+to\s+)([A-Za-z0-9._-]+)(?=:\d|\s|$)",
+        _replace_dns_host,
+        content,
+    )
+
     # Redact hashes (NTLM / LM:NTLM combinations)
     def _replace_hash_argument(match: re.Match[str]) -> str:
         prefix = match.group(1)
@@ -3555,6 +3600,23 @@ def _sanitize_rich_output(content: str) -> str:
     content = _sanitize_detected_credential_tables(content)
     # Sanitize Kerberos Delegations tables
     content = _sanitize_delegation_tables(content)
+
+    # LAST LINE OF DEFENCE — whole-buffer native-stack secret scrub.
+    # The marker-based + heuristic redaction above covers ADscan-originated
+    # output (values tagged with mark_sensitive() at creation time) and known
+    # credential tables. It does NOT cover raw native-stack authentication
+    # material that reached the recording WITHOUT a marker — e.g. a vendor
+    # ``print()`` mirrored to the --debug console, or a bridged vendor log line
+    # carrying an NTLMSSP message / NetNTLM hashcat string / Kerberos blob. We
+    # apply the SAME protocol-recognizable + label-gated detectors used by the
+    # native-stack logging bridge (single source of truth in
+    # ``adscan_core.native_secret_scrub``) over the entire exported buffer, so
+    # this material is redacted before upload regardless of how it got here.
+    # Runs BEFORE passthrough restore so the (known-safe) passthrough segments
+    # are never touched. ``scrub_native_secrets_buffer`` is best-effort and
+    # never raises; if a future change makes it raise, the surrounding
+    # try/except in ``capture_session_end`` skips the upload (fail-closed).
+    content = scrub_native_secrets_buffer(content)
 
     content = _restore_passthrough_segments(content, passthrough_mapping)
     return content

@@ -48,6 +48,7 @@ _EDGE_TRANSLATIONS: Final[dict[str, str]] = {
     # Delegation
     "AllowedToDelegate": "Constrained delegation configured to this host",
     "AllowedToAct": "Resource-based constrained delegation (RBCD)",
+    "SPNJack": "Host takeover via SPN hijacking and constrained delegation",
     # Session and execution
     "HasSession": "Active user session on the host",
     "AdminTo": "Local admin access on the host",

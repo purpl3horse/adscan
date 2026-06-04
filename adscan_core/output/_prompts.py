@@ -26,6 +26,7 @@ __all__ = [
     "questionary_checkbox_values",
     "questionary_checkbox_values_raw",
     "questionary_select_index",
+    "questionary_ordered_selection",
     "install_prompt_logging_wrappers",
 ]
 
@@ -288,6 +289,97 @@ def questionary_select_index(
         return options.index(selected_value)
     except ValueError:
         return None
+
+
+def questionary_ordered_selection(
+    *,
+    title: str,
+    options: list[str],
+    default_order: list[str],
+    shell: object | None = None,
+) -> list[str]:
+    """Select a subset of ``options`` AND the order to run them in.
+
+    Fills the gap between the unordered checkbox prompt and the single-select:
+    the operator picks options one at a time, each pick is appended to the
+    result order and removed from the remaining set, and the loop ends when the
+    operator picks the ``"Done"`` entry or the remaining set is empty. This is a
+    pure selection helper: it returns an ordered list of chosen options and runs
+    nothing — the caller executes the actions in the returned order.
+
+    In non-interactive runs (``adscan ci``) the prompt must NEVER block, so it
+    auto-resolves to ``default_order`` filtered to ``options`` (i.e. every
+    available option in the given order). The resolution is logged via
+    ``print_info_debug`` and mirrored to telemetry with ``mark_sensitive``,
+    exactly like the other questionary helpers.
+
+    Args:
+        title: Prompt title shown above the remaining choices each round.
+        options: The available options to choose from.
+        default_order: Ordered preference used as the CI auto-resolve answer
+            (filtered to ``options``); also the conservative default.
+        shell: Optional shell used by the non-interactive predicate.
+
+    Returns:
+        The ordered list of chosen options (subset of ``options``). Empty when
+        the operator picks ``"Done"`` immediately or cancels.
+    """
+    if not options:
+        return []
+
+    available = [str(option) for option in options if str(option).strip()]
+    if not available:
+        return []
+
+    # CI auto-resolve: default_order filtered to the available options, in the
+    # given order. Never block; log + mirror like the other helpers.
+    if _state._should_disable_prompt_interaction(shell):
+        available_set = set(available)
+        resolved = [str(value) for value in default_order if str(value) in available_set]
+        print_info_debug(
+            "[questionary] Non-interactive; selecting default ordered selection "
+            f"for '{title}': {resolved}"
+        )
+        print_telemetry_only(
+            f"[questionary][answer] {title}: "
+            f"{_state.mark_sensitive(str(resolved), 'text')}"
+        )
+        return resolved
+
+    done_label = "Done"
+    remaining = list(available)
+    chosen: list[str] = []
+
+    print_info_debug(f"[questionary] Prompt: {title}")
+    print_telemetry_only(f"[questionary] Prompt: {title}")
+
+    while remaining:
+        menu = list(remaining) + [done_label]
+        round_title = title
+        if chosen:
+            round_title = f"{title} (selected so far: {', '.join(chosen)})"
+        selected_idx = questionary_select_index(
+            title=round_title,
+            options=menu,
+            default_idx=0,
+            shell=shell,
+        )
+        # Cancellation (Ctrl-C / EOF / cancel) ends the loop with what we have.
+        if selected_idx is None:
+            break
+        if selected_idx < 0 or selected_idx >= len(menu):
+            break
+        picked = menu[selected_idx]
+        if picked == done_label:
+            break
+        chosen.append(picked)
+        remaining.remove(picked)
+
+    print_info_debug(f"[questionary] Ordered selection: {chosen}")
+    print_telemetry_only(
+        f"[questionary][answer] {title}: {_state.mark_sensitive(str(chosen), 'text')}"
+    )
+    return chosen
 
 
 def _fallback_numeric_select_index(

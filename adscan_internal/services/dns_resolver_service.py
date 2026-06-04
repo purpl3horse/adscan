@@ -770,8 +770,27 @@ class DNSResolverService(BaseService):
             print_exception(show_locals=False, exception=exc)
             return False
 
-    def add_hosts_entry(self, domain: str, ip: str | None, hostname: str | None) -> bool:
-        """Add or refresh a /etc/hosts entry for a domain's PDC."""
+    def add_hosts_entry(
+        self,
+        domain: str,
+        ip: str | None,
+        hostname: str | None,
+        *,
+        dns_a_records: list[str] | None = None,
+    ) -> bool:
+        """Add or refresh a /etc/hosts entry for a domain's PDC.
+
+        Args:
+            domain: The domain whose PDC FQDN is being mapped.
+            ip: The PDC/DC IP to write.
+            hostname: The PDC short hostname.
+            dns_a_records: Optional list of the domain's own DNS A-records.
+                Defense-in-depth: when provided and ``ip`` is NOT one of them,
+                writing is REFUSED. This prevents the cross-domain leak where a
+                foreign realm's FQDN would be mapped to the source domain's DC IP
+                (a resolver, not that realm's DC). When None, no realm check is
+                applied (legacy same-domain callers).
+        """
         hosts_path = self._hosts_path
         try:
             domain_norm = normalize_dns_like(domain)
@@ -783,6 +802,20 @@ class DNSResolverService(BaseService):
                     "Cannot add entry to /etc/hosts: missing domain, PDC IP, or hostname."
                 )
                 return False
+
+            if dns_a_records:
+                allowed = {str(rec).strip() for rec in dns_a_records if str(rec).strip()}
+                if allowed and ip_norm not in allowed:
+                    # The IP is not one of this domain's own A-records — refusing
+                    # to write protects against the cross-domain leak (mapping a
+                    # foreign realm's FQDN onto the source domain's DC/resolver IP).
+                    print_warning_debug(
+                        "add_hosts_entry refused: IP "
+                        f"{mark_sensitive(ip_norm, 'ip')} is not an A-record of "
+                        f"{mark_sensitive(domain_norm, 'domain')} "
+                        f"(A-records={mark_sensitive(sorted(allowed), 'ip')})"
+                    )
+                    return False
 
             fqdn_norm = f"{hostname_norm}.{domain_norm}"
             entry = f"{ip_norm}\t{fqdn_norm}\t{hostname_norm}\t{domain_norm}"

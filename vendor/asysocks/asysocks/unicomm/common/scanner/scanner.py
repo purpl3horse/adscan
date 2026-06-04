@@ -5,6 +5,7 @@ import datetime
 import sys
 from pathlib import Path
 from asysocks.unicomm.common.scanner.common import *
+from asysocks.unicomm import logger
 
 class UniScannerExecutor:
 	def __init__(self):
@@ -165,7 +166,7 @@ class UniScanner:
 						fhandles[rtype].write(result.to_line()+'\r\n')
 
 		except Exception as e:
-			print('SCANNER CRITICAL ERROR %s' % str(e))
+			logger.error('Scanner critical error: %s' % str(e))
 		finally:
 			flush_task.cancel()
 			await self.stop()

@@ -105,10 +105,11 @@ class SMB2Message:
 					classname += '_REQ'
 				msg.command = command2object[classname].from_buffer(buff)
 			except Exception as e:
-
-				import traceback
-				traceback.print_exc()
-				#print('Could not find command implementation! %s' % str(e))
+				# Vendor-noise fix (ADscan): a single unparseable/unexpected command
+				# must not dump a raw traceback to the operator's terminal. The
+				# graceful fallback below handles it and the failure is surfaced at
+				# the adscan call layer. See CLAUDE.md § Vendor noise.
+				_ = e
 				msg.command = SMB2NotImplementedCommand.from_buffer(buff)
 
 		return msg

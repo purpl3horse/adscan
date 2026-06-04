@@ -36,6 +36,9 @@ from adscan_internal.services.views._graph_share_reader import (
     GraphShareACL,
     GraphShareSnapshot,
 )
+from adscan_internal.services.collector.share_ntfs_verification import (
+    VERIFICATION_SHARE_ACL_ONLY,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +163,27 @@ class ShareView:
     def has_graph(self) -> bool:
         return self.graph_acl is not None and bool(self.graph_acl.principals)
 
+    @property
+    def graph_verification(self) -> str:
+        """NTFS verification tier recorded by the collector for this share."""
+        if self.graph_acl is None:
+            return VERIFICATION_SHARE_ACL_ONLY
+        return getattr(
+            self.graph_acl, "verification", VERIFICATION_SHARE_ACL_ONLY
+        )
+
+    @property
+    def is_graph_ntfs_verified(self) -> bool:
+        """True when the graph access was confirmed against the NTFS ACL.
+
+        ``share_acl_only`` graph access is a real lead but NTFS-unverified — a
+        share-ACL grant can be overridden by a denying NTFS folder ACL, so the
+        effective access may be lower than the graph implies.
+        """
+        return self.graph_acl is not None and getattr(
+            self.graph_acl, "is_ntfs_verified", False
+        )
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
@@ -172,6 +196,8 @@ class ShareView:
                 "probe_error": self.live_probe_error,
             },
             "graph": self.graph_acl.to_dict() if self.graph_acl else None,
+            "graph_verification": self.graph_verification,
+            "is_graph_ntfs_verified": self.is_graph_ntfs_verified,
             "delta": self.delta.value,
             "delta_reason": self.delta_reason,
         }

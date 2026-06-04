@@ -15,7 +15,6 @@ class UNITransport(Transport):
 
 	def get_extra_info(self, name, default=None):
 		"""Get optional transport information."""
-		print('Extrainfo', name, default)
 		return self.comms.get_extra_info(name, default)
 		
 	def is_closing(self):

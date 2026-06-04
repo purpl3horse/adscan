@@ -235,12 +235,20 @@ def run_native_collection(
         )
         posture_snapshot = get_posture(shell.domains_data, domain=target_domain)
 
+        from adscan_internal.cli._collection_selector import (
+            prompt_collection_selection,
+        )
+
+        selection = prompt_collection_selection(shell, target_domain)
+
         counters, collection_results, domain_timings = (
             CollectionOrchestrator().collect_scope(
                 shell=shell,
                 scopes=[scope],
                 credential=credential,
                 collection_scope=collection_scope,
+                collect_smb=selection.collect_samr,
+                collect_shares=selection.collect_shares,
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
             )
@@ -270,6 +278,7 @@ def run_native_collection(
         _print_collection_summary_from_graph(shell, target_domain, elapsed)
         _print_collector_enrichment_panel(collector_result, target_domain)
         _persist_collector_findings(shell, target_domain, collector_result)
+        _populate_adcs_metadata(shell, target_domain, collector_result)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error(f"Native collection failed: {exc}")
@@ -386,6 +395,29 @@ def _persist_collector_findings(
                     for f in findings
                 ],
             },
+        )
+
+
+def _populate_adcs_metadata(shell: Any, domain: str, result: Any) -> None:
+    """Bridge Phase 2 ADCS collection into the Phase 3 metadata cache.
+
+    Phase 2 (native domain collection) already enumerates CAs/templates into
+    the graph. This extracts the enrollment server + CA name from the
+    ALREADY-COLLECTED result and writes the same ``domains_data[domain]`` ADCS
+    flags Phase 3 sets, so the Phase 3 metadata step consumes this verdict
+    instead of re-running a second ``ADCSCollector.collect()`` (same dedup
+    pattern applied to massdns). When ``result`` is ``None`` (no native
+    collection ran) the flags are left absent and Phase 3 still falls back.
+    """
+    try:
+        from adscan_internal.cli.adcs import populate_adcs_metadata_from_collection
+
+        populate_adcs_metadata_from_collection(shell, domain=domain, result=result)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[intelligence] ADCS metadata populate failed for "
+            f"{mark_sensitive(domain, 'domain')}: {exc}"
         )
 
 

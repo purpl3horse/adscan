@@ -326,8 +326,6 @@ def SetContextAttributes(ctx, attr, data):
 	_SetContextAttributes.restype  = DWORD
 	_SetContextAttributes.errcheck  = errc
 
-	print('set data: %s' % data)
-	print('set attr: %s' % attr)
 	data_len = ULONG(len(data))
 	data_buff = ctypes.create_string_buffer(data, len(data))
 	

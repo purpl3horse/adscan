@@ -2249,10 +2249,247 @@ def _apply_default_seal_to_plain_ldap(
     return upgraded
 
 
+def _config_requests_explicit_cbt(config: "ADscanLDAPConfig") -> bool:
+    """Return whether *config* carries an EXPLICIT channel-binding intent.
+
+    A caller that set either ``channel_binding=True`` (send the real CBT) or
+    ``null_channel_binding=True`` (send a deliberately wrong CBT, used by the
+    CBT posture probe) has expressed an explicit intent that always wins over
+    the operational default-on policy below. Leaving both at their ``False``
+    defaults means "no opinion" -- eligible for the proactive default.
+    """
+    return bool(config.channel_binding or config.null_channel_binding)
+
+
+def _apply_default_cbt_to_authenticated_ldaps(
+    configs_to_try: list[tuple["ADscanLDAPConfig", bool]],
+) -> list[tuple["ADscanLDAPConfig", bool]]:
+    """Send the real ``tls-server-end-point`` CBT on operational LDAPS binds.
+
+    Hardened DCs with ``LdapEnforceChannelBinding=2`` reject an authenticated
+    Kerberos/NTLM bind over LDAPS that carries no channel binding (the AP-REQ
+    GSS checksum then advertises the 16-zero "no bindings" token) with
+    ``SEC_E_BAD_BINDINGS``. The vendor cb_data computation in
+    ``vendor/badldap/badldap/connection.py`` is correct but only runs when
+    ``_disable_channel_binding is False`` -- which the transport sets from
+    ``cfg.channel_binding``. Because that field defaults to ``False``, ADscan
+    historically sent no CBT on the FIRST attempt and only flipped it on via
+    the reactive self-heal AFTER a wasted failed round-trip.
+
+    A correctly-computed ``tls-server-end-point`` CBT is accepted by EVERY
+    Windows DC whether it enforces channel binding or not (the DC either
+    validates it or ignores it), so sending it proactively is always safe and
+    removes the wasted failure round-trip. This helper therefore forces
+    ``channel_binding=True`` on every LDAPS rung of an OPERATIONAL,
+    AUTHENTICATED bind so the real token is computed on the first try.
+
+    Strictly scoped -- leaves untouched (so the posture CBT probe can still
+    MEASURE enforcement, and explicit caller intent always wins):
+
+    - Plain-LDAP / StartTLS rungs (``is_ldaps=False``) -- there is no LDAPS TLS
+      cert to derive ``tls-server-end-point`` from; CBT is N/A.
+    - Anonymous / SIMPLE binds (``not _plain_ldap_can_seal``) -- they establish
+      no GSS context to carry a channel-binding token.
+    - Probe / failure-eliciting callers (``disable_self_heal=True``) -- the CBT
+      posture probe (U3) deliberately binds with no-CBT or wrong-CBT and
+      ``disable_self_heal=True`` to read back ``SEC_E_BAD_BINDINGS`` and
+      MEASURE enforcement. Forcing CBT on here would make the probe blind to
+      the answer it exists to collect.
+    - Callers that already expressed explicit CBT intent
+      (``channel_binding`` or ``null_channel_binding`` set) -- respected
+      unchanged via :func:`_config_requests_explicit_cbt`.
+
+    Returns a new list; the input list is not mutated.
+    """
+    import dataclasses as _dc_cbt
+
+    upgraded: list[tuple["ADscanLDAPConfig", bool]] = []
+    for cfg, is_ldaps in configs_to_try:
+        if (
+            not is_ldaps
+            or getattr(cfg, "disable_self_heal", False)
+            or _config_requests_explicit_cbt(cfg)
+            or not _plain_ldap_can_seal(cfg)
+        ):
+            upgraded.append((cfg, is_ldaps))
+            continue
+        upgraded.append((_dc_cbt.replace(cfg, channel_binding=True), is_ldaps))
+    return upgraded
+
+
+def _ldap_config_would_mint_fresh_tgt(config: "ADscanLDAPConfig") -> bool:
+    """Return True when an authenticated LDAP bind would mint a NEW TGT.
+
+    The badldap Kerberos auth kinds split into two families:
+
+    * ``kerberos-ccache`` (explicit ``ccache_path`` or, as the last-resort
+      slot, ``KRB5CCNAME``) — reuses an EXISTING ticket. No fresh AS-REQ is
+      sent, so the salt is irrelevant and there is nothing to pre-mint.
+    * ``kerberos-password`` / ``kerberos-aes`` / ``kerberos-rc4`` — badldap
+      sends a FRESH AS-REQ and derives the key from the credential. badldap's
+      ``get_TGT`` does NOT issue an ETYPE-INFO2 probe first, so on an AES-only
+      KDC with a NON-DEFAULT salt the AES key is derived with the wrong
+      (default) salt and the AS-REQ fails with ``KDC_ERR_PREAUTH_FAILED``.
+
+    Only the second family needs the salt-aware pre-mint (FIX 1). This mirrors
+    the auth-kind selection in :func:`_build_ldap_connection_url` exactly:
+    ``ccache_path`` wins (slot 1), then ``aes_key`` (slot 2), then NT-hash
+    (slot 3), then plaintext password (slot 4); ``KRB5CCNAME`` is the last
+    resort (slot 5) and is intentionally NOT pre-minted so its legacy
+    "reuse the ambient ticket" behaviour is preserved.
+    """
+    if not config.use_kerberos:
+        return False
+    # Slot 1: explicit ccache already reuses an existing ticket — never mint.
+    if str(config.ccache_path or "").strip():
+        return False
+    # Slots 2/3/4: a fresh-mintable secret is present.
+    if config.aes_key:
+        return True
+    password = str(config.password or "")
+    if password:  # NT hash (kerberos-rc4) or plaintext (kerberos-password)
+        return True
+    # Slot 5 (KRB5CCNAME) or no credential at all — leave as-is.
+    return False
+
+
+async def _premint_kerberos_ccache_for_ldap(
+    config: "ADscanLDAPConfig",
+) -> "ADscanLDAPConfig":
+    """Pre-mint a TGT once and rewrite ``config`` to ``kerberos-ccache``.
+
+    FIX 1 — ladder-bind dedup (the value that remains after the vendor fix):
+    an authenticated LDAPS→LDAP confidentiality ladder rebuilds the bind config
+    for every rung. If each rung carries a fresh-mintable Kerberos secret
+    (``kerberos-password`` / ``kerberos-aes`` / ``kerberos-rc4``), badldap →
+    badauth → kerbad mints a brand-new TGT (a full AS-REQ round-trip) on EVERY
+    rung. This helper mints ONCE up front, into a ccache, and switches the config
+    to ``kerberos-ccache`` so every subsequent rung reuses the cached ticket
+    instead of re-minting — one mint, many rungs.
+
+    Salt-correctness is NO LONGER this helper's job: it is now guaranteed at the
+    kerbad vendor layer. ``kerbad.aioclient.get_TGT`` runs the ETYPE-INFO2 salt
+    probe-first for password creds, so a fresh badldap-driven mint on a
+    non-default-salt KDC (e.g. ping.htb's ``PING.HTBC.Roberts``) already derives
+    the correct AES key without this pre-mint. The pre-mint still routes through
+    :func:`kerberos_transport.get_tgt` (which also probes and emits the posture
+    signal), so the cached ticket is salt-correct on BOTH default-salt (common)
+    and non-default-salt (hardened) domains; the behaviour is unchanged.
+
+    Best-effort: if the pre-mint fails (bad credentials, KDC unreachable, etc.)
+    the ORIGINAL config is returned unchanged so the bind surfaces the real
+    error through the existing path rather than masking it. Genuine credential
+    failures (``KDC_ERR_PREAUTH_FAILED`` from a wrong password) still surface on
+    the subsequent bind attempt.
+
+    Preserves:
+      * ``kerberos-ccache`` binds — :func:`_ldap_config_would_mint_fresh_tgt`
+        returns False for them, so this helper is never called.
+      * NTLM / anonymous / SIMPLE binds — gated on ``use_kerberos`` upstream.
+      * Cross-realm — ``auth_domain`` / ``auth_kdc`` map to the KerberosConfig
+        auth-realm fields so the AS-REQ reaches the correct KDC.
+      * The LDAPS→LDAP confidentiality ladder — every rung is rebuilt from the
+        rewritten (ccache) config by ``dataclasses.replace`` downstream.
+      * Clock-skew recovery — ``get_tgt`` calls ``with_clock_skew`` internally.
+    """
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from adscan_internal.services.kerberos_transport import (
+        KerberosConfig,
+        get_tgt,
+    )
+
+    # The Kerberos realm of the CREDENTIAL (auth domain), and the KDC that
+    # serves it. For single-realm binds auth_domain/auth_kdc are unset and we
+    # fall back to the target domain/DC. For cross-realm binds (ping → pong)
+    # the TGT must be minted against the AUTH KDC.
+    auth_realm = str(config.auth_domain or config.domain or "").strip()
+    auth_kdc_ip = str(config.auth_kdc or config.dc_ip or "").strip()
+    target_kdc_ip = str(config.dc_ip or "").strip()
+
+    password = str(config.password or "")
+    nt_hash = password if (password and _is_nt_hash(password)) else None
+    plaintext = password if (password and not _is_nt_hash(password)) else None
+
+    cross_realm = bool(
+        config.auth_domain
+        and config.auth_domain.strip().casefold()
+        != str(config.domain or "").strip().casefold()
+    )
+
+    try:
+        krb_cfg = KerberosConfig(
+            domain=auth_realm,
+            kdc_ip=auth_kdc_ip or target_kdc_ip,
+            username=str(config.username or "").strip(),
+            password=plaintext,
+            nt_hash=nt_hash,
+            aes_key=config.aes_key,
+            etypes=config.etypes,
+            # use_auth_kdc=True in get_tgt sends the AS-REQ to auth_kdc_ip when
+            # set; for single-realm leave it None so kdc_ip is used for both.
+            auth_kdc_ip=auth_kdc_ip if cross_realm else None,
+            posture_sink=getattr(config, "posture_sink", None),
+            posture_snapshot=getattr(config, "posture_snapshot", None),
+        )
+        print_info_debug(
+            "[ldap_transport] pre-minting salt-correct TGT via kerberos_transport."
+            f"get_tgt for user={mark_sensitive(krb_cfg.username, 'user')} "
+            f"realm={mark_sensitive(auth_realm, 'domain')} "
+            "(LDAP Kerberos bind would otherwise skip the ETYPE-INFO2 salt probe)"
+        )
+        ccache_bytes = await get_tgt(krb_cfg)
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort: do not mask the real error. Fall back to the original
+        # config so the bind surfaces the authentic failure on its own path.
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[ldap_transport] Kerberos TGT pre-mint failed "
+            f"({type(exc).__name__}: {exc}); falling back to the direct "
+            "kerberos-password/aes/rc4 bind path"
+        )
+        return config
+
+    # Persist the minted ccache to a private temp file for badldap.
+    fd, tmp_path = _tempfile.mkstemp(suffix=".ccache", prefix="adscan_ldap_tgt_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(ccache_bytes)
+        _Path(tmp_path).chmod(0o600)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[ldap_transport] failed to persist pre-minted ccache: {exc}; "
+            "falling back to the direct kerberos bind path"
+        )
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+        return config
+
+    import dataclasses as _dc_premint
+
+    # Switch to kerberos-ccache: clear the fresh-mint secrets so the URL
+    # builder selects ``kerberos-ccache`` (slot 1) and reuses our salt-correct
+    # ticket. ccache_path takes priority over KRB5CCNAME in the URL builder.
+    rewritten = _dc_premint.replace(
+        config,
+        ccache_path=tmp_path,
+        password=None,
+        aes_key=None,
+    )
+    print_info_debug(
+        f"[ldap_transport] pre-minted TGT written ({len(ccache_bytes)} B); "
+        "LDAP bind will reuse it as kerberos-ccache (salt-correct)"
+    )
+    return rewritten
+
+
 async def async_connect_with_ldap_fallback(
     config: "ADscanLDAPConfig",
     *,
     connect_timeout: float | None = None,
+    bind_only: bool = False,
 ) -> "LDAPConnectResult":
     """Async LDAP confidentiality ladder for native badldap consumers.
 
@@ -2274,6 +2511,16 @@ async def async_connect_with_ldap_fallback(
             proceeds to plain LDAP:389 instead of hanging. ``None`` (default) preserves
             the legacy unbounded-connect behaviour for authenticated callers that rely
             on the underlying transport's own timeouts.
+        bind_only: When ``True``, stop after the LDAP bind and return the bound
+            client WITHOUT running the post-bind rootDSE discovery
+            (``get_serverinfo`` / ``get_ad_info``). Used by the posture probes
+            (U2 LDAP signing, U3 channel binding) which must read the raw bind
+            result code to classify transport policy: a RestrictAnonymous DC
+            answers the post-bind rootDSE search with ``operationsError
+            (ERROR_NOT_AUTHENTICATED)``, masking the bind-level answer
+            (``strongerAuthRequired`` for signing-required, or bind success for
+            not-required). ``False`` (default) preserves the full discovery for
+            normal callers that need ``serverinfo`` / naming contexts.
 
     Returns:
         :class:`LDAPConnectResult` carrying the live ``MSLDAPClient``
@@ -2288,6 +2535,18 @@ async def async_connect_with_ldap_fallback(
     """
     modules = _load_badldap_modules()
     LDAPConnectionFactory = modules["LDAPConnectionFactory"]
+
+    # ---- FIX 1: salt-aware Kerberos TGT pre-mint ----------------------------
+    # When the bind would mint a FRESH TGT (kerberos-password / -aes / -rc4),
+    # badldap's get_TGT skips the ETYPE-INFO2 salt probe, so on an AES-only KDC
+    # with a non-default salt the AES key is derived wrong and the AS-REQ fails
+    # with KDC_ERR_PREAUTH_FAILED. Pre-mint the TGT via the salt-probing
+    # ``kerberos_transport.get_tgt`` into a ccache FIRST, then bind as
+    # ``kerberos-ccache`` so EVERY rung of the ladder below reuses one
+    # salt-correct ticket. ccache-based and non-Kerberos binds are untouched.
+    if _ldap_config_would_mint_fresh_tgt(config):
+        config = await _premint_kerberos_ccache_for_ldap(config)
+    # ------------------------------------------------------------------------
 
     # ---- Build the confidentiality ladder (per LDAP connection) -------------
     # Order, strongest-confidentiality-first:
@@ -2423,6 +2682,20 @@ async def async_connect_with_ldap_fallback(
     # LDAPS is untouched (TLS already seals). Callers may opt out via
     # ``disable_default_seal`` or by explicitly setting ``sign``.
     configs_to_try = _apply_default_seal_to_plain_ldap(configs_to_try)
+    # ---------------------------------------------------------------------------
+
+    # ---- Send the real CBT on operational authenticated LDAPS binds -----------
+    # Hardened DCs (LdapEnforceChannelBinding=2) reject an authenticated LDAPS
+    # bind that carries no channel binding with SEC_E_BAD_BINDINGS. A correctly
+    # computed ``tls-server-end-point`` CBT is accepted by EVERY Windows DC
+    # whether it enforces CBT or not, so sending it proactively on the FIRST
+    # attempt is always safe and removes the wasted failed round-trip that the
+    # reactive self-heal would otherwise incur. Strictly scoped to LDAPS rungs of
+    # OPERATIONAL authenticated binds -- the CBT posture probe (disable_self_heal
+    # =True) and any caller with explicit channel_binding/null_channel_binding
+    # intent are left untouched so the probe can still MEASURE enforcement. See
+    # :func:`_apply_default_cbt_to_authenticated_ldaps` for the full rule.
+    configs_to_try = _apply_default_cbt_to_authenticated_ldaps(configs_to_try)
     # ---------------------------------------------------------------------------
 
     # Refresh stale Kerberos ticket once before the LDAPS/LDAP attempts.  The
@@ -2580,17 +2853,35 @@ async def async_connect_with_ldap_fallback(
             if hasattr(conn, "_disable_signing"):
                 conn._disable_signing = not cfg.sign
             if hasattr(conn, "_disable_channel_binding"):
-                # StartTLS (RFC 2830) does not enforce channel binding; keep
-                # CBT off for the StartTLS rung so it works against more DCs.
-                conn._disable_channel_binding = (
-                    True if cfg.use_starttls else not cfg.channel_binding
-                )
+                # CBT is driven solely by ``cfg.channel_binding`` so an explicit
+                # CBT requirement (e.g. a SEC_E_BAD_BINDINGS self-heal retry, or
+                # the operational LDAPS default-on set by
+                # ``_apply_default_cbt_to_authenticated_ldaps``) is never silently
+                # dropped. On a StartTLS rung the vendor cb_data computation is
+                # gated on ``protocol == CLIENT_SSL_TCP`` (true LDAPS only), so a
+                # non-LDAPS StartTLS connection never derives a token regardless
+                # of this flag -- meaning we do NOT need to force-disable CBT for
+                # StartTLS here, and doing so would defeat an explicit CBT-required
+                # retry that lands on an LDAPS rung. ``channel_binding`` is left at
+                # its False default for StartTLS/plain rungs (see
+                # ``_apply_default_cbt_to_authenticated_ldaps``, which skips them),
+                # so this stays a no-op there.
+                conn._disable_channel_binding = not cfg.channel_binding
             if hasattr(conn, "_null_channel_binding"):
                 conn._null_channel_binding = cfg.null_channel_binding
             if hasattr(conn, "_use_starttls"):
                 # Tell badldap to upgrade the plain 389 session to TLS via
                 # StartTLS BEFORE bind when this rung requested it.
                 conn._use_starttls = bool(cfg.use_starttls)
+            if bind_only and hasattr(conn, "_bind_only"):
+                # BIND-ONLY mode: stop after the LDAP bind, skip the
+                # post-bind rootDSE discovery. Used by the posture probes so
+                # they read the raw bind result code (strongerAuthRequired vs
+                # success) instead of a downstream rootDSE search that a
+                # RestrictAnonymous DC answers with operationsError
+                # (ERROR_NOT_AUTHENTICATED), which would mask the policy
+                # answer. See vendor/badldap/badldap/client.py bind_only.
+                conn._bind_only = True
 
             if connect_timeout is not None:
                 ok, err = await asyncio.wait_for(

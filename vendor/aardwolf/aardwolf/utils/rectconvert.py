@@ -11,6 +11,8 @@ except ImportError:
 
 from PIL import Image
 
+from aardwolf import logger
+
 bpp_2_bytes = {
 	16: 2,
 	24: 3,
@@ -29,12 +31,12 @@ def rectconvert(width, height, bitsPerPixel, isCompress, data):
 	try:
 		image = librlers.bitmap_decompress(data, width, height, bitsPerPixel, int(isCompress))
 	except Exception as e:
-		print('Error decompressing bitmap data: %s' % e)
-		print('Data: %s' % data)
-		print('Width: %s' % width)
-		print('Height: %s' % height)
-		print('BitsPerPixel: %s' % bitsPerPixel)
-		print('IsCompress: %s' % isCompress)
+		# Do NOT log the raw bitmap `data`: it is decoded RDP screen content.
+		# Log only the non-sensitive geometry so a decode failure is diagnosable.
+		logger.warning(
+		    'Error decompressing RDP bitmap data (%sx%s, %s bpp, compressed=%s): %s'
+		    % (width, height, bitsPerPixel, isCompress, e)
+		)
 		raise
 	return Image.frombytes('RGBA', [width, height], bytes(image))
 

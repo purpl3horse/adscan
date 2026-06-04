@@ -1,5 +1,6 @@
 import ssl
 from asysocks.unicomm.common.packetizers import Packetizer
+from asysocks.unicomm import logger
 
 class PacketizerSSL(Packetizer):
 	def __init__(self, ssl_ctx, packetizer:Packetizer):
@@ -33,7 +34,7 @@ class PacketizerSSL(Packetizer):
 		ctr = 0
 		while True:
 			if self.__deepdebug is True:
-				print('DST start %s' % ctr)
+				logger.debug('DST start %s' % ctr)
 			
 			# setting a maximum number of iterations to avoid infinite loops
 			if ctr > 20:
@@ -44,14 +45,14 @@ class PacketizerSSL(Packetizer):
 				self.tls_obj.do_handshake()
 			except ssl.SSLWantReadError:
 				if self.__deepdebug is True:
-					print('DST want %s' % ctr)
+					logger.debug('DST want %s' % ctr)
 				
 				# again, we need to limit the number of iterations
 				for _ in range(10):
 					client_hello = self.tls_out_buff.read()
 					if client_hello != b'':
 						if self.__deepdebug is True:
-							print('DST client_hello %s' % len(client_hello))
+							logger.debug('DST client_hello %s' % len(client_hello))
 						writer.write(client_hello)
 						await writer.drain()
 					else:
@@ -60,16 +61,16 @@ class PacketizerSSL(Packetizer):
 					raise Exception('Handshake took too many iterations 2')
 				
 				if self.__deepdebug is True:
-					print('DST wating server hello %s' % ctr)
+					logger.debug('DST waiting server hello %s' % ctr)
 				server_hello = await reader.read(self.buffer_size)
 				if server_hello is None or server_hello == b'':
 					raise Exception('Connection closed')
 				if ctr == 1 and server_hello[0] != 0x16:
 					if self.__deepdebug is True:
-						print('Server did not send a valid TLS handshake packet')
+						logger.debug('Server did not send a valid TLS handshake packet')
 					raise Exception('Server did not send a valid TLS handshake packet')
 				if self.__deepdebug is True:
-					print('DST server_hello %s' % len(server_hello))
+					logger.debug('DST server_hello %s' % len(server_hello))
 				self.tls_in_buff.write(server_hello)
 
 				continue
@@ -77,16 +78,16 @@ class PacketizerSSL(Packetizer):
 				raise e
 			else:
 				if self.__deepdebug is True:
-					print('DST handshake ok %s' % ctr)
+					logger.debug('DST handshake ok %s' % ctr)
 				server_fin = self.tls_out_buff.read()
 				if self.__deepdebug is True:
-					print('DST server_fin %s ' %  server_fin)
+					logger.debug('DST server_fin len=%s' % len(server_fin))
 				if server_fin != b'':
 					writer.write(server_fin)
 					await writer.drain()
 				break
 		if self.__deepdebug is True:
-			print('Handshake done')
+			logger.debug('Handshake done')
 
 	async def data_out(self, data:bytes):
 		outdata = b''

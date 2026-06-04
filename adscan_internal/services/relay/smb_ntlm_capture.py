@@ -54,6 +54,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from adscan_core import telemetry
 from adscan_internal.rich_output import print_info_debug
 
 
@@ -227,21 +228,40 @@ class _SPNEGOCaptureAdapter:
         *args: object,
         **kwargs: object,
     ) -> tuple[bytes | None, bool, Exception | None]:
-        self._round += 1
-        if self._observer is not None:
-            # Round 1 carries the NTLM Negotiate token; round 2 is the client
-            # Authenticate. The server emits its Challenge between the two.
-            stage = "negotiate" if self._round == 1 else "authenticate"
-            self._observer.record_stage(self._connection, stage)
-        result, to_continue, err = await self._inner.authenticate_server(
-            token, *args, **kwargs
-        )
-        if self._observer is not None and to_continue and err is None:
-            # We produced a Challenge and are waiting for the Authenticate.
-            self._observer.record_stage(self._connection, "challenge")
-        if not to_continue and err is None:
-            await self._capture_queue.put(self._inner)
-        return result, to_continue, err
+        # Defense in depth: the capture for a *completed* auth has already
+        # landed in the queue by the time the handshake ends, so a parse or
+        # handshake failure on a later/other connection (e.g. a modern client
+        # sending an SMB2 negotiate context aiosmb cannot body-parse, or a
+        # malformed/aborted handshake) must never spam the operator's terminal
+        # with a raw traceback. Catch anything here at the listener boundary,
+        # DEBUG-demote it via print_info_debug + telemetry, and return it to the
+        # relay server as a normal auth error (None, False, err) so the server
+        # cleanly closes that connection and keeps listening.
+        try:
+            self._round += 1
+            if self._observer is not None:
+                # Round 1 carries the NTLM Negotiate token; round 2 is the client
+                # Authenticate. The server emits its Challenge between the two.
+                stage = "negotiate" if self._round == 1 else "authenticate"
+                self._observer.record_stage(self._connection, stage)
+            result, to_continue, err = await self._inner.authenticate_server(
+                token, *args, **kwargs
+            )
+            if self._observer is not None and to_continue and err is None:
+                # We produced a Challenge and are waiting for the Authenticate.
+                self._observer.record_stage(self._connection, "challenge")
+            if not to_continue and err is None:
+                await self._capture_queue.put(self._inner)
+            return result, to_continue, err
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a single bad connection must not crash the listener
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[smb-ntlm-capture] handshake/parse error on inbound "
+                f"connection (ignored, listener continues): {exc}"
+            )
+            return None, False, exc
 
     async def authenticate_relay_server_finished(self) -> tuple[bytes, None]:
         return await self._inner.authenticate_server_finished()

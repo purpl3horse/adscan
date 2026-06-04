@@ -43,7 +43,7 @@ class UniServer:
 		try:
 			import netifaces
 		except:
-			print('netifaces not found! Install it with "pip install netifaces"	')
+			logger.warning('netifaces not found! Install it with "pip install netifaces"')
 			return []
 		
 		interfaces = []
@@ -65,7 +65,7 @@ class UniServer:
 		try:
 			import netifaces
 		except:
-			print('netifaces not found! Install it with "pip install netifaces"	')
+			logger.warning('netifaces not found! Install it with "pip install netifaces"')
 			return []
 		
 		ips = []

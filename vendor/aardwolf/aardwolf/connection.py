@@ -1040,11 +1040,10 @@ class RDPConnection:
 								else:
 									mac = self.cryptolayer.calc_mac(data)
 								if mac != sec_hdr.dataSignature:
-									print('ERROR! Signature mismatch! Printing debug data')
-									print('Encrypted data: %s' % orig_data)
-									print('Decrypted data: %s' % data)
-									print('Original MAC  : %s' % sec_hdr.dataSignature)
-									print('Calculated MAC: %s' % mac)
+									# Do NOT log the decrypted/encrypted payload or the MAC bytes: they
+									# carry RDP session content (screen/clipboard/keystroke data) and
+									# would leak to stdout/telemetry. Emit a payload-free marker only.
+									logger.debug('RDP slow-path security signature mismatch (payload withheld)')
 					await self.__channel_id_lookup[x[1]['channelId']].process_channel_data(data)
 				else:
 					#print('fastpath data in -> %s' % len(response))
@@ -1056,12 +1055,9 @@ class RDPConnection:
 						else:
 							mac = self.cryptolayer.calc_mac(data)
 						if mac != fpdu.dataSignature:
-							print('ERROR! Signature mismatch! Printing debug data')
-							print('FASTPATH_SEC  : %s' % fpdu)
-							print('Encrypted data: %s' % fpdu.fpOutputUpdates[:100])
-							print('Decrypted data: %s' % data[:100])
-							print('Original MAC  : %s' % fpdu.dataSignature)
-							print('Calculated MAC: %s' % mac)
+							# Same as the slow path: never log the fastpath payload or MAC bytes
+							# (RDP session content). Emit a payload-free marker, then raise.
+							logger.debug('RDP fastpath security signature mismatch (payload withheld)')
 							raise Exception('Signature mismatch')
 						fpdu.fpOutputUpdates = TS_FP_UPDATE.from_bytes(data)
 					await self.__process_fastpath(fpdu)
@@ -1085,7 +1081,7 @@ class RDPConnection:
 		
 		try:
 			if fpdu.fpOutputUpdates.fragmentation != FASTPATH_FRAGMENT.SINGLE:
-				print('WARNING! FRAGMENTATION IS NOT IMPLEMENTED! %s' % fpdu.fpOutputUpdates.fragmentation)
+				logger.warning('RDP fastpath fragmentation is not implemented (fragment dropped)')
 			if fpdu.fpOutputUpdates.updateCode == FASTPATH_UPDATETYPE.BITMAP:
 				for bitmapdata in fpdu.fpOutputUpdates.update.rectangles:
 					self.desktop_buffer_has_data = True

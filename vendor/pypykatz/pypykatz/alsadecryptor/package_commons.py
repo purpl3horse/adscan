@@ -98,7 +98,7 @@ class PackageDecryptor:
 			await self.reader.move(ptr)
 			data = await self.reader.peek(datasize)
 			await self.reader.move(pos)
-			self.log('%s: %s\n%s' % (name, hex(ptr), hexdump(data, start = ptr)))
+			self.log('%s: %s (struct located)' % (name, hex(ptr)))
 		except Exception as e:
 			self.log('%s: Logging failed for position %s' % (name, hex(ptr)))
 		

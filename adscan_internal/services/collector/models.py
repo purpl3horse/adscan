@@ -237,12 +237,47 @@ class CollectionResult:
         self.fsp_placeholders[sid.upper()] = foreign_domain.lower()
 
 
+def _node_enabled_flag(node: CollectorNode) -> bool | None:
+    """Resolve a node's enabled state during collection (fail-open friendly).
+
+    ``enabled`` lives on the dataclass field at collection time and is only
+    copied into ``properties`` at persistence (``to_graph_payload``). Read the
+    field first, then fall back to the property so the predicate works on both
+    live ``CollectorNode`` objects and persisted graph payloads. ``None`` means
+    the flag is unknown.
+    """
+    flag = node.enabled
+    if flag is None:
+        flag = node.properties.get("enabled")
+    if flag is None:
+        return None
+    return bool(flag)
+
+
+def is_disabled_computer_account(node: CollectorNode) -> bool:
+    """Return True only when a Computer node is explicitly disabled.
+
+    Fail-open: a missing/unknown ``enabled`` flag is NOT treated as disabled.
+    Used by host-collection telemetry to count hosts skipped specifically for
+    being disabled (vs gMSA / non-SMB reasons).
+    """
+    if node.kind != "Computer":
+        return False
+    return _node_enabled_flag(node) is False
+
+
 def is_collectable_computer_host(node: CollectorNode) -> bool:
-    """Return True when a Computer node represents a real network host.
+    """Return True when a Computer node represents a real, reachable host.
 
     Some AD principals are computer-like accounts but not SMB endpoints. gMSAs
     commonly carry a trailing ``$`` and computer-like schema ancestry, but they
     should not be resolved, probed, or used as targets for host-local edges.
+
+    Disabled computer accounts cannot authenticate, so they are excluded from
+    SMB collection / DNS resolution (Phase 2) while remaining present in the
+    attack graph as LDAP principals. The enabled check is fail-open: an unknown
+    ``enabled`` flag keeps the host collectable so we never silently drop hosts
+    when the flag was not populated.
     """
     if node.kind != "Computer":
         return False
@@ -250,4 +285,6 @@ def is_collectable_computer_host(node: CollectorNode) -> bool:
         return False
     if node.properties.get("is_gmsa") is True:
         return False
-    return str(node.properties.get("account_type") or "").casefold() != "gmsa"
+    if str(node.properties.get("account_type") or "").casefold() == "gmsa":
+        return False
+    return _node_enabled_flag(node) is not False

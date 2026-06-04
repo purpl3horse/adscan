@@ -39,6 +39,9 @@ from adscan_internal.services.enumeration.network import is_computer_dc_for_doma
 from adscan_internal.services.network_preflight_service import (
     assess_target_reachability,
 )
+from adscan_internal.services.dns_discovery_service import (
+    normalize_ipv4_candidates,
+)
 from adscan_internal.services.dns_resolver_service import build_root_forwarders
 from rich.prompt import Prompt, Confirm
 from rich.text import Text
@@ -127,7 +130,7 @@ class DNSShell(Protocol):
     def do_update_resolv_conf(self, args: str) -> bool:  # noqa: ANN201
         ...
 
-    def add_to_hosts(self, domain: str) -> bool:  # noqa: ANN201
+    def add_to_hosts(self, domain: str, dns_a_records: list[str] | None = None) -> bool:  # noqa: ANN201
         ...
 
 
@@ -1133,22 +1136,6 @@ def _validate_dns_with_resolver(
         return False, "validation_error"
 
 
-def _normalize_ipv4_candidates(candidates: list[str | None]) -> list[str]:
-    """Normalize, deduplicate and validate IPv4 candidates."""
-    normalized: list[str] = []
-    for candidate in candidates:
-        value = str(candidate or "").strip()
-        if not value:
-            continue
-        try:
-            ipaddress.ip_address(value)
-        except ValueError:
-            continue
-        if value not in normalized:
-            normalized.append(value)
-    return normalized
-
-
 def _select_reachable_dc_resolver(
     shell: Any,
     *,
@@ -1169,7 +1156,7 @@ def _select_reachable_dc_resolver(
     for dc_ip in dc_ips:
         source_by_ip.setdefault(dc_ip, "dc_srv")
 
-    ordered_candidates = _normalize_ipv4_candidates(
+    ordered_candidates = normalize_ipv4_candidates(
         [discovered_pdc_ip, provided_ip, *(dc_ips or [])]
     )
     assessments: list[DcResolverCandidateAssessment] = []
@@ -1386,7 +1373,13 @@ def preflight_domain_pdc_noninteractive(
         domain=domain,
         provided_ip=candidate_ip,
     )
-    if selection.selected_ip and selection.selected_ip != candidate_ip:
+    # §3.3 resolver-vs-DC consistency: _select_reachable_dc_resolver picks the
+    # best DNS *resolver* (port 53), but find_pdc_with_selection /
+    # discover_domain_controllers now choose the persisted *DC/KDC* IP via a
+    # reachability-aware LDAP/Kerberos probe (389/88). Prefer that reachable DC
+    # IP for the realm's pdc; the port-53 resolver pick only drives the resolver.
+    persisted_dc_ip = selection.discovered_pdc_ip or selection.selected_ip
+    if persisted_dc_ip and persisted_dc_ip != candidate_ip:
         telemetry.capture(
             "pdc_preflight_auto_switched",
             properties={
@@ -1396,11 +1389,11 @@ def preflight_domain_pdc_noninteractive(
         )
         print_info_verbose(
             f"[pdc_preflight_noninteractive] Switching DC target for {marked_domain}: "
-            f"{marked_candidate} -> {mark_sensitive(selection.selected_ip, 'ip')}"
+            f"{marked_candidate} -> {mark_sensitive(persisted_dc_ip, 'ip')}"
         )
-        return PdcPreflightResult(action="use", domain=domain, pdc_ip=selection.selected_ip)
+        return PdcPreflightResult(action="use", domain=domain, pdc_ip=persisted_dc_ip)
 
-    if selection.selected_ip is None:
+    if selection.selected_ip is None and selection.discovered_pdc_ip is None:
         print_warning(
             "No reachable SRV-discovered DC/PDC resolver was found. "
             "Keeping the provided DC target."
@@ -2348,8 +2341,21 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
         domain=domain,
         provided_ip=ip,
     )
-    pdc_ip = selection.selected_ip
-    if not pdc_ip:
+    # §3.3 resolver-vs-DC consistency: ``selection.selected_ip`` is the best
+    # DNS *resolver* (port 53) winner, while ``selection.discovered_pdc_ip`` is
+    # the reachability-aware DC/KDC IP from the LDAP/Kerberos (389/88) probe in
+    # find_pdc_with_selection. The Unbound conditional forwarder must use the
+    # port-53 resolver winner, but the value persisted as the realm PDC
+    # (``shell.pdc`` + hostname lookup) must prefer the reachable DC/KDC IP so a
+    # multi-homed DC whose port-53 address differs from its LDAP/Kerberos
+    # address does not strand downstream transport configs. This mirrors
+    # ``preflight_domain_pdc_noninteractive`` exactly.
+    resolver_ip = selection.selected_ip
+    persisted_dc_ip = selection.discovered_pdc_ip or selection.selected_ip
+    # Forwarder falls back to the reachable DC IP when no port-53 resolver was
+    # selected but a reachable PDC was discovered — never strand the operator.
+    pdc_ip = resolver_ip or persisted_dc_ip
+    if not pdc_ip and not persisted_dc_ip:
         _render_dc_resolver_failure_panel(
             domain=domain,
             provided_ip=ip,
@@ -2360,14 +2366,14 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
             f"{marked_domain}."
         )
         return False
-    if pdc_ip != ip:
+    if pdc_ip and pdc_ip != ip:
         print_warning(
             "Provided DC/DNS IP was replaced by a reachable SRV-discovered resolver "
             f"for {marked_domain}: {mark_sensitive(pdc_ip, 'ip')}."
         )
     try:
-        setattr(shell, "pdc", pdc_ip)
-        hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
+        setattr(shell, "pdc", persisted_dc_ip)
+        hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=persisted_dc_ip)
         if hostname:
             setattr(shell, "pdc_hostname", hostname)
         # Persist the DNS-discovered FQDN/short hostname to the per-domain

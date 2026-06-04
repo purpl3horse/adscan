@@ -84,7 +84,6 @@ class LSASecretService(LSASecret):
 			self.service = self.key_name
 			self.username = 'UNKNOWN'
 			if self.system_hive is not None:
-				print(self.key_name[4:])
 				self.username = self.system_hive.get_service_user(self.key_name[4:])
 
 	def __str__(self):

@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
+from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.domain_posture import (
     ConstraintCategory,
     DomainPosture,
@@ -176,7 +177,75 @@ ProbeProgressCallback = Callable[[ConstraintCategory, Optional[ProbeResult]], No
 #                    which changes downstream interpretation (new
 #                    ``LDAP_STARTTLS_AVAILABLE`` category). Bumped so any
 #                    workspace written by v1 re-probes on first contact.
-_PROBE_SCHEMA_VERSION: int = 2
+#   v3 (2026-05-31): U2 (LDAP signing) and U3 (channel binding) rewritten
+#                    to BIND-ONLY classification. The old technique ran a
+#                    post-bind rootDSE search whose ``operationsError
+#                    (ERROR_NOT_AUTHENTICATED)`` on RestrictAnonymous DCs
+#                    (e.g. VulnLab Breach) masked the policy answer ->
+#                    ``unknown`` -> PROBE_FAILED. v3 reads the raw BIND
+#                    result instead (bind success = policy NOT required;
+#                    strongerAuthRequired / SEC_E_BAD_BINDINGS = REQUIRED),
+#                    uses a non-degrading random bogus principal, and adds
+#                    an authenticated unsigned-bind tiebreaker (A5) when
+#                    real creds are available and U2 stayed UNKNOWN. The
+#                    classification rules changed, so bump to re-probe.
+#   v4 (2026-06-02): probe_auth restructured to AUTH-first -> barrier ->
+#                    SERVICE-after, with two classification changes that
+#                    invalidate v3 caches for NTLM + SMB signing:
+#                    * A3 (NTLM_AUTHENTICATION): the NTLM-disabled signature
+#                      set was widened beyond SEC_E_LOGON_DENIED to also map
+#                      SEC_E_UNSUPPORTED_FUNCTION / 0x80090302 /
+#                      STATUS_NOT_SUPPORTED / STATUS_NTLM_BLOCKED to
+#                      DISABLED HIGH, with a new signal code
+#                      NTLM_REFUSED_UNSUPPORTED_FUNCTION.
+#                    * A4 (SMB_SIGNING): technique changed from a
+#                      post-session-setup signing read to a pre-auth NEGOTIATE
+#                      read; an observed NEGOTIATE that does not require signing
+#                      is now a HIGH "not required" verdict
+#                      (SMB_SIGNING_NEGOTIATED_NOT_REQUIRED), upgrading the old
+#                      inconclusive SMB_SIGNING_NOT_NEGOTIATED UNKNOWN/LOW.
+#                    Both change downstream interpretation, so bump to re-probe.
+#   v5 (2026-06-02): CBT (LDAP_CHANNEL_BINDING) detection made auth-method-aware
+#                    to fix a false "not enforced" on NTLM-DISABLED DCs:
+#                    * U3 (NTLM-based CBT probe) now detects the NTLM-disabled
+#                      SSP-collapse signature (SEC_E_UNSUPPORTED_FUNCTION /
+#                      0x80090302 / STATUS_NOT_SUPPORTED / STATUS_NTLM_BLOCKED,
+#                      and SEC_E_LOGON_DENIED+invalidCredentials) at BOTH bind
+#                      steps and returns UNKNOWN/LOW/no-emit
+#                      (NTLM_UNAVAILABLE_CANNOT_MEASURE) instead of falling
+#                      through to a HIGH "not enforced" verdict it could not
+#                      actually observe.
+#                    * New A6 Kerberos-path CBT probe measures channel-binding
+#                      enforcement over the operational Kerberos LDAPS bind
+#                      (no-CBT 16-zero token via disable_self_heal=True), gated
+#                      to run only when A3 found NTLM disabled. New signal codes
+#                      LDAP_CBT_REJECTED_BAD_BINDINGS_KERBEROS (REQUIRED) and
+#                      LDAP_CBT_NOT_ENFORCED_KERBEROS (DISABLED), authoritative
+#                      over U3 when NTLM is unavailable.
+#                    Classification rules changed for LDAP_CHANNEL_BINDING, so
+#                    bump to re-probe stale caches.
+#   v6 (2026-06-02): LDAP signing (LDAP_SIGNING) detection made auth-method-aware
+#                    to fix a false "signing not required" on NTLM-DISABLED DCs
+#                    (mirrors the v5 CBT fix):
+#                    * U2 (NTLM bogus-cred signing probe) now detects the
+#                      NTLM-disabled SSP-collapse signature
+#                      (SEC_E_UNSUPPORTED_FUNCTION / 0x80090302 /
+#                      STATUS_NOT_SUPPORTED / STATUS_NTLM_BLOCKED, and
+#                      SEC_E_LOGON_DENIED+invalidCredentials) BEFORE
+#                      classification and returns UNKNOWN/LOW/no-emit
+#                      (NTLM_UNAVAILABLE_CANNOT_MEASURE) instead of mis-reading
+#                      the SSP refusal as a "logon_failure -> signing not
+#                      required" HIGH verdict. This stops U2 from pre-empting A5.
+#                    * A5 (authenticated signing tiebreaker) is now
+#                      NTLM-disabled-aware: when A3 found NTLM disabled it binds
+#                      over KERBEROS (password/aes_key/ccache) on plain LDAP/389
+#                      with the same unsigned (sign=False + disable_self_heal)
+#                      measurement, so it can actually measure signing on a DC
+#                      where the NTLM bind would collapse. Skips when only an IP
+#                      is available (Kerberos needs an FQDN for the ldap/ SPN).
+#                    Classification rules changed for LDAP_SIGNING, so bump to
+#                    re-probe stale caches.
+_PROBE_SCHEMA_VERSION: int = 6
 
 
 # --------------------------------------------------------------------------- #
@@ -896,32 +965,75 @@ async def _probe_ldap_starttls_available(
 
 
 # --------------------------------------------------------------------------- #
-# Bogus-credential constants
+# Bogus-credential constants — BIND-ONLY transport-policy probing
 #
-# U2 (signing) and U3 (CBT) borrow NetExec's elegant insight: the DC
-# evaluates **transport-policy** (signing requirement, CBT requirement)
-# **before** it validates the supplied credential. So if we send a bind
-# with deliberately invalid credentials, the DC's response code tells us
-# which policy is in force:
+# U2 (signing) and U3 (CBT) ask the DC which **transport policy** is in force
+# by attempting an LDAP BIND with bogus credentials over an unsigned / no-CBT
+# channel, and reading the **bind result code** directly. Crucially the probe
+# runs in BIND-ONLY mode (``bind_only=True`` in
+# ``async_connect_with_ldap_fallback``): it stops after the bind and never
+# issues the post-bind rootDSE search. The bind result tells us the policy:
 #
-#   * If the policy is REQUIRED, the bind fails on the policy check
-#     with a transport-specific code (``strongerAuthRequired`` for
-#     signing; ``SEC_E_BAD_BINDINGS`` for CBT) — the DC never gets to
-#     evaluate the bad credential.
-#   * If the policy is NOT required, the DC evaluates the credential
-#     and rejects it with ``STATUS_LOGON_FAILURE`` (LDAP "data 52e").
+#   * Policy REQUIRED -> the bind fails on the policy check with a
+#     transport-specific code (``strongerAuthRequired`` for signing;
+#     ``SEC_E_BAD_BINDINGS`` for CBT). The DC short-circuits BEFORE the
+#     credential check, so the bogus credential never matters.
+#   * Policy NOT required -> the unsigned / no-CBT bind is ACCEPTED at the
+#     bind layer. (Against AD, an NTLM SICILY LDAP bind returns bind-level
+#     ``success`` even for a non-existent principal — the credential is only
+#     fully evaluated when a subsequent operation needs the security context.
+#     So "bind accepted" is the definitive NOT-required signal here, observed
+#     empirically against VulnLab Breach where ``nxc ldap`` reports
+#     ``signing:None``.)
 #
-# Either way the policy answer is HIGH confidence. No real credential
-# is needed in either ``start_unauth`` or ``start_auth`` flows — these
-# transport-policy questions belong in the unauth phase, full stop.
+# Why BIND-ONLY and not the old post-bind-search technique: the previous
+# design let badldap's ``client.connect()`` run ``get_serverinfo`` (a rootDSE
+# SEARCH) after the bind. On a RestrictAnonymous DC that search returns
+# ``operationsError (ERROR_NOT_AUTHENTICATED)`` — a SEARCH-level error that
+# has nothing to do with the bind policy — and the classifier could only
+# read ``unknown`` -> ``PROBE_FAILED``. Reading the bind result directly is
+# the robust fix.
 #
-# OPSEC note: the bogus bind generates a ``4625`` audit event on the
-# DC. NetExec produces the same event with every ``nxc ldap`` invocation,
-# so this is industry-norm noise for an authorised engagement. Operators
-# who need a quieter probe can opt out via ``ADSCAN_NO_POSTURE_PROBE=1``.
+# Why a non-degrading bogus principal (NOT an anonymous bind): an anonymous
+# LDAP bind can SUCCEED even when signing is enforced for AUTHENTICATED
+# principals (the "LDAP server signing requirements" GPO may apply only to
+# authenticated / SASL binds). NetExec's anonymous technique only POSITIVELY
+# confirms enforced (``strongerAuthRequired``) and DEFAULTS every other
+# outcome to "not enforced" -> false-negative risk. We deliberately do NOT
+# copy that. We force a genuine AUTHENTICATED NTLM bind by using a RANDOM,
+# almost-certainly-non-existent sAMAccountName per call (so it can never
+# accidentally match a real account and lock it out) with a bogus password.
+# A blank ``" "`` user is avoided because some stacks degrade it toward an
+# anonymous bind, which would re-introduce the false-negative.
+#
+# Layered design — authenticated tiebreaker (A5): when the unauth bogus-cred
+# probe returns UNKNOWN (e.g. a transient failure we could not classify) AND
+# valid domain credentials are available (``start_auth`` phase), an OPTIONAL
+# authenticated check runs an unsigned bind with the REAL credential. A
+# successful unsigned authenticated bind is the most definitive possible
+# "signing NOT required" signal. The unauth bogus-cred probe stays the
+# PRIMARY path (works with no creds); A5 is a tiebreaker layer, not a
+# replacement. See ``_probe_ldap_signing_authenticated``.
+#
+# OPSEC note: each bogus bind generates a ``4625`` audit event on the DC.
+# NetExec produces the same event with every ``nxc ldap`` invocation, so this
+# is industry-norm noise for an authorised engagement. Operators who need a
+# quieter probe can opt out via ``ADSCAN_NO_POSTURE_PROBE=1``.
 # --------------------------------------------------------------------------- #
-_BOGUS_CRED_USER = " "
-_BOGUS_CRED_PASSWORD = " "
+_BOGUS_CRED_PASSWORD = "Bogus!Probe#Pw0"  # noqa: S105 — intentionally rejected
+
+
+def _make_bogus_probe_user() -> str:
+    """Return a random, almost-certainly-non-existent sAMAccountName.
+
+    Used by the bogus-credential transport-policy probes (U2 signing, U3 CBT)
+    to force a GENUINE authenticated NTLM bind that the DC will not accept as
+    anonymous. The nonce varies per call so it can never accidentally match a
+    real account (and therefore never risks a lockout on a real principal).
+    """
+    import secrets
+
+    return f"adscan-probe-{secrets.token_hex(4)}"
 
 # DC response signatures. Sourced from:
 #   * ``vendor/badldap/badldap/protocol/messages.py`` (LDAP result codes)
@@ -985,6 +1097,48 @@ def _classify_ldap_policy_response(exc: BaseException) -> str:
     return "unknown"
 
 
+def _ntlm_bind_unavailable_in_chain(exc: BaseException) -> bool:
+    """Return whether a bogus-cred NTLM bind failed because NTLM is disabled.
+
+    On an NTLM-DISABLED DC (``LmCompatibilityLevel`` / ``RestrictNTLM`` GPO),
+    the NTLM SSP collapses BEFORE the DC ever reaches the credential check --
+    so the failure tells us nothing about the LDAP transport policy (signing,
+    channel binding) we were trying to measure with that bind. The signatures
+    below mirror the function-local ``_NTLM_REFUSED_PLAIN_BIND_MARKERS`` set in
+    :func:`_probe_ntlm_authentication` (A3).
+
+    Critically, ``invalidcredentials`` alone is NOT enough: a healthy DC that
+    merely rejected the BOGUS credential also surfaces ``invalidCredentials``
+    (``STATUS_LOGON_FAILURE`` / data 52e) -- that is the GOOD path that proves
+    the transport policy passed. We only treat the bind as "NTLM unavailable"
+    when one of the NTLM-SSP-collapse markers is present (optionally alongside
+    ``sec_e_logon_denied``, which on these DCs accompanies the SSP refusal).
+
+    This is the U3-context analogue of A3's classifier and is deliberately a
+    distinct, local predicate (not a shared module constant): the same markers
+    mean "seal could not negotiate -> cleartext downgrade" in
+    ``ldap_transport_service._is_seal_negotiation_failure`` where sealing was
+    requested, so they must never be unified into one classifier.
+    """
+    text = _chain_text(exc)
+    ntlm_ssp_collapse_markers = (
+        "sec_e_unsupported_function",
+        "0x80090302",
+        "80090302",
+        "status_not_supported",
+        "status_ntlm_blocked",
+    )
+    if any(m in text for m in ntlm_ssp_collapse_markers):
+        return True
+    # SEC_E_LOGON_DENIED with invalidCredentials but NO data-52e / logon_failure
+    # text is the cross-realm "NTLM rejected outright" signature A3 maps to
+    # DISABLED -- in U3's bogus-cred context it likewise means the bind never
+    # reached transport-policy validation.
+    if "sec_e_logon_denied" in text and "invalidcredentials" in text:
+        return True
+    return False
+
+
 async def _probe_ldap_signing(
     *,
     domain: str,
@@ -992,30 +1146,40 @@ async def _probe_ldap_signing(
     sink: PostureSink,
     timeout: float,
 ) -> ProbeResult:
-    """Probe U2 — LDAP signing enforcement via a bogus-cred NTLM bind.
+    """Probe U2 — LDAP signing enforcement via a BIND-ONLY bogus-cred bind.
 
-    Sends an NTLM LDAP bind on port 389 with deliberately invalid
-    credentials (``user=" "``, ``password=" "``) and ``sign=False``. The
-    DC validates signing policy **before** credentials, so:
+    Opens an NTLM LDAP bind on port 389 with a random non-existent
+    sAMAccountName, a bogus password, ``sign=False``, and ``bind_only=True``
+    (stop after the bind; never run the post-bind rootDSE search). The DC
+    validates signing policy at the BIND, so the bind result is conclusive:
 
-      * Signing REQUIRED → ``strongerAuthRequired`` (LDAP result code 8 /
-        ``ERROR_DS_STRONG_AUTH_REQUIRED`` = 0x00002028) — HIGH confidence.
-      * Signing NOT REQUIRED → ``STATUS_LOGON_FAILURE`` (NTLM data 52e /
-        ``0xC000006D``) because the DC accepted the unsigned bind and
-        then rejected the bogus credential — HIGH confidence.
+      * Bind ACCEPTED (no exception) -> the DC permitted an UNSIGNED
+        authenticated bind -> signing NOT required. ``DISABLED`` HIGH, emit.
+        (An NTLM SICILY LDAP bind against AD returns bind-level ``success``
+        even for a non-existent principal; "bind accepted" is therefore the
+        definitive not-required signal. Matches ``nxc ldap signing:None``.)
+      * ``strongerAuthRequired`` (LDAP result code 8 /
+        ``ERROR_DS_STRONG_AUTH_REQUIRED`` = 0x00002028) -> signing REQUIRED.
+        ``REQUIRED`` HIGH, emit.
+      * Any other outcome (timeout, transport failure, an
+        ``operationsError`` that escaped bind-only, an unclassifiable
+        exception) -> ``UNKNOWN`` LOW, **no emit**. Per the cache-only-
+        observations policy (CLAUDE.md Invariant 2), an inferred-by-absence
+        result must never persist; the next caller re-probes.
 
-    Either response is conclusive. No anonymous-bind inconclusive path
-    exists in this design.
+    Why bind-only: the previous post-bind rootDSE search returned
+    ``operationsError (ERROR_NOT_AUTHENTICATED)`` on RestrictAnonymous DCs
+    (e.g. VulnLab Breach), masking the bind answer -> ``unknown``. Reading
+    the bind result directly is the robust fix.
 
-    Why bogus creds instead of an anonymous bind: an anonymous LDAP bind
-    on port 389 may succeed (DC accepts it) **even when signing is
-    enforced for authenticated principals**, because the GPO can be
-    configured to apply only to authenticated binds. The bogus-cred NTLM
-    bind always exercises the authenticated path, so the policy answer
-    is unambiguous.
+    Why a random non-existent principal and not an anonymous bind: an
+    anonymous bind can succeed even when signing is enforced for
+    authenticated principals — false-negative risk. See the
+    ``_BOGUS_CRED_PASSWORD`` block comment for the full rationale, the
+    NetExec anonymous-technique critique, and the layered design.
 
-    Operational note: emits a ``4625`` audit event on the DC. See
-    ``_BOGUS_CRED_USER`` block comment for OPSEC discussion.
+    Operational note: emits a ``4625`` audit event on the DC. See the
+    bogus-credential block comment for OPSEC discussion.
     """
     from adscan_internal.services.ldap_transport_service import (
         ADscanLDAPConfig,
@@ -1029,7 +1193,7 @@ async def _probe_ldap_signing(
         dc_ip=dc_ip,
         use_ldaps=False,
         use_kerberos=False,
-        username=_BOGUS_CRED_USER,
+        username=_make_bogus_probe_user(),
         password=_BOGUS_CRED_PASSWORD,
         # Explicit OFF — the probe's purpose is to ask the DC whether it
         # enforces signing. A planner that already learned signing=REQUIRED
@@ -1043,17 +1207,16 @@ async def _probe_ldap_signing(
     )
 
     print_info_debug(
-        f"[posture_probe] U2 signing opening LDAP/389 bogus-cred bind to {dc_ip}:389 "
-        f"(timeout={timeout}s, sign=False, disable_self_heal=True)"
+        f"[posture_probe] U2 signing opening LDAP/389 bind-only bogus-cred bind to {dc_ip}:389 "
+        f"(timeout={timeout}s, sign=False, bind_only=True, disable_self_heal=True)"
     )
     try:
         conn, _ = await asyncio.wait_for(
-            async_connect_with_ldap_fallback(cfg), timeout=timeout
+            async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
         )
-        # The bogus credential SHOULD have been rejected — if we got a
-        # bound connection something is off (perhaps a DC that accepts
-        # any credential? extremely unusual). Treat as unknown rather
-        # than guessing.
+        # Bind ACCEPTED over an unsigned channel -> signing NOT required.
+        # This is the definitive not-required signal (bind-only never ran a
+        # post-bind search, so no RestrictAnonymous operationsError to mask it).
         try:
             disc = getattr(conn, "disconnect", None)
             if disc is not None:
@@ -1062,14 +1225,28 @@ async def _probe_ldap_signing(
                     await res
         except Exception as disc_exc:  # noqa: BLE001
             telemetry.capture_exception(disc_exc)
+        print_info_debug(
+            f"[posture_probe] U2 signing -> bind accepted (not required) on {dc_ip}:389 "
+            f"in {_now_ms() - started:.0f}ms"
+        )
+        _emit(
+            sink,
+            domain=domain,
+            category=cat,
+            state=TriState.DISABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_BIND_NO_SIGN_OK",
+            message="Unsigned LDAP bind accepted at the bind layer — signing not required",
+            protocol="ldap",
+        )
         return ProbeResult(
             category=cat,
-            state=TriState.UNKNOWN,
-            confidence=SignalConfidence.LOW,
-            signal_code="LDAP_BOGUS_CRED_BIND_UNEXPECTEDLY_OK",
-            message="Bogus-credential bind unexpectedly succeeded — DC config is unusual",
+            state=TriState.DISABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_BIND_NO_SIGN_OK",
+            message="Unsigned LDAP bind accepted at the bind layer — signing not required",
             duration_ms=_now_ms() - started,
-            succeeded=False,
+            succeeded=True,
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
@@ -1093,9 +1270,43 @@ async def _probe_ldap_signing(
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        # NTLM-disabled DC: the bogus-cred NTLM bind collapses in the SSP
+        # BEFORE the DC validates LDAP signing, so U2 cannot measure signing
+        # enforcement this way. Observe-don't-infer: return UNKNOWN/LOW with NO
+        # emit (never the false "signing not required" verdict). Critically,
+        # this must be checked BEFORE _classify_ldap_policy_response, because an
+        # NTLM-SSP collapse can surface ``invalidCredentials`` alongside the
+        # ``sec_e_unsupported_function`` marker -- and a bare ``invalidcredentials``
+        # would otherwise be (correctly, for the NTLM-available case) read as the
+        # GOOD ``logon_failure`` "reached credential check -> signing not required"
+        # path. ``_ntlm_bind_unavailable_in_chain`` only fires on the SSP-collapse
+        # markers (or sec_e_logon_denied + invalidCredentials), so a genuine data
+        # 52e on an NTLM-enabled DC still flows to the not-required branch below.
+        # Deferring here (no HIGH verdict) is what lets the authenticated A5
+        # tiebreaker actually run instead of being short-circuited by a false U2
+        # resolution. The Kerberos-capable A5 probe is the authoritative
+        # measurement in this case (mirrors U3 -> A6 for channel binding).
+        if _ntlm_bind_unavailable_in_chain(exc):
+            print_info_debug(
+                "[posture_probe] U2 signing -> NTLM unavailable on "
+                f"{dc_ip}:389; cannot measure LDAP signing via NTLM (deferring to "
+                "the authenticated A5 tiebreaker). No verdict emitted."
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.UNKNOWN,
+                confidence=SignalConfidence.LOW,
+                signal_code="NTLM_UNAVAILABLE_CANNOT_MEASURE",
+                message=(
+                    "NTLM bind unavailable on DC; LDAP signing not measurable via "
+                    "NTLM (authenticated A5 tiebreaker is authoritative)"
+                ),
+                duration_ms=_now_ms() - started,
+                succeeded=False,
+            )
         verdict = _classify_ldap_policy_response(exc)
         print_info_debug(
-            f"[posture_probe] U2 signing -> {verdict} on {dc_ip}:389 "
+            f"[posture_probe] U2 signing -> {verdict} (exception) on {dc_ip}:389 "
             f"in {_now_ms() - started:.0f}ms"
         )
         if verdict == "signing_required":
@@ -1119,6 +1330,10 @@ async def _probe_ldap_signing(
                 succeeded=True,
             )
         if verdict == "logon_failure":
+            # Some DCs reject the bogus credential at the bind layer with
+            # ``data 52e`` instead of accepting the bind. That still proves
+            # the DC PERMITTED the unsigned bind (it reached credential
+            # validation) -> signing NOT required. HIGH, emit.
             _emit(
                 sink,
                 domain=domain,
@@ -1127,7 +1342,7 @@ async def _probe_ldap_signing(
                 confidence=SignalConfidence.HIGH,
                 signal_code="LDAP_BIND_NO_SIGN_OK",
                 message=(
-                    "Unsigned LDAP bind accepted (credential rejected at credential check) — "
+                    "Unsigned LDAP bind reached credential validation (data 52e) — "
                     "signing not required"
                 ),
                 protocol="ldap",
@@ -1138,12 +1353,16 @@ async def _probe_ldap_signing(
                 confidence=SignalConfidence.HIGH,
                 signal_code="LDAP_BIND_NO_SIGN_OK",
                 message=(
-                    "Unsigned LDAP bind accepted (credential rejected at credential check) — "
+                    "Unsigned LDAP bind reached credential validation (data 52e) — "
                     "signing not required"
                 ),
                 duration_ms=_now_ms() - started,
                 succeeded=True,
             )
+        # Everything else (incl. an operationsError that escaped bind-only,
+        # transport error, clock skew) is inferred-by-absence -> UNKNOWN LOW,
+        # NO emit. The authenticated tiebreaker (A5) may resolve it later when
+        # real creds are available; otherwise the next caller re-probes.
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
@@ -1155,6 +1374,239 @@ async def _probe_ldap_signing(
         )
 
 
+async def _probe_ldap_signing_authenticated(
+    *,
+    domain: str,
+    dc_ip: str,
+    creds: "ProbeCredentials",
+    sink: PostureSink,
+    timeout: float,
+    posture: Optional[DomainPosture] = None,
+    dc_fqdn: Optional[str] = None,
+) -> ProbeResult:
+    """Probe A5 — authenticated LDAP-signing tiebreaker (real credentials).
+
+    Runs ONLY as a tiebreaker: when the unauth bogus-cred U2 probe could not
+    classify signing (stayed ``UNKNOWN``) AND valid domain credentials are
+    available (``start_auth`` phase). It performs an UNSIGNED, BIND-ONLY bind
+    with the REAL credential on port 389:
+
+      * Bind SUCCEEDS (unsigned authenticated bind accepted) -> the most
+        definitive possible "signing NOT required" signal — resolves
+        RestrictAnonymous DCs like VulnLab Breach where the unauth probe's
+        downstream signals were ambiguous. ``DISABLED`` HIGH, emit.
+      * ``strongerAuthRequired`` -> signing REQUIRED. ``REQUIRED`` HIGH, emit.
+      * Anything else (timeout, transport failure, even an auth failure —
+        which tells us nothing about the signing policy) -> stay ``UNKNOWN``
+        LOW, **no emit**.
+
+    This is a LAYER on top of the primary unauth probe, never a replacement:
+    the unauth path works with no creds and stays the default. See the
+    ``_BOGUS_CRED_PASSWORD`` block comment for the layered-design rationale.
+
+    Auth-method selection (mirrors A6's NTLM-disabled-aware design):
+      * When NTLM is known-disabled (HIGH, fresh in the supplied in-flight
+        ``posture``), an NTLM/SIMPLE unsigned bind would itself collapse in the
+        SSP (``SEC_E_UNSUPPORTED_FUNCTION``) BEFORE the DC validates signing --
+        the SAME trap that made U2 defer (Part A). A5 would then be unable to
+        measure either. So on an NTLM-disabled DC A5 binds over KERBEROS
+        (password/aes_key/ccache) on port 389, provided a DC FQDN is available
+        for the ``ldap/`` SPN (an IP cannot target a Kerberos SPN -- CLAUDE.md
+        § Kerberos SPNs). The just-merged LDAP-transport FIX1 pre-mints a
+        salt-correct TGT via ``kerberos_transport.get_tgt`` for kerberos-password
+        binds, so this works on non-default-salt / AES-only KDCs (ping.htb).
+      * Otherwise (NTLM available, or no in-flight posture) A5 keeps the
+        original NTLM/SIMPLE unsigned bind with password/NT-hash.
+
+    Either way the bind is UNSIGNED (``sign=False`` + ``disable_self_heal=True``).
+    ``disable_self_heal=True`` is load-bearing: it makes
+    ``_apply_default_seal_to_plain_ldap`` SKIP the seal-by-default upgrade for
+    authenticated plain-LDAP/389, so the bind stays unsigned (the measurement)
+    and the reactive self-heal does not retry with sign+seal after a
+    signing-required rejection. LDAP signing (``LdapServerIntegrity``) is
+    enforced at the bind on plain LDAP/389, so the bind verdict is conclusive
+    regardless of NTLM vs Kerberos: ``strongerAuthRequired`` -> REQUIRED;
+    bind accepted / reached credential validation -> NOT_REQUIRED.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address
+    from adscan_internal.services.ldap_transport_service import (
+        ADscanLDAPConfig,
+        async_connect_with_ldap_fallback,
+    )
+
+    cat = ConstraintCategory.LDAP_SIGNING
+    started = _now_ms()
+
+    # Decide whether NTLM is unusable on this DC (so the NTLM unsigned bind
+    # would collapse before measuring signing). Read the in-flight overlay
+    # (caller posture + A3's just-computed verdict) -- same source A6 uses.
+    ntlm_state = posture.get(ConstraintCategory.NTLM_AUTHENTICATION) if posture else None
+    ntlm_disabled_known = (
+        ntlm_state is not None
+        and ntlm_state.state == TriState.DISABLED
+        and ntlm_state.confidence == SignalConfidence.HIGH
+        and not ntlm_state.is_stale
+    )
+    has_kerberos_credential = (
+        creds.password is not None
+        or creds.aes_key is not None
+        or creds.ccache_path is not None
+    )
+
+    if ntlm_disabled_known and has_kerberos_credential:
+        # KERBEROS unsigned bind on 389. Resolve an FQDN for the ldap/ SPN; an
+        # IP cannot target a Kerberos SPN correctly (CLAUDE.md § Kerberos SPNs).
+        spn_host = str(dc_fqdn or "").strip().rstrip(".")
+        if not spn_host:
+            candidate = str(dc_ip or "").strip().rstrip(".")
+            if candidate and not is_ip_address(candidate):
+                spn_host = candidate
+        if not spn_host or is_ip_address(spn_host):
+            return _make_skipped(
+                cat,
+                reason=(
+                    "Skipped: NTLM disabled and only an IP is available -- the "
+                    "Kerberos LDAP-signing tiebreaker needs a DC FQDN for the "
+                    "ldap/ SPN"
+                ),
+            )
+        cfg = ADscanLDAPConfig(
+            domain=domain,
+            dc_ip=dc_ip,
+            use_ldaps=False,
+            use_kerberos=True,
+            username=creds.username,
+            password=creds.password,
+            aes_key=creds.aes_key,
+            ccache_path=creds.ccache_path,
+            kerberos_target_hostname=spn_host,
+            # UNSIGNED on purpose (see docstring): sign=False + disable_self_heal
+            # keeps the plain-LDAP/389 Kerberos bind off the seal-by-default
+            # upgrade, so an accepted bind proves signing NOT required.
+            sign=False,
+            disable_self_heal=True,
+        )
+        print_info_debug(
+            f"[posture_probe] A5 signing tiebreaker (NTLM disabled -> KERBEROS) "
+            f"opening LDAP/389 unsigned authenticated bind-only bind to {spn_host} "
+            f"(dc_ip={dc_ip}) as {mark_sensitive(creds.username, 'user')} "
+            f"(timeout={timeout}s)"
+        )
+    else:
+        # NTLM available (or no in-flight posture) -> original NTLM/SIMPLE
+        # unsigned bind. ccache-only Kerberos creds are not useful here when
+        # NTLM is the chosen mechanism; require a password or NT-hash.
+        password = creds.password if creds.password is not None else creds.nt_hash
+        if not creds.username or not password:
+            return _make_skipped(
+                cat,
+                reason=(
+                    "Skipped: authenticated signing tiebreaker requires "
+                    "username + password/hash (NTLM path)"
+                ),
+            )
+        cfg = ADscanLDAPConfig(
+            domain=domain,
+            dc_ip=dc_ip,
+            use_ldaps=False,
+            use_kerberos=False,
+            username=creds.username,
+            password=password,
+            # UNSIGNED on purpose: if the DC accepts an unsigned AUTHENTICATED
+            # bind, signing is definitively not required.
+            sign=False,
+            disable_self_heal=True,
+        )
+        print_info_debug(
+            f"[posture_probe] A5 signing tiebreaker opening LDAP/389 unsigned authenticated "
+            f"bind-only bind to {dc_ip}:389 as {mark_sensitive(creds.username, 'user')} "
+            f"(timeout={timeout}s)"
+        )
+    try:
+        conn, _ = await asyncio.wait_for(
+            async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
+        )
+        try:
+            disc = getattr(conn, "disconnect", None)
+            if disc is not None:
+                res = disc()
+                if asyncio.iscoroutine(res):
+                    await res
+        except Exception as disc_exc:  # noqa: BLE001
+            telemetry.capture_exception(disc_exc)
+        print_info_debug(
+            f"[posture_probe] A5 signing tiebreaker -> unsigned authenticated bind accepted "
+            f"(not required) on {dc_ip}:389 in {_now_ms() - started:.0f}ms"
+        )
+        _emit(
+            sink,
+            domain=domain,
+            category=cat,
+            state=TriState.DISABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_AUTH_BIND_NO_SIGN_OK",
+            message="Unsigned authenticated LDAP bind accepted — signing not required",
+            protocol="ldap",
+        )
+        return ProbeResult(
+            category=cat,
+            state=TriState.DISABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_AUTH_BIND_NO_SIGN_OK",
+            message="Unsigned authenticated LDAP bind accepted — signing not required",
+            duration_ms=_now_ms() - started,
+            succeeded=True,
+        )
+    except asyncio.TimeoutError as exc:
+        telemetry.capture_exception(exc)
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="PROBE_TIMEOUT",
+            message=f"Authenticated signing tiebreaker timed out after {timeout}s",
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        verdict = _classify_ldap_policy_response(exc)
+        print_info_debug(
+            f"[posture_probe] A5 signing tiebreaker -> {verdict} (exception) on {dc_ip}:389 "
+            f"in {_now_ms() - started:.0f}ms"
+        )
+        if verdict == "signing_required":
+            _emit(
+                sink,
+                domain=domain,
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_STRONG_AUTH_REQUIRED",
+                message="DC requires LDAP signing (observed via authenticated bind)",
+                protocol="ldap",
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_STRONG_AUTH_REQUIRED",
+                message="DC requires LDAP signing (observed via authenticated bind)",
+                duration_ms=_now_ms() - started,
+                succeeded=True,
+            )
+        # An auth failure (bad creds / locked) tells us nothing about the
+        # signing policy. Stay UNKNOWN, no emit.
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="PROBE_FAILED",
+            message=f"Authenticated signing tiebreaker inconclusive: {type(exc).__name__}",
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
+
 async def _probe_ldaps_channel_binding(
     *,
     domain: str,
@@ -1163,38 +1615,40 @@ async def _probe_ldaps_channel_binding(
     timeout: float,
     posture: Optional[DomainPosture] = None,
 ) -> ProbeResult:
-    """Probe U3 — LDAPS channel binding requirement via a bogus-cred NTLM bind.
+    """Probe U3 — LDAPS channel binding requirement via BIND-ONLY bogus-cred binds.
 
     Two-step probe modelled on NetExec's ``check_ldaps_cbt`` (see
-    ``reference/NetExec/nxc/protocols/ldap.py``):
+    ``reference/NetExec/nxc/protocols/ldap.py``), run in BIND-ONLY mode so the
+    bind result is read directly (no post-bind rootDSE search that a
+    RestrictAnonymous DC answers with ``operationsError`` — see the U2 probe
+    and the ``_BOGUS_CRED_PASSWORD`` block comment):
 
-      1. **No-CBT bind**. NTLM bind on LDAPS (port 636) with the CBT
-         field omitted and bogus credentials. The DC's response:
-           * ``SEC_E_BAD_BINDINGS`` (0x80090346) → CBT enforced for ALL
-             binds, regardless of credential validity. Emit
-             ``REQUIRED`` HIGH and return.
-           * ``STATUS_LOGON_FAILURE`` → the DC accepted the no-CBT bind
-             and then rejected the bogus credential. CBT is **not**
-             enforced for absent CBT — but the policy could still be
-             "When Supported" (enforce CBT only when a CBT token IS
-             supplied). Go to step 2 to disambiguate.
+      1. **No-CBT bind**. NTLM bind on LDAPS (port 636) with the CBT field
+         omitted and a random bogus principal. The bind result:
+           * ``SEC_E_BAD_BINDINGS`` (0x80090346) -> CBT enforced for ALL
+             binds, regardless of credential validity. Emit ``REQUIRED`` HIGH
+             and return.
+           * Bind ACCEPTED -> the DC permitted a bind WITHOUT a CBT token.
+             CBT is not enforced for absent CBT — but the policy could still
+             be "When Supported" (enforce CBT only when a token IS supplied).
+             Go to step 2 to disambiguate.
 
-      2. **Wrong-CBT bind**. Same NTLM bind, but this time with a
-         deliberately invalid CBT token populated (via
-         ``null_channel_binding`` → wired through ``_null_channel_binding``
-         in badldap connection). DC response:
-           * ``SEC_E_BAD_BINDINGS`` → DC validates CBT when present →
-             policy is "When Supported". Emit ``REQUIRED`` HIGH (treated
-             as required because any client that sends CBT must send a
-             valid one).
-           * ``STATUS_LOGON_FAILURE`` → DC ignored the wrong CBT
-             entirely → policy is "Never". Emit ``DISABLED`` HIGH.
+      2. **Wrong-CBT bind**. Same NTLM bind, but with a deliberately invalid
+         CBT token populated (``null_channel_binding`` -> ``_null_channel_binding``
+         in the badldap connection). Bind result:
+           * ``SEC_E_BAD_BINDINGS`` -> DC validates CBT when present -> policy
+             is "When Supported". Emit ``REQUIRED`` HIGH (any client that
+             sends CBT must send a valid one).
+           * Bind ACCEPTED -> DC ignored the wrong CBT token entirely ->
+             policy is "Never". Emit ``DISABLED`` HIGH.
 
-    Skipped when LDAPS is known to be unavailable — CBT lives only on
-    TLS, so there's nothing to bind to.
+    Anything else at either step (timeout, transport failure, an
+    unclassifiable exception) -> ``UNKNOWN`` LOW, **no emit** (cache-only-
+    observations policy). Skipped when LDAPS is known unavailable — CBT lives
+    only on TLS.
 
-    Operational note: each bogus bind generates a ``4625`` audit event
-    on the DC. See ``_BOGUS_CRED_USER`` block comment for OPSEC discussion.
+    Operational note: each bogus bind generates a ``4625`` audit event on the
+    DC. See the bogus-credential block comment for OPSEC discussion.
     """
     from adscan_internal.services.ldap_transport_service import (
         ADscanLDAPConfig,
@@ -1228,7 +1682,7 @@ async def _probe_ldaps_channel_binding(
             dc_ip=dc_ip,
             use_ldaps=True,
             use_kerberos=False,
-            username=_BOGUS_CRED_USER,
+            username=_make_bogus_probe_user(),
             password=_BOGUS_CRED_PASSWORD,
             # Default: no CBT in the bind. When ``null_cbt`` is True the
             # CBT field IS populated, but with garbage — used in step 2
@@ -1241,16 +1695,16 @@ async def _probe_ldaps_channel_binding(
     async def _attempt(
         cfg: "ADscanLDAPConfig", *, step: int
     ) -> tuple[Optional[Exception], bool]:
-        """Run a single bind; return (exception_or_None, opened_ok)."""
+        """Run a single BIND-ONLY bind; return (exception_or_None, bind_accepted)."""
         attempt_started = _now_ms()
         print_info_debug(
-            f"[posture_probe] U3 CBT opening LDAPS bogus-cred bind to {dc_ip}:636 "
+            f"[posture_probe] U3 CBT opening LDAPS bind-only bogus-cred bind to {dc_ip}:636 "
             f"(timeout={timeout}s, step={step}, "
             f"null_cbt={getattr(cfg, 'null_channel_binding', False)})"
         )
         try:
             conn, _ = await asyncio.wait_for(
-                async_connect_with_ldap_fallback(cfg), timeout=timeout
+                async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
             )
             try:
                 disc = getattr(conn, "disconnect", None)
@@ -1276,99 +1730,164 @@ async def _probe_ldaps_channel_binding(
             return exc, False
 
     # ---------------- Step 1 — no-CBT bind ----------------
-    exc, opened = await _attempt(_make_cfg(null_cbt=False), step=1)
-    if opened:
-        # Bogus credential accepted — unusual but treat as unknown.
-        return ProbeResult(
-            category=cat,
-            state=TriState.UNKNOWN,
-            confidence=SignalConfidence.LOW,
-            signal_code="LDAP_BOGUS_CRED_BIND_UNEXPECTEDLY_OK",
-            message="Bogus-credential LDAPS bind unexpectedly succeeded — DC config is unusual",
-            duration_ms=_now_ms() - started,
-            succeeded=False,
+    exc, accepted = await _attempt(_make_cfg(null_cbt=False), step=1)
+    if not accepted:
+        assert exc is not None
+        telemetry.capture_exception(exc)
+        if isinstance(exc, asyncio.TimeoutError):
+            return ProbeResult(
+                category=cat,
+                state=TriState.UNKNOWN,
+                confidence=SignalConfidence.LOW,
+                signal_code="PROBE_TIMEOUT",
+                message=f"CBT probe timed out after {timeout}s (step 1)",
+                duration_ms=_now_ms() - started,
+                succeeded=False,
+            )
+        if is_ldaps_transport_failure(exc):
+            return ProbeResult(
+                category=cat,
+                state=TriState.UNKNOWN,
+                confidence=SignalConfidence.LOW,
+                signal_code="LDAPS_UNAVAILABLE",
+                message="LDAPS unreachable; CBT requirement undetermined",
+                duration_ms=_now_ms() - started,
+                succeeded=False,
+            )
+        # NTLM-disabled DC: the bogus-cred NTLM bind collapses in the SSP
+        # BEFORE the DC validates channel binding, so U3 cannot measure CBT
+        # enforcement this way. Observe-don't-infer: return UNKNOWN/LOW with NO
+        # emit (never the false "not enforced" verdict). The Kerberos-path CBT
+        # probe in ``probe_auth`` is the authoritative measurement in this case.
+        if _ntlm_bind_unavailable_in_chain(exc):
+            print_info_debug(
+                "[posture_probe] U3 CBT step 1 -> NTLM unavailable on "
+                f"{dc_ip}:636; cannot measure CBT via NTLM (deferring to the "
+                "Kerberos-path CBT probe). No verdict emitted."
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.UNKNOWN,
+                confidence=SignalConfidence.LOW,
+                signal_code="NTLM_UNAVAILABLE_CANNOT_MEASURE",
+                message=(
+                    "NTLM bind unavailable on DC; CBT not measurable via NTLM "
+                    "(Kerberos-path CBT probe is authoritative)"
+                ),
+                duration_ms=_now_ms() - started,
+                succeeded=False,
+            )
+        verdict = _classify_ldap_policy_response(exc)
+        print_info_debug(
+            f"[posture_probe] U3 CBT step 1 -> {verdict} (exception) on {dc_ip}:636 "
+            f"in {_now_ms() - started:.0f}ms"
         )
-    assert exc is not None
-    telemetry.capture_exception(exc)
-    if isinstance(exc, asyncio.TimeoutError):
-        return ProbeResult(
-            category=cat,
-            state=TriState.UNKNOWN,
-            confidence=SignalConfidence.LOW,
-            signal_code="PROBE_TIMEOUT",
-            message=f"CBT probe timed out after {timeout}s (step 1)",
-            duration_ms=_now_ms() - started,
-            succeeded=False,
+        if verdict == "cbt_required":
+            _emit(
+                sink,
+                domain=domain,
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_CBT_REJECTED_BAD_BINDINGS",
+                message="DC rejected LDAPS bind without CBT (SEC_E_BAD_BINDINGS)",
+                protocol="ldap",
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_CBT_REJECTED_BAD_BINDINGS",
+                message="DC rejected LDAPS bind without CBT (SEC_E_BAD_BINDINGS)",
+                duration_ms=_now_ms() - started,
+                succeeded=True,
+            )
+        if verdict == "logon_failure":
+            # DC reached credential validation without rejecting the missing
+            # CBT -> CBT not enforced for absent CBT. Fall through to step 2
+            # to disambiguate "Never" vs "When Supported".
+            print_info_debug(
+                "[posture_probe] U3 CBT step 1 -> data 52e (no-CBT bind reached "
+                "credential check); proceeding to step 2"
+            )
+        else:
+            # Some other failure — cannot classify CBT requirement.
+            return ProbeResult(
+                category=cat,
+                state=TriState.UNKNOWN,
+                confidence=SignalConfidence.LOW,
+                signal_code="PROBE_FAILED",
+                message=f"CBT probe step 1 failed: {type(exc).__name__}",
+                duration_ms=_now_ms() - started,
+                succeeded=False,
+            )
+    else:
+        print_info_debug(
+            f"[posture_probe] U3 CBT step 1 -> no-CBT bind accepted on {dc_ip}:636 "
+            f"in {_now_ms() - started:.0f}ms; proceeding to step 2"
         )
-    if is_ldaps_transport_failure(exc):
-        return ProbeResult(
-            category=cat,
-            state=TriState.UNKNOWN,
-            confidence=SignalConfidence.LOW,
-            signal_code="LDAPS_UNAVAILABLE",
-            message="LDAPS unreachable; CBT requirement undetermined",
-            duration_ms=_now_ms() - started,
-            succeeded=False,
+
+    # ---------------- Step 2 — wrong-CBT bind to disambiguate ----------------
+    # Step 1 proved the DC accepted (or reached credential validation on) a
+    # bind WITHOUT a CBT token. Now bind with a deliberately wrong CBT token:
+    # if the DC validates CBT when present, this fails with SEC_E_BAD_BINDINGS
+    # ("When Supported"); if the DC ignores CBT entirely, the bind is accepted
+    # (or reaches credential validation) -> "Never".
+    exc2, accepted2 = await _attempt(_make_cfg(null_cbt=True), step=2)
+    if accepted2:
+        # Wrong-CBT bind ACCEPTED -> DC ignored the CBT token -> "Never".
+        print_info_debug(
+            f"[posture_probe] U3 CBT step 2 -> wrong-CBT bind accepted on {dc_ip}:636 "
+            f"in {_now_ms() - started:.0f}ms (channel binding NOT enforced)"
         )
-    verdict = _classify_ldap_policy_response(exc)
-    print_info_debug(
-        f"[posture_probe] U3 CBT step 1 -> {verdict} on {dc_ip}:636 "
-        f"in {_now_ms() - started:.0f}ms"
-    )
-    if verdict == "cbt_required":
         _emit(
             sink,
             domain=domain,
             category=cat,
-            state=TriState.REQUIRED,
+            state=TriState.DISABLED,
             confidence=SignalConfidence.HIGH,
-            signal_code="LDAP_CBT_REJECTED_BAD_BINDINGS",
-            message="DC rejected LDAPS bind without CBT (SEC_E_BAD_BINDINGS)",
+            signal_code="LDAP_CBT_NOT_ENFORCED",
+            message=(
+                "DC ignored both missing and wrong CBT tokens — channel binding not enforced"
+            ),
             protocol="ldap",
         )
         return ProbeResult(
             category=cat,
-            state=TriState.REQUIRED,
+            state=TriState.DISABLED,
             confidence=SignalConfidence.HIGH,
-            signal_code="LDAP_CBT_REJECTED_BAD_BINDINGS",
-            message="DC rejected LDAPS bind without CBT (SEC_E_BAD_BINDINGS)",
+            signal_code="LDAP_CBT_NOT_ENFORCED",
+            message=(
+                "DC ignored both missing and wrong CBT tokens — channel binding not enforced"
+            ),
             duration_ms=_now_ms() - started,
             succeeded=True,
         )
-    if verdict != "logon_failure":
-        # Some other failure — cannot classify CBT requirement.
-        return ProbeResult(
-            category=cat,
-            state=TriState.UNKNOWN,
-            confidence=SignalConfidence.LOW,
-            signal_code="PROBE_FAILED",
-            message=f"CBT probe step 1 failed: {type(exc).__name__}",
-            duration_ms=_now_ms() - started,
-            succeeded=False,
-        )
-
-    # ---------------- Step 2 — wrong-CBT bind to disambiguate ----------------
-    # Step 1 returned STATUS_LOGON_FAILURE, meaning the DC accepted the
-    # no-CBT bind. Now try with a deliberately wrong CBT token: if the
-    # DC validates CBT when present, this fails with SEC_E_BAD_BINDINGS
-    # ("When Supported"); if the DC ignores CBT entirely, it falls back
-    # to credential validation and returns STATUS_LOGON_FAILURE ("Never").
-    exc2, opened2 = await _attempt(_make_cfg(null_cbt=True), step=2)
-    if opened2:
-        return ProbeResult(
-            category=cat,
-            state=TriState.UNKNOWN,
-            confidence=SignalConfidence.LOW,
-            signal_code="LDAP_BOGUS_CRED_BIND_UNEXPECTEDLY_OK",
-            message="Bogus-credential LDAPS bind unexpectedly succeeded (step 2)",
-            duration_ms=_now_ms() - started,
-            succeeded=False,
-        )
     assert exc2 is not None
     telemetry.capture_exception(exc2)
+    # NTLM-disabled DC at step 2 as well: same observe-don't-infer rule. A
+    # wrong-CBT bind that collapsed in the NTLM SSP proves nothing about CBT
+    # enforcement, so never fall through to the "not enforced" verdict below.
+    if _ntlm_bind_unavailable_in_chain(exc2):
+        print_info_debug(
+            "[posture_probe] U3 CBT step 2 -> NTLM unavailable on "
+            f"{dc_ip}:636; cannot measure CBT via NTLM. No verdict emitted."
+        )
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="NTLM_UNAVAILABLE_CANNOT_MEASURE",
+            message=(
+                "NTLM bind unavailable on DC; CBT not measurable via NTLM "
+                "(Kerberos-path CBT probe is authoritative)"
+            ),
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
     verdict2 = _classify_ldap_policy_response(exc2)
     print_info_debug(
-        f"[posture_probe] U3 CBT step 2 -> {verdict2} on {dc_ip}:636 "
+        f"[posture_probe] U3 CBT step 2 -> {verdict2} (exception) on {dc_ip}:636 "
         f"in {_now_ms() - started:.0f}ms"
     )
     if verdict2 == "cbt_required":
@@ -1400,6 +1919,8 @@ async def _probe_ldaps_channel_binding(
             succeeded=True,
         )
     if verdict2 == "logon_failure":
+        # Wrong-CBT bind reached credential validation -> DC ignored the CBT
+        # token -> "Never".
         _emit(
             sink,
             domain=domain,
@@ -1432,6 +1953,257 @@ async def _probe_ldaps_channel_binding(
         duration_ms=_now_ms() - started,
         succeeded=False,
     )
+
+
+async def _probe_ldaps_channel_binding_kerberos(
+    *,
+    domain: str,
+    dc_ip: str,
+    creds: "ProbeCredentials",
+    sink: PostureSink,
+    timeout: float,
+    dc_fqdn: Optional[str] = None,
+) -> ProbeResult:
+    """Probe A6 -- LDAPS channel-binding requirement via a KERBEROS bind.
+
+    Authoritative replacement for U3 when NTLM is disabled. U3 measures CBT
+    enforcement with a bogus-credential **NTLM** bind; on an NTLM-DISABLED DC
+    that bind collapses in the SSP before the DC validates channel binding
+    (``SEC_E_UNSUPPORTED_FUNCTION`` etc.), so U3 cannot measure and (per Part A)
+    returns UNKNOWN/no-emit. This probe measures the SAME single LDAP policy
+    (``LdapEnforceChannelBinding``) over the operational Kerberos auth path that
+    every real ADscan LDAPS operation uses, so its verdict is authoritative.
+
+    Methodology (validated empirically against ping.htb, 2026-06):
+
+      * Build an LDAPS Kerberos bind config with ``channel_binding=False`` AND
+        ``disable_self_heal=True``. The just-merged "default CBT-on for
+        operational LDAPS binds" policy in
+        ``ldap_transport_service._apply_default_cbt_to_authenticated_ldaps``
+        SKIPS any config with ``disable_self_heal=True`` (or explicit
+        ``channel_binding`` / ``null_channel_binding``) -- see that helper's
+        discriminator:
+
+            if (not is_ldaps
+                or getattr(cfg, "disable_self_heal", False)
+                or _config_requests_explicit_cbt(cfg)
+                or not _plain_ldap_can_seal(cfg)):
+                # left untouched
+
+        ``disable_self_heal=True`` therefore guarantees the bind carries the
+        16-zero "no bindings" GSS checksum token and is NOT silently upgraded
+        to the real ``tls-server-end-point`` CBT -- which is exactly what makes
+        the measurement possible. ``disable_self_heal=True`` ALSO stops the
+        reactive self-heal from retrying with CBT after a ``SEC_E_BAD_BINDINGS``
+        rejection, so the raw verdict bubbles up.
+
+    Classification:
+      * Bind raises ``SEC_E_BAD_BINDINGS`` -> the DC rejected a no-CBT
+        Kerberos bind -> ``LDAP_CHANNEL_BINDING=REQUIRED`` HIGH (emit).
+      * Bind succeeds (or reaches credential validation without a bad-bindings
+        rejection) -> the DC accepted a no-CBT bind ->
+        ``LDAP_CHANNEL_BINDING=NOT_REQUIRED`` (``DISABLED``) HIGH (emit).
+      * Timeout / LDAPS-unreachable / unclassifiable -> ``UNKNOWN`` LOW, NO
+        emit (observe-don't-infer, same policy as U3 and § 7bis of the
+        AD-constraints checklist for slow links).
+
+    The Kerberos SPN MUST be an FQDN, never an IP (CLAUDE.md § Kerberos SPNs).
+    ``dc_fqdn`` is the caller-resolved FQDN (``resolve_dc_fqdn``); when absent
+    we fall back to ``dc_ip`` only if it is itself a hostname. If only an IP is
+    available the probe SKIPs (no FQDN -> a Kerberos bind cannot be attempted
+    correctly), rather than minting a ticket against a wrong SPN.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address
+    from adscan_internal.services.ldap_transport_service import (
+        ADscanLDAPConfig,
+        async_connect_with_ldap_fallback,
+        is_ldaps_transport_failure,
+    )
+
+    cat = ConstraintCategory.LDAP_CHANNEL_BINDING
+    started = _now_ms()
+
+    # Resolve an FQDN for the Kerberos SPN. An IP cannot target a Kerberos SPN
+    # correctly (CLAUDE.md § Kerberos SPNs) -- skip rather than mis-target.
+    spn_host = str(dc_fqdn or "").strip().rstrip(".")
+    if not spn_host:
+        candidate = str(dc_ip or "").strip().rstrip(".")
+        if candidate and not is_ip_address(candidate):
+            spn_host = candidate
+    if not spn_host or is_ip_address(spn_host):
+        return _make_skipped(
+            cat,
+            reason=(
+                "Skipped: Kerberos-path CBT probe needs a DC FQDN (only an IP "
+                "is available); cannot target the ldap/ SPN"
+            ),
+        )
+
+    cfg = ADscanLDAPConfig(
+        domain=domain,
+        dc_ip=dc_ip,
+        use_ldaps=True,
+        use_kerberos=True,
+        username=creds.username,
+        password=creds.password,
+        aes_key=creds.aes_key,
+        ccache_path=creds.ccache_path,
+        kerberos_target_hostname=spn_host,
+        # CRITICAL: channel_binding=False + disable_self_heal=True hits the
+        # SKIP discriminator in _apply_default_cbt_to_authenticated_ldaps, so
+        # the bind sends the 16-zero no-CBT token (the measurement) and the
+        # transport does NOT auto-retry with CBT after SEC_E_BAD_BINDINGS.
+        channel_binding=False,
+        disable_self_heal=True,
+    )
+    if creds.password is None and creds.nt_hash is not None and creds.aes_key is None:
+        # A plain NT hash cannot drive a Kerberos bind on its own; if that is
+        # the only secret, prefer ccache/aes already set above. Nothing to do.
+        pass
+
+    print_info_debug(
+        f"[posture_probe] A6 Kerberos-CBT opening LDAPS Kerberos no-CBT bind to "
+        f"{spn_host} (dc_ip={dc_ip}, timeout={timeout}s)"
+    )
+    try:
+        conn, _ = await asyncio.wait_for(
+            async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
+        )
+        try:
+            disc = getattr(conn, "disconnect", None)
+            if disc is not None:
+                res = disc()
+                if asyncio.iscoroutine(res):
+                    await res
+        except Exception as disc_exc:  # noqa: BLE001
+            telemetry.capture_exception(disc_exc)
+        # Bind accepted with NO CBT token -> CBT not enforced for absent CBT.
+        print_info_debug(
+            f"[posture_probe] A6 Kerberos-CBT -> no-CBT bind ACCEPTED on "
+            f"{spn_host} in {_now_ms() - started:.0f}ms (channel binding NOT required)"
+        )
+        _emit(
+            sink,
+            domain=domain,
+            category=cat,
+            state=TriState.DISABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_CBT_NOT_ENFORCED_KERBEROS",
+            message=(
+                "DC accepted a Kerberos LDAPS bind without channel binding -- "
+                "channel binding not enforced"
+            ),
+            protocol="ldap",
+        )
+        return ProbeResult(
+            category=cat,
+            state=TriState.DISABLED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="LDAP_CBT_NOT_ENFORCED_KERBEROS",
+            message=(
+                "DC accepted a Kerberos LDAPS bind without channel binding -- "
+                "channel binding not enforced"
+            ),
+            duration_ms=_now_ms() - started,
+            succeeded=True,
+        )
+    except asyncio.TimeoutError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[posture_probe] A6 Kerberos-CBT timed out after {timeout}s on "
+            f"{spn_host} -- elapsed {_now_ms() - started:.0f}ms; no verdict emitted"
+        )
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="PROBE_TIMEOUT",
+            message=f"Kerberos CBT probe timed out after {timeout}s",
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        if is_ldaps_transport_failure(exc):
+            return ProbeResult(
+                category=cat,
+                state=TriState.UNKNOWN,
+                confidence=SignalConfidence.LOW,
+                signal_code="LDAPS_UNAVAILABLE",
+                message="LDAPS unreachable; CBT requirement undetermined",
+                duration_ms=_now_ms() - started,
+                succeeded=False,
+            )
+        verdict = _classify_ldap_policy_response(exc)
+        print_info_debug(
+            f"[posture_probe] A6 Kerberos-CBT -> {verdict} (exception) on "
+            f"{spn_host} in {_now_ms() - started:.0f}ms"
+        )
+        if verdict == "cbt_required":
+            _emit(
+                sink,
+                domain=domain,
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_CBT_REJECTED_BAD_BINDINGS_KERBEROS",
+                message=(
+                    "DC rejected a Kerberos LDAPS bind without channel binding "
+                    "(SEC_E_BAD_BINDINGS)"
+                ),
+                protocol="ldap",
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_CBT_REJECTED_BAD_BINDINGS_KERBEROS",
+                message=(
+                    "DC rejected a Kerberos LDAPS bind without channel binding "
+                    "(SEC_E_BAD_BINDINGS)"
+                ),
+                duration_ms=_now_ms() - started,
+                succeeded=True,
+            )
+        if verdict == "logon_failure":
+            # Reached credential validation without a bad-bindings rejection ->
+            # the DC accepted the no-CBT channel -> CBT not enforced.
+            _emit(
+                sink,
+                domain=domain,
+                category=cat,
+                state=TriState.DISABLED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_CBT_NOT_ENFORCED_KERBEROS",
+                message=(
+                    "DC accepted a Kerberos LDAPS bind without channel binding "
+                    "-- channel binding not enforced"
+                ),
+                protocol="ldap",
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.DISABLED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="LDAP_CBT_NOT_ENFORCED_KERBEROS",
+                message=(
+                    "DC accepted a Kerberos LDAPS bind without channel binding "
+                    "-- channel binding not enforced"
+                ),
+                duration_ms=_now_ms() - started,
+                succeeded=True,
+            )
+        # Anything else (clock skew, KDC error, unclassifiable) -- observe,
+        # don't infer.
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="PROBE_FAILED",
+            message=f"Kerberos CBT probe failed: {type(exc).__name__}",
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1751,23 +2523,54 @@ async def _probe_ntlm_authentication(
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         text = _chain_text(exc)
-        if "invalidcredentials" in text and "sec_e_logon_denied" in text:
+        # CRITICAL BOUNDARY (design §5.2): this marker set is function-local and
+        # MUST NOT become a module-level shared constant. The bind here is a
+        # PLAIN NTLM bind with NO sealing requested (use_ldaps=False,
+        # use_kerberos=False, disable_self_heal=True above), so in THIS context
+        # every one of these substrings means "the DC refused plain NTLM" —
+        # i.e. NTLM is disabled by policy. The SAME ``sec_e_unsupported_function``
+        # marker means something different (seal-layer could not negotiate ->
+        # cleartext downgrade) in ``ldap_transport_service._is_seal_negotiation_failure``
+        # where sealing WAS requested; those NTLM-refused markers are deliberately
+        # NOT added to that classifier. See the boundary structural test.
+        _NTLM_REFUSED_PLAIN_BIND_MARKERS = (
+            "sec_e_unsupported_function",
+            "0x80090302",
+            "80090302",
+            "status_not_supported",
+            "status_ntlm_blocked",
+        )
+        ntlm_disabled = (
+            ("invalidcredentials" in text and "sec_e_logon_denied" in text)
+            or any(m in text for m in _NTLM_REFUSED_PLAIN_BIND_MARKERS)
+        )
+        if ntlm_disabled:
+            code = (
+                "NTLM_REJECTED_VIA_LDAP"
+                if "sec_e_logon_denied" in text
+                else "NTLM_REFUSED_UNSUPPORTED_FUNCTION"
+            )
+            message = (
+                "DC rejected NTLM bind with SEC_E_LOGON_DENIED"
+                if code == "NTLM_REJECTED_VIA_LDAP"
+                else "DC refused plain NTLM bind (NTLM appears disabled by policy)"
+            )
             _emit(
                 sink,
                 domain=domain,
                 category=cat,
                 state=TriState.DISABLED,
                 confidence=SignalConfidence.HIGH,
-                signal_code="NTLM_REJECTED_VIA_LDAP",
-                message="DC rejected NTLM bind with SEC_E_LOGON_DENIED",
+                signal_code=code,
+                message=message,
                 protocol="ldap",
             )
             return ProbeResult(
                 category=cat,
                 state=TriState.DISABLED,
                 confidence=SignalConfidence.HIGH,
-                signal_code="NTLM_REJECTED_VIA_LDAP",
-                message="DC rejected NTLM bind with SEC_E_LOGON_DENIED",
+                signal_code=code,
+                message=message,
                 duration_ms=_now_ms() - started,
                 succeeded=True,
             )
@@ -1789,17 +2592,39 @@ async def _probe_smb_signing(
     creds: ProbeCredentials,
     sink: PostureSink,
     timeout: float,
+    posture: Optional[DomainPosture] = None,
 ) -> ProbeResult:
-    """Probe A4 — SMB session-setup; reads ``signing_required`` after login."""
-    from adscan_internal.services.smb_transport import SMBConfig, smb_machine_for
+    """Probe A4 — SMB signing policy.
+
+    Primary path (auth-independent): a pre-auth SMB NEGOTIATE read via
+    :func:`smb_transport.smb_negotiate_signing`. The DC sends its
+    ``SecurityMode`` REQUIRED flag in the NEGOTIATE response before any
+    credential is presented, so this verdict does not depend on NTLM/Kerberos
+    succeeding — it cannot hang on a Kerberos-only / NTLM-disabled DC (the
+    failure mode of the old session-setup read, DEFECT A4).
+
+    - NEGOTIATE set signing-required  -> ``SMB_SIGNING=REQUIRED HIGH``, emit.
+    - NEGOTIATE did NOT set required   -> signing NOT required: the codebase
+      represents "not required" with ``TriState.DISABLED`` (same member the
+      LDAP-signing not-required path uses, see ``_probe_ldap_signing*``).
+      ``DISABLED HIGH``, emit.
+    - timeout / connect failure        -> ``UNKNOWN LOW``, NO emit
+      (observe-don't-infer; our budget ran out, not a DC answer).
+
+    ``posture`` is the in-flight posture overlay built by the orchestrator
+    (A1/A2/A3 verdicts layered onto the persisted snapshot). It is threaded
+    into the ``SMBConfig`` so the §4.2 session-setup fallback path can let
+    ``build_smb_plan`` choose Kerberos when NTLM is known-disabled. The primary
+    NEGOTIATE path does not authenticate, so it is unaffected by posture.
+    """
+    from adscan_internal.services.smb_transport import (
+        SMBConfig,
+        smb_negotiate_signing,
+    )
 
     cat = ConstraintCategory.SMB_SIGNING
     started = _now_ms()
-    use_kerberos = (
-        creds.password is None
-        and creds.nt_hash is None
-        and creds.ccache_path is not None
-    )
+
     cfg = SMBConfig(
         target_ip=dc_ip,
         domain=domain,
@@ -1808,26 +2633,126 @@ async def _probe_smb_signing(
         nt_hash=creds.nt_hash,
         ccache_path=creds.ccache_path,
         kdc_ip=dc_ip,
-        use_kerberos=use_kerberos,
-        # Sink is wired so smb_transport's success/failure classifiers
-        # emit SMB_SIGNING / NTLM_AUTHENTICATION signals via the same
-        # sink we hand the caller.
+        # Auth scheme is irrelevant for the primary NEGOTIATE read (no
+        # session-setup). It only matters for the §4.2 fallback, where
+        # build_smb_plan re-selects it from the in-flight posture.
+        use_kerberos=False,
         posture_sink=sink,
-        # Probe wants the raw SMBSigningRequiredError to surface for
-        # ``SMB_SIGNING=REQUIRED``. Without this flag, smb_machine_for's
-        # self-heal silently retries with sign=True and the negotiate
-        # succeeds — the probe then sees signing_required=False on the
-        # connection (because we ARE signing now) and falsely concludes
-        # signing is not required.
+        posture_snapshot=posture,
+        # Probe wants the raw SMBSigningRequiredError to surface in the fallback
+        # path rather than being silently retried with sign=True.
         disable_self_heal=True,
     )
 
+    # ----- Primary: pre-auth NEGOTIATE read (auth-independent) -----
+    try:
+        neg = await asyncio.wait_for(smb_negotiate_signing(cfg), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        telemetry.capture_exception(exc)
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="PROBE_TIMEOUT",
+            message=f"SMB NEGOTIATE timed out after {timeout}s",
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # NEGOTIATE could not complete (connect refused, TLS/RST, or aiosmb
+        # hides the standalone negotiate step in some runtime). Try the §4.2
+        # posture-aware session-setup fallback before giving up.
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[posture_probe] A4 NEGOTIATE read failed "
+            f"({type(exc).__name__}); trying posture-aware session-setup fallback"
+        )
+        return await _probe_smb_signing_fallback(
+            cfg=cfg,
+            domain=domain,
+            sink=sink,
+            timeout=timeout,
+            started=started,
+            posture=posture,
+        )
+
+    # Observed NEGOTIATE response — the DC answered, so this is HIGH either way.
+    if neg.signing_required:
+        _emit(
+            sink,
+            domain=domain,
+            category=cat,
+            state=TriState.REQUIRED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="SMB_SIGNING_NEGOTIATED_REQUIRED",
+            message="DC NEGOTIATE response set SecurityMode signing-required",
+            protocol="smb",
+        )
+        return ProbeResult(
+            category=cat,
+            state=TriState.REQUIRED,
+            confidence=SignalConfidence.HIGH,
+            signal_code="SMB_SIGNING_NEGOTIATED_REQUIRED",
+            message="DC NEGOTIATE response set SecurityMode signing-required",
+            duration_ms=_now_ms() - started,
+            succeeded=True,
+        )
+    # NEGOTIATE observed and did NOT set signing-required -> signing NOT
+    # required. ``TriState.DISABLED`` is how the codebase encodes "not required"
+    # for signing constraints (mirrors the LDAP-signing not-required verdict).
+    _emit(
+        sink,
+        domain=domain,
+        category=cat,
+        state=TriState.DISABLED,
+        confidence=SignalConfidence.HIGH,
+        signal_code="SMB_SIGNING_NEGOTIATED_NOT_REQUIRED",
+        message="DC NEGOTIATE response did not set signing-required",
+        protocol="smb",
+    )
+    return ProbeResult(
+        category=cat,
+        state=TriState.DISABLED,
+        confidence=SignalConfidence.HIGH,
+        signal_code="SMB_SIGNING_NEGOTIATED_NOT_REQUIRED",
+        message="DC NEGOTIATE response did not set signing-required",
+        duration_ms=_now_ms() - started,
+        succeeded=True,
+    )
+
+
+async def _probe_smb_signing_fallback(
+    *,
+    cfg: "Any",
+    domain: str,
+    sink: PostureSink,
+    timeout: float,
+    started: float,
+    posture: Optional[DomainPosture],
+) -> ProbeResult:
+    """A4 §4.2 fallback — posture-aware session-setup signing read.
+
+    Used only when the primary pre-auth NEGOTIATE read could not complete as a
+    standalone step. Auth is selected by ``build_smb_plan`` from the in-flight
+    posture (NTLM-disabled -> Kerberos), NOT from credential shape — that was
+    the DEFECT A4 root cause. ``disable_self_heal`` stays True so a real
+    SMBSigningRequiredError surfaces as REQUIRED rather than being retried with
+    sign=True.
+
+    Timeout / connect failure -> ``UNKNOWN LOW``, NO emit (observe-don't-infer).
+    """
+    import dataclasses as _dc
+
+    from adscan_internal.services.auth_plan import build_smb_plan
+    from adscan_internal.services.smb_transport import smb_machine_for
+
+    cat = ConstraintCategory.SMB_SIGNING
+
+    plan = build_smb_plan(config=cfg, posture=posture)
+    cfg_planned = _dc.replace(cfg, use_kerberos=plan.attempt.use_kerberos)
+
     async def _run() -> ProbeResult:
-        async with smb_machine_for(cfg) as _machine:
-            # smb_transport._emit_smb_success_posture has already emitted
-            # SMB_SIGNING REQUIRED HIGH when the connection negotiated it.
-            # Mirror that into a ProbeResult by best-effort reading the
-            # connection's signing_required flag through the machine.
+        async with smb_machine_for(cfg_planned) as _machine:
             connection = getattr(_machine, "connection", None)
             signing = False
             if connection is not None:
@@ -1843,7 +2768,7 @@ async def _probe_smb_signing(
                     state=TriState.REQUIRED,
                     confidence=SignalConfidence.HIGH,
                     signal_code="SMB_SIGNING_NEGOTIATED_REQUIRED",
-                    message="DC negotiated SMB signing as required",
+                    message="DC negotiated SMB signing as required (session-setup read)",
                     protocol="smb",
                 )
                 return ProbeResult(
@@ -1851,18 +2776,29 @@ async def _probe_smb_signing(
                     state=TriState.REQUIRED,
                     confidence=SignalConfidence.HIGH,
                     signal_code="SMB_SIGNING_NEGOTIATED_REQUIRED",
-                    message="DC negotiated SMB signing as required",
+                    message="DC negotiated SMB signing as required (session-setup read)",
                     duration_ms=_now_ms() - started,
                     succeeded=True,
                 )
+            # Session-setup succeeded with signing_required False -> not required.
+            _emit(
+                sink,
+                domain=domain,
+                category=cat,
+                state=TriState.DISABLED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="SMB_SIGNING_NEGOTIATED_NOT_REQUIRED",
+                message="SMB session established without required signing",
+                protocol="smb",
+            )
             return ProbeResult(
                 category=cat,
-                state=TriState.UNKNOWN,
-                confidence=SignalConfidence.LOW,
-                signal_code="SMB_SIGNING_NOT_NEGOTIATED",
-                message="SMB negotiated without required signing — inconclusive",
+                state=TriState.DISABLED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="SMB_SIGNING_NEGOTIATED_NOT_REQUIRED",
+                message="SMB session established without required signing",
                 duration_ms=_now_ms() - started,
-                succeeded=False,
+                succeeded=True,
             )
 
     try:
@@ -1874,11 +2810,34 @@ async def _probe_smb_signing(
             state=TriState.UNKNOWN,
             confidence=SignalConfidence.LOW,
             signal_code="PROBE_TIMEOUT",
-            message=f"SMB signing probe timed out after {timeout}s",
+            message=f"SMB signing fallback timed out after {timeout}s",
             duration_ms=_now_ms() - started,
             succeeded=False,
         )
     except Exception as exc:  # noqa: BLE001
+        # A real SMBSigningRequiredError IS a definitive DC answer -> REQUIRED.
+        from adscan_internal.services.smb_transport import SMBSigningRequiredError
+
+        if isinstance(exc, SMBSigningRequiredError):
+            _emit(
+                sink,
+                domain=domain,
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="SMB_SIGNING_NEGOTIATED_REQUIRED",
+                message="DC rejected unsigned SMB session — signing required",
+                protocol="smb",
+            )
+            return ProbeResult(
+                category=cat,
+                state=TriState.REQUIRED,
+                confidence=SignalConfidence.HIGH,
+                signal_code="SMB_SIGNING_NEGOTIATED_REQUIRED",
+                message="DC rejected unsigned SMB session — signing required",
+                duration_ms=_now_ms() - started,
+                succeeded=True,
+            )
         telemetry.capture_exception(exc)
         return ProbeResult(
             category=cat,
@@ -1947,6 +2906,61 @@ def _make_skipped(
         duration_ms=0.0,
         succeeded=True,
         skipped=True,
+    )
+
+
+def _layer_auth_verdicts(
+    base: Optional[DomainPosture],
+    domain: str,
+    auth_results: list[ProbeResult],
+) -> Optional[DomainPosture]:
+    """Return a DomainPosture = ``base`` + every OBSERVED HIGH AUTH verdict.
+
+    Mirrors the ``posture_for_u3`` pattern: the persisted snapshot handed to
+    ``probe_auth`` is the *before-probes* state, so the SERVICE group (A4) must
+    also see the AUTH group's (A1/A2/A3) just-computed verdicts WITHOUT a
+    round-trip through the sink/store. This layers the finished AUTH
+    ``ProbeResult``s onto ``base`` to build a fresh in-flight view.
+
+    Only HIGH-confidence, non-UNKNOWN, succeeded, non-skipped results are
+    layered — a timeout / UNKNOWN / skipped AUTH result contributes nothing
+    (observe-don't-infer). When nothing qualifies, ``base`` is returned
+    unchanged.
+
+    Args:
+        base: The caller's pre-probe posture snapshot (may be ``None``).
+        domain: Target domain, used when ``base`` is ``None``.
+        auth_results: The finished AUTH-group ``ProbeResult``s (A1..A3).
+
+    Returns:
+        A new ``DomainPosture`` overlaying the observed AUTH verdicts, or
+        ``base`` when no AUTH verdict qualified.
+    """
+    from adscan_internal.services.domain_posture import (
+        ConstraintState as _CState,
+        DomainPosture as _DP,
+    )
+
+    overlay: dict[ConstraintCategory, _CState] = {}
+    for r in auth_results:
+        if r.skipped or not r.succeeded:
+            continue
+        if r.state == TriState.UNKNOWN or r.confidence != SignalConfidence.HIGH:
+            continue
+        overlay[r.category] = _CState(
+            category=r.category,
+            state=r.state,
+            confidence=r.confidence,
+        )
+    if not overlay:
+        return base
+    if base is None:
+        return _DP(domain=domain, constraints=dict(overlay))
+    return _DP(
+        domain=base.domain or domain,
+        constraints={**base.constraints, **overlay},
+        updated_at=base.updated_at,
+        password_policy=base.password_policy,
     )
 
 
@@ -2025,7 +3039,7 @@ async def probe_unauth(
     wall-clock.
 
     Why these live in UNAUTH even though they exercise an NTLM bind:
-    the bogus-credential technique (see ``_BOGUS_CRED_USER`` comment
+    the bogus-credential technique (see ``_BOGUS_CRED_PASSWORD`` comment
     block) does not require a real principal — it only exercises the
     DC's transport-policy validation, which runs **before** credential
     validation. So the same code path produces an authoritative answer
@@ -2164,6 +3178,7 @@ async def probe_auth(
     timeout_per_probe: float = 5.0,
     force: bool = False,
     posture: Optional[DomainPosture] = None,
+    dc_fqdn: Optional[str] = None,
 ) -> list[ProbeResult]:
     """Run the auth-mechanism probe set against the DC.
 
@@ -2174,16 +3189,41 @@ async def probe_auth(
     in ``start_unauth`` and ``start_auth``, and the AUTH phase stays
     purely about what authentication actually requires a credential.
 
-    Probes (4 physical, 5 distinct posture signals):
+    Probes (4 physical core + 2 conditional, 6 distinct posture signals):
         A1 — ``KERBEROS_RC4`` + ``KERBEROS_AES_ONLY`` (one explicit-etype AS-REQ).
         A2 — ``KERBEROS_ETYPE_PROBE``.
         A3 — ``NTLM_AUTHENTICATION``.
         A4 — ``SMB_SIGNING``.
+        A6 — ``LDAP_CHANNEL_BINDING`` Kerberos-path probe (conditional; runs
+             ONLY when A3 found NTLM disabled, the case where the unauth U3
+             NTLM-based CBT probe could not measure). Authoritative.
+        A5 — ``LDAP_SIGNING`` authenticated tiebreaker (conditional).
 
-    Concurrency: A1+A2 share the KDC and run sequentially within a
-    Kerberos sub-group; A3 (NTLM) and A4 (SMB signing) are independent
-    and run alongside. All three sub-flows converge via ``asyncio.gather``
-    — no inter-phase dependencies, no sequential second phase.
+    Ordering — AUTH-first -> barrier -> SERVICE-after:
+
+        AUTH GROUP (sequential): A1 -> A2 -> A3. Each consumes what the prior
+        learned. Fully sequential for the same event-loop-starvation reason the
+        unauth phase was sequentialised (vendor TLS/NTLM ops do not yield the
+        loop cleanly; "parallel" probes serialize de-facto and inflate each
+        other's wall-clock past their wait_for budgets).
+
+        BARRIER: the AUTH group is fully awaited before the SERVICE group
+        starts. The finished AUTH verdicts are layered onto the caller's
+        posture via :func:`_layer_auth_verdicts` to build an in-flight overlay
+        (only HIGH/observed/succeeded verdicts), mirroring ``posture_for_u3``.
+
+        SERVICE GROUP: A4 (SMB signing) consumes the in-flight overlay so it
+        sees A3's ``NTLM_AUTHENTICATION=DISABLED`` and A1's
+        ``KERBEROS_AES_ONLY`` computed seconds earlier — its §4.2 fallback can
+        then pick Kerberos on a Kerberos-only DC instead of forcing NTLM. A6
+        (Kerberos-path CBT) consumes the same overlay and runs ONLY when A3
+        found NTLM disabled — it is the authoritative CBT measurement in that
+        case (U3's NTLM-based probe is blind on NTLM-disabled DCs). A5
+        (LDAP-signing tiebreaker) runs after, unchanged.
+
+    This replaces the old single-wave ``asyncio.gather(_kerberos_group(),
+    _independent_group())`` in which A4 ran before/alongside the Kerberos and
+    NTLM verdicts and could not consume them (DEFECT A4 root cause).
 
     Probes whose required credential type is missing are skipped silently
     (``ProbeResult.skipped=True``, no sink call).
@@ -2198,9 +3238,16 @@ async def probe_auth(
         force: When ``True``, ignore existing fresh HIGH posture and re-run.
         posture: Optional pre-loaded ``DomainPosture`` used for skip logic.
 
+    Args (continued):
+        dc_fqdn: Optional caller-resolved DC FQDN (``resolve_dc_fqdn``) for the
+            A6 Kerberos-path CBT probe's ``ldap/`` SPN. When absent the probe
+            falls back to ``dc_ip`` only if it is a hostname; an IP-only DC
+            makes A6 skip (a Kerberos SPN cannot be an IP).
+
     Returns:
-        Four ``ProbeResult`` entries, one per physical probe, in the
-        order ``[A1, A2, A3, A4]``.
+        ``ProbeResult`` entries in the order ``[A1, A2, A3, A4, (A6?), (A5?)]``
+        — order preserved for callers/tests. A6 is appended only when it ran
+        (NTLM disabled + Kerberos credential), A5 only when it ran.
     """
     has_password = creds.password is not None
     has_password_or_hash = has_password or (creds.nt_hash is not None)
@@ -2208,79 +3255,73 @@ async def probe_auth(
         has_password or (creds.nt_hash is not None) or (creds.ccache_path is not None)
     )
 
-    async def _kerberos_group() -> tuple[ProbeResult, ProbeResult]:
-        # A1
-        if has_password:
+    # ----------------------------------------------------------------- #
+    # AUTH GROUP — sequential A1 -> A2 -> A3 (each consumes what the
+    # prior learned). Fully sequential per the event-loop-starvation
+    # rationale documented in ``probe_unauth``.
+    # ----------------------------------------------------------------- #
 
-            async def _a1() -> ProbeResult:
-                return await _probe_kerberos_rc4(
-                    domain=domain,
-                    dc_ip=dc_ip,
-                    creds=creds,
-                    sink=sink,
-                    posture=posture,
-                    force=force,
-                    timeout=timeout_per_probe,
-                )
+    # A1 — explicit-etype AS-REQ (needs plaintext password).
+    if has_password:
 
-            a1 = await _run_with_lifecycle(
-                category=ConstraintCategory.KERBEROS_RC4,
-                runner=_a1,
-                on_progress=on_progress,
+        async def _a1() -> ProbeResult:
+            return await _probe_kerberos_rc4(
+                domain=domain,
+                dc_ip=dc_ip,
+                creds=creds,
+                sink=sink,
                 posture=posture,
                 force=force,
+                timeout=timeout_per_probe,
             )
-        else:
-            skipped = _make_skipped(
-                ConstraintCategory.KERBEROS_RC4,
-                reason="Skipped: explicit-etype AS-REQ requires plaintext password",
-            )
-            _safe_progress(on_progress, ConstraintCategory.KERBEROS_RC4, None)
-            _safe_progress(on_progress, ConstraintCategory.KERBEROS_RC4, skipped)
-            a1 = skipped
 
-        # A2 — sequential after A1.
-        if has_password:
+        a1 = await _run_with_lifecycle(
+            category=ConstraintCategory.KERBEROS_RC4,
+            runner=_a1,
+            on_progress=on_progress,
+            posture=posture,
+            force=force,
+        )
+    else:
+        a1 = _make_skipped(
+            ConstraintCategory.KERBEROS_RC4,
+            reason="Skipped: explicit-etype AS-REQ requires plaintext password",
+        )
+        _safe_progress(on_progress, ConstraintCategory.KERBEROS_RC4, None)
+        _safe_progress(on_progress, ConstraintCategory.KERBEROS_RC4, a1)
 
-            async def _a2() -> ProbeResult:
-                return await _probe_kerberos_etype(
-                    domain=domain,
-                    dc_ip=dc_ip,
-                    creds=creds,
-                    sink=sink,
-                    timeout=timeout_per_probe,
-                )
+    # A2 — ETYPE-INFO2 probe (needs plaintext password). Sequential after A1.
+    if has_password:
 
-            a2 = await _run_with_lifecycle(
-                category=ConstraintCategory.KERBEROS_ETYPE_PROBE,
-                runner=_a2,
-                on_progress=on_progress,
-                posture=posture,
-                force=force,
+        async def _a2() -> ProbeResult:
+            return await _probe_kerberos_etype(
+                domain=domain,
+                dc_ip=dc_ip,
+                creds=creds,
+                sink=sink,
+                timeout=timeout_per_probe,
             )
-        else:
-            skipped = _make_skipped(
-                ConstraintCategory.KERBEROS_ETYPE_PROBE,
-                reason="Skipped: ETYPE-INFO2 probe requires plaintext password",
-            )
-            _safe_progress(on_progress, ConstraintCategory.KERBEROS_ETYPE_PROBE, None)
-            _safe_progress(
-                on_progress, ConstraintCategory.KERBEROS_ETYPE_PROBE, skipped
-            )
-            a2 = skipped
-        return a1, a2
 
-    async def _ntlm_probe() -> ProbeResult:
-        if not has_password_or_hash:
-            skipped = _make_skipped(
-                ConstraintCategory.NTLM_AUTHENTICATION,
-                reason="Skipped: NTLM probe requires password or NT hash",
-            )
-            _safe_progress(on_progress, ConstraintCategory.NTLM_AUTHENTICATION, None)
-            _safe_progress(on_progress, ConstraintCategory.NTLM_AUTHENTICATION, skipped)
-            return skipped
+        a2 = await _run_with_lifecycle(
+            category=ConstraintCategory.KERBEROS_ETYPE_PROBE,
+            runner=_a2,
+            on_progress=on_progress,
+            posture=posture,
+            force=force,
+        )
+    else:
+        a2 = _make_skipped(
+            ConstraintCategory.KERBEROS_ETYPE_PROBE,
+            reason="Skipped: ETYPE-INFO2 probe requires plaintext password",
+        )
+        _safe_progress(on_progress, ConstraintCategory.KERBEROS_ETYPE_PROBE, None)
+        _safe_progress(on_progress, ConstraintCategory.KERBEROS_ETYPE_PROBE, a2)
 
-        async def _runner() -> ProbeResult:
+    # A3 — plain NTLM bind via LDAP (needs password or NT hash). Sequential
+    # after A2 so its verdict lands before the SERVICE group.
+    if has_password_or_hash:
+
+        async def _a3() -> ProbeResult:
             return await _probe_ntlm_authentication(
                 domain=domain,
                 dc_ip=dc_ip,
@@ -2289,49 +3330,166 @@ async def probe_auth(
                 timeout=timeout_per_probe,
             )
 
-        return await _run_with_lifecycle(
+        a3 = await _run_with_lifecycle(
             category=ConstraintCategory.NTLM_AUTHENTICATION,
-            runner=_runner,
+            runner=_a3,
             on_progress=on_progress,
             posture=posture,
             force=force,
         )
+    else:
+        a3 = _make_skipped(
+            ConstraintCategory.NTLM_AUTHENTICATION,
+            reason="Skipped: NTLM probe requires password or NT hash",
+        )
+        _safe_progress(on_progress, ConstraintCategory.NTLM_AUTHENTICATION, None)
+        _safe_progress(on_progress, ConstraintCategory.NTLM_AUTHENTICATION, a3)
 
-    async def _smb_probe() -> ProbeResult:
-        if not has_smb_credential:
-            skipped = _make_skipped(
-                ConstraintCategory.SMB_SIGNING,
-                reason="Skipped: SMB probe requires password, NT hash, or ccache",
-            )
-            _safe_progress(on_progress, ConstraintCategory.SMB_SIGNING, None)
-            _safe_progress(on_progress, ConstraintCategory.SMB_SIGNING, skipped)
-            return skipped
+    # --------------------------- BARRIER --------------------------- #
+    # The AUTH group is fully resolved above. Build the in-flight posture
+    # overlay (caller's snapshot + observed HIGH AUTH verdicts) so the
+    # SERVICE group sees A1/A2/A3's just-computed verdicts without a
+    # round-trip through the sink/store. Mirrors ``posture_for_u3``.
+    in_flight = _layer_auth_verdicts(posture, domain, [a1, a2, a3])
 
-        async def _runner() -> ProbeResult:
+    # ----------------------------------------------------------------- #
+    # SERVICE GROUP — A4 (SMB signing) consumes the in-flight overlay.
+    # ----------------------------------------------------------------- #
+    if has_smb_credential:
+
+        async def _a4() -> ProbeResult:
             return await _probe_smb_signing(
                 domain=domain,
                 dc_ip=dc_ip,
                 creds=creds,
                 sink=sink,
                 timeout=timeout_per_probe,
+                posture=in_flight,
             )
 
-        return await _run_with_lifecycle(
+        a4 = await _run_with_lifecycle(
             category=ConstraintCategory.SMB_SIGNING,
-            runner=_runner,
+            runner=_a4,
             on_progress=on_progress,
-            posture=posture,
+            posture=in_flight,
             force=force,
         )
+    else:
+        a4 = _make_skipped(
+            ConstraintCategory.SMB_SIGNING,
+            reason="Skipped: SMB probe requires password, NT hash, or ccache",
+        )
+        _safe_progress(on_progress, ConstraintCategory.SMB_SIGNING, None)
+        _safe_progress(on_progress, ConstraintCategory.SMB_SIGNING, a4)
 
-    async def _independent_group() -> tuple[ProbeResult, ProbeResult]:
-        a3, a4 = await asyncio.gather(_ntlm_probe(), _smb_probe())
-        return a3, a4
-
-    (a1, a2), (a3, a4) = await asyncio.gather(
-        _kerberos_group(), _independent_group()
+    # A6 — Kerberos-path CBT probe (SERVICE group). Runs ONLY when NTLM is
+    # known-disabled, because that is exactly the case where U3's NTLM-based
+    # CBT probe could not measure channel-binding enforcement (it returned
+    # UNKNOWN/no-emit per Part A). When NTLM is available, U3's verdict stands
+    # and this Kerberos probe is redundant. Gating consumes the SAME in-flight
+    # overlay A4 uses (caller posture + A3's just-computed
+    # NTLM_AUTHENTICATION verdict), so it sees A3's DISABLED without a
+    # round-trip through the sink/store.
+    a6: Optional[ProbeResult] = None
+    ntlm_state = in_flight.get(ConstraintCategory.NTLM_AUTHENTICATION) if in_flight else None
+    ntlm_disabled_known = (
+        ntlm_state is not None
+        and ntlm_state.state == TriState.DISABLED
+        and ntlm_state.confidence == SignalConfidence.HIGH
+        and not ntlm_state.is_stale
     )
-    return [a1, a2, a3, a4]
+    # Has a Kerberos-usable credential? (password mints AS-REQ, aes_key or
+    # ccache bind directly; a bare NT hash alone cannot drive a Kerberos bind.)
+    has_kerberos_credential = (
+        creds.password is not None
+        or creds.aes_key is not None
+        or creds.ccache_path is not None
+    )
+    if ntlm_disabled_known and has_kerberos_credential:
+        async def _a6() -> ProbeResult:
+            return await _probe_ldaps_channel_binding_kerberos(
+                domain=domain,
+                dc_ip=dc_ip,
+                creds=creds,
+                sink=sink,
+                timeout=timeout_per_probe,
+                dc_fqdn=dc_fqdn,
+            )
+
+        a6 = await _run_with_lifecycle(
+            category=ConstraintCategory.LDAP_CHANNEL_BINDING,
+            runner=_a6,
+            on_progress=on_progress,
+            posture=in_flight,
+            # The Kerberos-path verdict is authoritative when NTLM is disabled
+            # and must REPLACE U3's now-suppressed non-verdict. force=True so
+            # _run_with_lifecycle does not short-circuit on a stale/UNKNOWN
+            # LDAP_CHANNEL_BINDING category the unauth U3 may have written.
+            force=True,
+        )
+    elif ntlm_disabled_known and not has_kerberos_credential:
+        print_info_debug(
+            "[posture_probe] A6 Kerberos-CBT skipped — NTLM disabled but no "
+            "Kerberos-usable credential (password/aes_key/ccache) available"
+        )
+
+    # A5 — authenticated LDAP-signing tiebreaker. Runs ONLY when the unauth
+    # U2 probe could not classify signing (UNKNOWN / absent / stale) AND a
+    # usable password/hash credential is available. The unauth bogus-cred
+    # probe stays the PRIMARY signing path; A5 is a layered tiebreaker that
+    # resolves RestrictAnonymous DCs whose unauth signals were ambiguous.
+    # An unsigned AUTHENTICATED bind that the DC accepts is the most
+    # definitive "signing NOT required" signal possible. Sequential (after
+    # the gather) so it can read the just-emitted U2 verdict via ``posture``.
+    a5: Optional[ProbeResult] = None
+    if has_password_or_hash:
+        signing_state = posture.get(ConstraintCategory.LDAP_SIGNING) if posture else None
+        signing_resolved = (
+            signing_state is not None
+            and signing_state.state != TriState.UNKNOWN
+            and signing_state.confidence == SignalConfidence.HIGH
+            and not signing_state.is_stale
+        )
+        if force or not signing_resolved:
+            async def _a5() -> ProbeResult:
+                return await _probe_ldap_signing_authenticated(
+                    domain=domain,
+                    dc_ip=dc_ip,
+                    creds=creds,
+                    sink=sink,
+                    timeout=timeout_per_probe,
+                    # Pass the in-flight overlay (caller posture + A3's
+                    # just-computed NTLM verdict) so A5 picks Kerberos instead
+                    # of the NTLM/SIMPLE bind on an NTLM-disabled DC -- the same
+                    # source A6 reads. dc_fqdn supplies the ldap/ SPN for the
+                    # Kerberos path (an IP-only DC makes the Kerberos branch skip).
+                    posture=in_flight,
+                    dc_fqdn=dc_fqdn,
+                )
+
+            a5 = await _run_with_lifecycle(
+                category=ConstraintCategory.LDAP_SIGNING,
+                runner=_a5,
+                on_progress=on_progress,
+                posture=posture,
+                # A5 has its OWN freshness gate above (it only runs when U2
+                # left signing UNKNOWN); pass force=True so _run_with_lifecycle
+                # does not short-circuit on the LDAP_SIGNING category that the
+                # unauth phase may have just written as UNKNOWN/LOW.
+                force=True,
+            )
+        else:
+            print_info_debug(
+                "[posture_probe] A5 signing tiebreaker skipped — U2 already "
+                "resolved LDAP signing at HIGH confidence"
+            )
+
+    results = [a1, a2, a3, a4]
+    if a6 is not None:
+        results.append(a6)
+    if a5 is not None:
+        results.append(a5)
+    return results
 
 
 # --------------------------------------------------------------------------- #

@@ -1,5 +1,8 @@
+import logging
 import pathlib
 from aiowinreg.filestruct.header import NTRegistryHeadr
+
+logger = logging.getLogger('pypykatz')
 
 class RegFinder:
     def __init__(self):
@@ -73,7 +76,7 @@ class RegFinder:
                         finder.entries['SOFTWARE'] = filepath
 
             except Exception as e:
-                print(f'Error reading {filepath}: {e}')
+                logger.debug('Error reading %s: %s' % (filepath, e))
                 continue
 
         return finder.entries

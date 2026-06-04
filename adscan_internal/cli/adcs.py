@@ -113,6 +113,115 @@ def _extract_adcs_metadata(result: CollectionResult) -> tuple[str | None, str | 
     return None, None
 
 
+# Detection-state ``via`` value stamped when Phase 2 (native domain collection)
+# is the source of the ADCS metadata. Phase 3 (Domain Intelligence) reads this
+# to decide it can CONSUME the already-collected result instead of re-running a
+# second ``ADCSCollector.collect()``.
+ADCS_DETECTED_VIA_NATIVE_COLLECTOR = "native_collector"
+
+
+def populate_adcs_metadata_from_collection(
+    shell: Any,
+    *,
+    domain: str,
+    result: CollectionResult | None,
+) -> bool | None:
+    """Populate ``domains_data[domain]`` ADCS flags from a Phase 2 result.
+
+    This is the single-source-of-truth bridge between Phase 2 (native domain
+    collection, which already enumerates CAs/templates/NTAuth/AIA into the
+    graph) and Phase 3 (Domain Intelligence ADCS metadata). It extracts the
+    enrollment server + CA name from the ALREADY-COLLECTED ``CollectionResult``
+    and writes the same keys Phase 3 sets, stamping
+    ``adcs_detected_via="native_collector"`` so Phase 3 can detect a fresh
+    Phase-2 verdict and skip its own ``ADCSCollector.collect()``.
+
+    The ADCS scope of the native collector always runs as part of the mandatory
+    LDAP base, so the absence of an ``EnterpriseCA`` node is a VALID NEGATIVE
+    (``adcs_detected=False``), not "unknown". When ``result`` is ``None`` (no
+    native collection ran) the flags are left ABSENT so Phase 3 still falls
+    back to its BloodHound -> LDAP detection path.
+
+    Args:
+        shell: Shell exposing ``domains_data`` (and optional ``save_domain_data``).
+        domain: Target domain whose ADCS flags are being populated.
+        result: The ``CollectionResult`` produced by Phase 2, or ``None``.
+
+    Returns:
+        ``True`` when an EnterpriseCA was collected, ``False`` when the ADCS
+        scope ran and found none, or ``None`` when no metadata was populated
+        (no result / wrong type) and Phase 3 should fall back.
+    """
+    if result is None or not isinstance(result, CollectionResult):
+        return None
+    if not hasattr(shell, "domains_data"):
+        return None
+    try:
+        enrollment_server, ca_name = _extract_adcs_metadata(result)
+        detected = bool(enrollment_server or ca_name)
+
+        domain_data = shell.domains_data.get(domain, {})
+        if not isinstance(domain_data, dict):
+            domain_data = {}
+        if enrollment_server:
+            domain_data["adcs"] = enrollment_server
+            _set_adcs_fqdn_if_hostname(domain_data, enrollment_server)
+        if ca_name:
+            domain_data["ca"] = ca_name
+        shell.domains_data[domain] = domain_data
+
+        _set_adcs_detection_state(
+            shell,
+            domain=domain,
+            detected=detected,
+            via=ADCS_DETECTED_VIA_NATIVE_COLLECTOR,
+            reason="enterprise_ca_collected"
+            if detected
+            else "native_collection_no_ca",
+            source_context="phase2_native_collection",
+        )
+        marked_domain = mark_sensitive(domain, "domain")
+        if detected:
+            print_info_debug(
+                f"[adcs] Phase 2 populated ADCS metadata for {marked_domain} "
+                f"(server={mark_sensitive(str(enrollment_server or 'unknown'), 'hostname')}, "
+                f"ca={mark_sensitive(str(ca_name or 'unknown'), 'text')})."
+            )
+        else:
+            print_info_debug(
+                f"[adcs] Phase 2 ran ADCS scope for {marked_domain}; no "
+                "EnterpriseCA collected (valid negative)."
+            )
+        return detected
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[adcs] Phase 2 ADCS populate failed: {exc}")
+        return None
+
+
+def _is_fresh_native_collector_detection(domain_data: dict[str, Any]) -> bool:
+    """Return True when Phase 2 stamped a fresh native-collector ADCS verdict.
+
+    Phase 3 consumes this verdict directly (no second ``ADCSCollector.collect()``
+    / BloodHound / LDAP round-trip). "Fresh" means: the recorded ``via`` is the
+    native collector AND a definite ``adcs_detected`` boolean is present. The
+    state is written in the same session immediately before Phase 3, so a
+    presence check (not a TTL) is the right freshness signal -- the existing
+    cache short-circuits in ``ensure_adcs_metadata`` already handle staleness.
+    """
+    if not isinstance(domain_data, dict):
+        return False
+    via = str(domain_data.get("adcs_detected_via") or "").strip()
+    if via != ADCS_DETECTED_VIA_NATIVE_COLLECTOR:
+        return False
+    detected = domain_data.get("adcs_detected")
+    if not isinstance(detected, bool):
+        return False
+    if not str(domain_data.get("adcs_detected_checked_at") or "").strip():
+        return False
+    return True
+
+
 def _collect_adcs_metadata_native(
     *,
     domain: str,
@@ -690,6 +799,29 @@ def ensure_adcs_metadata(
                 f"Domain {marked_domain} is not initialized. Cannot resolve ADCS."
             )
         return False
+
+    # ── Phase 2 single-source consume ─────────────────────────────────────
+    # If Phase 2 (native domain collection) already stamped a fresh ADCS
+    # verdict, CONSUME it directly: no second ADCSCollector.collect(), no
+    # BloodHound/LDAP round-trip. Phase 2 always runs the ADCS LDAP scope as
+    # part of its mandatory base, so its verdict (positive OR negative) is
+    # authoritative for this session.
+    if not force and _is_fresh_native_collector_detection(domain_data):
+        detected = bool(domain_data.get("adcs_detected"))
+        if not silent:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_info_debug(
+                f"[adcs] Consuming Phase 2 native-collector ADCS verdict for "
+                f"{marked_domain} (detected={detected!r}); skipping re-detection."
+            )
+        if detected and emit_telemetry:
+            _capture_adcs_discovered(
+                shell,
+                domain_data,
+                domain_data.get("adcs"),
+                domain_data.get("ca"),
+            )
+        return detected
 
     if not force and domain_data.get("adcs") and domain_data.get("ca"):
         if not silent:

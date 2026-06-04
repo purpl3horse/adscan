@@ -191,42 +191,8 @@ class LDAPConnectionFactory:
 			
 		return t
 
-if __name__ == '__main__':
-	url_tests = [
-		'ldap://10.10.10.2',
-		'ldap://10.10.10.2:9999',
-		'ldap://test:password@10.10.10.2',
-		'ldap://domain\\test@10.10.10.2',
-		'ldap://domain\\test:password@10.10.10.2:9999',
-		'ldap://domain\\test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@10.10.10.2:9999',
-		'ldaps+sspi-ntlm://10.10.10.2',
-		'ldaps+sspi-kerberos://10.10.10.2',
-		'ldaps+ntlm-password://domain\\test:password@10.10.10.2:9999',
-		'ldaps+ntlm-nt://domain\\test:password@10.10.10.2:9999',
-		'ldaps+kerberos-password://domain\\test:password@10.10.10.2:9999',
-		'ldaps://10.10.10.2:9999',
-		'ldaps://test:password@10.10.10.2',
-		'ldaps://domain\\test@10.10.10.2',
-		'ldaps://domain\\test:password@10.10.10.2:9999',
-		'ldaps://DOMAIN\\test:password@10.10.10.2:9999/?proxytype=socks5&proxyserver=127.0.0.1',
-		'ldaps://DOMAIN\\test:password@10.10.10.2:9999/?proxytype=socks5&proxyserver=127.0.0.1&proxyuser=admin&proxypass=alma',
-		'ldaps://DOMAIN\\test:password@10.10.10.2:9999/?proxytype=multiplexor&proxyserver=127.0.0.1&proxyport=9999&proxyuser=admin&proxypass=alma',
-		'ldaps://10.10.10.2',
-		'ldaps://10.10.10.2:6666',
-	]
-	for url in url_tests:
-		print('===========================================================================')
-		print(url)
-		try:
-			dec = LDAPConnectionFactory.from_url(url)
-			creds = dec.get_credential()
-			target = dec.get_target()
-		except Exception as e:
-			import traceback
-			traceback.print_exc()
-			print('ERROR! Reason: %s' % e)
-			input()
-		else:
-			print(str(creds))
-			print(str(target))
-			input()
+# ADSCAN log-hygiene: the upstream ``if __name__ == '__main__':`` self-test
+# harness was removed. It printed ``str(creds)`` (a raw credential dump to
+# stdout, bypassing telemetry) and called ``input()`` (which would hang any
+# non-interactive run). It was never reached on import; deleting it removes a
+# latent credential-exfiltration path with zero runtime value.

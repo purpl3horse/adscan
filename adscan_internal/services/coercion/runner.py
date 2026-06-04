@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from adscan_internal.rich_output import mark_sensitive, print_info_debug, print_success_debug
 from adscan_internal.services.coercion.aiosmb_adapter import AiosmbRpcAdapter
 from adscan_internal.services.coercion.core import (
+    CaptureSignal,
     CoercionAuthType,
     CoercionEngine,
     CoercionListener,
@@ -19,22 +20,35 @@ from adscan_internal.services.coercion.core import (
 from adscan_internal.services.coercion.display import print_coercion_summary
 from adscan_internal.services.coercion.registry import default_coercion_methods
 
+
 @dataclass(frozen=True)
 class NativeCoercionRunConfig:
-    """Runtime configuration for native coercion."""
+    """Runtime configuration for native coercion.
+
+    ``protocols`` defaults to the empty tuple, which means "walk the entire
+    ordered catalog" (EFSR, then RPRN, then FSRVP, EVEN, DFSNM - coercer's
+    order). This is deliberate: an empty filter is required so the run reaches
+    vectors like MS-RPRN that coerce single-homed members but were never
+    attempted under the old EFSR-only default. Pass an explicit protocol tuple
+    only when the operator narrows the surface with ``--method``.
+
+    ``capture_signal`` is forwarded to the engine as the authoritative stop
+    condition (a real inbound NTLM capture observed by the listener). When
+    ``None`` the engine walks the whole catalog and stops only on timeout.
+    """
 
     listener_host: str
     listener_auth_type: CoercionAuthType = "smb"
     listener_port: int | None = None
     timeout_seconds: float = 60.0
     delay_seconds: float = 0.05
-    stop_on_first_success: bool = True
-    protocols: tuple[str, ...] = ("EFSR", "RPRN")
+    protocols: tuple[str, ...] = ()
     transports: tuple[RpcTransport, ...] = ("ncan_np",)
     method_names: tuple[str, ...] = ()
     methods: tuple[CoercionMethod, ...] = field(
         default_factory=default_coercion_methods
     )
+    capture_signal: CaptureSignal | None = None
     show_summary: bool = True
 
 
@@ -69,17 +83,18 @@ async def run_native_coercion(
             methods=config.methods,
             timeout_seconds=config.timeout_seconds,
             delay_seconds=config.delay_seconds,
-            stop_on_first_success=config.stop_on_first_success,
             protocols=config.protocols,
             transports=config.transports,
             method_names=config.method_names,
             auth_types=(config.listener_auth_type,),
+            capture_signal=config.capture_signal,
         ),
     )
     result = await engine.run()
     print_success_debug(
         f"[coercion] completed target={mark_sensitive(target.label, 'hostname')} "
-        f"success={result.success} attempts={result.attempts} timed_out={result.timed_out}"
+        f"captured={result.captured} attempts={result.attempts} "
+        f"timed_out={result.timed_out}"
     )
     if config.show_summary:
         print_coercion_summary(result)

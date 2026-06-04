@@ -90,7 +90,7 @@ class CredSSPClientNative:
 			# padding causes issues
 			logger.debug('CredSSP - removing pubkey padding')
 			return pubkey[1:]
-		logger.debug('CredSSP - pubkey: %s' % pubkey.hex())
+		logger.debug('CredSSP - pubkey resolved')  # ADSCAN: do not dump raw server pubkey hex
 		return pubkey
 	
 	def get_cipher_name(self):
@@ -176,7 +176,7 @@ class CredSSPClientNative:
 					return ssldata, True, None
 			
 			logger.debug('CredSSP - auth continue: %s' % self.__internal_auth_continue)
-			logger.debug('CredSSP - token: %s' % token)
+			logger.debug('CredSSP - auth token present: %s' % (token is not None))  # ADSCAN: do not dump raw SSPI/SPNEGO token
 			if token is None:
 				# initial auth
 				returndata, self.__internal_auth_continue, err = await self.auth_ctx.authenticate(token, flags = flags, spn = spn)
@@ -191,19 +191,19 @@ class CredSSPClientNative:
 					'negoTokens' : NegoDatas([NegoData(negotoken)])
 				}
 				result = TSRequest(retoken)
-				logger.debug('CredSSP - sending initial auth token: %s' % result.native)
+				logger.debug('CredSSP - sending initial auth token')  # ADSCAN: do not dump raw auth token / TSRequest
 				return self.__return(result.dump(), True, None)
 			else:
 				if self.__internal_auth_continue is True:
 					tdata = TSRequest.load(token)
-					logger.debug('CredSSP - got token from server: %s' % tdata.native)
+					logger.debug('CredSSP - got token from server')  # ADSCAN: do not dump raw server TSRequest
 					if tdata.native['version'] < self.version:
 						logger.debug('[CREDSSP] Server supports version %s which is smaller than our supported version %s' % (tdata.native['version'], self.version))
 						self.version = tdata.native['version']
 					if tdata.native['negoTokens'] is None:
 						raise Exception('SSPI auth not supported by server')
 					sspitoken = tdata.native['negoTokens'][0]['negoToken']
-					logger.debug('CredSSP - SSPI token: %s' % sspitoken)
+					logger.debug('CredSSP - SSPI token received')  # ADSCAN: do not dump raw SSPI token bytes
 					returndata, self.__internal_auth_continue, err = await self.auth_ctx.authenticate(sspitoken, flags = flags, spn = spn)
 					if err is not None:
 						raise err
@@ -223,7 +223,7 @@ class CredSSPClientNative:
 						if self.version in [5,6]:
 							ClientServerHashMagic = b"CredSSP Client-To-Server Binding Hash\x00"
 							ClientServerHash = sha256(ClientServerHashMagic + self.nonce + self.__pubkey).digest()
-							logger.debug('CredSSP - ClientServerHash: %s' % ClientServerHash.hex())
+							logger.debug('CredSSP - ClientServerHash computed')  # ADSCAN: do not dump pubkey-auth binding hash
 							sealedMessage, signature = await self.auth_ctx.encrypt(ClientServerHash, self.seqno)
 							self.seqno += 1
 							retoken['pubKeyAuth'] = signature+sealedMessage
@@ -235,7 +235,7 @@ class CredSSPClientNative:
 							retoken['pubKeyAuth'] = signature+sealedMessage
 					
 					result = TSRequest(retoken)
-					logger.debug('CredSSP - sending internal auth token: %s' % result.native)
+					logger.debug('CredSSP - sending internal auth token')  # ADSCAN: do not dump raw auth token / TSRequest
 					return self.__return(result.dump(), True, None)
 				else:
 					logger.debug('CredSSP - internal auth finished')
@@ -250,11 +250,11 @@ class CredSSPClientNative:
 					
 					# Verifying server signature
 					verification_data, _ = await self.auth_ctx.decrypt(tdata['pubKeyAuth'], 0)
-					logger.debug('CredSSP - verification data: %s' % verification_data.hex())
+					logger.debug('CredSSP - verification data decrypted')  # ADSCAN: do not dump decrypted verification data
 					if self.version in [5,6]:
 						ClientServerHashMagic = b"CredSSP Server-To-Client Binding Hash\x00"
 						ClientServerHash = sha256(ClientServerHashMagic + self.nonce + self.__pubkey).digest()
-						logger.debug('CredSSP - ClientServerHash: %s' % ClientServerHash.hex())
+						logger.debug('CredSSP - ClientServerHash computed')  # ADSCAN: do not dump pubkey-auth binding hash
 						if verification_data != ClientServerHash:
 							raise Exception('CredSSP - Server verification failed!')
 					elif self.version in [2,3,4]:
@@ -291,11 +291,10 @@ class CredSSPClientNative:
 							'authInfo' : signature+sealedMessage
 						}
 						result = TSRequest(retoken)
-						logger.debug('CredSSP - sending credentials: %s' % result.native)
+						logger.debug('CredSSP - sending credentials')  # ADSCAN: do not dump the credential TSRequest (authInfo = sealed credentials)
 						return self.__return(result.dump(), False, None)
 					else:
 						# TODO: implement remote credguard
-						print('DO NOT USE THIS! THIS IS NOT IMPLEMENTED YET!')
 						credBuffer = b''
 						data = {
 							'packageName' : 'KERBEROS'.encode('utf-16-le'), #dont forget the encoding!

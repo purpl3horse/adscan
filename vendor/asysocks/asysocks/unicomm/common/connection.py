@@ -1,7 +1,6 @@
 import ssl
 import copy
 import asyncio
-import traceback
 import ipaddress
 from asysocks.unicomm.common.target import UniTarget
 from asysocks.unicomm.common.packetizers import Packetizer, StreamPacketizer
@@ -135,7 +134,6 @@ class UniConnection:
 						protocol.eof_received()
 						break
 		except Exception as e:
-			traceback.print_exc()
 			err = e
 		finally:
 			protocol.connection_lost(err)

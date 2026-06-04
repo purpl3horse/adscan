@@ -28,6 +28,7 @@ from adscan_internal.services.collector.models import CollectionResult
 from adscan_internal.services.collector.persistence import CollectorPersistence
 from adscan_internal.services.collector.smb_collector import SMBCollectorConfig
 from adscan_internal.services.collector.share_collector import ShareCollectorConfig
+from adscan_internal.workspaces import domain_subpath
 
 
 @dataclass
@@ -108,8 +109,14 @@ class CollectionOrchestrator:
         collect_shares: bool = True,
         posture_sink: Optional["PostureSink"] = None,
         posture_snapshot: Optional["DomainPosture"] = None,
+        output_dir: str | None = None,
     ) -> tuple[CollectionResult, CollectionTiming]:
-        """Collect a single domain and return the raw result with per-phase timing."""
+        """Collect a single domain and return the raw result with per-phase timing.
+
+        When ``output_dir`` is supplied it is the workspace domain directory the
+        Phase 2 DNS resolver persists ``massdns_resolution_report.json`` into;
+        when None the resolver stays in-memory only (no file written).
+        """
         timing = CollectionTiming()
         print_info_verbose(
             f"Collecting domain {mark_sensitive(target_domain, 'domain')}..."
@@ -154,7 +161,12 @@ class CollectionOrchestrator:
 
         if collect_smb or collect_shares:
             _t = time.monotonic()
-            resolve_computer_nodes(result, dc_address)
+            resolve_computer_nodes(
+                result,
+                dc_address,
+                output_dir=output_dir,
+                domain=target_domain,
+            )
             timing.dns = time.monotonic() - _t
 
         if collect_smb or collect_shares:
@@ -246,6 +258,7 @@ class CollectionOrchestrator:
                 collect_shares=collect_shares,
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
+                output_dir=self._domain_output_dir(shell, scope.domain),
             )
             results[scope.domain] = result
             timings[scope.domain] = timing
@@ -264,6 +277,24 @@ class CollectionOrchestrator:
             )
         self._resolve_cross_domain_references(results)
         return counters, results, timings
+
+    @staticmethod
+    def _domain_output_dir(shell: Any, domain: str) -> str | None:
+        """Return the workspace domain dir for persisting Phase 2 artifacts.
+
+        Mirrors the path Phase 3 (``cli/nmap``) and ``CollectorPersistence``
+        use: ``<workspace>/<domains_dir>/<domain>/``. Returns None when the
+        workspace dir is unavailable so the resolver stays in-memory only.
+        """
+        workspace_cwd = (
+            shell._get_workspace_cwd()  # noqa: SLF001
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", "")
+        )
+        if not workspace_cwd:
+            return None
+        domains_dir = getattr(shell, "domains_dir", "domains")
+        return domain_subpath(workspace_cwd, domains_dir, domain)
 
     def _resolve_cross_domain_references(
         self, results: dict[str, CollectionResult]

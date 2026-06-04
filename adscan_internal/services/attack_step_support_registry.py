@@ -99,12 +99,20 @@ TARGET_OUTCOME_SECTION_STYLES: dict[str, tuple[str, str, str]] = {
 # class surfaced under a section labelled "High-Impact Privileges" while the
 # section labelled "Domain Compromise Enablers" was fed by ``PRIVILEGED_ESCALATOR``.
 DISPLAY_TIER_DOMAIN_COMPROMISE = "domain_compromised"
+# Tier-0 Foothold — an access edge (CanRDP/CanPSRemote/SQLAdmin/AdminTo) that
+# lands on a Tier-0 asset. Per the nomenclature standard (rule 2) this is NOT a
+# domain compromise: the operator still has to execute post-ex on the box to
+# promote it. It is its own triage tier so the renderer never appends the
+# "⇒ Domain Compromised" closure marker for these paths (that marker is gated on
+# DISPLAY_TIER_DOMAIN_COMPROMISE), while still ranking the path above generic
+# enablers because reaching a Tier-0 box is high severity.
+DISPLAY_TIER_TIER0_FOOTHOLD = "tier0_foothold"
 DISPLAY_TIER_COMPROMISE_ENABLER = "compromise_enabler"
 DISPLAY_TIER_LATERAL_PIVOT = "lateral_pivot"
 
 _OUTCOME_CLASS_TO_DISPLAY_TIER: dict[str, str] = {
     "direct_compromise": DISPLAY_TIER_DOMAIN_COMPROMISE,
-    "tier0_foothold": DISPLAY_TIER_DOMAIN_COMPROMISE,
+    "tier0_foothold": DISPLAY_TIER_TIER0_FOOTHOLD,
     "followup_terminal": DISPLAY_TIER_COMPROMISE_ENABLER,
     "graph_extension": DISPLAY_TIER_COMPROMISE_ENABLER,
     "future_followup": DISPLAY_TIER_LATERAL_PIVOT,
@@ -114,6 +122,7 @@ _OUTCOME_CLASS_TO_DISPLAY_TIER: dict[str, str] = {
 
 DISPLAY_TIER_ORDER: tuple[str, ...] = (
     DISPLAY_TIER_DOMAIN_COMPROMISE,
+    DISPLAY_TIER_TIER0_FOOTHOLD,
     DISPLAY_TIER_COMPROMISE_ENABLER,
     DISPLAY_TIER_LATERAL_PIVOT,
 )
@@ -121,6 +130,7 @@ DISPLAY_TIER_ORDER: tuple[str, ...] = (
 # (label, icon, style_key) — style_key indexes BRAND_COLORS at the call site.
 DISPLAY_TIER_STYLES: dict[str, tuple[str, str, str]] = {
     DISPLAY_TIER_DOMAIN_COMPROMISE: ("Domain Compromised", "🔥", "error"),
+    DISPLAY_TIER_TIER0_FOOTHOLD: ("Tier 0 Footholds (post-ex pending)", "🔓", "warning"),
     DISPLAY_TIER_COMPROMISE_ENABLER: ("Compromise Enablers", "🎯", "warning"),
     DISPLAY_TIER_LATERAL_PIVOT: ("Lateral & Pivot", "➜", "info"),
 }
@@ -316,6 +326,10 @@ def build_path_priority_key(
     return (
         priority_class_order.get(target_priority_class, 2),
         terminal_class_order.get(target_terminal_class, 3),
+        # Domain-object-first within the (priority_class, terminal_class) bucket:
+        # a path landing on the Domain node itself precedes one landing on a
+        # direct-compromise principal (DA/DCs). Stamped by the annotation phase.
+        0 if record.get("target_is_domain_object") else 1,
         target_followup_status_order.get(target_followup_status, 3),
         target_priority_rank,
         target_viability_rank,

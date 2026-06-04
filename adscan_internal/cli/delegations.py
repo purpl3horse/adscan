@@ -454,61 +454,31 @@ def _persist_service_ticket_after_s4u(
     """Register an S4U-derived service ticket in ``domains_data["service_tickets"]``.
 
     Service tickets produced by RBCD or constrained-delegation flows must
-    NOT be stored in ``kerberos_tickets``: they are not TGTs. This helper
-    parses the resulting ccache, extracts the issuance / expiry timestamps
-    and persists a structured record so follow-up steps can locate the
-    ticket by SPN/host instead of walking workspace files.
+    NOT be stored in ``kerberos_tickets``: they are not TGTs. This is a thin
+    wrapper over the shared :func:`persist_service_ticket` helper (single
+    source of truth, shared with the RBCD chain) which parses the resulting
+    ccache, extracts the issuance / expiry timestamps and persists a
+    structured record so follow-up steps can locate the ticket by SPN/host
+    instead of walking workspace files.
 
-    Failures are logged at debug level and swallowed: missing persistence is
-    a soft loss (the ccache file is still on disk), not worth aborting an
-    otherwise successful exploitation.
+    Failures are logged at debug level and swallowed inside the shared helper:
+    missing persistence is a soft loss (the ccache file is still on disk), not
+    worth aborting an otherwise successful exploitation.
     """
-    try:
-        from adscan_internal.models.service_ticket import (  # noqa: PLC0415
-            ServiceTicket,
-            ServiceTicketKind,
-        )
-        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
-            CredentialStoreService,
-        )
-        from adscan_internal.services.kerberos_ccache_inspector import (  # noqa: PLC0415
-            inspect_ccache,
-        )
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        persist_service_ticket,
+    )
 
-        info = inspect_ccache(ccache_path)
-        first_st = info.first_service_ticket()
-        ticket = ServiceTicket(
-            ccache_path=str(ccache_path).strip(),
-            kind=ServiceTicketKind.coerce(kind),
-            owner_principal=str(owner_principal or "").strip()
-            or (info.default_client_name or ""),
-            impersonated_user=str(impersonated_user or "").strip(),
-            spn=str(spn or "").strip()
-            or (first_st.server_spn if first_st else ""),
-            target_host=str(target_host or "").strip(),
-            realm=(info.default_client_realm or domain.upper() if domain else "")
-            .strip()
-            .upper(),
-            issued_at=first_st.starttime if first_st else None,
-            expires_at=first_st.endtime if first_st else None,
-        )
-        CredentialStoreService().store_service_ticket(
-            domains_data=getattr(shell, "domains_data", {}),
-            domain=domain,
-            ticket=ticket,
-        )
-        print_info_debug(
-            f"[delegation] persisted service ticket {mark_sensitive(ticket.ccache_path, 'path')} "
-            f"kind={ticket.kind.value} spn={mark_sensitive(ticket.spn, 'service')} "
-            f"impersonated={mark_sensitive(ticket.impersonated_user, 'user')}"
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_info_debug(
-            f"[delegation] failed to persist service ticket "
-            f"{mark_sensitive(ccache_path, 'path')}: "
-            f"{type(exc).__name__}: {mark_sensitive(str(exc), 'detail')}"
-        )
+    persist_service_ticket(
+        getattr(shell, "domains_data", {}),
+        domain=domain,
+        ccache_path=ccache_path,
+        kind=kind,
+        owner_principal=owner_principal,
+        impersonated_user=impersonated_user,
+        spn=spn,
+        target_host=target_host,
+    )
 
 
 def _handle_constrained_native_result(

@@ -24,7 +24,7 @@ class DCERPCServerSMBTransport:
 				await self.in_q.put(data)
 
 		except Exception as e:
-			traceback.print_exc()
+			pass
 		finally:
 			await self.diconnect()
 	
@@ -35,7 +35,7 @@ class DCERPCServerSMBTransport:
 				await self.smb_out_q.put(data)
 
 		except Exception as e:
-			traceback.print_exc()
+			pass
 		finally:
 			await self.diconnect()
 

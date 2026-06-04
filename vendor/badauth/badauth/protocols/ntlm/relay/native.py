@@ -19,7 +19,14 @@ from kerbad.gssapi.channelbindings import ChannelBindingsStruct
 from typing import Callable
 
 async def log_cb_dummy(msg):
-	print(msg)
+	# Silenced (ADscan): the upstream default printed every relay log line —
+	# including raw NTLM message bytes and the parsed Challenge struct (server
+	# challenge) — directly to stdout, bypassing ADscan's _TeeConsole/bridge
+	# scrubber. That is a data-exfiltration channel for authentication
+	# material. When ADscan wires its own scrubbed, DEBUG-gated log_callback
+	# this default is unused; when it is not wired, silence is the only safe
+	# behaviour.
+	pass
 
 class NTLMRelaySettings:
 	def __init__(self, log_callback = log_cb_dummy):
@@ -374,7 +381,9 @@ class NTLMRelayHandler:
 		This function is to be called by the server side which we obtain the auth material from
 		"""
 		try:
-			await self.log_async(logging.DEBUG, '[SRV] AUTHDATA: %s' % authdata.hex())
+			# ADscan: removed '[SRV] AUTHDATA: <hex>' log — it dumped the raw NTLM
+			# message bytes (NEGOTIATE/AUTHENTICATE, incl. the NetNTLM response)
+			# to the log_callback. No benign value; never log authentication material.
 			if self.ntlmNegotiate is None:
 				self.ntlmNegotiate_server_raw = authdata
 				self.ntlmNegotiate_server = NTLMNegotiate.from_bytes(self.ntlmNegotiate_server_raw)
@@ -427,7 +436,8 @@ class NTLMRelayHandler:
 				self.iteration_cnt += 1
 				self.ntlmChallenge_raw = authData
 				self.ntlmChallenge = NTLMChallenge.from_bytes(authData)
-				await self.log_async(logging.DEBUG, '[CLI] Challenge %s' % self.ntlmChallenge)
+				# ADscan: removed '[CLI] Challenge <NTLMChallenge>' log — the struct's
+				# __str__ dumps the ServerChallenge and TargetInfo. Never log it.
 				
 				_, err = await self.modify_challenge()
 				if err is not None:

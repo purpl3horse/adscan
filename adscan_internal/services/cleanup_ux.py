@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 _STATUS_ICON: dict[str, str] = {
     "reverted": "✓",
+    "kept": "★",
     "pending": "●",
     "failed": "✗",
     "operator_required": "⚠",
@@ -23,6 +24,7 @@ _STATUS_ICON: dict[str, str] = {
 
 _STATUS_STYLE: dict[str, str] = {
     "reverted": "green",
+    "kept": "cyan",
     "pending": "dim",
     "failed": "bold red",
     "operator_required": "yellow",
@@ -40,6 +42,9 @@ _KIND_DISPLAY: dict[str, str] = {
     "dacl_ace_added":           "DACL ACE (GenericAll)",
     "owner_changed":            "Object owner",
     "spn_added":                "SPN (Kerberoast)",
+    "machine_account_created":  "Machine account",
+    "rbcd_delegation_added":    "RBCD delegation",
+    "keycredentiallink_added":  "KeyCredentialLink",
 }
 
 
@@ -64,6 +69,7 @@ def render_cleanup_exit_panel(ledger: "EnvironmentChangeLedger") -> None:
 
     summary = ledger.get_summary()
     reverted = [c for c in changes if c.get("revert_status") == "reverted"]
+    kept = [c for c in changes if c.get("revert_status") == "kept"]
     needs_action = [
         c for c in changes
         if c.get("revert_status") in ("operator_required", "failed", "pending")
@@ -75,14 +81,26 @@ def render_cleanup_exit_panel(ledger: "EnvironmentChangeLedger") -> None:
         count = len(reverted)
         renderables.append(
             Text(
-                f"✓ REVERTED AUTOMATICALLY          {count} change{'s' if count != 1 else ''}",
+                f"✓ REVERTED                        {count} change{'s' if count != 1 else ''}",
                 style="bold green",
             )
         )
         renderables.append(_build_changes_table(reverted, show_instructions=False))
 
+    if kept:
+        if renderables:
+            renderables.append(Text(""))
+        count = len(kept)
+        renderables.append(
+            Text(
+                f"★ KEPT BY OPERATOR                {count} change{'s' if count != 1 else ''}",
+                style="bold cyan",
+            )
+        )
+        renderables.append(_build_changes_table(kept, show_instructions=False))
+
     if needs_action:
-        if reverted:
+        if renderables:
             renderables.append(Text(""))
         count = len(needs_action)
         renderables.append(
@@ -98,6 +116,8 @@ def render_cleanup_exit_panel(ledger: "EnvironmentChangeLedger") -> None:
         border_style = "red"
     elif summary.get("pending_manual", 0) > 0:
         border_style = "yellow"
+    elif kept and not reverted:
+        border_style = "cyan"
 
     print_panel(
         Group(*renderables),

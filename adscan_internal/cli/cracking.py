@@ -50,6 +50,14 @@ from adscan_core.theme import (
     COLOR_SAGE,
     COLOR_STEEL,
 )
+from adscan_core.tui.patience_notice import (
+    PatienceNoticeConfig,
+    maybe_show_patience_notice,
+)
+from adscan_core.tui.progress_dashboard import (
+    ProgressDashboard,
+    ProgressDashboardConfig,
+)
 
 # Import services directly to avoid circular dependencies
 try:
@@ -87,6 +95,28 @@ _HASHCAT_BENIGN_STDERR_PATTERNS = (
     "nvmlDeviceGetFanSpeed(): Not Supported",
     "Mixing --show with --username or --dynamic-x can cause exponential delay in output.",
 )
+
+# Output signatures that mean hashcat could NOT PARSE the hash file (a FORMAT
+# error), as opposed to "wordlist exhausted / no match". These are emitted by
+# hashcat at parse time, before any candidate is tried, so they must never be
+# interpreted as a genuine no-match. The single most common cause in ADscan is
+# a hash line that is not ``--username``-safe (see ``_HASHCAT_USERNAME_RULES``):
+# every crack ADscan launches passes ``--username``, which strips the first
+# colon-field of each line, so a line that lacks a leading ``username:`` field
+# gets its real hash corrupted -> "Token length exception" / "No hashes loaded".
+_HASHCAT_FORMAT_ERROR_MARKERS = (
+    "token length exception",
+    "salt-length exception",
+    "separator unmatched",
+    "no hashes loaded",
+    "signature unmatched",
+)
+
+# Placeholder used for the prepended username field when a hash line is bare
+# AND no embedded username can be extracted AND we cannot prompt (CI). It keeps
+# the line a valid ``field:hash`` shape so hashcat parses it; the field is
+# stripped by ``--username`` and never affects the crack itself.
+_HASHCAT_UNKNOWN_USERNAME = "unknown"
 
 # Symbols used in cracked / not-cracked rows. Glyphs pair with color so the
 # panels stay legible under NO_COLOR.
@@ -553,6 +583,8 @@ def _resolve_hashcat_mode_and_description(hash_type: str) -> tuple[str, str]:
         "kerberoast": ("13100", "Kerberos 5 TGS-REP etype 23"),
         "timeroast": ("31300", "MS-SNTP Timeroast"),
     }
+    if "NTLMv1" in hash_type:
+        return "5500", "NetNTLMv1"
     if "NTLMv2" in hash_type:
         return "5600", "NetNTLMv2"
     return hash_details.get(hash_type, ("Unknown", hash_type))
@@ -665,6 +697,289 @@ def _extract_hash_users(hash_file: str) -> list[str]:
         return []
 
 
+# --- Centralized --username guardrail -----------------------------------------
+#
+# ALL ADscan cracking goes through ``_build_hashcat_cmd``, which ALWAYS passes
+# ``--username``. ``--username`` makes hashcat strip the first colon-field of
+# every hashfile line as a username, so EVERY line must be shaped ``field:hash``
+# for the real hash to survive parsing. A BARE hash line (no leading field)
+# gets its first hash token stripped -> "Token length exception" / "No hashes
+# loaded" -> the crack SILENTLY reports "no match".
+#
+# The per-mode behaviour below was validated empirically against hashcat v7.1.2
+# (see the PR handoff for the full table). For each mode ADscan invokes:
+#
+#   mode 13100 (kerberoast)  raw ``$krb5tgs$...``      NOT --username-safe -> prepend
+#   mode 18200 (asreproast)  raw ``$krb5asrep$...``    NOT --username-safe -> prepend
+#   mode 31300 (timeroast)   ``RID:$sntp-ms$...``      already field:hash  -> leave
+#   mode  5500 (NetNTLMv1)   ``user::dom:...``         NOT --username-safe -> prepend
+#   mode  5600 (NetNTLMv2)   ``user::dom:...``         NOT --username-safe -> prepend
+#
+# The guardrail is CONSERVATIVE: it only prepends a field to a line it can
+# CONFIDENTLY identify as bare-and-needing-a-prepend for its mode, and it never
+# touches a line that already parses (already has a leading ``field:`` for a
+# mode that wants one, or is a mode that does not want one at all). Anything it
+# cannot fix is left untouched so Layer 3 (post-run format-error detection)
+# catches it loudly.
+
+
+def _extract_kerberoast_username(hash_value: str) -> str | None:
+    """Extract the principal from a ``$krb5tgs$`` line (mode 13100).
+
+    Format: ``$krb5tgs$<etype>$*<user>$<realm>$<spn>*$<checksum>$<edata>``.
+    The username is the ``*<user>$`` segment immediately after the etype.
+    """
+    match = re.search(r"\$krb5tgs\$\d+\$\*([^$*]+)\$", hash_value)
+    if match:
+        user = match.group(1).strip()
+        return user or None
+    return None
+
+
+def _extract_asrep_username(hash_value: str) -> str | None:
+    """Extract the principal from a ``$krb5asrep$`` line (mode 18200).
+
+    Format: ``$krb5asrep$<etype>$<user>@<realm>:<checksum>$<edata>``.
+    The username is the ``<user>@<realm>`` token before the first ``:``.
+    """
+    match = re.search(r"\$krb5asrep\$\d+\$([^:$]+@[^:$]+):", hash_value)
+    if match:
+        user = match.group(1).strip()
+        return user or None
+    # Some emitters omit the etype prefix on the principal; fall back to the
+    # leading ``user@realm`` token if one is present before a colon.
+    match = re.search(r"\$krb5asrep\$([^:$]+@[^:$]+):", hash_value)
+    if match:
+        user = match.group(1).strip()
+        return user or None
+    return None
+
+
+def _extract_netntlm_username(hash_value: str) -> str | None:
+    """Extract the account from a NetNTLMv1/v2 line (modes 5500/5600).
+
+    Format: ``<user>::<domain>:...``. The username is the field before the
+    ``::`` separator.
+    """
+    idx = hash_value.find("::")
+    if idx <= 0:
+        return None
+    user = hash_value[:idx].strip()
+    return user or None
+
+
+def _sanitize_username_field(username: str) -> str:
+    """Collapse characters that would shift hashcat's ``--username`` split."""
+    return username.replace(":", "_").replace(" ", "_").strip() or _HASHCAT_UNKNOWN_USERNAME
+
+
+# Per-mode guardrail rules. ``needs_prepend`` is True when the mode's raw on-disk
+# format does NOT carry a leading ``field:`` for ``--username`` to strip (so a
+# bare line must be repaired by prepending the embedded username). ``extractor``
+# pulls that embedded username from the raw hash for the auto-fix; ``None`` means
+# the mode is already field-prefixed and must be left untouched.
+_HASHCAT_USERNAME_RULES: dict[str, dict[str, object]] = {
+    "13100": {"needs_prepend": True, "extractor": _extract_kerberoast_username},
+    "18200": {"needs_prepend": True, "extractor": _extract_asrep_username},
+    "31300": {"needs_prepend": False, "extractor": None},
+    "5500": {"needs_prepend": True, "extractor": _extract_netntlm_username},
+    "5600": {"needs_prepend": True, "extractor": _extract_netntlm_username},
+}
+
+
+def _line_is_username_safe_for_mode(line: str, mode: str) -> bool:
+    """Return True when ``line`` already survives hashcat ``--username`` parsing.
+
+    A line is safe when stripping its first colon-field leaves an intact hash.
+    For modes that do NOT need a prepend (e.g. timeroast, whose RID is the
+    field), every non-empty line is considered safe. For modes that DO need a
+    prepend, a line is only safe when its first colon-field is a plain prefix
+    (no hash-signature characters / no ``::`` immediately after the first
+    field), i.e. it has already been repaired.
+    """
+    rule = _HASHCAT_USERNAME_RULES.get(mode)
+    if rule is None or not rule.get("needs_prepend"):
+        return True
+    if ":" not in line:
+        # No field at all -> --username would strip the whole line. Not safe.
+        return False
+    first_field, remainder = line.split(":", 1)
+    # The raw, un-repaired formats all begin their hash material right at the
+    # start of the line: ``$krb5tgs$``, ``$krb5asrep$`` (signature in the first
+    # field) or ``user::dom`` (the ``::`` lands so the remainder starts with a
+    # colon). A repaired line has a clean leading field and a remainder that is
+    # itself a valid bare hash for the mode.
+    if first_field.startswith("$krb5"):
+        return False
+    if "$" in first_field:
+        return False
+    if remainder.startswith(":"):
+        # Pattern ``user::dom:...`` — first_field is the real account but the
+        # remainder still starts with the second ``:`` of ``::``; --username
+        # leaves ``:dom:...`` which corrupts the NetNTLM hash. Not safe.
+        return False
+    return True
+
+
+def write_crack_hashfile(
+    path: str,
+    pairs: "list[tuple[str | None, str]]",
+    *,
+    mode: str,
+) -> int:
+    """Write a ``--username``-safe hashfile for ``mode`` and return line count.
+
+    This is the single, make-it-impossible writer for crack hashfiles. Every
+    caller that materialises hashes for ADscan cracking should route through it
+    so a bare (un-parseable-under-``--username``) file can never be produced.
+
+    Args:
+        path: Destination hashfile path.
+        pairs: ``(username, raw_hash)`` tuples. ``username`` may be ``None`` /
+            empty; for modes that need a prepend the SUPPLIED username wins when
+            present (the caller knows the real principal, incl. domain fallback),
+            otherwise the embedded username is extracted from the raw hash,
+            falling back to a safe placeholder. For modes that are already
+            field-shaped (timeroast), the raw hash is written verbatim.
+        mode: hashcat mode string (e.g. ``"5600"``).
+
+    Returns:
+        Number of de-duplicated lines written.
+    """
+    rule = _HASHCAT_USERNAME_RULES.get(mode, {})
+    needs_prepend = bool(rule.get("needs_prepend"))
+    extractor = rule.get("extractor")
+    seen: set[str] = set()
+    lines: list[str] = []
+    for supplied_user, raw_hash in pairs:
+        raw_hash = (raw_hash or "").strip()
+        if not raw_hash:
+            continue
+        if needs_prepend and _line_is_username_safe_for_mode(raw_hash, mode) is False:
+            supplied = (supplied_user or "").strip()
+            embedded = extractor(raw_hash) if callable(extractor) else None
+            username = supplied or embedded or _HASHCAT_UNKNOWN_USERNAME
+            line = f"{_sanitize_username_field(username)}:{raw_hash}"
+        else:
+            line = raw_hash
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("".join(f"{line}\n" for line in lines))
+    return len(lines)
+
+
+def _preflight_fix_crack_hashfile(
+    shell: CrackingShell,
+    *,
+    hash_file: str,
+    mode: str,
+) -> int:
+    """Repair bare hash lines in-place so hashcat ``--username`` can parse them.
+
+    Mode-aware pre-flight (Layer 2). For each line that is NOT already
+    ``--username``-safe for ``mode`` it tries, in order:
+
+    1. Extract the embedded username from the hash and prepend it.
+    2. If extraction fails, prompt the operator (interactive) for the username.
+    3. In non-interactive / CI mode it cannot prompt, so it prepends a
+       deterministic placeholder and logs a LOUD warning (never hangs, never
+       silently drops the hash).
+
+    Lines that already parse are left untouched (conservative). Returns the
+    number of lines that were auto-fixed.
+    """
+    rule = _HASHCAT_USERNAME_RULES.get(mode)
+    if rule is None or not rule.get("needs_prepend"):
+        return 0
+    if not hash_file or not os.path.exists(hash_file):
+        return 0
+    try:
+        with open(hash_file, "r", encoding="utf-8") as handle:
+            raw_lines = handle.read().splitlines()
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        return 0
+
+    extractor = rule.get("extractor")
+    non_interactive = bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell)
+    fixed_count = 0
+    placeholder_count = 0
+    out_lines: list[str] = []
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _line_is_username_safe_for_mode(stripped, mode):
+            out_lines.append(stripped)
+            continue
+        embedded = extractor(stripped) if callable(extractor) else None
+        username = (embedded or "").strip()
+        if not username:
+            if non_interactive:
+                username = _HASHCAT_UNKNOWN_USERNAME
+                placeholder_count += 1
+                marked_hash = mark_sensitive(stripped[:24] + "…", "hash")
+                print_warning(
+                    "Could not extract a username from a hash line and cannot "
+                    f"prompt in non-interactive mode; using placeholder "
+                    f"'{_HASHCAT_UNKNOWN_USERNAME}' so it still cracks: {marked_hash}"
+                )
+            else:
+                from adscan_core.rich_output import prompt_ask
+
+                marked_hash = mark_sensitive(stripped[:24] + "…", "hash")
+                answer = prompt_ask(
+                    f"Username for hash {marked_hash} (blank = "
+                    f"'{_HASHCAT_UNKNOWN_USERNAME}')",
+                    default=_HASHCAT_UNKNOWN_USERNAME,
+                )
+                username = (answer or "").strip() or _HASHCAT_UNKNOWN_USERNAME
+        out_lines.append(f"{_sanitize_username_field(username)}:{stripped}")
+        fixed_count += 1
+
+    if fixed_count:
+        try:
+            with open(hash_file, "w", encoding="utf-8") as handle:
+                handle.write("".join(f"{ln}\n" for ln in out_lines))
+        except OSError as exc:
+            telemetry.capture_exception(exc)
+            print_warning(
+                "Failed to rewrite the repaired hash file; cracking may fail to "
+                "parse the original bare lines."
+            )
+            return 0
+        suffix = (
+            f" ({placeholder_count} with placeholder username)"
+            if placeholder_count
+            else ""
+        )
+        print_info(
+            f"[cracking] Pre-flight repaired {fixed_count} bare hash line(s) for "
+            f"hashcat --username (mode {mode}){suffix}."
+        )
+    return fixed_count
+
+
+def _detect_hashcat_format_error(combined_output: str) -> bool:
+    """Return True when hashcat reported a parse/FORMAT error (Layer 3).
+
+    A format error means hashcat could not load the hashes at all — distinct
+    from "wordlist exhausted / no candidate matched". The most common cause in
+    ADscan is a ``--username``-unsafe line (see ``_HASHCAT_FORMAT_ERROR_MARKERS``).
+    """
+    lowered = (combined_output or "").lower()
+    if any(marker in lowered for marker in _HASHCAT_FORMAT_ERROR_MARKERS):
+        return True
+    # ``Parsing Hashes: 0/N`` with no successful parse is also a format error.
+    if re.search(r"parsing hashes:\s*0/\d+", lowered) and "parsed hashes:" not in lowered:
+        return True
+    return False
+
+
 def _render_cracking_preflight(
     shell: CrackingShell,
     *,
@@ -737,6 +1052,130 @@ def _render_cracking_preflight(
     )
 
 
+def crack_captured_netntlm(
+    shell: CrackingShell,
+    *,
+    domain: str,
+    captures: list[dict[str, Any]],
+) -> None:
+    """Crack captured NetNTLM (v1/v2) responses with the existing hashcat path.
+
+    Reuses :func:`run_cracking` end-to-end — wordlist resolution (CI-safe),
+    backend selection, the pre-flight panel, ``hashcat`` invocation, the
+    potfile ``--show`` extraction, and the credential feed-back via
+    ``shell.add_credential``. NOTHING about hashcat is reimplemented here; this
+    helper only materialises the captured ``fullhash`` tokens into per-version
+    hash files and dispatches each batch with the CORRECT mode:
+
+    * ``NTLMv1`` → ``hash_type="NTLMv1"`` → ``hashcat -m 5500``
+    * ``NTLMv2`` → ``hash_type="NTLMv2"`` → ``hashcat -m 5600``
+
+    The version is taken from each capture's ``ntlm_version`` (already the real
+    value classified from the wire by the listener — never assumed). Captures of
+    mixed versions in one session are split into separate batches so each runs
+    under its own mode.
+
+    Args:
+        shell: Active session shell (workspace dir, ``add_credential``, run env).
+        domain: Domain the captures belong to (drives the cracking output dir).
+        captures: List of capture dicts as persisted in
+            ``domains_data[domain]["captured_netntlm"]`` — each with at least a
+            ``fullhash`` and ``ntlm_version``.
+    """
+    # Group hashes by their canonical NetNTLM version so each batch runs under
+    # the right hashcat mode. Empty / malformed captures are skipped.
+    #
+    # Each line is materialised as ``username:<fullhash>`` (the bare sAMAccountName
+    # prepended with a colon) to match the kerberoast/asrep convention consumed by
+    # :func:`_extract_hash_users` ("hash file formatted as user:hash"). hashcat is
+    # always invoked with ``--username`` (see :func:`_build_hashcat_cmd`), which
+    # strips the first colon-field of every line before parsing the hash. A bare
+    # NetNTLMv2 line (``user::domain:challenge:ntproof:blob``) would have its
+    # leading ``user`` stripped, leaving ``:domain:...`` -> "Token length exception"
+    # -> "No hashes loaded". Prepending the username gives ``--username`` a field to
+    # strip, so the real NetNTLM hash parses AND the cracked plaintext is attributed
+    # back to the right account by the ``--show --outfile-format 2`` step.
+    batches: dict[str, list[tuple[str, str]]] = {}
+    for cap in captures or []:
+        cap_dict = cap or {}
+        fullhash = str(cap_dict.get("fullhash") or "").strip()
+        if not fullhash:
+            continue
+        # Capture dicts carry the principal under ``user`` (clean_user /
+        # sAMAccountName); accept ``username`` too for robustness. A missing /
+        # empty username must NOT produce a bare hash line (``--username`` would
+        # then strip the first field of the hash itself), so fall back to the
+        # capture's domain, then to a literal ``unknown`` placeholder -- either
+        # keeps the line a valid ``field:hash`` shape that hashcat can parse.
+        username = str(
+            cap_dict.get("user") or cap_dict.get("username") or ""
+        ).strip()
+        if not username:
+            username = str(cap_dict.get("domain") or "").strip() or "unknown"
+        # A colon or whitespace in the prepended field would shift hashcat's
+        # split point; collapse them so the username stays a single clean field.
+        username = username.replace(":", "_").replace(" ", "_")
+        raw_version = str(cap_dict.get("ntlm_version") or "").strip().lower()
+        version = "NTLMv1" if "v1" in raw_version else "NTLMv2"
+        batches.setdefault(version, []).append((username, fullhash))
+
+    if not batches:
+        print_info("[~] No captured NTLM hashes to crack.")
+        return
+
+    cracking_directory = os.path.join(
+        shell.current_workspace_dir or os.getcwd(),
+        "domains",
+        domain,
+        "cracking",
+    )
+    try:
+        os.makedirs(cracking_directory, exist_ok=True)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_error("Could not prepare the cracking workspace directory.")
+        return
+
+    wordlists_dir = str(get_adscan_home() / "wordlists")
+
+    for version, entries in batches.items():
+        # Deterministic per-version file the existing potfile/--show step reads.
+        hash_file = os.path.join(cracking_directory, f"captured_{version.lower()}.txt")
+        mode = "5500" if version == "NTLMv1" else "5600"
+        try:
+            # Route through the centralized --username-safe writer (Layer 1):
+            # it prepends the captured account so the bare ``user::dom:...``
+            # NetNTLM hash survives hashcat's --username field-stripping, and it
+            # de-dupes while preserving order.
+            written = write_crack_hashfile(
+                hash_file,
+                [(username, fullhash) for username, fullhash in entries],
+                mode=mode,
+            )
+        except OSError as exc:
+            telemetry.capture_exception(exc)
+            print_error(f"Could not write the captured {version} hash file.")
+            continue
+
+        print_info(
+            f"[*] Cracking {written} captured {version} hash(es) "
+            f"(mode {mode})."
+        )
+        try:
+            run_cracking(
+                shell,
+                hash_type=version,
+                domain=domain,
+                hash_file=hash_file,
+                wordlists_dir=wordlists_dir,
+                failed=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error(f"Cracking the captured {version} hash(es) failed.")
+            print_exception(show_locals=False, exception=exc)
+
+
 def run_cracking(
     shell: CrackingShell,
     *,
@@ -797,15 +1236,20 @@ def run_cracking(
         failed_retry=failed,
     )
 
+    # hashcat is ALWAYS invoked with --username (see _build_hashcat_cmd), so
+    # every hash line must be shaped ``field:hash``. Repair any bare line for
+    # this mode BEFORE building the command (Layer 2 of the --username
+    # guardrail). Conservative: lines that already parse are left untouched.
     command = None
-    if hash_type == "asreproast":
-        command = _build_hashcat_cmd(hash_file, wordlist, "18200", shell)
-    elif hash_type == "kerberoast":
-        command = _build_hashcat_cmd(hash_file, wordlist, "13100", shell)
-    elif hash_type == "timeroast":
-        command = _build_hashcat_cmd(hash_file, wordlist, "31300", shell)
-    elif "NTLMv2" in hash_type:
-        command = _build_hashcat_cmd(hash_file, wordlist, "5600", shell)
+    if hashcat_mode != "Unknown":
+        try:
+            _preflight_fix_crack_hashfile(shell, hash_file=hash_file, mode=hashcat_mode)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"[cracking] hashfile pre-flight repair failed (continuing): {exc}"
+            )
+        command = _build_hashcat_cmd(hash_file, wordlist, hashcat_mode, shell)
 
     if hashcat_mode != "Unknown":
         print_info_debug(
@@ -1048,6 +1492,109 @@ def run_sync_clock(shell: CrackingShell, domain: str, *, verbose: bool = False) 
     return success
 
 
+def _build_spray_dashboard() -> ProgressDashboard:
+    """Indeterminate password-spraying dashboard (kerbrute stdout is opaque).
+
+    kerbrute's spray subprocess is blocking and exposes no parseable live
+    stream, so a determinate X/N bar would require a guessed (lying) ETA.
+    Indeterminate mode shows a spinner + elapsed so the operator can see the
+    spray is alive and avoid Ctrl+C-ing a working run.
+    """
+    return ProgressDashboard(
+        ProgressDashboardConfig(
+            title="Password Spraying",
+            total=None,  # indeterminate -- spinner + elapsed (no per-try stream)
+            unit="attempts",
+        )
+    )
+
+
+def _estimate_spray_candidate_count(command: str) -> int:
+    """Best-effort count of spray candidates for the patience notice.
+
+    kerbrute embeds the users-file path as a positional argument; a single
+    password is sprayed against every user, so the user count is the natural
+    scale (users x passwords collapses to the user count for one password).
+    The command is parsed best-effort: the first existing file argument is
+    treated as the users file and its non-empty lines are counted. Returns 0
+    on any failure so the notice simply stays silent.
+
+    Args:
+        command: Full kerbrute spray command string.
+
+    Returns:
+        Number of candidate usernames, or 0 when it cannot be determined.
+    """
+    try:
+        for token in shlex.split(command):
+            if not token or token.startswith("-"):
+                continue
+            if os.path.isfile(token):
+                with open(token, encoding="utf-8", errors="ignore") as handle:
+                    return sum(1 for line in handle if line.strip())
+    except (OSError, ValueError):
+        return 0
+    return 0
+
+
+def _run_spray_with_dashboard(run_spray: "Any") -> Any:
+    """Run the blocking kerbrute spray under an indeterminate dashboard.
+
+    ``run_spray`` is a zero-arg callable that executes the blocking spray and
+    returns its result dict. It runs in a single worker thread so the dashboard
+    spinner + elapsed can tick while kerbrute blocks. The thread is always
+    joined (the ``with`` on the pool blocks until the future resolves), so it
+    never leaks; ``fut.result()`` re-raises any worker exception, preserving the
+    caller's error handling exactly.
+
+    FAIL-SAFE: if the dashboard cannot be built / driven, the blocking call is
+    still executed directly so the spray always runs and the result handling is
+    never skipped. ``call_started`` distinguishes a dashboard/LiveSession setup
+    failure (fall back to a plain call) from a failure raised by ``run_spray``
+    itself (must propagate -- never re-run the spray).
+
+    Args:
+        run_spray: Zero-arg callable performing the blocking spray.
+
+    Returns:
+        Whatever ``run_spray`` returns (the spray result dict).
+    """
+    import concurrent.futures
+    import time as _time
+
+    try:
+        dashboard = _build_spray_dashboard()
+    except Exception:  # noqa: BLE001 -- dashboard build must never block the scan
+        return run_spray()
+
+    def _safe_update(dash: "ProgressDashboard") -> None:
+        try:
+            dash.update()
+        except Exception:  # noqa: BLE001 -- a render error must not abort the run
+            pass
+
+    call_started = False
+    try:
+        with dashboard.live_session():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(run_spray)
+                call_started = True
+                while not fut.done():
+                    _safe_update(dashboard)
+                    _time.sleep(0.25)
+                result = fut.result()  # re-raises worker exceptions here
+                _safe_update(dashboard)
+                return result
+    except Exception:  # noqa: BLE001
+        if call_started:
+            # ``run_spray`` (or its worker plumbing) raised -- propagate to the
+            # caller's existing try/except. Do NOT re-run the spray.
+            raise
+        # Dashboard / LiveSession failed before the call started -- fall back to
+        # a plain blocking call so the spray still completes.
+        return run_spray()
+
+
 def run_password_spraying(
     shell: CrackingShell,
     command: str,
@@ -1062,10 +1609,21 @@ def run_password_spraying(
     """
     from adscan_internal.cli.common import SECRET_MODE
 
-    marked_domain = mark_sensitive(domain, "domain")
-    print_warning(
-        f"Performing the spraying on {marked_domain}. Please be patient (this can take a while)"
-    )
+    # Upfront patience notice -- threshold-gated on the candidate count. Silent
+    # for small lists; a single line under non-interactive runs. Never blocks.
+    try:
+        maybe_show_patience_notice(
+            PatienceNoticeConfig(
+                operation="Password spraying",
+                unit="candidate usernames",
+                threshold=500,
+                env_var="ADSCAN_PATIENCE_THRESHOLD_SPRAY",
+            ),
+            count=_estimate_spray_candidate_count(command),
+            non_interactive=is_non_interactive(shell),
+        )
+    except Exception:  # noqa: BLE001 -- notice must never abort the spray
+        pass
 
     # Create executor that uses shell.run_command
     def executor(cmd: str, timeout: int | None) -> Any:
@@ -1088,12 +1646,21 @@ def run_password_spraying(
         )
 
     service = CredentialService()
-    result = service.execute_password_spraying(
-        command=command,
-        domain=domain,
-        executor=executor,
-        scan_id=None,
-    )
+
+    # Indeterminate live dashboard. The blocking spray runs in a worker thread
+    # so the spinner + elapsed tick while kerbrute blocks; LiveSession falls
+    # back to inline logging on non-TTY/CI itself. FAIL-SAFE: a render error
+    # never aborts the run -- the helper falls back to a direct blocking call
+    # and the result handling below is unchanged.
+    def _run_spray() -> Any:
+        return service.execute_password_spraying(
+            command=command,
+            domain=domain,
+            executor=executor,
+            scan_id=None,
+        )
+
+    result = _run_spray_with_dashboard(_run_spray)
 
     # Process results and display to user
     if result["returncode"] != 0:
@@ -1465,7 +2032,7 @@ def _render_cracked_credentials_panel(
             "[bold]Next:[/bold] machine account passwords unlock silver tickets and "
             "RBCD primitives against the corresponding host."
         )
-    elif "NTLMv2" in hash_type:
+    elif "NTLMv1" in hash_type or "NTLMv2" in hash_type:
         next_lines.append(
             "[bold]Next:[/bold] try the cracked passwords across the domain "
             "with password spraying, watching for reused credentials."
@@ -1486,6 +2053,57 @@ def _render_cracked_credentials_panel(
         title_align="left",
         border_style=COLOR_SAGE,
         box=rich.box.HEAVY,
+        padding=(1, 2),
+    )
+
+
+def _render_cracking_format_error_panel(
+    *,
+    hash_type: str,
+    hash_description: str,
+    hashcat_mode: str,
+    hash_file: str,
+) -> None:
+    """Render a DISTINCT, loud panel when hashcat could not PARSE the hashfile.
+
+    This is the Layer 3 verdict surface. A format error is fundamentally
+    different from "no match": hashcat never loaded any hash, so reporting a
+    generic no-crack would be misleading. The panel names the likely cause (a
+    ``--username`` formatting issue: every line must be ``username:hash``) and
+    points at the file so the operator can act.
+    """
+    marked_file = mark_sensitive(hash_file, "path")
+    body = Group(
+        Text.from_markup(
+            f"[{COLOR_CRIMSON}]{_GLYPH_FAILED}[/] "
+            f"[bold]{hash_description}[/bold] "
+            f"[{COLOR_MUTED}]· hash file could not be parsed[/]"
+        ),
+        Text(""),
+        Text.from_markup(
+            f"[bold]Diagnosis:[/bold] hashcat could not parse the hash file for "
+            f"mode {hashcat_mode} — this is a FORMAT error, not a failed crack. "
+            f"No password was even attempted."
+        ),
+        Text.from_markup(
+            f"[{COLOR_MUTED}]{_GLYPH_INFO} Cracking always runs with --username, "
+            f"so every line must be shaped [code]username:hash[/code]. A bare hash "
+            f"line has its first token stripped and stops parsing.[/]"
+        ),
+        Text.from_markup(f"[{COLOR_MUTED}]{_GLYPH_INFO} Hash file: {marked_file}[/]"),
+        Text(""),
+        Text.from_markup(
+            "[bold]Next:[/bold] re-run cracking — ADscan auto-repairs bare lines "
+            "before launching hashcat. If this persists, the file may contain a "
+            "hash that does not match the selected mode."
+        ),
+    )
+    print_panel(
+        body,
+        title=f"[bold]Hash Cracking[/bold] [{COLOR_MUTED}]· format error[/]",
+        title_align="left",
+        border_style=COLOR_CRIMSON,
+        box=rich.box.ROUNDED,
         padding=(1, 2),
     )
 
@@ -1637,6 +2255,20 @@ def execute_cracking(
             if cause_from_output != "unknown":
                 initial_failure_cause = cause_from_output
 
+            # Layer 3 — hard FORMAT-error detection. A parse error means hashcat
+            # never loaded the hashes (NOT "wordlist exhausted / no match"), so
+            # the silent "no match" path below would be misleading. Surface a
+            # distinct, loud panel and return FORMAT_ERROR so this class can
+            # never again be confused with a genuine no-crack.
+            if _detect_hashcat_format_error(combined_output):
+                _render_cracking_format_error_panel(
+                    hash_type=hash_type,
+                    hash_description=hash_description,
+                    hashcat_mode=hashcat_mode,
+                    hash_file=hash,
+                )
+                return {"status": "format_error", "cracked_count": 0}
+
         # Second phase: hashcat --show to extract cracked passwords
         file_name = f"cracked_{hash_type}.txt"
         cracking_directory = os.path.join(
@@ -1664,6 +2296,24 @@ def execute_cracking(
         show_cmd = maybe_wrap_hashcat_for_container(show_cmd)
         print_info_debug(f"Executing hashcat show command: {show_cmd}")
         completed_process_show = shell.run_command(show_cmd, timeout=300)
+
+        # Layer 3 (continued) — the --show pass is a second hashcat invocation
+        # over the same file; a parse error here is the same FORMAT class. Catch
+        # it so it is never silently downgraded to "no match".
+        if completed_process_show is not None:
+            show_combined = (
+                (completed_process_show.stdout or "")
+                + "\n"
+                + (completed_process_show.stderr or "")
+            )
+            if _detect_hashcat_format_error(show_combined):
+                _render_cracking_format_error_panel(
+                    hash_type=hash_type,
+                    hash_description=hash_description,
+                    hashcat_mode=hashcat_mode,
+                    hash_file=hash,
+                )
+                return {"status": "format_error", "cracked_count": 0}
 
         if completed_process_show is None:
             print_warning("'hashcat --show' command failed to execute.")

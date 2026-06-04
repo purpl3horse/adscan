@@ -677,9 +677,514 @@ def _normalize_hex_secret(value: str | None, *, expected_len: int) -> str:
         return ""
     return candidate
 
+# --------------------------------------------------------------------------- #
+# Service-ticket persistence + host-scoped resolution (shared, single source)
+# --------------------------------------------------------------------------- #
+#
+# A step that mints a derived service ticket (RBCD/S4U, constrained delegation,
+# silver) and a step that later authenticates to the same host both go through
+# the helpers below.  Centralising them keeps the producer (delegations.py and
+# relay_rbcd.py) and the consumer (attack_path_execution.py) on ONE definition
+# of "what is a host match" — the bug this prevents is a ``cifs/WEB01`` ticket
+# being mis-used for a DCSync against the DC.
+
+
+def persist_service_ticket(
+    domains_data: MutableMapping[str, Any],
+    *,
+    domain: str,
+    ccache_path: str,
+    kind: Any,
+    owner_principal: str,
+    impersonated_user: str,
+    spn: str,
+    target_host: str,
+) -> bool:
+    """Persist an S4U/RBCD/delegation-derived service ticket (single source).
+
+    Parses the resulting ccache via :func:`inspect_ccache` to recover the
+    issuance / expiry timestamps and the realm, builds a :class:`ServiceTicket`
+    and stores it under ``domains_data[domain]["service_tickets"]`` through
+    :meth:`CredentialStoreService.store_service_ticket`.
+
+    This is the DRY core shared by ``delegations._persist_service_ticket_after_s4u``
+    and the RBCD chain in ``relay_rbcd._run_s4u`` — both produce host-scoped
+    tickets that MUST NOT land in ``kerberos_tickets`` (they are not TGTs).
+
+    Args:
+        domains_data: Shared workspace domain mapping.
+        domain: Domain key in ``domains_data``.
+        ccache_path: Filesystem path to the produced ``.ccache`` file.
+        kind: ``ServiceTicketKind`` or a string coercible to one.
+        owner_principal: Principal whose TGT/key produced the ST (for RBCD the
+            attacker machine account, e.g. ``ADSCANE66DD6$``).
+        impersonated_user: The "for client" of the ST (e.g. ``Administrator``).
+        spn: Service principal name the ticket grants (e.g.
+            ``cifs/web01.example.local``).  When empty, recovered from the
+            ccache's first service ticket.
+        target_host: Host portion of the SPN, kept separate so consumers can
+            match by host without parsing.
+
+    Returns:
+        ``True`` when the ticket was persisted, ``False`` otherwise.  Failures
+        are swallowed (logged at debug) — a missing persistence is a soft loss
+        (the ccache file is still on disk), never worth aborting exploitation.
+    """
+    from adscan_internal.models.service_ticket import (  # noqa: PLC0415
+        ServiceTicket,
+        ServiceTicketKind,
+    )
+    from adscan_internal.services.kerberos_ccache_inspector import (  # noqa: PLC0415
+        inspect_ccache,
+    )
+    from adscan_internal.rich_output import (  # noqa: PLC0415
+        mark_sensitive,
+        print_info_debug,
+    )
+    from adscan_core import telemetry  # noqa: PLC0415
+
+    normalized_ccache = str(ccache_path or "").strip()
+    if not normalized_ccache:
+        return False
+    try:
+        info = inspect_ccache(normalized_ccache)
+        first_st = info.first_service_ticket()
+        ticket = ServiceTicket(
+            ccache_path=normalized_ccache,
+            kind=ServiceTicketKind.coerce(kind),
+            owner_principal=str(owner_principal or "").strip()
+            or (info.default_client_name or ""),
+            impersonated_user=str(impersonated_user or "").strip(),
+            spn=str(spn or "").strip() or (first_st.server_spn if first_st else ""),
+            target_host=str(target_host or "").strip()
+            or _spn_host(first_st.server_spn if first_st else ""),
+            realm=(
+                (info.default_client_realm or (domain.upper() if domain else ""))
+                .strip()
+                .upper()
+            ),
+            etype=getattr(first_st, "etype", None) if first_st else None,
+            issued_at=first_st.starttime if first_st else None,
+            expires_at=first_st.endtime if first_st else None,
+        )
+        stored = CredentialStoreService().store_service_ticket(
+            domains_data=domains_data,
+            domain=domain,
+            ticket=ticket,
+        )
+        if stored:
+            print_info_debug(
+                f"service_tickets: persisted {mark_sensitive(ticket.ccache_path, 'path')} "
+                f"kind={ticket.kind.value} spn={mark_sensitive(ticket.spn, 'service')} "
+                f"impersonated={mark_sensitive(ticket.impersonated_user, 'user')}"
+            )
+        return stored
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"service_tickets: failed to persist {mark_sensitive(normalized_ccache, 'path')}: "
+            f"{type(exc).__name__}: {mark_sensitive(str(exc), 'detail')}"
+        )
+        return False
+
+
+def _spn_host(spn: str) -> str:
+    """Return the host portion of an SPN (``cifs/web01.example.local`` -> host)."""
+    raw = str(spn or "").strip()
+    if "/" not in raw:
+        return ""
+    host = raw.split("/", 1)[1].strip()
+    # SPNs occasionally carry a port or instance (``host:445``, ``host:inst``).
+    return host.split(":", 1)[0].strip()
+
+
+def host_match_keys(value: str) -> set[str]:
+    """Return the alias-aware comparison keys for one host identifier.
+
+    Service-ticket ``target_host`` (an SPN host, usually an FQDN) and the host a
+    follow-up step resolves to (FQDN, short name, IP, or ``HOST$``) must compare
+    equal when they denote the same machine.  This produces a normalised set so
+    a match is ``keys(a) & keys(b)`` being non-empty:
+
+    - lowercased, trailing dot and trailing ``$`` stripped
+    - the full value (FQDN or IP)
+    - the short hostname (label before the first dot) for non-IP values
+
+    IPs are preserved verbatim (no short-name split).  Empty/blank input yields
+    an empty set so it never matches anything.
+    """
+    raw = str(value or "").strip().strip(".").rstrip("$").lower()
+    if not raw:
+        return set()
+    keys = {raw}
+    # IPv4 literal -> keep as-is, do not derive a "short name".
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", raw):
+        return keys
+    short = raw.split(".", 1)[0].strip()
+    if short:
+        keys.add(short)
+    return keys
+
+
+def hosts_match(a: str, b: str) -> bool:
+    """Return whether two host identifiers denote the same machine (alias-aware)."""
+    keys_a = host_match_keys(a)
+    keys_b = host_match_keys(b)
+    return bool(keys_a and keys_b and (keys_a & keys_b))
+
+
+def resolve_scoped_ticket_for_host(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    service: str = "cifs",
+) -> Optional[tuple[str, str]]:
+    """Return the best stored service ticket scoped to *host*, if any.
+
+    Walks ``domains_data[domain]["service_tickets"]`` and returns the newest,
+    non-expired ticket whose ``target_host`` (or SPN host) is an alias of
+    *host*.  This is the consumer half of the service-ticket handoff: a step
+    that authenticates to a host (DumpLSA, DumpDPAPI, DCSync, …) calls this
+    BEFORE the generic credential resolver and, on a hit, runs as the ticket's
+    ``impersonated_user`` with the ticket's ccache.
+
+    The alias-aware host match (:func:`hosts_match`) is exactly what stops a
+    ``cifs/WEB01`` ticket from being handed to a DCSync against the DC: a
+    different ``target_host`` yields no match, so the caller falls back to the
+    generic resolver.
+
+    Args:
+        shell: Shell exposing ``domains_data``.
+        domain: Domain key in ``domains_data``.
+        host: Target host the follow-up step resolved to (FQDN/IP/short/``HOST$``).
+        service: Optional service prefix filter (default ``cifs``).  When set,
+            only tickets whose SPN service matches are considered; pass ``""``
+            to accept any service.
+
+    Returns:
+        ``(impersonated_user, ccache_path)`` for the best match, or ``None``.
+    """
+    normalized_host = str(host or "").strip()
+    if not normalized_host:
+        return None
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return None
+
+    tickets = CredentialStoreService().iter_service_tickets(
+        domains_data=domains_data,
+        domain=domain,
+    )
+    if not tickets:
+        return None
+
+    service_prefix = str(service or "").strip().lower()
+    import time  # noqa: PLC0415
+
+    now = int(time.time())
+
+    # IP<->FQDN bridge. host_match_keys is string-only (it explicitly keeps IPs
+    # verbatim), so an IP can never alias-match an FQDN. But a scoped ticket is
+    # stored under its SPN host (an FQDN, e.g. ldap/DC01.pirate.htb) while a
+    # follow-up step often knows the host only by IP (domains_data may carry only
+    # `pdc`/dc_ip, no dc_fqdn — exactly the DCSync-after-SPNJack case). Expand the
+    # query host through the persisted workspace IP<->hostname inventory so an IP
+    # query matches an FQDN ticket and vice-versa. Best-effort: no inventory →
+    # behaves exactly as before (direct hosts_match only).
+    query_hosts: set[str] = {normalized_host}
+    try:
+        from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+            load_workspace_ip_hostname_inventory,
+        )
+
+        inventory = (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=getattr(shell, "current_workspace_dir", "") or "",
+                domains_dir=getattr(shell, "domains_dir", "domains") or "domains",
+                domain=domain,
+            )
+            or {}
+        )
+        nh_low = normalized_host.lower().rstrip(".").rstrip("$")
+        nh_short = nh_low.split(".", 1)[0]
+        for ip, names in inventory.items():
+            names_low = {str(n).lower().rstrip(".") for n in (names or [])}
+            shorts = {n.split(".", 1)[0] for n in names_low}
+            if (
+                nh_low == str(ip).lower()
+                or nh_low in names_low
+                or nh_short in shorts
+            ):
+                query_hosts.add(str(ip))
+                query_hosts.update(names or [])
+    except Exception:  # noqa: BLE001 — inventory bridge is best-effort
+        pass
+
+    candidates: list = []
+    for ticket in tickets:
+        if not ticket.ccache_path or not ticket.impersonated_user:
+            continue
+        if service_prefix:
+            spn_service = (
+                ticket.spn.split("/", 1)[0].strip().lower() if ticket.spn else ""
+            )
+            if spn_service and spn_service != service_prefix:
+                continue
+        # Host match: prefer the explicit target_host, fall back to the SPN host.
+        # Match against any bridged form of the query host (IP<->FQDN aliases).
+        ticket_host = ticket.target_host or _spn_host(ticket.spn)
+        if not any(hosts_match(ticket_host, qh) for qh in query_hosts):
+            continue
+        # Drop tickets we know are expired; keep tickets with unknown expiry
+        # (a None expiry means the ccache was unparseable for times — the file
+        # is still the source of truth and may be valid).
+        if ticket.expires_at is not None and ticket.expires_at <= now:
+            continue
+        candidates.append(ticket)
+
+    if not candidates:
+        return None
+
+    # Newest first: prefer the most recently issued ticket; ties broken by the
+    # later expiry.  Unknown timestamps sort last (treated as oldest).
+    def _sort_key(t) -> tuple[int, int]:
+        return (t.issued_at or 0, t.expires_at or 0)
+
+    best = max(candidates, key=_sort_key)
+    return best.impersonated_user, best.ccache_path
+
+
+# --------------------------------------------------------------------------- #
+# Relation -> Kerberos service map (the consumer's "which ST do I need?")
+# --------------------------------------------------------------------------- #
+#
+# A step that authenticates to a host must consume a service ticket whose SPN
+# class matches the service its transport actually binds — NOT a guess. Before
+# this map the two scoped-ticket consumers hard-wired their service string
+# inline, and one was wrong: DCSync passed ``service="ldap"`` even though the
+# native DRSUAPI replication runs over an aiosmb SMB connection
+# (``smb_machine_with_fallback`` in ``native_dump_service.dcsync`` →
+# ``cifs/<dc>``). It only worked because the SPNJack-minted ccaches carried the
+# administrator TGT, so the SMB bind could derive ``cifs/<dc>`` regardless of
+# the filter — luck, not design. A pure ldap service ticket (no TGT) would have
+# selected "right" by the filter and then failed the cifs bind.
+#
+# This is the single source of truth for "relation -> Kerberos service class".
+# Keys are lowercase relation/action strings (the same strings the attack-path
+# engine and ACE executor dispatch on). Values are lowercase SPN service
+# prefixes, matched against ``ServiceTicket.spn.split('/')[0].lower()`` by
+# :func:`resolve_scoped_ticket_for_host`.
+#
+# DRSUAPI / dump steps -> cifs (all authenticate via an aiosmb SMB connection):
+#   * dcsync     -> DRSUAPI GetNCChanges over SMB
+#   * dumplsa    -> LSASS dump over SMB
+#   * dumpdpapi  -> DPAPI material over SMB
+#   * dumpsam    -> SAM/SYSTEM hive over SMB
+#
+# Lateral access steps -> the protocol's own SPN class. These are NOT wired as
+# scoped-ticket consumers yet (their native verifiers classify only
+# password-vs-NT-hash and do not detect a .ccache credential — see the Phase 2
+# entry in BACKLOG.md). The rows live here so that when each verifier is taught
+# to route a ccache, wiring the consumer is a one-line change and the service
+# class is already correct by construction:
+#   * adminto / hassession -> cifs   (SMB local-admin)
+#   * canpsremote          -> http   (WinRM / WSMAN: HTTP/<host>)
+#   * canrdp               -> termsrv
+#   * sqladmin / sqlaccess -> mssqlsvc
+_DEFAULT_KERBEROS_SERVICE = "cifs"
+
+RELATION_TO_KERBEROS_SERVICE: dict[str, str] = {
+    # DRSUAPI / dump family — all bind over SMB.
+    "dcsync": "cifs",
+    "dumplsa": "cifs",
+    "dumpdpapi": "cifs",
+    "dumpsam": "cifs",
+    # Lateral access family (Phase 2 — see BACKLOG.md).
+    "adminto": "cifs",
+    "hassession": "cifs",
+    "canpsremote": "http",
+    "canrdp": "termsrv",
+    "sqladmin": "mssqlsvc",
+    "sqlaccess": "mssqlsvc",
+}
+
+
+def kerberos_service_for_relation(relation: str) -> str:
+    """Return the Kerberos SPN service class a *relation* authenticates with.
+
+    Single source of truth for "which service ticket does the next step need".
+    Falls back to ``cifs`` for unknown relations — the safest default because a
+    ccache that carries a TGT can mint a ``cifs`` ticket for the host, and most
+    post-ex steps bind over SMB.
+
+    Args:
+        relation: Lowercase (or any-case) relation/action string, e.g.
+            ``"dcsync"``, ``"dumplsa"``, ``"canpsremote"``.
+
+    Returns:
+        Lowercase SPN service prefix (``"cifs"``, ``"http"``, ``"termsrv"``,
+        ``"mssqlsvc"``, ``"ldap"``, …).
+    """
+    return RELATION_TO_KERBEROS_SERVICE.get(
+        str(relation or "").strip().lower(), _DEFAULT_KERBEROS_SERVICE
+    )
+
+
+def resolve_execution_credential(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    relation: str,
+) -> Optional[tuple[str, str]]:
+    """Return the best host-scoped service ticket for the NEXT step, or ``None``.
+
+    The single entry point a chained step should call to reuse a service ticket
+    minted by a prior step (RBCD/S4U2Proxy, constrained delegation, SPNJack,
+    silver). It combines two pieces that used to be hand-wired at each call
+    site:
+
+      1. **Service correctness** — derives the Kerberos service class from
+         *relation* via :func:`kerberos_service_for_relation`, so DCSync asks
+         for ``cifs`` (DRSUAPI-over-SMB), DumpLSA for ``cifs``, a future WinRM
+         consumer for ``http`` — correct by construction, never a guess.
+
+      2. **Preferent matching** — first looks for a ticket whose SPN service
+         already matches (the exact ticket for this step); on no match, falls
+         back to *any* non-expired ticket for the host. This avoids a false
+         negative: a ccache that carries the principal's TGT is usable for any
+         service on the host, so rejecting it merely because its SPN prefix is
+         ``ldap`` rather than ``cifs`` would be wrong. The service class is a
+         preference (and tie-breaker), not a hard gate.
+
+    On ``None`` the caller falls back to its generic credential resolver
+    (password/NT-hash for the execution principal) exactly as before.
+
+    Args:
+        shell: Shell exposing ``domains_data`` (and workspace paths for the
+            IP↔FQDN bridge inside :func:`resolve_scoped_ticket_for_host`).
+        domain: Domain key in ``domains_data``.
+        host: Target host the follow-up step resolved to (FQDN/IP/short/``HOST$``).
+        relation: The relation/action of the step about to authenticate
+            (``"dcsync"``, ``"dumplsa"``, …). Selects the preferred service.
+
+    Returns:
+        ``(impersonated_user, ccache_path)`` for the best match, or ``None``.
+    """
+    service = kerberos_service_for_relation(relation)
+    # Preferent: a ticket whose SPN class already matches this step wins.
+    hit = resolve_scoped_ticket_for_host(
+        shell, domain=domain, host=host, service=service
+    )
+    if hit is not None:
+        return hit
+    # No service-matched ticket — accept any non-expired ticket for this host
+    # (a ccache carrying the TGT serves every service on the host).
+    return resolve_scoped_ticket_for_host(
+        shell, domain=domain, host=host, service=""
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Capability-bearing TGT marker (ESC13 / Pass-the-Certificate)
+# --------------------------------------------------------------------------- #
+#
+# Most TGT ccaches in ``kerberos_tickets`` are interchangeable with a stored
+# password/hash for the same principal, so the generic resolver prefers the
+# password (it is reusable, the ccache may be expired).  ESC13 PtC is the
+# exception: the minted TGT carries a synthetic group SID in its PAC that the
+# password CANNOT reproduce.  Dropping that ccache for the password on re-auth
+# silently discards the ESC13 privilege.
+#
+# This marker records, per user, the ccache that MUST be preferred over a
+# password/hash for that user.  It is a plain ``{user: ccache_path}`` map
+# (JSON-safe) under ``domains_data[domain]["capability_bearing_ccache"]`` and
+# is honoured ONLY by the resolver for the marked user — the global
+# password-first default is unchanged for every other flow.
+
+_CAPABILITY_BEARING_KEY = "capability_bearing_ccache"
+
+
+def _normalize_marker_user(username: str) -> str:
+    """Normalize a username for the marker map (lowercase, no realm/domain prefix)."""
+    name = str(username or "").strip()
+    if "\\" in name:
+        name = name.split("\\", 1)[1]
+    if "@" in name:
+        name = name.split("@", 1)[0]
+    return name.strip().lower()
+
+
+def mark_capability_bearing_ccache(
+    domains_data: MutableMapping[str, Any],
+    *,
+    domain: str,
+    username: str,
+    ccache_path: str,
+) -> bool:
+    """Mark *ccache_path* as the prefer-over-password ccache for *username*.
+
+    Used by the ESC13 / Pass-the-Certificate flow when the minted TGT carries a
+    synthetic group SID in its PAC.  Returns ``True`` when the marker was
+    written.
+    """
+    normalized_user = _normalize_marker_user(username)
+    normalized_path = str(ccache_path or "").strip()
+    if not normalized_user or not normalized_path:
+        return False
+    domain_data = CredentialStoreService.ensure_domain_entry(domains_data, domain)
+    marker = domain_data.setdefault(_CAPABILITY_BEARING_KEY, {})
+    if not isinstance(marker, dict):
+        marker = {}
+        domain_data[_CAPABILITY_BEARING_KEY] = marker
+    marker[normalized_user] = normalized_path
+    return True
+
+
+def get_capability_bearing_ccache(
+    domains_data: Any,
+    *,
+    domain: str,
+    username: str,
+) -> Optional[str]:
+    """Return the prefer-over-password ccache for *username*, if marked.
+
+    Returns the marked ccache path only when the user has an explicit marker
+    AND the path is non-empty; otherwise ``None`` (the caller keeps the global
+    password-first default).
+    """
+    if not isinstance(domains_data, dict):
+        return None
+    domain_data = domains_data.get(domain)
+    if not isinstance(domain_data, dict):
+        return None
+    marker = domain_data.get(_CAPABILITY_BEARING_KEY)
+    if not isinstance(marker, dict):
+        return None
+    target = _normalize_marker_user(username)
+    if not target:
+        return None
+    for stored_user, path in marker.items():
+        if _normalize_marker_user(str(stored_user)) != target:
+            continue
+        text = str(path or "").strip()
+        return text or None
+    return None
+
+
 __all__ = [
     "CredentialStoreService",
     "DomainCredentialUpdateResult",
     "KerberosKeyMaterial",
     "LocalCredentialUpdateResult",
+    "persist_service_ticket",
+    "resolve_scoped_ticket_for_host",
+    "resolve_execution_credential",
+    "kerberos_service_for_relation",
+    "RELATION_TO_KERBEROS_SERVICE",
+    "host_match_keys",
+    "hosts_match",
+    "mark_capability_bearing_ccache",
+    "get_capability_bearing_ccache",
 ]

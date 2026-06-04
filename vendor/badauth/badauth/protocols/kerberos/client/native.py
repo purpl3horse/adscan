@@ -142,6 +142,14 @@ class KerberosClientNative:
 				
 				try:
 					#check TGS first, maybe ccache already has what we need
+					# Guard: password/hash/aes credentials have no ccache (ccred.ccache
+					# is None) — calling .list_targets() on None raised an AttributeError
+					# that, while caught by the broad ``except`` below, masked the real
+					# Kerberos failure (e.g. KDC_ERR_PREAUTH_FAILED) in tracebacks and
+					# debug logs. Skip the ccache reuse check cleanly when there is no
+					# ccache rather than relying on the exception path.
+					if self.ccred.ccache is None:
+						raise Exception('No CCACHE present for this credential; minting a fresh TGT')
 					for target in self.ccred.ccache.list_targets():
 						# just printing this to debug...
 						logger.debug('CCACHE SPN record: %s' % target)
@@ -180,9 +188,11 @@ class KerberosClientNative:
 						spn.domain = self.credential.cross_realm
 					tgs, encpart, self.session_key = await self.kc.with_clock_skew(self.kc.get_TGS, spn)#, override_etype = self.preferred_etypes)
 				
-				logger.debug('TGS: %s' % tgs)
-				logger.debug('encpart: %s' % encpart)
-				logger.debug('session_key: %s' % self.session_key)
+				# ADSCAN: do NOT dump the full TGS/encpart/session-key — they
+				# contain the encrypted ticket cipher and the raw Kerberos
+				# session key (sensitive), and are now bridged to telemetry at
+				# DEBUG. Log only a non-sensitive marker.
+				logger.debug('TGS acquired (session key etype=%s)' % getattr(self.session_key, 'enctype', '?'))
 
 				ap_opts = []
 				if GSSAPIFlags.GSS_C_MUTUAL_FLAG in self.flags or GSSAPIFlags.GSS_C_DCE_STYLE in self.flags:
@@ -211,7 +221,7 @@ class KerberosClientNative:
 							now = self.kc._now(),
 						)
 
-					logger.debug('APREQ constructed: %s' % apreq)
+					logger.debug('APREQ constructed')  # ADSCAN: do not dump raw AP-REQ bytes
 					return apreq, True, None
 
 				else:
@@ -238,14 +248,14 @@ class KerberosClientNative:
 							now = self.kc._now(),
 						)
 					
-					logger.debug('APREQ constructed: %s' % apreq)
+					logger.debug('APREQ constructed')  # ADSCAN: do not dump raw AP-REQ bytes
 					self.gssapi = get_gssapi(self.session_key)
 					return apreq, False, None
 
 			else:
 				self.seq_number = seq_number
 
-				logger.debug('Processing AP_REP %s' % authData.hex())
+				logger.debug('Processing AP_REP')  # ADSCAN: do not dump raw AP_REP bytes
 				try:
 					temp = KRB5_MECH_INDEP_TOKEN.from_bytes(authData)
 					try:
@@ -253,7 +263,7 @@ class KerberosClientNative:
 					except Exception:
 						# Some hosts omit the 2-byte token-type prefix inside the GSSAPI
 						# wrapper; try without skipping it before falling back.
-						logger.debug('AP_REP load with [2:] failed, retrying without offset hex=%s' % temp.data.hex())
+						logger.debug('AP_REP load with [2:] failed, retrying without offset')  # ADSCAN: do not dump raw AP_REP bytes
 						aprep = AP_REP.load(temp.data).native
 				except Exception as e:
 					# KRB5_MECH_INDEP_TOKEN.from_bytes() failed — happens on Windows 10
@@ -266,7 +276,7 @@ class KerberosClientNative:
 					# to parse from each candidate offset.  This extracts the raw AP-REP
 					# that Windows 10 embeds inside the GSSAPI wrapper without re-implementing
 					# the full GSSAPI/SPNEGO parser.
-					logger.debug('AP_REP fallback: GSSAPI parse error=%s raw_hex=%s' % (e, authData.hex()))
+					logger.debug('AP_REP fallback: GSSAPI parse error=%s' % e)  # ADSCAN: do not dump raw AP_REP bytes
 					aprep = None
 					if authData and authData[0:1] == b'\x60':
 						search_window = authData[:256]
@@ -284,11 +294,11 @@ class KerberosClientNative:
 							aprep = AP_REP.load(authData).native
 						except Exception as parse_exc:
 							raise Exception(
-								'Error parsing %s.AP_REP - %s [raw_hex:%s]'
-								% (AP_REP.__module__, parse_exc, authData[:32].hex())
+								'Error parsing %s.AP_REP - %s'  # ADSCAN: do not include raw AP_REP bytes in the error
+								% (AP_REP.__module__, parse_exc)
 							) from parse_exc
 				
-				logger.debug('AP_REP: %s' % aprep)
+				logger.debug('AP_REP parsed')  # ADSCAN: do not dump parsed AP_REP (enc-part cipher)
 				cipher = _enctype_table[int(aprep['enc-part']['etype'])]()
 				cipher_text = aprep['enc-part']['cipher']
 				temp = cipher.decrypt(self.session_key, 12, cipher_text)
@@ -304,20 +314,20 @@ class KerberosClientNative:
 				#print('seq %s' % enc_part['seq-number'])
 				#self.seq_number = 0 #enc_part['seq-number']
 				
-				logger.debug('apreppart_data: %s' % apreppart_data)
+				# ADSCAN: apreppart_data carries subkey material — do not dump.
 				apreppart_data_enc = cipher.encrypt(self.session_key, 12, EncAPRepPart(apreppart_data).dump(), None)
-					
+
 				#overriding current session key
 				self.session_key = Key(cipher.enctype, enc_part['subkey']['keyvalue'])
-				
-				logger.debug('SessionKey: %s' % self.session_key)
+
+				logger.debug('mutual-auth subkey derived (etype=%s)' % getattr(self.session_key, 'enctype', '?'))  # ADSCAN: do not dump the session key
 
 				ap_rep = {}
 				ap_rep['pvno'] = 5 
 				ap_rep['msg-type'] = MESSAGE_TYPE.KRB_AP_REP.value
 				ap_rep['enc-part'] = EncryptedData({'etype': self.session_key.enctype, 'cipher': apreppart_data_enc}) 
 				
-				logger.debug('AP_REP: %s' % ap_rep)
+				logger.debug('AP_REP (mutual-auth) constructed')  # ADSCAN: do not dump AP_REP (enc-part cipher)
 				token = AP_REP(ap_rep).dump()
 				if GSSAPIFlags.GSS_C_DCE_STYLE in self.flags:
 					self.gssapi = gssapi_smb(self.session_key)

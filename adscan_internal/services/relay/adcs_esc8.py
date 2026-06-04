@@ -352,8 +352,20 @@ def _select_auth_method(header: str) -> str:
         return "Negotiate"
     if "ntlm" in lowered:
         return "NTLM"
+    # Distinguish the two failure modes so the operator gets an actionable
+    # signal. An empty WWW-Authenticate (or no header at all) on the certsrv
+    # endpoint means we did not reach an authenticating certsrv handler — the
+    # scheme/port is wrong, the endpoint redirected (e.g. HTTP→HTTPS), or this
+    # is not certsrv. A non-empty header that simply lacks NTLM/Negotiate means
+    # the CA actively refused those schemes (only Basic/other offered).
+    if not header.strip():
+        raise RuntimeError(
+            "ADCS Web Enrollment returned no WWW-Authenticate header — the "
+            "endpoint is not an authenticating certsrv handler (wrong "
+            "scheme/port or an SSL/redirect in front). Re-check the CA scheme."
+        )
     raise RuntimeError(
-        f"ADCS Web Enrollment did not offer NTLM/Negotiate auth: {header!r}"
+        f"ADCS Web Enrollment refused NTLM/Negotiate (offered: {header!r})"
     )
 
 

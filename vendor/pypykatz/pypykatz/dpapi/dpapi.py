@@ -207,7 +207,7 @@ class DPAPI:
 		for key in [key1, key2, key3, key4]:
 			if key is not None:
 				self.prekeys[key] = 1
-				logger.debug('Prekey_%d %s %s %s %s' % (count, sid, password, nt_hash, key.hex()))
+				logger.debug('Prekey_%d derived for SID %s' % (count, sid))
 			count += 1
 
 		return key1, key2, key3, key4
@@ -227,8 +227,8 @@ class DPAPI:
 		if lr.security:
 			for secret in lr.security.cached_secrets:
 				if isinstance(secret, (LSASecretDPAPI, ALSASecretDPAPI)):
-					logger.debug('[DPAPI] Found DPAPI user key in registry! Key: %s' % secret.user_key)
-					logger.debug('[DPAPI] Found DPAPI machine key in registry! Key: %s' % secret.machine_key)
+					logger.debug('[DPAPI] Found DPAPI user key in registry')
+					logger.debug('[DPAPI] Found DPAPI machine key in registry')
 					self.prekeys[secret.user_key] = 1
 					user.append(secret.user_key)
 					self.prekeys[secret.machine_key] = 1
@@ -239,7 +239,7 @@ class DPAPI:
 				if secret.nt_hash:
 					sid = '%s-%s' % (lr.sam.machine_sid, secret.rid)
 					x, key2, key3, y = self.get_prekeys_from_password(sid, nt_hash = secret.nt_hash)
-					logger.debug('[DPAPI] NT hash method. Calculated user key for user %s! Key2: %s Key3: %s' % (sid, key2, key3))
+					logger.debug('[DPAPI] NT hash method. Calculated user key for user %s' % sid)
 					user.append(key2)
 					user.append(key3)
 					continue
@@ -422,7 +422,7 @@ class DPAPI:
 				for user_key in self.prekeys:
 					dec_key = mkf.masterkey.decrypt(user_key)
 					if dec_key:
-						logger.debug('user key win: %s' % user_key.hex())
+						logger.debug('user key matched masterkey')
 						self.masterkeys[mkf.guid] = dec_key
 						mks[mkf.guid] = dec_key
 						break
@@ -931,7 +931,7 @@ class DPAPI:
 
 		for entry in CryptoKeysFinder.from_dir(cryptokeys_dir):
 			if entry.description in pin_guids:
-				print(f'Found matching GUID: {entry.description}')
+				logger.debug('Found matching GUID for WinHello PIN entry')
 				properties_raw = self.decrypt_blob_bytes(entry.fields[1], entropy=b'6jnkd5J3ZdQDtrsu\x00')
 				properties = CryptoAPIKeyProperties.from_bytes(properties_raw)
 				blob = DPAPI_BLOB.from_bytes(entry.fields[2])

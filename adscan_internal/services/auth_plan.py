@@ -513,6 +513,28 @@ def build_kerberos_plan(
                 "AES-only enforced by posture — offering [AES256, AES128] only."
             )
 
+        # Decide-before-mint: AES is required (RC4 disabled / AES-only enforced)
+        # but the ONLY available secret is an NT hash. AES keys cannot be derived
+        # from an NT hash (string_to_key needs a plaintext password or a
+        # precomputed AES key). Surfacing this here — before the mint — turns the
+        # otherwise-cryptic kerbad failure ("There is no key for AES256
+        # encryption" / KDC_ERR_PREAUTH_FAILED) into an actionable note.
+        only_nt_hash = (
+            getattr(config, "nt_hash", None)
+            and not getattr(config, "password", None)
+            and not getattr(config, "aes_key", None)
+            and not getattr(config, "ccache_path", None)
+            and not getattr(config, "ccache_bytes", None)
+            and not getattr(config, "kirbi_path", None)
+            and not getattr(config, "cert_pfx_path", None)
+        )
+        if only_nt_hash:
+            notes.append(
+                "AES encryption is required by this KDC (RC4 disabled), but only "
+                "an NT hash is available. AES keys cannot be derived from an NT "
+                "hash — a plaintext password or a precomputed AES key is required."
+            )
+
     # Rule 2: probe known-needed → force the probe.
     probe_enabled_high = _has_high_confidence(
         probe_entry.effective_state, probe_entry.confidence

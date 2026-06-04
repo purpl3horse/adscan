@@ -88,8 +88,17 @@ WALK_MAX_FILE_SIZE: int = 1024
 WALK_TIMEOUT_SECONDS: float = 18.0
 
 # Roots launched in parallel — each gets its own ``list_r`` invocation.
+#
+# NOTE: the unbounded whole-drive ``\C$\\`` root was deliberately REMOVED.
+# A full recursive walk of C: is the single most expensive operation in the
+# collector and reliably exceeded the 25s hard cap on slow/unstable DCs — it
+# was cancelled before reaching custom top-level directories (e.g.
+# ``C:\share\transfer\user.txt``) and emitted no diagnostic. The dedicated
+# roots below cover the common deep paths (user profiles, IIS, XAMPP); custom
+# top-level directories are now covered cheaply by the shallow top-level
+# discovery strategy (see ``TOP_LEVEL_*`` below), which lists ``\C$\`` once
+# and runs a bounded shallow walk only on non-system, non-covered directories.
 WALK_ROOTS: tuple[str, ...] = (
-    r"\C$\\",
     r"\C$\Users\\",
     r"\C$\inetpub\\",
     r"\C$\xampp\\",
@@ -114,6 +123,98 @@ WALK_EXCLUDE_DIRS: tuple[str, ...] = (
     "Microsoft.NET",
     "assembly",
 )
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3b — Shallow top-level ``C:\`` discovery configuration.
+#
+# Replaces the removed unbounded ``\C$\\`` walk. It lists the top level of
+# ``\C$\`` once (one cheap directory enumeration), drops system directories
+# and directories already covered by the dedicated roots, then runs a SHALLOW
+# bounded walk on each remaining CUSTOM top-level directory (``share``,
+# ``backup``, ``temp``, ``data``, …). Pure SMB byte-read, no command-exec —
+# it works even when the exec cascade (smbexec/atexec/WinRM) is denied.
+# ---------------------------------------------------------------------------
+
+# Depth of the per-custom-dir shallow walk. ``C:\share\transfer\user.txt`` is
+# reachable at depth 2 (share → transfer → user.txt). A small headroom (3)
+# catches one more nesting level without inviting unbounded recursion.
+TOP_LEVEL_WALK_DEPTH: int = 3
+
+# Entry cap for each per-custom-dir shallow walk (much tighter than the deep
+# roots — a custom flag directory is small by definition).
+TOP_LEVEL_WALK_MAX_ENTRIES: int = 400
+
+# Hard cap on how many custom top-level directories we shallow-walk. Bounds
+# breadth so a host with dozens of top-level dirs can't eat the whole budget.
+TOP_LEVEL_MAX_DIRS: int = 12
+
+# Per-custom-dir shallow-walk timeout. Keeps any single slow directory from
+# starving the others; the overall strategy still lives under the 25s cap.
+TOP_LEVEL_PER_DIR_TIMEOUT_SECONDS: float = 4.0
+
+# Timeout for the single top-level ``\C$\`` directory listing.
+TOP_LEVEL_LIST_TIMEOUT_SECONDS: float = 5.0
+
+# Top-level directory basenames (case-insensitive) already covered by a
+# dedicated ``WALK_ROOTS`` entry — skip them in the top-level discovery to
+# avoid duplicate work.
+WALK_COVERED_TOP_LEVEL_DIRS: frozenset[str] = frozenset(
+    {"users", "inetpub", "xampp"}
+)
+
+# Top-level directory basenames (case-insensitive) that are pure Windows
+# system noise and never carry CTF flags — skipped on top of
+# ``WALK_EXCLUDE_DIRS`` (which is matched everywhere, not just top-level).
+# These are common ``C:\`` entries that ``WALK_EXCLUDE_DIRS`` may not name.
+TOP_LEVEL_SYSTEM_DIRS: frozenset[str] = frozenset(
+    {
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "$recycle.bin",
+        "$winreagent",
+        "$sysreset",
+        "recovery",
+        "perflogs",
+        "system volume information",
+        "documents and settings",  # junction → Users on modern Windows
+        "msocache",
+        "config.msi",
+        "intel",
+        "amd",
+        "nvidia",
+        "drivers",
+        "windows.old",
+        "boot",
+        "efi",
+    }
+)
+
+
+def is_custom_top_level_dir(name: str) -> bool:
+    """Return True if ``name`` is a CUSTOM top-level ``C:\\`` directory.
+
+    A custom directory is one that is neither pure Windows system noise nor
+    already covered by a dedicated walk root — i.e. exactly the kind of
+    operator/box-author-created directory (``share``, ``backup``, ``data``)
+    that may carry a flag in a non-standard path.
+
+    Args:
+        name: Top-level directory basename (no path).
+    """
+    if not name:
+        return False
+    lname = name.lower()
+    if lname in WALK_COVERED_TOP_LEVEL_DIRS:
+        return False
+    if lname in TOP_LEVEL_SYSTEM_DIRS:
+        return False
+    if lname in {d.lower() for d in WALK_EXCLUDE_DIRS}:
+        return False
+    return True
+
 
 # Filename extensions considered for flag candidates.
 WALK_FLAG_EXTENSIONS: tuple[str, ...] = (".txt", ".flag")
@@ -200,6 +301,14 @@ __all__ = [
     "WALK_FLAG_EXTENSIONS",
     "WALK_FLAG_EXACT_NAMES",
     "WALK_NAME_NOISE",
+    "TOP_LEVEL_WALK_DEPTH",
+    "TOP_LEVEL_WALK_MAX_ENTRIES",
+    "TOP_LEVEL_MAX_DIRS",
+    "TOP_LEVEL_PER_DIR_TIMEOUT_SECONDS",
+    "TOP_LEVEL_LIST_TIMEOUT_SECONDS",
+    "WALK_COVERED_TOP_LEVEL_DIRS",
+    "TOP_LEVEL_SYSTEM_DIRS",
+    "is_custom_top_level_dir",
     "build_alternative_candidates",
     "is_flag_candidate_name",
 ]

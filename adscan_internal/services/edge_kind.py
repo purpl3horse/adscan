@@ -192,6 +192,16 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         "WebDAVEnabled",
         "DropTheMIC",
         "NTLMReflection",
+        # NTLMv1 relay attack-step surface marker (sub-project #3). A discovered
+        # NTLMv1-on-host misconfiguration is a finding on its own, materialized
+        # as a derived surface edge like PrinterBugSurface / WebDAVEnabled.
+        "Ntlmv1Enabled",
+        # MSSQL S4U2self -> altservice escalation: the principal running the
+        # MSSQL service mints a Kerberos ST impersonating a Domain Admin to its
+        # own MSSQLSvc SPN and logs in as that DA -> sysadmin. This is a derived
+        # edge (post-ex success: a confirmed DA-sysadmin login), not the
+        # structural escalation surface in _ESCALATION_EDGES.
+        "MssqlS4U2selfEscalation",
     }
 )
 
@@ -242,6 +252,31 @@ _ESCALATION_EDGES: Final[frozenset[str]] = frozenset(
         "MssqlTrustworthyDbEscalation",
         # MSSQL NTLMv2 hash theft via xp_dirtree / forced SMB auth
         "MssqlNtlmv2Theft",
+        # NTLMv1 coerce→relay escalation edges (sub-project #3). Each grants an
+        # ADscan-custom escalation over a Computer X via NTLMv1 relay:
+        #   * Ntlmv1RelayRBCD       — admin-capability (joins AdminTo/ReadLAPS),
+        #     compromise_semantics=access_capability_only → DumpLSA chains.
+        #   * Ntlmv1RelayShadowCreds — credential-granting (yields machine NT
+        #     hash directly), compromise_semantics=credential_access_only → no DumpLSA.
+        "Ntlmv1RelayRBCD",
+        "Ntlmv1RelayShadowCreds",
+        # SPN-jacking + KCD escalation (ADscan native, not in BloodHound CE). A
+        # principal with constrained delegation + protocol transition (T2A4D) and
+        # servicePrincipalName-write over a Computer relocates its delegated SPN
+        # onto that computer, then S4U2Self+S4U2Proxy (+altservice) to compromise
+        # it as any user — deterministic, no offline crack. Replaces the phantom
+        # WriteSPN→Computer kerberoast edge (which is non-traversable; a machine
+        # account password is uncrackable). compromise_semantics =
+        # direct_target_compromise.
+        "SPNJack",
+        # NTLMv1 offline crack (sub-project #3, refinement 2026-06-02b). The MOST
+        # universal NTLMv1 technique — no relay target, no reflection/signing/CBT
+        # dependency, works single-DC and against any machine account. Coerce +
+        # capture the NTLMv1 response, crack the DES-based response offline
+        # (crack.sh / hashcat 14000) → machine NT hash. Credential-granting
+        # (compromise_semantics=credential_access_only) → no DumpLSA chains; the
+        # recovered machine hash IS the credential.
+        "CrackNTLMv1",
     }
 )
 

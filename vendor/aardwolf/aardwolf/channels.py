@@ -1,8 +1,8 @@
 
 import asyncio
-import traceback
 
 from aardwolf.protocol.T124.userdata.constants import ChannelOption
+from aardwolf import logger
 
 class Channel:
 	def __init__(self, name:str, options:ChannelOption = ChannelOption.INITIALIZED|ChannelOption.ENCRYPT_RDP):
@@ -30,7 +30,7 @@ class Channel:
 				raise err
 			return True, None
 		except Exception as e:
-			traceback.print_exc()
+			logger.debug('Channel.run raised an exception; returning it to the caller', exc_info=True)
 			return None, e
 
 

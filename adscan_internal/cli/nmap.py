@@ -41,6 +41,20 @@ from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.cli.target_scope_warning import confirm_large_target_scope
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces import domain_subpath
+from adscan_internal.services.reachability.massdns_report import (
+    _flatten_massdns_unique_ips,
+    _load_massdns_resolution_report,
+    _write_massdns_resolution_report,
+)
+from adscan_core.interaction import is_non_interactive
+from adscan_core.tui.patience_notice import (
+    PatienceNoticeConfig,
+    maybe_show_patience_notice,
+)
+from adscan_core.tui.progress_dashboard import (
+    ProgressDashboard,
+    ProgressDashboardConfig,
+)
 
 NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS = 7200
 NMAP_DC_DISCOVERY_LARGE_RANGE_THRESHOLD = 4096
@@ -535,84 +549,6 @@ def parse_massdns_ndjson_a_record_map(path: str) -> dict[str, list[str]]:
     return records
 
 
-def _flatten_massdns_unique_ips(
-    hostnames: list[str],
-    host_to_ips: dict[str, list[str]],
-) -> list[str]:
-    """Return unique IPs preserving hostname/input order from a massdns mapping."""
-    normalized_host_to_ips = {
-        str(hostname or "").strip().rstrip(".").lower(): list(ips)
-        for hostname, ips in host_to_ips.items()
-        if str(hostname or "").strip()
-    }
-    unique_ips: list[str] = []
-    seen_ips: set[str] = set()
-    for hostname in hostnames:
-        normalized_hostname = str(hostname or "").strip().rstrip(".").lower()
-        for ip_value in normalized_host_to_ips.get(normalized_hostname, []):
-            if ip_value in seen_ips:
-                continue
-            seen_ips.add(ip_value)
-            unique_ips.append(ip_value)
-    return unique_ips
-
-
-def _build_massdns_resolution_report(
-    hostnames: list[str],
-    host_to_ips: dict[str, list[str]],
-    *,
-    domain: str | None = None,
-    input_file: str | None = None,
-    resolvers: list[str] | None = None,
-    ip_file: str | None = None,
-    raw_output_file: str | None = None,
-) -> dict[str, object]:
-    """Build a structured massdns hostname resolution report."""
-    resolved: list[dict[str, object]] = []
-    unresolved: list[str] = []
-
-    for original_host in hostnames:
-        normalized_host = str(original_host or "").strip().rstrip(".").lower()
-        ips = list(host_to_ips.get(normalized_host, []))
-        if ips:
-            resolved.append({"hostname": original_host, "ips": ips})
-            continue
-        unresolved.append(original_host)
-
-    unique_ips = _flatten_massdns_unique_ips(
-        [str(item["hostname"]) for item in resolved],
-        {str(item["hostname"]): list(item["ips"]) for item in resolved},
-    )
-    multi_ip_hostnames = [
-        str(item["hostname"]) for item in resolved if len(list(item["ips"])) > 1
-    ]
-    payload: dict[str, object] = {
-        "summary": {
-            "total_hostnames": len(hostnames),
-            "resolved_hostnames": len(resolved),
-            "unresolved_hostnames": len(unresolved),
-            "unique_ip_count": len(unique_ips),
-            "multi_ip_hostnames": multi_ip_hostnames,
-        },
-        "resolved": resolved,
-        "unresolved": unresolved,
-    }
-    context: dict[str, object] = {}
-    if domain:
-        context["domain"] = domain
-    if input_file:
-        context["input_file"] = input_file
-    if resolvers:
-        context["resolver_sources"] = list(dict.fromkeys(resolvers))
-    if ip_file:
-        context["resolved_ip_file"] = ip_file
-    if raw_output_file:
-        context["raw_massdns_output_file"] = raw_output_file
-    if context:
-        payload["context"] = context
-    return payload
-
-
 def _apply_persisted_pdc_ip_fallback(
     *,
     shell: NmapShell,
@@ -669,49 +605,6 @@ def _apply_persisted_pdc_ip_fallback(
             injected = True
 
     return updated, injected, fallback_reason
-
-
-def _write_massdns_resolution_report(
-    report_path: str,
-    *,
-    hostnames: list[str],
-    host_to_ips: dict[str, list[str]],
-    domain: str | None = None,
-    input_file: str | None = None,
-    resolvers: list[str] | None = None,
-    ip_file: str | None = None,
-    raw_output_file: str | None = None,
-) -> bool:
-    """Persist a structured massdns resolution report for later review."""
-    try:
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        payload = _build_massdns_resolution_report(
-            hostnames,
-            host_to_ips,
-            domain=domain,
-            input_file=input_file,
-            resolvers=resolvers,
-            ip_file=ip_file,
-            raw_output_file=raw_output_file,
-        )
-        with open(report_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=False)
-            handle.write("\n")
-    except OSError:
-        return False
-    return True
-
-
-def _load_massdns_resolution_report(report_path: str) -> dict[str, object] | None:
-    """Load a persisted massdns resolution report from disk."""
-    if not report_path or not os.path.exists(report_path):
-        return None
-    try:
-        with open(report_path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
 
 
 def _filter_massdns_resolution_payload(
@@ -1295,6 +1188,84 @@ def _run_nmap_command_with_optional_sudo_retry(
     )
 
 
+def _build_important_port_scan_dashboard() -> ProgressDashboard:
+    """Indeterminate important-port-scan dashboard (Nmap stdout is opaque).
+
+    The Nmap subprocess is blocking and exposes no parseable live progress
+    stream, so a determinate X/N bar would require a guessed (lying) ETA.
+    Indeterminate mode shows a spinner + elapsed so the operator can see the
+    scan is alive and avoid Ctrl+C-ing a working long scan.
+    """
+    return ProgressDashboard(
+        ProgressDashboardConfig(
+            title="Important Port Scan",
+            total=None,  # indeterminate -- spinner + elapsed (no per-host stream)
+            unit="hosts",
+        )
+    )
+
+
+def _run_important_port_scan_with_dashboard(
+    run_scan: "callable",
+) -> any:
+    """Run the blocking important-port Nmap scan under an indeterminate dashboard.
+
+    ``run_scan`` is a zero-arg callable that executes the (already configured)
+    blocking Nmap invocation -- including its sudo-retry and timeout-recovery
+    logic -- and returns its result. It runs in a single worker thread so the
+    dashboard spinner + elapsed can tick while Nmap blocks. The thread is always
+    joined (the ``with`` on the pool blocks until the future resolves), so it
+    never leaks; ``fut.result()`` re-raises any worker exception, preserving the
+    caller's error handling exactly.
+
+    FAIL-SAFE: if the dashboard cannot be built / driven, the blocking call is
+    still executed directly so the scan always runs and the result handling is
+    never skipped. ``call_started`` distinguishes a dashboard/LiveSession setup
+    failure (fall back to a plain call) from a failure raised by ``run_scan``
+    itself (must propagate -- never re-run the scan).
+
+    Args:
+        run_scan: Zero-arg callable performing the blocking Nmap scan.
+
+    Returns:
+        Whatever ``run_scan`` returns (the completed scan process or ``None``).
+    """
+    import concurrent.futures
+    import time as _time
+
+    try:
+        dashboard = _build_important_port_scan_dashboard()
+    except Exception:  # noqa: BLE001 -- dashboard build must never block the scan
+        return run_scan()
+
+    def _safe_update(dash: "ProgressDashboard") -> None:
+        try:
+            dash.update()
+        except Exception:  # noqa: BLE001 -- a render error must not abort the scan
+            pass
+
+    call_started = False
+    try:
+        with dashboard.live_session():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(run_scan)
+                call_started = True
+                while not fut.done():
+                    _safe_update(dashboard)
+                    _time.sleep(0.25)
+                result = fut.result()  # re-raises worker exceptions here
+                _safe_update(dashboard)
+                return result
+    except Exception:  # noqa: BLE001
+        if call_started:
+            # ``run_scan`` (or its worker plumbing) raised -- propagate to the
+            # caller's existing try/except. Do NOT re-run the scan.
+            raise
+        # Dashboard / LiveSession failed before the call started -- fall back to
+        # a plain blocking call so the scan still completes.
+        return run_scan()
+
+
 def _parse_gnmap_open_ports(text: str) -> dict[str, set[int]]:
     """Parse `nmap -oG` output and return open TCP ports per host.
 
@@ -1862,6 +1833,140 @@ def save_host_to_file(shell: NmapShell, host: str, service_dir: str) -> None:
             f.write(f"{host}\n")
 
 
+def _normalize_massdns_hostname(hostname: object) -> str:
+    """Normalize a hostname for massdns map lookups (strip, drop trailing dot, lowercase)."""
+    return str(hostname or "").strip().rstrip(".").lower()
+
+
+def _load_persisted_massdns_host_to_ips(report_path: str) -> dict[str, list[str]] | None:
+    """Load a persisted massdns report and return a normalized hostname -> IPs map.
+
+    Returns ``None`` when the report is absent or unreadable, signalling the caller
+    to fall back to a full massdns resolution (no regression for standalone use).
+
+    Args:
+        report_path: Path to the persisted ``massdns_resolution_report.json``.
+
+    Returns:
+        A mapping of normalized hostname to its list of resolved IPs, or ``None``.
+    """
+    payload = _load_massdns_resolution_report(report_path)
+    if not isinstance(payload, dict):
+        return None
+    resolved = payload.get("resolved")
+    if not isinstance(resolved, list):
+        return None
+    host_to_ips: dict[str, list[str]] = {}
+    for entry in resolved:
+        if not isinstance(entry, dict):
+            continue
+        normalized = _normalize_massdns_hostname(entry.get("hostname"))
+        if not normalized:
+            continue
+        ips = entry.get("ips")
+        if not isinstance(ips, list):
+            continue
+        host_to_ips[normalized] = [str(ip) for ip in ips if str(ip).strip()]
+    return host_to_ips
+
+
+def _resolve_normalized_host_to_ips(
+    *,
+    shell: "NmapShell",
+    domain: str,
+    cleaned_hosts: list[str],
+    report_path: str,
+    massdns_bin: str,
+    resolvers_file: str,
+    hosts_file: str,
+    massdns_output: str,
+) -> tuple[dict[str, list[str]], bool]:
+    """Resolve hostnames to IPs, consuming the persisted massdns report when present.
+
+    Delta top-up: Phase 2 (the collector DNS resolver) persists a superset
+    ``massdns_resolution_report.json`` into the same domain dir. When that report
+    is present, this consumes it and only runs massdns for the hostnames it does
+    not already cover. When it is absent or unreadable (Phase 2 never ran, or this
+    is a standalone ``nmap``/CLI invocation), it falls back to a full massdns
+    resolution so standalone use is never regressed.
+
+    Args:
+        shell: The active shell instance (used for ``run_command``).
+        domain: Domain name (for user-facing messages).
+        cleaned_hosts: The hostnames Phase 3 needs resolved.
+        report_path: Path to the persisted ``massdns_resolution_report.json``.
+        massdns_bin: Path to the massdns binary.
+        resolvers_file: Path to the massdns resolvers file.
+        hosts_file: Path to the massdns hosts input file (rewritten for the delta).
+        massdns_output: Path to the massdns NDJSON output file.
+
+    Returns:
+        A tuple of ``(normalized_host_to_ips, ok)``. ``ok`` is ``False`` only when
+        a required massdns run failed (the caller should return early).
+    """
+
+    def _run_massdns(host_list_file: str) -> dict[str, list[str]] | None:
+        marked_domain = mark_sensitive(domain, "domain")
+        massdns_command = (
+            f"{shlex.quote(massdns_bin)} -r {shlex.quote(resolvers_file)} "
+            f"-t A -o J -w {shlex.quote(massdns_output)} {shlex.quote(host_list_file)}"
+        )
+        completed = shell.run_command(massdns_command, timeout=300)
+        if completed is None:
+            print_error(
+                f"Failed to resolve hostnames to IPs for domain {marked_domain} "
+                "(massdns timeout or execution error)."
+            )
+            return None
+        return parse_massdns_ndjson_a_record_map(massdns_output)
+
+    report_host_to_ips = _load_persisted_massdns_host_to_ips(report_path)
+    marked_domain = mark_sensitive(domain, "domain")
+
+    if report_host_to_ips is None:
+        # Report absent / unreadable -> full resolution (no regression for standalone use).
+        host_to_ips = _run_massdns(hosts_file)
+        if host_to_ips is None:
+            return {}, False
+        normalized_host_to_ips = {
+            _normalize_massdns_hostname(hostname): list(ips)
+            for hostname, ips in host_to_ips.items()
+            if _normalize_massdns_hostname(hostname)
+        }
+        return normalized_host_to_ips, True
+
+    normalized_host_to_ips = {
+        normalized: list(ips) for normalized, ips in report_host_to_ips.items()
+    }
+    delta_hosts = [
+        host
+        for host in cleaned_hosts
+        if _normalize_massdns_hostname(host) not in report_host_to_ips
+    ]
+    if not delta_hosts:
+        print_info_verbose(
+            f"Reusing persisted DNS resolution for {marked_domain}; "
+            "all required hostnames are already resolved (skipping massdns)."
+        )
+        return normalized_host_to_ips, True
+
+    print_info_verbose(
+        f"Reusing persisted DNS resolution for {marked_domain}; "
+        f"resolving {len(delta_hosts)} new hostname(s) not yet in the report."
+    )
+    with open(hosts_file, "w", encoding="utf-8") as f:
+        for host in delta_hosts:
+            f.write(f"{host}\n")
+    delta_host_to_ips = _run_massdns(hosts_file)
+    if delta_host_to_ips is None:
+        return {}, False
+    for hostname, ips in delta_host_to_ips.items():
+        normalized = _normalize_massdns_hostname(hostname)
+        if normalized:
+            normalized_host_to_ips[normalized] = list(ips)
+    return normalized_host_to_ips, True
+
+
 def convert_hostnames_to_ips_and_scan(
     shell: NmapShell,
     domain: str,
@@ -1996,24 +2101,19 @@ def convert_hostnames_to_ips_and_scan(
             domain,
             "massdns_output.jsonl",
         )
-        massdns_command = (
-            f"{shlex.quote(massdns_bin)} -r {shlex.quote(resolvers_file)} "
-            f"-t A -o J -w {shlex.quote(massdns_output)} {shlex.quote(hosts_file)}"
-        )
-        completed = shell.run_command(massdns_command, timeout=300)
-        if completed is None:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(
-                f"Failed to resolve hostnames to IPs for domain {marked_domain} (massdns timeout or execution error)."
-            )
-            return
 
-        host_to_ips = parse_massdns_ndjson_a_record_map(massdns_output)
-        normalized_host_to_ips = {
-            str(hostname or "").strip().rstrip(".").lower(): list(ips)
-            for hostname, ips in host_to_ips.items()
-            if str(hostname or "").strip()
-        }
+        normalized_host_to_ips, resolution_ok = _resolve_normalized_host_to_ips(
+            shell=shell,
+            domain=domain,
+            cleaned_hosts=cleaned_hosts,
+            report_path=resolution_report_file,
+            massdns_bin=massdns_bin,
+            resolvers_file=resolvers_file,
+            hosts_file=hosts_file,
+            massdns_output=massdns_output,
+        )
+        if not resolution_ok:
+            return
         hostname_ip_map = {
             hostname: normalized_host_to_ips.get(
                 str(hostname or "").strip().rstrip(".").lower(),
@@ -2256,18 +2356,46 @@ def convert_hostnames_to_ips_and_scan(
             )
             marked_domain = mark_sensitive(domain, "domain")
             print_info(
-                f"Executing combined reachability and important-port scan in domain {marked_domain} (this might take a while in big domains)..."
+                f"Executing combined reachability and important-port scan in domain {marked_domain}..."
             )
             print_info_debug(f"Port scan command: {port_scan_command}")
 
-            completed_scan_process = _run_nmap_command_with_optional_sudo_retry(
-                shell,
-                command=port_scan_command,
-                domain=domain,
-                timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
-                _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
-                _sudo_validate=_sudo_validate,
-                retry_debug_context="combined reachability/port scan",
+            # Upfront patience notice -- threshold-gated on the IP count queued
+            # for the scan. Silent for small scopes; a single line under
+            # non-interactive runs. Never blocks the scan.
+            try:
+                maybe_show_patience_notice(
+                    PatienceNoticeConfig(
+                        operation="Important port scan",
+                        unit="hosts",
+                        threshold=100,
+                        env_var="ADSCAN_PATIENCE_THRESHOLD_IMPORTANT_PORT_SCAN",
+                    ),
+                    count=ip_count,
+                    non_interactive=is_non_interactive(shell),
+                )
+            except Exception:  # noqa: BLE001 -- notice must never abort the scan
+                pass
+
+            # Indeterminate live dashboard. The blocking Nmap call (incl. its
+            # sudo-retry + timeout-recovery logic) runs in a worker thread so
+            # the spinner + elapsed tick while Nmap blocks; LiveSession falls
+            # back to inline logging on non-TTY/CI itself. FAIL-SAFE: a render
+            # error never aborts the scan -- the helper falls back to a direct
+            # blocking call and the result handling below is unchanged.
+            def _run_port_scan() -> any:
+                return _run_nmap_command_with_optional_sudo_retry(
+                    shell,
+                    command=port_scan_command,
+                    domain=domain,
+                    timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
+                    _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
+                    _sudo_validate=_sudo_validate,
+                    retry_debug_context="combined reachability/port scan",
+                )
+
+            completed_scan_process = _run_important_port_scan_with_dashboard(
+                _run_port_scan
             )
 
             if completed_scan_process is None:

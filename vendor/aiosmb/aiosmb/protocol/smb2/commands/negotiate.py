@@ -35,7 +35,7 @@ class NEGOTIATE_REQ:
 		self.SecurityMode    = None
 		self.Reserved        = 0
 		self.Capabilities    = None
-		self.ClientGuid      = None			
+		self.ClientGuid      = None
 		self.ClientStartTime = 0
 		self.NegotiateContextOffset = None
 		self.NegotiateContextCount = None
@@ -43,7 +43,7 @@ class NEGOTIATE_REQ:
 
 		self.NegotiateContextList = []
 		self.Dialects        = []
-		
+
 	def to_bytes(self):
 		if self.Dialects == []:
 			raise Exception('At least one dialect MUST be set!')
@@ -58,7 +58,7 @@ class NEGOTIATE_REQ:
 			dp = b''
 			for dialect in self.Dialects:
 				dp += dialect.value.to_bytes(2, byteorder='little', signed = False)
-			
+
 			padding_starts = 64+2+2+2+2+4+16+8+len(dp)
 			dp += b'\x00' * ((8 - padding_starts) % 8)
 			self.NegotiateContextOffset = 64+2+2+2+2+4+16+8+len(dp)
@@ -72,13 +72,13 @@ class NEGOTIATE_REQ:
 				t += ctx.to_bytes()
 				if i != self.NegotiateContextCount - 1:
 					t += b'\x00' * ((8 - len(t)) % 8)
-			
+
 		else:
 			t += self.ClientStartTime.to_bytes(8, byteorder='little', signed = False)
-			
+
 			for dialect in self.Dialects:
 				t += dialect.value.to_bytes(2, byteorder='little', signed = False)
-		
+
 		return t
 
 	@staticmethod
@@ -95,8 +95,8 @@ class NEGOTIATE_REQ:
 		# skipping the next field because it's interpretation depends on the data after it...
 		pos = buff.tell()
 		buff.seek(8, io.SEEK_CUR)
-		
-		cmd.Dialects = []		
+
+		cmd.Dialects = []
 		for _ in range(0, cmd.DialectCount):
 			cmd.Dialects.append(NegotiateDialects(int.from_bytes(buff.read(2), byteorder = 'little', signed = False)))
 
@@ -111,7 +111,12 @@ class NEGOTIATE_REQ:
 			buff.seek(cmd.NegotiateContextOffset, io.SEEK_SET)
 
 			for _ in range(0, cmd.NegotiateContextCount):
-				cmd.NegotiateContextList.append(SMB2NegotiateContext.from_buffer(buff))
+				# from_buffer tolerates unknown/unhandled context types: it never
+				# raises and returns None for those, which we simply skip so the
+				# remaining contexts still parse (see SMB2NegotiateContext.from_buffer).
+				ctx = SMB2NegotiateContext.from_buffer(buff)
+				if ctx is not None:
+					cmd.NegotiateContextList.append(ctx)
 				pad_pos = buff.tell()
 				#aligning buffer, because the next data must be on 8-byte aligned position
 				q,m = divmod(pad_pos, 8)
@@ -139,13 +144,19 @@ class NEGOTIATE_REQ:
 				t += repr(ctx)
 		else:
 			t += 'ClientStartTime:    %s\r\n' % self.ClientStartTime
-		
+
 		for dialect in self.Dialects:
 			t += '\t Dialect: %s\r\n' % dialect.name
 
 		return t
 
 
+# MS-SMB2 §2.2.3.1 — NEGOTIATE_CONTEXT ContextType values.
+# Members ADscan has a dedicated body-parser for are handled in
+# SMB2NegotiateContext.from_buffer; the rest fall through to the
+# tolerant skip path. Keeping the full set here lets the enum
+# constructor succeed for known modern-client contexts instead of
+# raising ValueError before we even reach the skip path.
 class SMB2ContextType(enum.Enum):
 	PREAUTH_INTEGRITY_CAPABILITIES = 0x0001
 	ENCRYPTION_CAPABILITIES = 0x0002
@@ -159,6 +170,45 @@ class SMB2ContextType(enum.Enum):
 class SMB2HashAlgorithm(enum.Enum):
 	SHA_512 = 0x0001
 
+
+class SMB2UnknownNegotiateContext:
+	"""Benign placeholder for a NEGOTIATE_CONTEXT we do not body-parse.
+
+	Modern Windows clients send negotiate contexts (e.g.
+	RDMA_TRANSFORM_CAPABILITIES = 0x0007) that aiosmb has no dedicated
+	body-parser for, and may send context types newer than MS-SMB2 §2.2.3.1
+	knows about. A capture/relay listener must never crash on these. This
+	type records the raw context type value and data so parsing can continue
+	with the remaining contexts; the caller is free to ignore it.
+	"""
+
+	def __init__(self):
+		self.ContextTypeValue = None   # raw 16-bit value (the enum may not have a member)
+		self.ContextType = None        # SMB2ContextType member if recognised, else None
+		self.DataLength = None
+		self.Reserved = 0
+		self.Data = b''
+
+	@staticmethod
+	def from_buffer(buff):
+		ctx = SMB2UnknownNegotiateContext()
+		ctx.ContextTypeValue = int.from_bytes(buff.read(2), byteorder='little', signed=False)
+		try:
+			ctx.ContextType = SMB2ContextType(ctx.ContextTypeValue)
+		except ValueError:
+			ctx.ContextType = None
+		ctx.DataLength = int.from_bytes(buff.read(2), byteorder='little', signed=False)
+		ctx.Reserved = int.from_bytes(buff.read(4), byteorder='little', signed=False)
+		ctx.Data = buff.read(ctx.DataLength)
+		return ctx
+
+	def __repr__(self):
+		t = '==== SMB2 Unknown Negotiate Context ====\r\n'
+		t += 'ContextTypeValue: 0x%04x\r\n' % (self.ContextTypeValue or 0)
+		t += 'ContextType: %s\r\n' % self.ContextType
+		t += 'DataLength: %s\r\n' % self.DataLength
+		return t
+
 #
 # https://msdn.microsoft.com/en-us/library/mt208834.aspx
 class SMB2NegotiateContext:
@@ -167,9 +217,24 @@ class SMB2NegotiateContext:
 
 	@staticmethod
 	def from_buffer(buff):
+		# MS-SMB2 §2.2.3.1: every NEGOTIATE_CONTEXT starts with
+		#   ContextType (2) + DataLength (2) + Reserved (4) + Data (DataLength).
+		# We must tolerate unknown/unhandled context types — a capture or relay
+		# listener must never crash because a modern client sent a context aiosmb
+		# does not body-parse (e.g. RDMA_TRANSFORM_CAPABILITIES) or a type newer
+		# than this enum knows about. For those, skip the context gracefully
+		# (consume exactly 8 + DataLength bytes) and return a benign placeholder;
+		# the caller handles the 8-byte inter-context alignment.
 		pos = buff.tell()
-		ContextType = SMB2ContextType(int.from_bytes(buff.read(2), byteorder = 'little', signed = False))
+		raw_context_type = int.from_bytes(buff.read(2), byteorder='little', signed=False)
 		buff.seek(pos)
+
+		try:
+			ContextType = SMB2ContextType(raw_context_type)
+		except ValueError:
+			# Context type not in the enum at all (newer than MS-SMB2 §2.2.3.1
+			# as known here). Skip gracefully.
+			return SMB2UnknownNegotiateContext.from_buffer(buff)
 
 		if ContextType == SMB2ContextType.PREAUTH_INTEGRITY_CAPABILITIES:
 			return SMB2PreauthIntegrityCapabilities.from_buffer(buff)
@@ -186,10 +251,12 @@ class SMB2NegotiateContext:
 			return SMB2TransportCapabilities.from_buffer(buff)
 		elif ContextType == SMB2ContextType.SIGNING_CAPABILITIES:
 			return SMB2SigningCapabilities.from_buffer(buff)
-			
 
 		else:
-			raise Exception('Unknown contextype %s' % ContextType)
+			# Recognised by the enum but we have no dedicated body-parser
+			# (e.g. RDMA_TRANSFORM_CAPABILITIES). Skip gracefully instead of
+			# raising, so the remaining contexts still parse.
+			return SMB2UnknownNegotiateContext.from_buffer(buff)
 
 class SMB2PreauthIntegrityCapabilities:
 	def __init__(self):
@@ -240,7 +307,7 @@ class SMB2PreauthIntegrityCapabilities:
 		t += self.DataLength.to_bytes(2, byteorder = 'little', signed=False)
 		t += self.Reserved.to_bytes(4, byteorder = 'little', signed=False)
 		t += data
-		
+
 		return t
 
 	def __repr__(self):
@@ -248,7 +315,7 @@ class SMB2PreauthIntegrityCapabilities:
 		t += 'HashAlgorithmCount: %s\r\n' % self.HashAlgorithmCount
 		t += 'SaltLength: %s\r\n' % self.SaltLength
 		t += 'Salt: %s\r\n' % self.Salt
-		
+
 		for algo in self.HashAlgorithms:
 			t += 'HashAlgo: %s\r\n' % algo.name
 
@@ -306,7 +373,7 @@ class SMB2EncryptionCapabilities:
 
 
 		return t
-			
+
 
 	def __repr__(self):
 		t = '==== SMB2 Encryption Capabilities ====\r\n'
@@ -366,7 +433,7 @@ class SMB2SigningCapabilities:
 
 
 		return t
-			
+
 
 	def __repr__(self):
 		t = '==== SMB2 Singing Capabilities ====\r\n'
@@ -383,9 +450,29 @@ class SMB2CompressionType(enum.Enum):
 	LZ77_Huffman = 0x0003 #LZ77+Huffman compression algorithm
 	Pattern_V1 = 0x0004 #Pattern Scanning algorithm
 
+	@classmethod
+	def _missing_(cls, value):
+		# MS-SMB2: tolerate unknown/reserved compression algorithm IDs instead of
+		# raising ValueError, so an unexpected NEGOTIATE context never crashes the
+		# whole SMB message parse. Returns an unregistered pseudo-member.
+		pseudo = object.__new__(cls)
+		pseudo._name_ = 'UNKNOWN_0x%04X' % (value if isinstance(value, int) else 0)
+		pseudo._value_ = value
+		return pseudo
+
 class SMB2CompressionFlags(enum.Enum):
 	NONE = 0x00000000 #Chained compression is not supported.
 	CHAINED = 0x00000001 #Chained compression is supported on this connection.
+
+	@classmethod
+	def _missing_(cls, value):
+		# MS-SMB2: Flags is a bit field; tolerate unknown/reserved bits instead of
+		# raising ValueError, so an unexpected NEGOTIATE context never crashes the
+		# whole SMB message parse. Returns an unregistered pseudo-member.
+		pseudo = object.__new__(cls)
+		pseudo._name_ = 'UNKNOWN_0x%08X' % (value if isinstance(value, int) else 0)
+		pseudo._value_ = value
+		return pseudo
 
 class SMB2CompressionCapabilities:
 	def __init__(self):
@@ -416,7 +503,7 @@ class SMB2CompressionCapabilities:
 	@staticmethod
 	def from_comp_list(supp_comp_list, is_chained = False):
 		#supp_comp_list > a list of SMB2CompressionType enums
-		# flags > bool, will be converted to SMB2CompressionFlags 
+		# flags > bool, will be converted to SMB2CompressionFlags
 		s = SMB2CompressionCapabilities()
 		s.Flags = SMB2CompressionFlags.NONE
 		if is_chained is True:
@@ -426,14 +513,14 @@ class SMB2CompressionCapabilities:
 		return s
 
 	def to_bytes(self):
-		
+
 		data  = self.CompressionAlgorithmCount.to_bytes(2, byteorder = 'little', signed=False)
 		data += self.Padding.to_bytes(2, byteorder = 'little', signed=False)
 		data += self.Flags.value.to_bytes(2, byteorder = 'little', signed=False)
 		data += self.CompressionAlgorithmCount.to_bytes(2, byteorder = 'little', signed=False)
 		for compalgo in self.CompressionAlgorithms:
 			data += compalgo.value.to_bytes(2, byteorder = 'little', signed=False)
-		
+
 		self.DataLength = len(data)
 		t = self.ContextType.value.to_bytes(2, byteorder = 'little', signed=False)
 		t += self.DataLength.to_bytes(2, byteorder = 'little', signed=False)
@@ -441,7 +528,7 @@ class SMB2CompressionCapabilities:
 		t += data
 
 		return t
-			
+
 
 	def __repr__(self):
 		t = '==== SMB2 Compression Capabilities ====\r\n'
@@ -474,7 +561,7 @@ class SMB2TransportCapabilities:
 
 	def to_bytes(self):
 		data = self.Flags.to_bytes(2, byteorder = 'little', signed=False)
-		
+
 		self.DataLength = len(data)
 		t = self.ContextType.value.to_bytes(2, byteorder = 'little', signed=False)
 		t += self.DataLength.to_bytes(2, byteorder = 'little', signed=False)
@@ -482,7 +569,7 @@ class SMB2TransportCapabilities:
 		t += data
 
 		return t
-			
+
 	def __repr__(self):
 		t = '==== SMB2 Transport Capabilities ====\r\n'
 		t += 'Flags: %s\r\n' % self.Flags
@@ -508,7 +595,7 @@ class SMB2NetnameNegotiateContextID:
 
 	def to_bytes(self):
 		return self.NetName.encode('utf-18-le')
-			
+
 	def __repr__(self):
 		t = '==== SMB2 Netname Negotiate Context ID ====\r\n'
 		t += 'NetName: %s\r\n' % self.NetName
@@ -572,7 +659,12 @@ class NEGOTIATE_REPLY:
 			msg.NegotiateContextList = []
 			buff.seek(msg.NegotiateContextOffset, io.SEEK_SET)
 			for _ in range(msg.NegotiateContextCount):
-				msg.NegotiateContextList.append(SMB2NegotiateContext.from_buffer(buff))
+				# Tolerant of unknown/unhandled context types (returns None) so a
+				# server that responds with a newer negotiate context never makes
+				# the client crash. See SMB2NegotiateContext.from_buffer.
+				ctx = SMB2NegotiateContext.from_buffer(buff)
+				if ctx is not None:
+					msg.NegotiateContextList.append(ctx)
 				padsize = ((8 - buff.tell()) % 8)
 				buff.seek(padsize, io.SEEK_CUR)
 

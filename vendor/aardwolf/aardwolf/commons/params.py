@@ -39,7 +39,6 @@ class RDPConnectionParams:
 		}
 
 		url = url_template.format(**params)
-		print(url)
 		return url
 
 

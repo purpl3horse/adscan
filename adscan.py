@@ -14560,6 +14560,7 @@ class PentestShell:
         credential_origin: str | None = None,
         local_account_rid: str | None = None,
         metadata=None,
+        force_recheck_user_privs: bool = False,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -14589,6 +14590,7 @@ class PentestShell:
             credential_origin=credential_origin,
             local_account_rid=local_account_rid,
             metadata=metadata,
+            force_recheck_user_privs=force_recheck_user_privs,
         )
 
     def add_credentials_batch(
@@ -15780,7 +15782,7 @@ class PentestShell:
                 "Host Inventory",
                 lambda: self.do_host_inventory(domain),
                 step_number=1,
-                total_steps=3,
+                total_steps=4,
             ):
                 return
 
@@ -15790,7 +15792,7 @@ class PentestShell:
                 "Identity Inventory",
                 lambda: self.do_identity_inventory(domain),
                 step_number=2,
-                total_steps=3,
+                total_steps=4,
             ):
                 return
 
@@ -15802,7 +15804,32 @@ class PentestShell:
                     source_context="authenticated_enum_phase1",
                 ),
                 step_number=3,
-                total_steps=3,
+                total_steps=4,
+            ):
+                return
+
+            # Per-host NTLMv1 sweep (sub-project #2). Runs HERE -- after the
+            # reachable host set is known (Host Inventory) and BEFORE Attack
+            # Paths Discovery -- so the per-host NTLMv1/v2 verdicts are persisted
+            # when attack paths compute (see the per-host NTLMv1 detection
+            # design spec, section 5.2). The sweep is fully self-gating: type
+            # scope (ctf=all reachable / audit=DCs only with operator opt-in),
+            # the >=2-reachable relay gate, the OPSEC confirm prompt
+            # (auto-resolved in non-interactive runs), serial execution, and
+            # per-host persistence all live inside the entry point. It emits its
+            # own user-facing output; the returned summary dict is logged at
+            # debug only.
+            def _run_ntlm_auth_type_sweep_step() -> None:
+                summary = self.ask_for_ntlm_auth_type_sweep(domain)
+                print_info_debug(
+                    f"[ntlm-capture][sweep] phase summary: {summary}"
+                )
+
+            if _run_step(
+                "NTLM Auth-Type Sweep",
+                _run_ntlm_auth_type_sweep_step,
+                step_number=4,
+                total_steps=4,
             ):
                 return
 
@@ -15892,7 +15919,7 @@ class PentestShell:
         # ========== PHASE 3: Quick Credential Wins ==========
         _enter_phase("Quick Credential Wins")
         step_num = 1
-        total_quickwin_steps = 3 + (2 if self.type == "audit" else 0)
+        total_quickwin_steps = 2 + (2 if self.type == "audit" else 0)
 
         if _run_step(
             "Timeroast Candidate Check",
@@ -15932,13 +15959,12 @@ class PentestShell:
                 return
             step_num += 1
 
-        if _run_step(
-            "DC NTLM Auth-Type Check",
-            lambda: self.ask_for_dc_ntlm_auth_type_quick_win(domain),
-            step_number=step_num,
-            total_steps=total_quickwin_steps,
-        ):
-            return
+        # NTLM auth-type detection (per-host sweep + DC-only classification) is
+        # fully consolidated into Phase 3 (Domain Intelligence): every sweep path
+        # either persists the DC's verdict (full per-host sweep), or runs the
+        # DC-only quick-win directly (operator-skip and <2-reachable fallbacks,
+        # for all engagement types incl. ctf which self-gates). There is no
+        # remaining Quick-Credential-Wins NTLM step.
 
         if stop_after_phase == 3:
             return
@@ -17317,8 +17343,29 @@ class PentestShell:
         """Stop the native poisoning suite."""
         stop_poisoning(self)
 
+    def do_check_ntlm_auth(self, args):
+        """Coerce a target host and classify NTLMv1 vs NTLMv2.
+
+        Usage:
+            check_ntlm_auth <domain> <ip>   explicit SPN/credential domain + target IP
+            check_ntlm_auth <ip>            IP only; domain inferred from context
+            check_ntlm_auth <domain>        domain only; targets that domain's PDC
+
+        Optional flags:
+            --socks5 host:port              pivot the coercion trigger via SOCKS5
+            --timeout=<seconds>             listener capture window
+            --trigger-timeout=<seconds>     coercion trigger timeout
+            --method=<method_name>          restrict the native coercion vector
+        """
+        from adscan_internal.cli.ntlm_capture import run_check_ntlm_auth
+
+        run_check_ntlm_auth(self, args)
+
     def do_check_dc_ntlm_auth_type(self, args):
-        """Coerce the current domain PDC and classify NTLMv1 vs NTLMv2.
+        """[DEPRECATED] Alias for ``check_ntlm_auth`` (DC/PDC behaviour).
+
+        Use ``check_ntlm_auth`` instead. With no explicit target IP this falls
+        through to the current domain's PDC, exactly as before.
 
         Usage:
             check_dc_ntlm_auth_type <domain> [--timeout=<seconds>] [--trigger-timeout=<seconds>] [--method=<method_name>]
@@ -17327,11 +17374,109 @@ class PentestShell:
 
         run_check_dc_ntlm_auth_type(self, args)
 
+    def do_capture_ntlm_share_drop(self, args):
+        """Drop NTLMv2-capture bait into a writable share (passive icon UNC).
+
+        Stages an identifiable ADscan bait file (\\.url\\ icon UNC by default,
+        \\.library-ms\\ as fallback) into a WRITABLE SMB share. When any domain
+        user browses the folder, Windows resolves the icon over UNC and
+        authenticates to ADscan's native SMB listener, capturing their NTLMv2.
+        The bait is tracked in the environment-change ledger and cleaned up.
+
+        Usage:
+            capture_ntlm_share_drop <domain> <host> <share> [--file-type=url|library-ms]
+                [--filename=<name>] [--wait=<seconds>] [--dir=<subdir>]
+        """
+        from adscan_internal.cli.ntlmv2_share_capture import run_capture_ntlm_share_drop
+
+        run_capture_ntlm_share_drop(self, args)
+
+    def do_relay_ldap(self, args):
+        """Coerce a member, relay its NTLM to LDAP, write RBCD or Shadow Creds.
+
+        Composes the existing native relay primitives into one chain: coerce the
+        victim's NTLM auth -> relay it to the DC's LDAP (drop-the-MIC /
+        CVE-2019-1040) -> write ONE of two attributes on the victim:
+
+        * --method rbcd: msDS-AllowedToActOnBehalfOfOtherIdentity granting a
+          controlled delegate -> S4U2Self+Proxy to mint an impersonation ticket.
+        * --method shadow-creds: msDS-KeyCredentialLink (Shadow Credentials) ->
+          PKINIT to recover the victim's NT hash (requires a CA / NTAuth PKI).
+
+        With no --method the verb prompts (shadow-creds is offered only when a
+        PKI is present). A posture-driven feasibility gate runs first; every
+        change is tracked in the environment-change ledger and auto-reverted on
+        exit (success or failure).
+
+        Usage:
+            relay_ldap <victim-ip> [--method rbcd|shadow-creds] [--listener-ip IP]
+                [--socks5 host:port] [--actor-sid SID] [--impersonate USER]
+                [--spn service/host] [--domain DOMAIN]
+        """
+        from adscan_internal.cli.relay_rbcd import run_relay_ldap
+
+        run_relay_ldap(self, args)
+
+    def do_relay_rbcd(self, args):
+        """[DEPRECATED] Alias for ``relay_ldap --method rbcd``.
+
+        Use ``relay_ldap`` instead and pick the write method (RBCD or Shadow
+        Credentials). This alias pins the RBCD method for backward compatibility.
+
+        Usage:
+            relay_rbcd <victim-ip> [--listener-ip IP] [--socks5 host:port]
+                [--actor-sid SID] [--impersonate USER] [--spn service/host]
+                [--domain DOMAIN]
+        """
+        from adscan_internal.cli.relay_rbcd import run_relay_rbcd
+
+        run_relay_rbcd(self, args)
+
     def ask_for_dc_ntlm_auth_type_quick_win(self, target_domain):
         """Run the Phase 3 DC NTLM auth-type quick win."""
         from adscan_internal.cli.ntlm_capture import run_ntlm_auth_type_quick_win
 
         return run_ntlm_auth_type_quick_win(self, target_domain)
+
+    def ask_for_ntlm_auth_type_sweep(self, target_domain):
+        """Run the per-host NTLMv1 sweep (Domain Intelligence phase).
+
+        Thin wrapper over the fully self-gating entry point in
+        ``ntlm_capture``; returns the per-host summary dict for debug logging.
+        """
+        from adscan_internal.cli.ntlm_capture import run_ntlm_auth_type_sweep
+
+        return run_ntlm_auth_type_sweep(self, target_domain)
+
+    def _phase3_sweep_classified_dc(self, target_domain) -> bool:
+        """Return ``True`` when the Phase 3 NTLM sweep already classified the DC.
+
+        Avoids running the DC NTLM auth-type check twice in one pipeline. The
+        sweep classifies the DC either by setting ``dc_ntlm_auth_type`` (its
+        decline / <2-reachable fallbacks invoke the DC-only quick-win) or by
+        persisting a non-``unknown`` per-host verdict for the DC IP in
+        ``ntlm_auth_type_by_host`` (the full per-host sweep path).
+        """
+        domain_state = self.domains_data.get(target_domain) or {}
+        if not isinstance(domain_state, dict):
+            return False
+        if domain_state.get("dc_ntlm_auth_type"):
+            return True
+        host_map = domain_state.get("ntlm_auth_type_by_host") or {}
+        if not isinstance(host_map, dict) or not host_map:
+            return False
+        try:
+            from adscan_internal.models.domain import resolve_dc_ip as _resolve_dc_ip
+
+            dc_ip = _resolve_dc_ip(domain_state)
+        except Exception:  # noqa: BLE001 - best effort; fall back to no-skip
+            dc_ip = None
+        if not dc_ip:
+            return False
+        verdict = host_map.get(dc_ip)
+        if not isinstance(verdict, dict):
+            return False
+        return verdict.get("ntlm_auth_type") in {"NTLMv1", "NTLMv2"}
 
     def ask_for_asreproast(self, target_domain, *, auto_crack: bool = True):
         """Prompt user to perform AS-REP Roasting attack."""
@@ -19185,21 +19330,102 @@ class PentestShell:
             )
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_info(
-            f"Searching for possible passwords in the shares of domain {marked_target_domain}. This might take a while, please be patient"
+            f"Searching for possible passwords in the shares of domain {marked_target_domain}."
         )
         print_info_debug(f"Command: {command}")
-        return self.execute_manspider(
-            command,
-            target_domain,
-            "passw",
-            hosts=hosts,
-            shares=shares,
-            auth_username=username,
-            loot_dir=spider_output_dir,
-            credsweeper_jobs=get_default_credsweeper_jobs(),
-            phase=phase,
-            analysis_context=analysis_context,
+
+        from adscan_core.interaction import is_non_interactive
+        from adscan_core.tui.patience_notice import (
+            PatienceNoticeConfig,
+            maybe_show_patience_notice,
         )
+        from adscan_core.tui.progress_dashboard import (
+            ProgressDashboard,
+            ProgressDashboardConfig,
+        )
+
+        # Upfront patience notice -- threshold-gated on the host count queued for
+        # the share credential hunt. Silent below the threshold; a single line
+        # under non-interactive runs. Centralizes the old ad-hoc "be patient"
+        # print. count=0 keeps it silent when the host set is unavailable.
+        host_count = len(hosts) if hosts else 0
+        try:
+            maybe_show_patience_notice(
+                PatienceNoticeConfig(
+                    operation="Share credential hunt",
+                    unit="hosts",
+                    threshold=10,
+                    env_var="ADSCAN_PATIENCE_THRESHOLD_SHARE_CRED_HUNT",
+                ),
+                count=host_count,
+                non_interactive=is_non_interactive(self),
+            )
+        except Exception:  # noqa: BLE001 -- notice must never abort the hunt
+            pass
+
+        # Indeterminate live dashboard. manspider is a blocking subprocess with
+        # no parseable live-progress stream, so a determinate X/N bar would
+        # require a guessed ETA -- spinner + elapsed shows the hunt is alive so
+        # the operator avoids Ctrl+C-ing a working long scan. The blocking call
+        # runs in a single worker thread so the spinner ticks while it blocks;
+        # LiveSession falls back to inline logging on non-TTY/CI itself.
+        # FAIL-SAFE: a dashboard/LiveSession setup failure falls back to a plain
+        # blocking call so the hunt always runs and parsing is never skipped;
+        # an exception raised by the hunt itself propagates unchanged.
+        def _run_manspider() -> any:
+            return self.execute_manspider(
+                command,
+                target_domain,
+                "passw",
+                hosts=hosts,
+                shares=shares,
+                auth_username=username,
+                loot_dir=spider_output_dir,
+                credsweeper_jobs=get_default_credsweeper_jobs(),
+                phase=phase,
+                analysis_context=analysis_context,
+            )
+
+        try:
+            dashboard = ProgressDashboard(
+                ProgressDashboardConfig(
+                    title="Share Credential Hunt",
+                    total=None,  # indeterminate -- spinner + elapsed (opaque subprocess)
+                    unit="hosts",
+                )
+            )
+        except Exception:  # noqa: BLE001 -- dashboard build must never block the hunt
+            return _run_manspider()
+
+        def _safe_update(dash: "ProgressDashboard") -> None:
+            try:
+                dash.update()
+            except Exception:  # noqa: BLE001 -- a render error must not abort the hunt
+                pass
+
+        import concurrent.futures
+        import time as _time
+
+        call_started = False
+        try:
+            with dashboard.live_session():
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    fut = pool.submit(_run_manspider)
+                    call_started = True
+                    while not fut.done():
+                        _safe_update(dashboard)
+                        _time.sleep(0.25)
+                    result = fut.result()  # re-raises worker exceptions here
+                    _safe_update(dashboard)
+                    return result
+        except Exception:  # noqa: BLE001
+            if call_started:
+                # The hunt (or its worker plumbing) raised -- propagate to the
+                # caller's existing handling. Do NOT re-run the hunt.
+                raise
+            # Dashboard / LiveSession failed before the call started -- fall back
+            # to a plain blocking call so the hunt still completes.
+            return _run_manspider()
 
     def do_netexec_smb_descriptions(self, domain):
         """
@@ -23896,6 +24122,7 @@ class PentestShell:
         *,
         step_context: dict[str, object] | None = None,
         store_credential: bool = True,
+        capability_bearing: bool = False,
     ):
         """Perform Pass-the-Certificate using native PKINIT and display the result."""
         from adscan_internal.rich_output import mark_sensitive
@@ -23930,6 +24157,7 @@ class PentestShell:
                         pfx_password=pfx_password,
                         username=username,
                         cwd=kerberos_dir,
+                        domains_data=self.domains_data,
                     )
                     if native_result.success and native_result.nt_hash:
                         result = native_result
@@ -23959,10 +24187,15 @@ class PentestShell:
                     error_message="Native PKINIT did not deliver an NT hash.",
                 )
 
-            if not result.success or not result.nt_hash or not result.username:
+            # A PKINIT TGT/ccache is a usable credential on its own — the NT hash
+            # is a best-effort bonus that is unrecoverable on NTLM-disabled / AES-only
+            # domains. Only fail when there is NO usable credential at all (no ccache
+            # AND no hash). The ccache registration below feeds kerberos_tickets, which
+            # downstream steps (DCSync/DRSUAPI, LDAP, SMB) select via Kerberos.
+            if not result.success or not result.username or not (result.nt_hash or result.ticket_path):
                 print_error(
                     result.error_message
-                    or "Could not extract the NT hash from Certipy output"
+                    or "Pass-the-Certificate did not obtain a usable credential (no TGT/ccache and no NT hash)."
                 )
                 # If we are executing within an attack path, mark the step as failed.
                 try:
@@ -24013,19 +24246,31 @@ class PentestShell:
             resolved_domain = result.resolved_domain or domain
 
             print_info("Performing a Pass the Certificate")
-            cred_table = Table(
-                title="[bold green]Extracted NT Hash[/bold green]",
-                header_style="bold green",
-                box=rich.box.SIMPLE,
-            )
-            cred_table.add_column("Domain", style="cyan")
-            cred_table.add_column("User", style="magenta")
-            cred_table.add_column("NT Hash", style="green")
-            marked_dom = mark_sensitive(resolved_domain, "domain")
-            marked_user = mark_sensitive(result.username, "user")
-            marked_nt_hash = mark_sensitive(result.nt_hash, "password")
-            cred_table.add_row(marked_dom, marked_user, marked_nt_hash)
-            self.console.print(cred_table)
+            if result.nt_hash:
+                cred_table = Table(
+                    title="[bold green]Extracted NT Hash[/bold green]",
+                    header_style="bold green",
+                    box=rich.box.SIMPLE,
+                )
+                cred_table.add_column("Domain", style="cyan")
+                cred_table.add_column("User", style="magenta")
+                cred_table.add_column("NT Hash", style="green")
+                marked_dom = mark_sensitive(resolved_domain, "domain")
+                marked_user = mark_sensitive(result.username, "user")
+                marked_nt_hash = mark_sensitive(result.nt_hash, "password")
+                cred_table.add_row(marked_dom, marked_user, marked_nt_hash)
+                self.console.print(cred_table)
+            else:
+                # NTLM-disabled / AES-only: no NT hash to recover. The PKINIT TGT
+                # (ccache) is the deliverable and is registered into kerberos_tickets
+                # below for Kerberos-backed downstream steps.
+                print_success(
+                    "Obtained a PKINIT TGT (Kerberos ccache) for "
+                    f"{mark_sensitive(result.username, 'user')}@"
+                    f"{mark_sensitive(resolved_domain, 'domain')} — NT hash not "
+                    "recovered (UnPAC-the-hash unavailable; NTLM likely disabled). "
+                    "Downstream steps will authenticate via Kerberos."
+                )
 
             # Decide whether this Pass-the-Certificate satisfied the intended target user.
             expected_user = (username or "").strip()
@@ -24081,9 +24326,39 @@ class PentestShell:
                     f"user={mark_sensitive(result.username, 'user')} "
                     f"ticket={mark_sensitive(result.ticket_path, 'path')}"
                 )
+                if capability_bearing:
+                    # ESC13: the minted TGT carries a synthetic group SID in its
+                    # PAC that a stored password/hash cannot reproduce. Mark the
+                    # ccache prefer-over-password for this user so the resolver
+                    # hands the next step the ticket, not a generic credential.
+                    from adscan_internal.services.credential_store_service import (
+                        mark_capability_bearing_ccache,
+                    )
 
-            if store_credential:
+                    mark_capability_bearing_ccache(
+                        self.domains_data,
+                        domain=resolved_domain,
+                        username=result.username,
+                        ccache_path=result.ticket_path,
+                    )
+                    print_info_debug(
+                        "certipy: Marked ccache capability-bearing (ESC13) for "
+                        f"{mark_sensitive(result.username, 'user')}"
+                    )
+
+            if store_credential and result.nt_hash:
                 self.add_credential(resolved_domain, result.username, result.nt_hash)
+            elif store_credential and not result.nt_hash:
+                # No NT hash (NTLM-disabled / AES-only). Do NOT store a null
+                # password/hash credential — the usable credential is the PKINIT
+                # ccache already registered in kerberos_tickets above, which
+                # downstream Kerberos-backed steps select on their own.
+                print_info_debug(
+                    "[certipy] PTC yielded a ccache (no NT hash); credential is the "
+                    "registered Kerberos ticket, not add_credential: "
+                    f"user={mark_sensitive(result.username, 'user')} "
+                    f"domain={mark_sensitive(resolved_domain, 'domain')}"
+                )
             else:
                 print_info_debug(
                     "[certipy] Skipping add_credential for PTC result by caller request: "
@@ -27230,14 +27505,20 @@ class PentestShell:
         )
         return selected_ip
 
-    def add_to_hosts(self, domain):
-        """Delegate /etc/hosts update to DNSResolverService."""
+    def add_to_hosts(self, domain, dns_a_records=None):
+        """Delegate /etc/hosts update to DNSResolverService.
+
+        When ``dns_a_records`` is provided, the resolver service refuses to write
+        a line whose IP is not one of the domain's own A-records (defense-in-depth
+        against the cross-domain leak). Legacy callers pass nothing → unchanged.
+        """
         try:
             service = self._get_dns_resolver_service()
             return service.add_hosts_entry(
                 domain=domain,
                 ip=getattr(self, "pdc", None),
                 hostname=getattr(self, "pdc_hostname", None),
+                dns_a_records=dns_a_records,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -28280,6 +28561,19 @@ class PentestShell:
         except Exception as exc:  # pragma: no cover - best-effort shutdown
             telemetry.capture_exception(exc)
             print_info_debug(f"[ligolo-cleanup] shutdown cleanup failed: {exc}")
+        # Durable operator_confirmed changes (machine accounts, RBCD grants,
+        # KeyCredentialLink) are NOT auto-reverted. Prompt the operator whether
+        # to revert them now (non-interactive policy: CI reverts all, otherwise
+        # keep). The auto_revert class is handled by the owning services above.
+        try:
+            from adscan_internal.cli.relay_rbcd import (
+                run_operator_confirmed_exit_cleanup,
+            )
+
+            run_operator_confirmed_exit_cleanup(self)
+        except Exception as exc:  # pragma: no cover - best-effort shutdown
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[ledger] operator-confirmed exit cleanup failed: {exc}")
         # Render environment change cleanup summary and finalise ledger
         try:
             if getattr(self, "environment_change_ledger", None) is not None:

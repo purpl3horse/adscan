@@ -35,9 +35,7 @@ class LsaDecryptor_NT5(PackageDecryptor):
 				self.random_key = self.get_random(sigpos)
 				#self.log('randomkey bytes:\n%s' % hexdump(self.random_key, start = 0))
 			except:
-				import traceback
-				traceback.print_exc()
-				#input()
+				pass
 			else:
 				break
 
@@ -110,11 +108,7 @@ class LsaDecryptor_NT5(PackageDecryptor):
 		return cleartext
 
 	def dump(self):
-		self.log('Recovered LSA encryption keys\n')
-		self.log('Feedback ({}): {}'.format(len(self.feedback), self.feedback.hex()))
-		self.log('Random Key ({}): {}'.format(len(self.random_key), self.random_key.hex()))
-		self.log('DESX inputwhitening Key ({}): {}'.format(len(self.des_key.inputWhitening), self.des_key.inputWhitening.hex()))
-		self.log('DESX outputwhitening Key ({}): {}'.format(len(self.des_key.outputWhitening), self.des_key.outputWhitening.hex()))
+		self.log('Recovered LSA encryption keys')
 		#self.log('DESX DES Expanded Key ({}): {}' % (self.des_key.desKey.roundKey))
 
 	def __desx_decrypt_internal_block(self, chunk):

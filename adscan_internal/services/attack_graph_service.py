@@ -7609,7 +7609,7 @@ def compute_maximal_attack_paths(
     incoming: dict[str, int] = {}
     outgoing: dict[str, int] = {}
     for edge in _iter_runtime_graph_edges(graph):
-        if attack_graph_core._is_excluded_share_access_edge(edge):  # noqa: SLF001
+        if attack_graph_core._is_nontraversable_attack_edge(edge, nodes_map):  # noqa: SLF001
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
@@ -8187,7 +8187,16 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         for s in executable_steps
     ):
         derived_status = "blocked"
-    elif any(s == "unsupported" for s in statuses):
+    elif any(s == "unsupported" for s in statuses) or any(
+        # Live support classification is the single source of truth: a relation
+        # whose catalog ``support_kind`` is ``unsupported`` surfaces as such even
+        # when the persisted edge status still carries the pre-flip default
+        # (e.g. CrackNTLMv1 flipped supported→unsupported after the graph was
+        # last enumerated). Mirrors the live ``policy_blocked`` check above.
+        classify_relation_support(str(s.relation or "").strip().lower()).kind
+        == "unsupported"
+        for s in executable_steps
+    ):
         derived_status = "unsupported"
 
     steps_for_ui: list[dict[str, Any]] = []
@@ -9090,6 +9099,7 @@ def upsert_netexec_privilege_edge(
     relation: str,
     target_ip: str,
     target_hostname: str | None = None,
+    notes_extra: dict[str, Any] | None = None,
 ) -> bool:
     """Upsert a privilege edge discovered via NetExec into the attack graph.
 
@@ -9108,6 +9118,8 @@ def upsert_netexec_privilege_edge(
         relation: Relationship to upsert (e.g. ``AdminTo``).
         target_ip: IP address of the target host (from NetExec output).
         target_hostname: Optional hostname captured from NetExec output (often NetBIOS).
+        notes_extra: Optional extra metadata merged into the edge ``notes`` dict
+            (e.g. an impersonated principal or the technique used).
 
     Returns:
         True when the edge was recorded, False otherwise.
@@ -9166,6 +9178,8 @@ def upsert_netexec_privilege_edge(
             notes["fqdn"] = fqdn
         if target_hostname:
             notes["hostname"] = str(target_hostname).strip()
+        if isinstance(notes_extra, dict):
+            notes.update(notes_extra)
 
         upsert_edge(
             graph,
@@ -11034,7 +11048,7 @@ def compute_maximal_attack_paths_from_start(
 
     adjacency: dict[str, list[dict[str, Any]]] = {}
     for edge in _iter_runtime_graph_edges(graph):
-        if attack_graph_core._is_excluded_share_access_edge(edge):  # noqa: SLF001
+        if attack_graph_core._is_nontraversable_attack_edge(edge, nodes_map):  # noqa: SLF001
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
@@ -11352,6 +11366,18 @@ def _trim_trailing_memberof_edges(
     trimmed["nodes"] = nodes
     trimmed[rel_key] = rels
     trimmed["target"] = nodes[-1]
+    # ``terminal_target_label`` is stamped at path-creation time from the
+    # pre-trim ``path.target_id``. When we strip trailing MemberOf hops the
+    # terminal node changes, so the stamped label is now stale and points at
+    # the discarded pivot group (e.g. a CrackNTLMv1 path trimmed back to the DC
+    # computer object would still carry the trailing
+    # ``DENIED RODC PASSWORD REPLICATION GROUP`` label). Stage-7 classification
+    # resolves the target node via ``terminal_target_label`` first, so leaving
+    # it stale mislabels the path (compromise_enabler instead of
+    # domain_breaker). Reset it to the trimmed terminal label so the classifier
+    # resolves the real terminal node.
+    if "terminal_target_label" in trimmed:
+        trimmed["terminal_target_label"] = nodes[-1]
     return trimmed
 
 
@@ -11437,6 +11463,14 @@ def _annotate_record_target_priority(
     record["target_priority_rank"] = target_priority_rank
     record["target_terminal_class"] = target_terminal_class
     record["target_followup_status"] = target_followup_status
+    # Domain-object-first ordering within the Domain Compromised tier: a path
+    # terminating at the Domain node itself (WriteDACL/GenericAll on the domain)
+    # outranks one terminating at a direct-compromise principal (DA/DCs). The
+    # sort key reads this flag right after terminal_class. ("Los que acaban en
+    # el objeto dominio van primero SIEMPRE.")
+    record["target_is_domain_object"] = (
+        str(node.get("kind") or "").strip().lower() == "domain"
+    )
     record["is_tier_zero"] = target_priority_class == "tierzero"
     record["target_is_high_value"] = target_priority_class in {"tierzero", "highvalue"}
     _annotate_effective_target_basis(
@@ -14178,6 +14212,18 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
     ):
         # Policy-blocked steps should surface as blocked even before any execution attempt.
         return "blocked"
+    if any(
+        # Live support classification is the single source of truth — surface an
+        # ``unsupported`` relation even when the persisted edge status still
+        # carries the pre-flip default (see CrackNTLMv1).
+        classify_relation_support(str(step.get("action") or "").strip().lower()).kind
+        == "unsupported"
+        for step in steps
+        if isinstance(step, dict)
+        and str(step.get("action") or "").strip().lower()
+        not in _CONTEXT_RELATIONS_LOWER
+    ):
+        return "unsupported"
     return "theoretical"
 
 

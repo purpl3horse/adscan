@@ -620,11 +620,8 @@ class KerbrosClient:
 			S4UByteArray += user_to_impersonate.username.encode()
 			S4UByteArray += user_to_impersonate.domain.encode()
 			S4UByteArray += auth_package_name.encode()
-			logger.debug('[S4U2self] S4UByteArray: %s' % S4UByteArray.hex())
-			logger.debug('[S4U2self] S4UByteArray: %s' % S4UByteArray)
 			
 			chksum_data = _HMACMD5.checksum(self.kerberos_session_key, 17, S4UByteArray)
-			logger.debug('[S4U2self] chksum_data: %s' % chksum_data.hex())
 			
 			
 			chksum = {}

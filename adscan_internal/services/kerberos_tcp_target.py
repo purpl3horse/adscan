@@ -39,11 +39,17 @@ def is_ip_address(value: str) -> bool:
         return False
 
 
-def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str | None:
-    """Resolve an A record, optionally querying a specific resolver directly."""
+def _query_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> list[str]:
+    """Resolve ALL A records (in resolution order), optionally via a resolver.
+
+    Returns the full ordered, de-duplicated list of IPv4 addresses the host
+    resolves to. Callers that only need one address use :func:`_query_a_record`;
+    callers that must choose among multiple A records (e.g. a multi-homed host
+    that advertises both an internal and a routable address) use this.
+    """
     hostname = str(fqdn or "").strip().rstrip(".")
     if not hostname:
-        return None
+        return []
 
     # Try /etc/hosts + system resolver via socket first — this respects the
     # /etc/hosts entries added by ADscan's host-helper (e.g. babydc.baby.vl).
@@ -52,23 +58,24 @@ def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str
     if not resolver_ip:
         import socket as _socket
 
-        def _try_socket(name: str) -> str | None:
+        def _try_socket(name: str) -> list[str]:
+            ips: list[str] = []
             try:
                 results = _socket.getaddrinfo(name, None, _socket.AF_INET)
                 for _fam, _typ, _pro, _cn, sockaddr in results:
                     c = sockaddr[0]
-                    if c and is_ip_address(c):
-                        return c
+                    if c and is_ip_address(c) and c not in ips:
+                        ips.append(c)
             except _socket.gaierror:
                 pass
             except Exception:  # noqa: BLE001
                 pass
-            return None
+            return ips
 
         # Try the hostname as given first.
-        ip = _try_socket(hostname)
-        if ip:
-            return ip
+        found = _try_socket(hostname)
+        if found:
+            return found
 
         # If the hostname is a short label (no dots), also try with the search
         # domain from /etc/resolv.conf — short hostnames like 'babydc' may not
@@ -80,12 +87,14 @@ def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str
                         _l = _line.strip()
                         if _l.startswith("search ") or _l.startswith("domain "):
                             for _domain in _l.split()[1:]:
-                                ip = _try_socket(f"{hostname}.{_domain}")
-                                if ip:
-                                    return ip
+                                found = _try_socket(f"{hostname}.{_domain}")
+                                if found:
+                                    return found
             except Exception:  # noqa: BLE001
                 pass
+        return found
 
+    found: list[str] = []
     try:
         import dns.exception
         import dns.resolver
@@ -108,8 +117,8 @@ def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str
         answers = resolver.resolve(hostname, "A")
         for answer in answers:
             candidate = str(answer).strip()
-            if candidate and is_ip_address(candidate):
-                return candidate
+            if candidate and is_ip_address(candidate) and candidate not in found:
+                found.append(candidate)
     except dns.exception.DNSException as exc:
         print_info_debug(
             f"[kerberos-target] A lookup failed for {mark_sensitive(hostname, 'hostname')}: {exc}"
@@ -119,7 +128,13 @@ def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str
         print_info_debug(
             f"[kerberos-target] unexpected A lookup error for {mark_sensitive(hostname, 'hostname')}: {exc}"
         )
-    return None
+    return found
+
+
+def _query_a_record(fqdn: str, resolver_ip: str | None, timeout_s: float) -> str | None:
+    """Resolve a single A record (first in resolution order)."""
+    records = _query_a_records(fqdn, resolver_ip, timeout_s)
+    return records[0] if records else None
 
 
 def _log_resolv_conf_state(context: str) -> None:
@@ -232,7 +247,20 @@ def resolve_kerberos_tcp_target(
             server_ip=target_clean if spn_value != target_clean else None,
         )
 
-    resolved_ip = _query_a_record(target_clean, resolver_clean, timeout_s)
+    resolved_ips = _query_a_records(target_clean, resolver_clean, timeout_s)
+    # Prefer the resolver IP when the target resolves to it among several A
+    # records. ``resolver_clean`` is the reachability-selected DC/KDC IP we are
+    # already successfully talking to, so for a multi-homed host (e.g. an
+    # Enterprise CA co-located on a DC that advertises both an internal and a
+    # routable address) it is the reachable one. The bare first A record may be
+    # an internal, non-routable IP that times out on connect — observed live:
+    # ADCS ESC enrollment to dc1.<realm> resolved to the internal 192.168.x A
+    # record and timed out on EPM/135, while the routable KDC IP (already
+    # selected for Kerberos) was reachable on every port.
+    if resolver_clean and resolver_clean in resolved_ips:
+        resolved_ip: str | None = resolver_clean
+    else:
+        resolved_ip = resolved_ips[0] if resolved_ips else None
     spn_value = explicit_spn or target_clean
     return KerberosTcpTarget(
         spn_host=spn_value,

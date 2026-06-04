@@ -123,7 +123,7 @@ class WorkspaceLoaderShell(Protocol):
     def convert_hostnames_to_ips_and_scan(
         self, domain: str, computers_file: str, nmap_dir: str
     ) -> Any: ...
-    def add_to_hosts(self, domain: str) -> None: ...
+    def add_to_hosts(self, domain: str, dns_a_records: list[str] | None = None) -> None: ...
     def _clean_domain_entries(self, domain: str) -> None: ...
     def _get_dns_discovery_service(self) -> Any: ...
 
@@ -752,6 +752,36 @@ def _attempt_workspace_dns_repair_interactive(
         return False
 
 
+def _pdc_directly_reachable(pdc_ip: str) -> bool:
+    """True when the PDC IP answers a DC service port from the current vantage.
+
+    Probes the IP directly (445/389/88), never the hostname, so it is
+    DNS-independent and safe to call during workspace-load classification —
+    before any per-domain DNS / ``/etc/hosts`` is configured.
+
+    Used to decide whether a domain whose PDC nominally falls within an
+    *inactive* Ligolo route is genuinely reachable only through that tunnel
+    (defer its DNS) or is in fact directly reachable (do NOT defer).  Deferring
+    a directly-reachable DC deadlocks the pivot relaunch: the Phase-2 relaunch
+    probe resolves the DC hostname (``asyncio.open_connection``), which fails
+    while the DC's DNS sits deferred in Phase 3 — the relaunch then blocks on
+    the very DC that was reachable all along.
+    """
+    try:
+        from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
+        from adscan_internal.services.network_probe_service import (  # noqa: PLC0415
+            tcp_probe_multi,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        probe = run_async_sync(tcp_probe_multi(pdc_ip, [445, 389, 88], timeout=2.0))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return False
+    return getattr(probe, "status", "") == "open"
+
+
 def _classify_workspace_pivot_domains(
     shell: Any,
     *,
@@ -834,6 +864,32 @@ def _classify_workspace_pivot_domains(
                     continue
                 if any(pdc_addr in route for route in inactive_routes):
                     pivot_dns_domains.add(domain_name)
+
+        # A domain whose PDC is DIRECTLY reachable from the current vantage must
+        # NOT have its DNS deferred — whether it was seeded from reconciliation
+        # (restored_direct_vantage) or matched an inactive route above.  Deferring
+        # a directly-reachable DC deadlocks the pivot relaunch: the Phase-2 probe
+        # resolves the DC hostname while its DNS sits deferred in Phase 3, so the
+        # relaunch blocks on a DC that was reachable all along (self-heals only by
+        # accident on the next session).  Probe by IP so this is DNS-independent.
+        if pivot_dns_domains:
+            domains_data = getattr(shell, "domains_data", {}) or {}
+            for domain_name in sorted(pivot_dns_domains):
+                info = domains_data.get(domain_name)
+                pdc_str = (
+                    str(info.get("pdc") or "").strip()
+                    if isinstance(info, dict)
+                    else ""
+                )
+                if pdc_str and _pdc_directly_reachable(pdc_str):
+                    pivot_dns_domains.discard(domain_name)
+                    print_info_debug(
+                        "[workspace_load] PDC "
+                        f"{mark_sensitive(pdc_str, 'ip')} for "
+                        f"{mark_sensitive(domain_name, 'domain')} is directly "
+                        "reachable; not deferring its DNS (avoids pivot-relaunch "
+                        "DNS deadlock)."
+                    )
 
         if relaunch_domains or pivot_dns_domains:
             print_info_debug(

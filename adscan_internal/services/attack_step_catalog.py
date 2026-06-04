@@ -1710,6 +1710,46 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         is_acl_edge=True,
     ),
     _entry(
+        "spnjack",
+        support_kind="supported",
+        support_reason=(
+            "SPN-jacking + constrained delegation with protocol transition. The "
+            "principal holds msDS-AllowedToDelegateTo plus TrustedToAuthForDelegation "
+            "(T2A4D) and servicePrincipalName-write over a target computer. It "
+            "relocates its delegated SPN onto the target (delspn from the current "
+            "owner, addspn onto the target), then S4U2Self+S4U2Proxy and an "
+            "altservice sname rewrite to obtain a service ticket against the target "
+            "as any user (e.g. Administrator). Deterministic — no offline crack."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="delegation",
+        description=(
+            "Compromise a computer by hijacking a delegated SPN: move the SPN the "
+            "principal can delegate to onto the target computer, then abuse "
+            "constrained delegation (S4U) with protocol transition to mint a "
+            "service ticket against the target as a privileged user"
+        ),
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Remove servicePrincipalName-write (WriteSPN / GenericWrite / GenericAll "
+            "/ WriteDacl / Owns) on computer objects from non-privileged principals. "
+            "Remove unnecessary constrained-delegation (msDS-AllowedToDelegateTo) and "
+            "TrustedToAuthForDelegation from the source principal, or add it to "
+            "Protected Users. Any one of these closes this avenue."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1558.003",
+        mitre_technique_name="Steal or Forge Kerberos Tickets: Kerberoasting",
+        detection_event_ids=("4769", "5136"),
+        bh_native=False,
+        bh_cypher_names=("SPNJack",),
+        is_acl_edge=False,
+        requires_execution_context=True,
+        execution_target_access_requirement="computer_reachable",
+        source_context_requirement="user_credentials",
+    ),
+    _entry(
         "writelogonscript",
         support_kind="supported",
         support_reason=(
@@ -2240,6 +2280,172 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_cypher_names=("UserDescription",),
     ),
+    # ── NTLMv1 coerce→relay attack steps (sub-project #3) ─────────────────────
+    # Surface marker: NTLMv1 enabled on a Computer. A finding on its own,
+    # regardless of relay viability. Template: a context-only surface like the
+    # CVE-scanner enablers. Not executed directly (the relay edges are).
+    _entry(
+        "Ntlmv1Enabled",
+        support_kind="context",
+        support_reason=(
+            "NTLMv1 authentication is enabled on this host — its challenge/response "
+            "is trivially crackable and relayable; a discovered misconfiguration."
+        ),
+        compromise_semantics="context_only",
+        compromise_effort="none",
+        category="ntlm",
+        description=(
+            "NTLMv1 authentication enabled on the host (LmCompatibilityLevel < 3). "
+            "The host's NTLMv1 response can be coerced and relayed or cracked to a "
+            "machine NT hash."
+        ),
+        vuln_key="ntlmv1_enabled",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable NTLMv1 by setting LmCompatibilityLevel to 3 or higher via GPO "
+            "(Network security: LAN Manager authentication level → "
+            "'Send NTLMv2 response only. Refuse LM & NTLM')."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1556",
+        mitre_technique_name="Modify Authentication Process",
+        detection_event_ids=("4624",),
+        bh_native=False,
+        bh_cypher_names=("Ntlmv1Enabled",),
+        remediation_steps=(
+            "Audit LmCompatibilityLevel across the estate "
+            "(reg query HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v LmCompatibilityLevel).",
+            "Set 'Network security: LAN Manager authentication level' to "
+            "'Send NTLMv2 response only. Refuse LM & NTLM' via GPO.",
+            "Disable NTLMv1 fallback and monitor Event ID 4624 for "
+            "Authentication Package = NTLM V1.",
+        ),
+    ),
+    # RBCD relay: Domain Users → Ntlmv1RelayRBCD → Computer X. Joins the
+    # admin-capability family (AdminTo / ReadLAPSPassword). access_capability_only
+    # + NOT context-transparent → DumpLSA chains automatically (the S4U
+    # Administrator ccache grants a real local-admin session). Template:
+    # coerceandrelayntlmtoadcs (coerce/relay) + allowedtoact (RBCD semantics).
+    _entry(
+        "Ntlmv1RelayRBCD",
+        support_kind="supported",
+        support_reason=(
+            "Coerce the NTLMv1 host, relay its authentication to the DC LDAP, write "
+            "msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD) for a controlled delegate, "
+            "then S4U2Self+Proxy to mint an Administrator ticket on the victim. "
+            "Executed natively via the relay handler."
+        ),
+        compromise_semantics="access_capability_only",
+        compromise_effort="high",
+        category="ntlm_relay",
+        description=(
+            "NTLMv1 coerce-and-relay to RBCD: a domain user coerces the victim "
+            "computer, relays its NTLMv1 authentication to the DC, configures "
+            "resource-based constrained delegation, and obtains local administrator "
+            "access on the victim via S4U."
+        ),
+        vuln_key="ntlmv1_relay_rbcd",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Disable NTLMv1 (LmCompatibilityLevel ≥ 3) via GPO; enforce LDAP signing "
+            "and channel binding (drop-the-MIC is blocked when signing is enforced); "
+            "remove authentication-coercion vectors (disable vulnerable RPC services). "
+            "Any one of these closes this avenue."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1187",
+        mitre_technique_name="Forced Authentication",
+        detection_event_ids=("4768", "4769", "5136"),
+        bh_native=False,
+        bh_cypher_names=("Ntlmv1RelayRBCD",),
+        source_context_requirement="user_credentials",
+        execution_target_access_requirement="computer_reachable",
+    ),
+    # Shadow Credentials relay: Domain Users → Ntlmv1RelayShadowCreds → Computer X.
+    # Credential-granting (like ReadGMSAPassword): PKINIT yields the machine NT
+    # hash directly → SHORTER path, no DumpLSA. credential_access_only →
+    # provides credential_recovered, which does NOT satisfy DumpLSA's
+    # local_admin_session requirement. Template: coerceandrelayntlmtoadcs +
+    # HasShadowCredentials (Shadow Creds semantics).
+    _entry(
+        "Ntlmv1RelayShadowCreds",
+        support_kind="supported",
+        support_reason=(
+            "Coerce the NTLMv1 host, relay its authentication to the DC LDAP, append "
+            "msDS-KeyCredentialLink (Shadow Credentials), then PKINIT with the minted "
+            "key to recover the victim machine NT hash directly. Requires ADCS PKI. "
+            "Executed natively via the relay handler."
+        ),
+        compromise_semantics="credential_access_only",
+        compromise_effort="high",
+        category="ntlm_relay",
+        description=(
+            "NTLMv1 coerce-and-relay to Shadow Credentials: a domain user coerces the "
+            "victim computer, relays its NTLMv1 authentication to the DC, writes a "
+            "key credential, and recovers the victim's machine NT hash via PKINIT."
+        ),
+        vuln_key="ntlmv1_relay_shadowcreds",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Disable NTLMv1 (LmCompatibilityLevel ≥ 3); enforce LDAP signing and "
+            "channel binding; harden ADCS/PKINIT (this avenue writes a key credential "
+            "and needs the PKI). Any one of these closes this avenue."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1187",
+        mitre_technique_name="Forced Authentication",
+        detection_event_ids=("4768", "4769", "5136"),
+        bh_native=False,
+        bh_cypher_names=("Ntlmv1RelayShadowCreds",),
+        source_context_requirement="user_credentials",
+        execution_target_access_requirement="computer_reachable",
+    ),
+    # Offline NTLMv1 crack: Domain Users → CrackNTLMv1 → Computer X. The MOST
+    # universal NTLMv1 technique — no relay target, no reflection/signing/CBT
+    # dependency, works single-DC and against any machine account. ADscan can
+    # coerce + capture the NTLMv1 challenge/response, but it does NOT perform the
+    # offline crack: there is no crack.sh submission, DES rainbow-table, or GPU
+    # (hashcat 14000) integration, so we cannot recover the machine NT hash on
+    # our own. The step is therefore ``unsupported`` (capture-only) — it is
+    # surfaced as a manual follow-up, not an automated capability. It models a
+    # credential_access_only avenue so the graph reasons about it correctly, but
+    # the operator must run the crack out-of-band.
+    _entry(
+        "CrackNTLMv1",
+        support_kind="unsupported",
+        support_reason=(
+            "ADscan captures the NetNTLMv1 challenge/response from the coerced host "
+            "but does NOT perform the offline crack: there is no crack.sh / DES "
+            "rainbow-table / GPU (hashcat 14000) integration to recover the machine "
+            "account NT hash. Capture-only — the operator must run the offline crack "
+            "out-of-band to obtain the credential."
+        ),
+        compromise_semantics="credential_access_only",
+        compromise_effort="high",
+        category="ntlm_relay",
+        description=(
+            "NTLMv1 offline crack: a domain user coerces the victim computer, captures "
+            "its NTLMv1 response, and cracks it offline to recover the victim's machine "
+            "account NT hash. The most universal NTLMv1 avenue — independent of relay "
+            "viability, LDAP signing, channel binding, ADCS, or DC count."
+        ),
+        vuln_key="ntlmv1_crack",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Disable NTLMv1 (LmCompatibilityLevel ≥ 3) via GPO and remove "
+            "authentication-coercion vectors. Unlike the relay avenues, LDAP signing "
+            "and channel binding do NOT mitigate this — only disabling NTLMv1 itself "
+            "closes it (the crack is offline)."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1187",
+        mitre_technique_name="Forced Authentication",
+        detection_event_ids=("4768", "4769"),
+        bh_native=False,
+        bh_cypher_names=("CrackNTLMv1",),
+        source_context_requirement="user_credentials",
+        execution_target_access_requirement="computer_reachable",
+    ),
 )
 
 
@@ -2335,6 +2541,7 @@ _RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
         "writedacl",
         "writeowner",
         "writespn",
+        "spnjack",
         "writeaccountrestrictions",
         "owns",
         "dcsync",

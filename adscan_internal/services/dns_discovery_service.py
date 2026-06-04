@@ -31,6 +31,10 @@ import dns.reversename
 import dns.rdatatype
 
 from adscan_internal import telemetry
+from adscan_internal.services.network_preflight_service import (
+    NetworkPreflightHost,
+    assess_target_reachability,
+)
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error_context,
@@ -118,6 +122,29 @@ def _is_valid_ipv4(value: str) -> bool:
         return False
 
 
+def normalize_ipv4_candidates(candidates: list[str | None]) -> list[str]:
+    """Normalize, deduplicate and IPv4-validate a candidate list (order-preserving).
+
+    Single source of truth for IPv4 validate/dedup across the DC/PDC selection
+    path. Strips empty/whitespace values, drops anything that is not a valid
+    IPv4 literal, and removes duplicates while preserving first-seen order.
+
+    Args:
+        candidates: Raw candidate values (may include None / whitespace).
+
+    Returns:
+        Deduplicated list of valid IPv4 strings in first-seen order.
+    """
+    normalized: list[str] = []
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value or not _is_valid_ipv4(value):
+            continue
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
 def choose_preferred_pdc_ip(
     ip_candidates: list[str],
     *,
@@ -179,6 +206,293 @@ def choose_preferred_pdc_ip(
         return fallback_pref
 
     return normalized[0]
+
+
+# Ports that DEFINE a domain controller: LDAP + Kerberos. Probing these (not
+# DNS/53) is what binds reachability to "is this a usable KDC/DC", per spec.
+DC_REACHABILITY_PROBE_PORTS: tuple[int, ...] = (389, 88)
+
+# Per-probe TCP budget. The local-lab default (2.0s) is too tight for VPN RTT
+# to HTB/segmented client networks; 5.0s is the AD-constraints §7bis guidance.
+# Amplio != infinito — this is a hard ceiling, never unbounded.
+DC_REACHABILITY_VPN_BUDGET_SECONDS: float = 5.0
+
+
+@dataclass(frozen=True)
+class DcIpSelection:
+    """Outcome of reachability-aware DC/KDC IP selection for one FQDN.
+
+    Attributes:
+        selected_ip: The chosen DC/KDC IP, or None only when there are no
+            valid candidates at all (never None merely because probes timed out).
+        candidates: Full ordered candidate set actually considered (provided
+            first, then DNS), de-duplicated and IPv4-validated.
+        reachable_ips: Subset of candidates that passed route + at least one
+            open probe port.
+        source_by_ip: Per-IP provenance for audit ("provided" | "dns").
+        reason: One of "provided_reachable" | "dns_reachable" |
+            "pure_fallback_unverified" | "cross_domain_unreachable" | "none".
+        unreachable_dns_ip: The target realm's OWN best DNS A-record IP, even
+            when ``selected_ip is None``. ALWAYS a realm-authoritative A-record
+            (drawn from ``dns_candidates``), NEVER a provided/source resolver IP
+            — so a caller can persist it as a pivot-retry breadcrumb for a
+            cross-domain-unreachable realm without re-introducing the cross-realm
+            DC-IP leak (the connectivity record stays ``reachable=False`` so it is
+            never selected as a KDC pre-pivot). None when there are no DNS
+            A-record candidates at all.
+    """
+
+    selected_ip: str | None
+    candidates: list[str]
+    reachable_ips: list[str]
+    source_by_ip: dict[str, str]
+    reason: str
+    unreachable_dns_ip: str | None = None
+
+
+def select_reachable_dc_ip(
+    *,
+    reachability_host: NetworkPreflightHost,
+    dns_candidates: list[str],
+    provided_ips: list[str | None] | None = None,
+    reference_ip: str | None = None,
+    probe_ports: tuple[int, ...] = DC_REACHABILITY_PROBE_PORTS,
+    expected_interface: str | None = None,
+    timeout_seconds: float = DC_REACHABILITY_VPN_BUDGET_SECONDS,
+    cross_domain: bool = False,
+) -> DcIpSelection:
+    """Reachability-aware DC/KDC IP selection composing candidate union + probes.
+
+    Composes (1) candidate-set construction (provided_ips FIRST, then DNS
+    A-records — the rule that fixes the multi-homed PingPong bug), (2) a route
+    + TCP-port reachability probe of LDAP/Kerberos ports (389/88, NOT 53), and
+    (3) a deterministic pure-selector fallback when no candidate is verifiably
+    reachable.
+
+    Reachability is the PRIMARY selection key; candidate order is only the
+    tiebreaker among equally-reachable IPs. Because provided IPs come first, a
+    reachable operator-provided IP beats a reachable DNS IP.
+
+    Observe-vs-infer safeguard: a timeout never yields a negative verdict and
+    nothing is cached. If every candidate's ports are filtered/timed out (vs
+    explicitly refused with RST), the result is treated as INCONCLUSIVE and the
+    function falls back to the pure selector (``choose_preferred_pdc_ip``) —
+    it never returns ``selected_ip=None`` on a transient VPN hiccup. The next
+    call re-probes cleanly. No ``PostureSignal`` is emitted here (this is
+    route/port reachability, not DC hardening).
+
+    The Kerberos SPN invariant is preserved: this returns an IP for the KDC
+    network address ONLY. The FQDN flows separately into the SPN field; the
+    caller must never leak the selected IP into a Kerberos SPN.
+
+    Args:
+        reachability_host: Host handle exposing ``run_command`` (the shell).
+        dns_candidates: A-records from ``resolve_ipv4_addresses_robust``.
+        provided_ips: Operator-provided / known-reachable IPs (HIGH priority).
+        reference_ip: Subnet-match hint for the pure-selector fallback only;
+            NOT auto-injected as a candidate.
+        probe_ports: TCP ports defining a DC (default 389/88).
+        expected_interface: Optional expected route interface.
+        timeout_seconds: Per-probe TCP budget (VPN-tuned default).
+        cross_domain: When True, this is resolving a DIFFERENT (trusted) realm's
+            DC. In that mode a provided/reference IP is treated as a DNS RESOLVER
+            ONLY — never as a DC candidate. Only an IP that is present in the
+            target realm's own A-records (``dns_candidates``) AND reachable may be
+            selected. If no DNS-derived IP is reachable the result is
+            ``selected_ip=None, reason="cross_domain_unreachable"`` — the source
+            realm's DC IP must NEVER be substituted as the foreign realm's PDC
+            (it is the wrong KDC → KDC_ERR_WRONG_REALM). Defaults to False, which
+            preserves the same-domain behavior byte-for-byte.
+
+    Returns:
+        A ``DcIpSelection`` describing the chosen IP, the candidate set, the
+        reachable subset, per-IP provenance, and the selection reason.
+    """
+    # 1. Candidate-set construction (§4): provided FIRST, then DNS, de-duped.
+    provided_clean = normalize_ipv4_candidates(list(provided_ips or []))
+    dns_clean = normalize_ipv4_candidates(list(dns_candidates or []))
+
+    # Best realm-authoritative A-record for the discovered-but-unreachable
+    # breadcrumb. ALWAYS drawn from the target realm's own DNS answers
+    # (``dns_clean``), so it is NEVER a provided/source resolver IP. Surfaced on
+    # every return (notably the cross_domain_unreachable verdicts where
+    # ``selected_ip is None``) so the caller can persist a pivot-retry breadcrumb
+    # carrying the realm's REAL DC IP without leaking the source realm's DC.
+    best_dns_ip = dns_clean[0] if dns_clean else None
+
+    source_by_ip: dict[str, str] = {}
+    candidates: list[str] = []
+    for ip_val in (*provided_clean, *dns_clean):
+        if _is_loopback_ip(ip_val):
+            continue
+        if ip_val not in source_by_ip:
+            source_by_ip[ip_val] = "provided" if ip_val in provided_clean else "dns"
+            candidates.append(ip_val)
+
+    if not candidates:
+        return DcIpSelection(
+            selected_ip=None,
+            candidates=[],
+            reachable_ips=[],
+            source_by_ip={},
+            reason="none",
+            unreachable_dns_ip=best_dns_ip,
+        )
+
+    # 2. Probe each candidate; reachable iff route.ok AND any probe port open.
+    reachable_ips: list[str] = []
+    # DNS-derived candidates (target realm's own A-records) that have a working
+    # route, regardless of port verdict. Used by the cross_domain fallback to
+    # distinguish "route exists, ports inconclusive/closed" (observe-vs-infer:
+    # admissible unverified fallback) from "no route at all" (definitively
+    # discovered-but-unreachable → no leak of the source realm's DC).
+    dns_routed: list[str] = []
+    dns_set = set(dns_clean)
+    any_filtered = False
+    for candidate in candidates:
+        try:
+            assessment = assess_target_reachability(
+                reachability_host,
+                target_ip=candidate,
+                expected_interface=expected_interface,
+                tcp_ports=tuple(probe_ports),
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let a probe failure crash selection.
+            telemetry.capture_exception(exc)
+            any_filtered = True
+            continue
+
+        if assessment.route.ok and candidate in dns_set:
+            dns_routed.append(candidate)
+
+        if assessment.route.ok and any(
+            assessment.is_port_open(port) for port in probe_ports
+        ):
+            reachable_ips.append(candidate)
+        elif assessment.route.ok and any(
+            assessment.is_port_filtered(port) for port in probe_ports
+        ):
+            # Route works but ports timed out → inconclusive, not "closed".
+            any_filtered = True
+
+    # 3. Among reachable candidates, prefer a DNS-resolved (realm-authoritative)
+    #    IP over a provided/known IP. The target domain's DNS A-records resolve
+    #    THAT domain's DC FQDN, so a reachable DNS IP is guaranteed to serve the
+    #    target realm. The provided/known IP, by contrast, can belong to a
+    #    DIFFERENT realm: trust enumeration calls this with the SOURCE domain's
+    #    resolver/DC IP as `provided_ips` while querying a TRUSTED domain's PDC.
+    #    That source-realm DC is reachable on 389/88 but is the WRONG KDC for the
+    #    target realm — selecting it sends the cross-realm TGS to the wrong KDC
+    #    (observed: essos DC chosen for sevenkingdoms.local PDC → KDC_ERR_WRONG_REALM).
+    #    So the provided IP wins ONLY when no DNS A-record is reachable — which is
+    #    exactly the multi-homed case it was added for (DNS gave only an
+    #    unroutable internal IP; the operator-provided IP for THIS same domain is
+    #    the reachable one). DNS-reachable-first is realm-safe and preserves that.
+    if reachable_ips:
+        # "DNS-resolved" = present in the target domain's A-record set
+        # (``dns_clean``), regardless of whether it is ALSO an operator-provided
+        # IP. Use set membership, NOT the first-seen ``source_by_ip`` label: an
+        # IP that is both provided AND a DNS A-record is still realm-authoritative
+        # and must win over a provided-ONLY IP from a different realm.
+        dns_reachable = [ip for ip in reachable_ips if ip in dns_set]
+        if cross_domain:
+            # Cross-domain: a provided/reference IP is a DNS RESOLVER for the
+            # foreign realm, NOT a DC candidate for it. ONLY a reachable IP from
+            # the target realm's own A-records may win. If none of the target's
+            # A-records are reachable, fall through to the cross-domain
+            # unreachable verdict below — never substitute the source realm's DC.
+            if dns_reachable:
+                selected = dns_reachable[0]
+                return DcIpSelection(
+                    selected_ip=selected,
+                    candidates=candidates,
+                    reachable_ips=reachable_ips,
+                    source_by_ip=source_by_ip,
+                    reason="dns_reachable",
+                    unreachable_dns_ip=best_dns_ip,
+                )
+        else:
+            selected = dns_reachable[0] if dns_reachable else reachable_ips[0]
+            reason = (
+                "provided_reachable"
+                if source_by_ip.get(selected) == "provided"
+                else "dns_reachable"
+            )
+            return DcIpSelection(
+                selected_ip=selected,
+                candidates=candidates,
+                reachable_ips=reachable_ips,
+                source_by_ip=source_by_ip,
+                reason=reason,
+                unreachable_dns_ip=best_dns_ip,
+            )
+
+    # 4. Nothing verifiably reachable → deterministic pure-selector fallback.
+    # This preserves today's behavior exactly and, critically, NEVER returns
+    # None on a transient timeout (observe-vs-infer): a VPN hiccup must not
+    # trip the "PDC not reachable" panel. `any_filtered` is informational here
+    # — the fallback path is identical for closed and filtered, because in both
+    # cases we have no positive proof and must not infer a negative verdict.
+    _ = any_filtered
+    if cross_domain:
+        # Cross-domain pure fallback: the foreign realm's A-records are the ONLY
+        # admissible source. preferred_ips / reference_ip belong to the SOURCE
+        # realm (resolver) and must NOT be substitutable as the foreign PDC.
+        #
+        # Discovered-but-unreachable verdict: if NONE of the target realm's own
+        # A-records even have a working ROUTE, the realm is genuinely unreachable
+        # from this vantage — return None so the caller marks it
+        # discovered-but-unreachable and stops. NEVER leak the source realm's DC.
+        #
+        # Observe-vs-infer: a routed A-record whose ports were closed/filtered is
+        # still an admissible UNVERIFIED fallback (a transient port hiccup must
+        # not bury a real target DC), but the source realm's IP is never one.
+        if not dns_routed:
+            return DcIpSelection(
+                selected_ip=None,
+                candidates=candidates,
+                reachable_ips=[],
+                source_by_ip=source_by_ip,
+                reason="cross_domain_unreachable",
+                unreachable_dns_ip=best_dns_ip,
+            )
+        fallback = choose_preferred_pdc_ip(
+            dns_routed,
+            preferred_ips=None,
+            reference_ip=None,
+        )
+        if not fallback:
+            return DcIpSelection(
+                selected_ip=None,
+                candidates=candidates,
+                reachable_ips=[],
+                source_by_ip=source_by_ip,
+                reason="cross_domain_unreachable",
+                unreachable_dns_ip=best_dns_ip,
+            )
+        return DcIpSelection(
+            selected_ip=fallback,
+            candidates=candidates,
+            reachable_ips=[],
+            source_by_ip=source_by_ip,
+            reason="pure_fallback_unverified",
+            unreachable_dns_ip=best_dns_ip,
+        )
+
+    fallback = choose_preferred_pdc_ip(
+        dns_clean,
+        preferred_ips=list(provided_ips or []) or None,
+        reference_ip=reference_ip,
+    )
+    return DcIpSelection(
+        selected_ip=fallback,
+        candidates=candidates,
+        reachable_ips=[],
+        source_by_ip=source_by_ip,
+        reason="pure_fallback_unverified",
+        unreachable_dns_ip=best_dns_ip,
+    )
 
 
 def preflight_install_dns(
@@ -909,7 +1223,12 @@ class DNSDiscoveryService:
         resolver_ip: str,
         preferred_ips: list[str | None] | None = None,
         reference_ip: str | None = None,
-    ) -> tuple[str | None, str | None]:
+        cross_domain: bool = False,
+        return_selection: bool = False,
+    ) -> (
+        tuple[str | None, str | None]
+        | tuple[str | None, str | None, DcIpSelection | None]
+    ):
         """Resolve PDC IP and hostname using a specific resolver with IP selection.
 
         This extends find_pdc_via_resolver to include preferred IP selection logic
@@ -920,13 +1239,34 @@ class DNSDiscoveryService:
             resolver_ip: DNS resolver IP to use
             preferred_ips: List of preferred IPs in priority order
             reference_ip: Reference IP for subnet matching
+            cross_domain: When True, resolve a DIFFERENT (trusted) realm's DC;
+                the resolver/reference IP is a DNS resolver only, never a DC
+                candidate (see ``select_reachable_dc_ip``).
+            return_selection: When True, return a 3-tuple appending the full
+                ``DcIpSelection`` (or None when SRV resolution never succeeded).
+                Used by the cross-domain trust-enum path to recover the trusted
+                realm's OWN real A-record IP (``selection.unreachable_dns_ip``)
+                for a pivot-retry breadcrumb even when ``selected_ip is None``.
+                Defaults to False, preserving the legacy 2-tuple contract.
 
         Returns:
-            Tuple of (selected_ip, hostname) or (None, None) if not found
+            ``(selected_ip, hostname)`` — or ``(selected_ip, hostname,
+            selection)`` when ``return_selection=True``. ``(None, None)`` /
+            ``(None, None, None)`` when the PDC could not be discovered at all.
         """
+
+        def _ret(
+            selected: str | None,
+            hostname: str | None,
+            selection: "DcIpSelection | None",
+        ):
+            if return_selection:
+                return selected, hostname, selection
+            return selected, hostname
+
         normalized_domain = (domain or "").strip().rstrip(".")
         if not normalized_domain or not resolver_ip:
-            return None, None
+            return _ret(None, None, None)
 
         marked_domain = mark_sensitive(normalized_domain, "domain")
         marked_ip = mark_sensitive(resolver_ip, "ip")
@@ -961,11 +1301,11 @@ class DNSDiscoveryService:
             print_warning_debug(
                 f"[dns_find_pdc_resolv] No PDC SRV answer for {marked_domain} via resolver {marked_ip}"
             )
-            return None, None
+            return _ret(None, None, None)
 
         hostname = srv_targets[0].rstrip(".")
         if not hostname:
-            return None, None
+            return _ret(None, None, None)
 
         pdc_hostname = hostname.split(".")[0]
         fqdn = f"{pdc_hostname}.{normalized_domain}"
@@ -973,24 +1313,31 @@ class DNSDiscoveryService:
             fqdn, resolver=resolver_ip, tcp=False
         )
 
-        selected_ip = choose_preferred_pdc_ip(
-            ip_candidates,
-            preferred_ips=preferred_ips,
+        selection = select_reachable_dc_ip(
+            reachability_host=self._host,
+            dns_candidates=ip_candidates,
+            provided_ips=preferred_ips,
             reference_ip=reference_ip,
+            cross_domain=cross_domain,
         )
+        selected_ip = selection.selected_ip
 
         if selected_ip:
             marked_ip_candidates = mark_sensitive(ip_candidates, "ip")
             print_info_debug(
-                f"[DNS] Selected PDC IP via resolver {marked_ip} for {marked_domain}: {selected_ip} (candidates={marked_ip_candidates})"
+                f"[DNS] Selected PDC IP via resolver {marked_ip} for {marked_domain}: "
+                f"{selected_ip} (reason={selection.reason}, candidates={marked_ip_candidates})"
             )
-            return selected_ip, pdc_hostname
+            return _ret(selected_ip, pdc_hostname, selection)
 
         marked_ip_candidates = mark_sensitive(ip_candidates, "ip")
         print_warning_debug(
             f"[DNS] Resolver {marked_ip} returned candidates {marked_ip_candidates} but none selected for {marked_domain}"
         )
-        return None, None
+        # Legacy 2-tuple callers keep the exact (None, None) contract. Only the
+        # 3-tuple (return_selection) path surfaces the real hostname + selection
+        # so the cross-domain breadcrumb can carry the realm's own DC identity.
+        return _ret(None, pdc_hostname if return_selection else None, selection)
 
     def discover_domain_controllers(
         self,
@@ -998,6 +1345,7 @@ class DNSDiscoveryService:
         domain: str,
         pdc_ip: str | None = None,
         preferred_ips: list[str | None] | None = None,
+        cross_domain: bool = False,
     ) -> tuple[list[str], list[str], dict[str, str]]:
         """Discover all domain controllers for a domain via SRV records.
 
@@ -1051,17 +1399,33 @@ class DNSDiscoveryService:
             ip_candidates = self.resolve_ipv4_addresses_robust(dc, resolver=pdc_ip)
             print_info_debug(f"[dns_find_dcs] IP candidates for {dc}: {ip_candidates}")
 
-            # Build preferred IPs list
+            # Build preferred IPs list. The caller-provided ``preferred_ips``
+            # apply to every DC. The resolver/PDC ``pdc_ip`` is injected as a
+            # first-class candidate ONLY when this DC's own DNS A-records prove
+            # it IS the PDC (i.e. ``pdc_ip`` appears in ``ip_candidates``).
+            # Injecting ``pdc_ip`` for every hostname would let a genuine
+            # multi-DC domain mis-map the PDC's address onto a different
+            # (non-PDC) DC whenever ``pdc_ip`` happens to be reachable on the
+            # probe port (389/88) but is not that DC's real address. Single-DC
+            # domains (e.g. PingPong) are unaffected: the one DC == PDC, so its
+            # A-records contain ``pdc_ip`` and the injection still applies.
             pref_list = preferred_ips or []
-            if pdc_ip and pdc_ip not in pref_list:
+            if pdc_ip and pdc_ip in ip_candidates and pdc_ip not in pref_list:
                 pref_list = [pdc_ip] + pref_list
 
-            reference_ip = pdc_ip
-            selected_ip = choose_preferred_pdc_ip(
-                ip_candidates,
-                preferred_ips=pref_list if pref_list else None,
+            # Leak #2 (applies even same-domain): a reference_ip that is NOT
+            # one of THIS hostname's resolved A-records must never be
+            # substitutable as its address. Restrict the subnet-match hint to a
+            # reference IP that genuinely belongs to this DC's candidate set.
+            reference_ip = pdc_ip if pdc_ip in ip_candidates else None
+            selection = select_reachable_dc_ip(
+                reachability_host=self._host,
+                dns_candidates=ip_candidates,
+                provided_ips=pref_list if pref_list else None,
                 reference_ip=reference_ip,
+                cross_domain=cross_domain,
             )
+            selected_ip = selection.selected_ip
 
             marked_reference_ip = (
                 mark_sensitive(reference_ip, "ip") if reference_ip else None
@@ -1093,6 +1457,7 @@ class DNSDiscoveryService:
         *,
         domain: str,
         preferred_ips: list[str | None] | None = None,
+        cross_domain: bool = False,
     ) -> tuple[str | None, str | None]:
         """Discover PDC for a domain using SRV queries.
 
@@ -1138,14 +1503,19 @@ class DNSDiscoveryService:
             f"[dns_find_pdc] IP candidates for PDC FQDN {marked_fqdn}: {ip_candidates}"
         )
 
-        selected_ip = choose_preferred_pdc_ip(
-            ip_candidates, preferred_ips=preferred_ips
+        selection = select_reachable_dc_ip(
+            reachability_host=self._host,
+            dns_candidates=ip_candidates,
+            provided_ips=preferred_ips,
+            cross_domain=cross_domain,
         )
+        selected_ip = selection.selected_ip
 
         if selected_ip:
             marked_domain = mark_sensitive(normalized_domain, "domain")
             print_info_debug(
-                f"[DNS] Selected PDC IP for {marked_domain}: {selected_ip} (candidates={ip_candidates})"
+                f"[DNS] Selected PDC IP for {marked_domain}: {selected_ip} "
+                f"(reason={selection.reason}, candidates={ip_candidates})"
             )
             return selected_ip, pdc_hostname
 

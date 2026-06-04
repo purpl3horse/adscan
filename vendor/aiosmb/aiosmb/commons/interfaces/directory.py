@@ -217,6 +217,91 @@ class SMBDirectory:
 
 
 		return self.security_descriptor, None
+
+	async def query_maximal_access(self, connection:SMBConnection):
+		"""Server-computed effective access for the caller token on this directory.
+
+		Attaches an ``SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST`` ("MxAc") create
+		context to a non-intrusive open of the directory and reads the
+		``MaximalAccess`` field the server returns in the matching
+		``SMB2_CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE`` create context.
+
+		The server computes this value against the caller's FULL token (every
+		group membership) AND the object's NTFS DACL, then intersects it with the
+		share-level permissions. It is therefore the authoritative *effective*
+		access — strictly more accurate than the share-level ``maximal_access``
+		returned by ``tree_connect`` (which reflects only the share ACL and
+		over-reports WRITE when NTFS denies it).
+
+		NON-INTRUSIVE: this opens the directory for FILE_READ_ATTRIBUTES only and
+		never creates or writes any object. The open uses ``FILE_OPEN`` so it
+		never creates the directory either.
+
+		Returns ``(FileAccessMask, None)`` on success. Returns ``(None, None)``
+		when the open is denied (ACCESS_DENIED == the caller has no access at
+		all). Returns ``(None, Exception)`` on any other transport/parse error.
+		"""
+		tree_id = None
+		file_id = None
+		owns_tree = self.tree_id is None
+		try:
+			tree_id = self.tree_id
+			if tree_id is None:
+				tree_entry, err = await connection.tree_connect(self.share_path)
+				if err is not None:
+					raise err
+				tree_id = tree_entry.tree_id
+
+			desired_access = FileAccessMask.FILE_READ_ATTRIBUTES
+			share_mode = ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE | ShareAccess.FILE_SHARE_DELETE
+			create_options = CreateOptions.FILE_DIRECTORY_FILE | CreateOptions.FILE_SYNCHRONOUS_IO_NONALERT
+			file_attrs = 0
+			create_disposition = CreateDisposition.FILE_OPEN
+
+			mxac_req = CREATE_QUERY_MAXIMAL_ACCESS_REQUEST()
+			file_id, reply, err = await connection.create(
+				tree_id,
+				self.fullpath,
+				desired_access,
+				share_mode,
+				create_options,
+				create_disposition,
+				file_attrs,
+				create_contexts=[mxac_req],
+				return_reply=True,
+			)
+			if err is not None:
+				# ACCESS_DENIED on the open means the caller has no effective
+				# access at all — report it as None (not an error) so callers can
+				# distinguish "no access" from "probe failed".
+				if 'ACCESS_DENIED' in str(err).upper():
+					return None, None
+				raise err
+
+			if reply is None or not getattr(reply, 'CreateContext', None):
+				return None, Exception('server returned no MxAc create context')
+
+			contexts = parse_create_contexts(reply.CreateContext)
+			mxac_data = contexts.get(b'MxAc')
+			if not mxac_data:
+				return None, Exception('MxAc create context missing from CREATE reply')
+
+			mxac = CREATE_QUERY_MAXIMAL_ACCESS_RESPONSE.from_bytes(mxac_data)
+			return mxac.MaximalAccess, None
+		except Exception as e:
+			return None, e
+		finally:
+			if file_id is not None:
+				try:
+					await connection.close(tree_id, file_id)
+				except Exception:
+					pass
+			if tree_id is not None and owns_tree:
+				try:
+					await connection.tree_disconnect(tree_id)
+				except Exception:
+					pass
+
 	
 
 	def get_console_output(self):

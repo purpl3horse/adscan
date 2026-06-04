@@ -809,6 +809,7 @@ def print_attack_paths_summary(
         DISPLAY_TIER_LATERAL_PIVOT,
         DISPLAY_TIER_ORDER,
         DISPLAY_TIER_STYLES,
+        DISPLAY_TIER_TIER0_FOOTHOLD,
         describe_path_target_outcome,
         get_path_display_tier,
     )
@@ -1283,7 +1284,8 @@ def print_attack_paths_summary(
             BRAND_COLORS["error"]
             if display_tier == DISPLAY_TIER_DOMAIN_COMPROMISE
             else BRAND_COLORS["warning"]
-            if display_tier == DISPLAY_TIER_COMPROMISE_ENABLER
+            if display_tier
+            in (DISPLAY_TIER_TIER0_FOOTHOLD, DISPLAY_TIER_COMPROMISE_ENABLER)
             else None
         )
         idx_cell: str | Text = (

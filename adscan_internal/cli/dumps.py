@@ -607,6 +607,15 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
     wants_kerberos = bool(creds.get("ccache_path") or creds.get("aes_key"))
     has_ntlm_cred = bool(creds.get("password") or creds.get("nt_hash"))
 
+    # A LOCAL-scope credential (the islocal dump path sets auth_domain="") is a
+    # local SAM account, NOT a domain principal — it cannot obtain a Kerberos
+    # TGT, so it must authenticate over NTLM regardless of the Kerberos-first
+    # posture. Domain credentials (auth_domain set) keep the Kerberos-first
+    # logic below untouched.
+    force_ntlm_local = ("auth_domain" in creds) and not str(
+        creds.get("auth_domain") or ""
+    ).strip()
+
     if resolution.kerberos_viable:
         spn_host = resolution.spn_host
         use_kerberos = wants_kerberos
@@ -623,6 +632,13 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
         print_info_debug(
             f"[dump] SMB SPN resolution for {host}: {resolution.reason}; "
             f"use_kerberos={use_kerberos} has_ntlm_cred={has_ntlm_cred}"
+        )
+
+    if force_ntlm_local and use_kerberos:
+        use_kerberos = False
+        print_info_debug(
+            f"[dump] local-scope credential on {host} → forcing NTLM "
+            "(a local SAM account cannot obtain a Kerberos TGT)"
         )
 
     return SMBConfig(
@@ -1847,6 +1863,9 @@ def _select_reuse_candidates_with_checkbox(
         credential = str(item.get("credential") or "").strip()
         if not username or not credential:
             continue
+        if credential.lower() == _EMPTY_NTLM_HASH:
+            # Never present a blank-password account as a reuse candidate.
+            continue
         marked_user = mark_sensitive(username, "user")
         label = f"{idx}. {marked_user} (RID {rid}, seen on {source_hosts} host(s))"
         options.append(label)
@@ -2071,6 +2090,11 @@ def _run_optional_domain_account_reuse_validation(
         credential = str(item.get("credential") or "").strip()
         rid = str(item.get("rid") or "-").strip() or "-"
         if not username or not credential:
+            continue
+        if credential.lower() == _EMPTY_NTLM_HASH:
+            # Blank-password account: exclude the empty-string NTLM hash from
+            # SAM -> Domain reuse so it is never offered or pre-selected for
+            # domain spraying.
             continue
         key = credential.lower()
         bucket = grouped.setdefault(
@@ -2565,6 +2589,16 @@ def _resolve_reuse_candidate_credentials(
         username = str(current.get("username") or "").strip()
         credential = str(current.get("credential") or "").strip()
         if not username or not credential:
+            continue
+        if credential.lower() == _EMPTY_NTLM_HASH:
+            # Blank-password account: the empty-string NTLM hash can only ever
+            # match accounts that themselves have no password, so it is dropped
+            # before reuse validation rather than wasting spray budget.
+            print_info_debug(
+                "[sam_reuse] Excluding blank-password candidate "
+                f"{mark_sensitive(username, 'user')}: empty NTLM hash is "
+                "not a usable credential."
+            )
             continue
         filtered_candidates.append(current)
         raw_pairs.append((username, credential))
@@ -4385,6 +4419,11 @@ def _build_native_sam_reuse_candidates(
         nt_hash = str(getattr(cred, "nt_hash", "") or "").strip()
         if not username or not nt_hash:
             continue
+        if nt_hash.lower() == _EMPTY_NTLM_HASH:
+            # Blank-password account: the empty-string NTLM hash is not a
+            # usable credential, so it must never be offered as a reuse/spray
+            # candidate.
+            continue
         rid = str(getattr(cred, "rid", "-") or "-").strip() or "-"
         key = (username.casefold(), rid, nt_hash.lower())
         if key in seen:
@@ -4471,6 +4510,19 @@ def _native_execute_dump_sam(
     )
     add_kwargs: dict[str, Any] = {"source_steps": source_steps} if source_steps else {}
     for cred in result.credentials:
+        nt_hash_clean = str(getattr(cred, "nt_hash", "") or "").strip().lower()
+        if nt_hash_clean == _EMPTY_NTLM_HASH:
+            # Blank-password accounts (Guest/DefaultAccount/WDAGUtilityAccount,
+            # etc.) hash to the well-known empty-string NTLM value. It is not a
+            # usable credential, so never store it. The display table still
+            # shows it tagged as blank for situational awareness.
+            print_info_debug(
+                "[sam_dump] Skipping blank-password account "
+                f"{mark_sensitive(cred.username, 'user')} on "
+                f"{mark_sensitive(host, 'hostname')}: empty NTLM hash is "
+                "not a usable credential."
+            )
+            continue
         try:
             shell.add_credential(
                 domain,

@@ -1254,15 +1254,26 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         classify_relation_support,
     )
 
-    if any(
-        classify_relation_support(str(step.get("action") or "").strip().lower()).kind
-        == "policy_blocked"
+    non_context_actions = [
+        str(step.get("action") or "").strip().lower()
         for step in steps
         if isinstance(step, dict)
         and str(step.get("action") or "").strip().lower()
         not in _CONTEXT_RELATIONS_LOWER
+    ]
+    if any(
+        classify_relation_support(action).kind == "policy_blocked"
+        for action in non_context_actions
     ):
         return "blocked"
+    if any(
+        # Live support classification is the single source of truth — surface an
+        # ``unsupported`` relation even when the persisted step status still
+        # carries the pre-flip default (see CrackNTLMv1).
+        classify_relation_support(action).kind == "unsupported"
+        for action in non_context_actions
+    ):
+        return "unsupported"
     return "theoretical"
 
 

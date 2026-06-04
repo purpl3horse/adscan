@@ -89,7 +89,11 @@ class SMBRelayServerConnection:
 			if self.connection is not None:
 				await self.connection.close()
 		except Exception as e:
-			await self.print('[ERR] %s' % e)
+			# Surface the REAL error: an exception with an empty __str__ (e.g.
+			# asyncio.TimeoutError) used to log a blank "[ERR] " line, masking the
+			# real connection-teardown/relay failure. Fall back to repr/type.
+			_exc_detail = str(e) or repr(e) or type(e).__name__
+			await self.print('[ERR] %s' % _exc_detail)
 
 	async def print(self, msg):
 		if self.settings.log_callback is not None:
@@ -290,7 +294,11 @@ class SMBRelayServerConnection:
 
 				return True, None
 		except Exception as e:
-			await self.print('[ERR] %s' % e)
+			# Surface the REAL error: exceptions with an empty __str__ (e.g.
+			# asyncio.TimeoutError) used to log a blank "[ERR] " line, masking
+			# the actual session-setup/relay failure. Fall back to repr/type.
+			_exc_detail = str(e) or repr(e) or type(e).__name__
+			await self.print('[ERR] %s' % _exc_detail)
 
 			reply.header = SMB2Header_SYNC()
 			reply.header.Command  = SMB2Command.SESSION_SETUP

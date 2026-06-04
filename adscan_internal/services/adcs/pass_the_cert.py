@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.services.async_bridge import run_async_sync
@@ -88,6 +88,42 @@ def _extract_username_from_pfx(pfx_path: str, pfx_password: str) -> Optional[str
     return None
 
 
+def _compute_skip_unpac(
+    domains_data: Optional[Mapping[str, Any]], domain: str
+) -> bool:
+    """Decide whether to skip the UnPAC-the-hash U2U round-trip.
+
+    Returns True only when posture reports ``NTLM_AUTHENTICATION`` as DISABLED
+    with HIGH confidence for ``domain`` — on such domains the PAC carries no
+    NTLM credential, so the U2U could never recover an NT hash. Any other
+    state (UNKNOWN, ENABLED, stale, low-confidence) returns False so the U2U
+    runs as before (observe-don't-infer). Never reimplements posture detection
+    — it consumes the canonical :func:`get_constraint` helper. Best-effort:
+    any failure resolves to False (run the U2U).
+    """
+    if not domains_data or not domain:
+        return False
+    try:
+        from adscan_internal.services.domain_posture import (
+            ConstraintCategory,
+            SignalConfidence,
+            TriState,
+            get_constraint,
+        )
+
+        ntlm = get_constraint(
+            domains_data,
+            domain=domain,
+            category=ConstraintCategory.NTLM_AUTHENTICATION,
+        )
+        return (
+            ntlm.effective_state is TriState.DISABLED
+            and ntlm.confidence is SignalConfidence.HIGH
+        )
+    except Exception:  # noqa: BLE001 — posture read is advisory, never fatal.
+        return False
+
+
 def pass_the_certificate_native(
     *,
     domain: str,
@@ -96,6 +132,7 @@ def pass_the_certificate_native(
     pfx_password: Optional[str] = None,
     username: Optional[str] = None,
     cwd: Optional[str] = None,
+    domains_data: Optional[Mapping[str, Any]] = None,
 ) -> PassTheCertificateResult:
     """Native PKINIT + UnPAC-the-hash using kerbad.
 
@@ -103,10 +140,17 @@ def pass_the_certificate_native(
     (``shell.ptc_certipy``) can route the result through its existing
     post-processing pipeline unchanged.
 
-    The result is marked ``success=True`` only when both a TGT was obtained
-    *and* an NT hash was recovered via UnPAC — the existing ``ptc_certipy``
-    glue gates everything (credential store, attack-graph status, table
-    rendering) on these two fields.
+    A PKINIT TGT (ccache) is itself a full authentication, so the result is
+    marked ``success=True`` once a usable principal + ccache exist; the NT
+    hash recovered via UnPAC is a best-effort bonus. When ``domains_data`` is
+    supplied and posture reports NTLM as DISABLED (HIGH confidence) for
+    ``domain``, the UnPAC U2U round-trip is skipped entirely (it could never
+    recover a hash on such domains) — see :func:`_compute_skip_unpac`.
+
+    Args:
+        domains_data: Optional workspace ``domains_data`` mapping used to read
+            the domain posture (NTLM state). When omitted, the UnPAC U2U runs
+            as before.
     """
     output_dir = Path(cwd) if cwd else Path.cwd()
     try:
@@ -124,12 +168,18 @@ def pass_the_certificate_native(
         if san_upn:
             effective_username = san_upn.split("@", 1)[0]
 
+    # Posture-aware: on NTLM-disabled (HIGH) domains the PAC carries no NTLM
+    # credential, so UnPAC-the-hash can never recover a hash — skip the wasted
+    # U2U round-trip. The PKINIT ccache remains the deliverable either way.
+    skip_unpac = _compute_skip_unpac(domains_data, domain)
+
     cfg = CertAuthConfig(
         domain=domain,
         kdc_ip=pdc_ip,
         pfx_path=Path(pfx_file),
         pfx_password=pfx_password or "",
         username=effective_username,
+        skip_unpac=skip_unpac,
     )
 
     try:
@@ -173,11 +223,20 @@ def pass_the_certificate_native(
     resolved_domain = parsed_realm or domain
 
     nt_hash = result.nt_hash
-    success = bool(nt_hash and parsed_user)
+    ticket_path = str(result.ccache_path) if result.ccache_path else None
+    # Success = we obtained a usable credential for the principal. A PKINIT TGT
+    # (ccache) IS a full authentication: usable for Kerberos-backed next steps
+    # (DCSync/DRSUAPI, LDAP, SMB) and, for ESC13, it already carries the
+    # issuance-policy OID -> group membership in its PAC. UnPAC-the-hash
+    # (NT-hash recovery) is a best-effort BONUS that is EXPECTED to fail on
+    # NTLM-disabled / AES-only domains (no NTLM credential in the PAC) and must
+    # NOT fail the step — the ccache is the deliverable. Posture-aware callers
+    # skip the U2U round-trip entirely when NTLM is known-disabled.
+    success = bool(parsed_user and (ticket_path or nt_hash))
     error_message: Optional[str] = None
     if not success:
         error_message = (
-            "PKINIT obtained a TGT but UnPAC-the-hash did not recover an NT hash."
+            "PKINIT did not obtain a usable credential (no TGT/ccache and no NT hash)."
         )
 
     raw_output = (
@@ -192,7 +251,7 @@ def pass_the_certificate_native(
         username=parsed_user or effective_username,
         resolved_domain=resolved_domain,
         nt_hash=nt_hash,
-        ticket_path=str(result.ccache_path) if result.ccache_path else None,
+        ticket_path=ticket_path,
         raw_output=raw_output,
         success=success,
         error_message=error_message,

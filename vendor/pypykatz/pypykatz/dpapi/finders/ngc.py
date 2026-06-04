@@ -1,5 +1,8 @@
+import logging
 import pathlib
 from typing import Iterator, List
+
+logger = logging.getLogger('pypykatz')
 
 class NGCProtector:
     def __init__(self):
@@ -50,22 +53,22 @@ class NGCProtectorFinder:
                 sid_file_path = ngc_dir / directory / '1.dat'
                 fpd = ngc_dir / directory / 'Protectors' / '1'
                 if not sid_file_path.exists():
-                    print(f'NGC missing SID file at: {sid_file_path}')
+                    logger.debug('NGC missing SID file at: {sid_file_path}')
                     continue
                 
                 if not fpd.exists():
-                    print(f'NGC missing Protector directory at: {directory}')
+                    logger.debug('NGC missing Protector directory at: {directory}')
                     continue
 
                 sid = sid_file_path.read_text('utf-16-le').strip('\x00')
                 pfp = fpd / '1.dat'
                 if not pfp.exists():
-                    print(f'NGC missing Protector file at: {pfp}')
+                    logger.debug('NGC missing Protector file at: {pfp}')
                     continue
 
                 gfp = fpd / '2.dat'
                 if not gfp.exists():
-                    print(f'NGC missing GUID file at: {gfp}')
+                    logger.debug('NGC missing GUID file at: {gfp}')
                     continue
 
 

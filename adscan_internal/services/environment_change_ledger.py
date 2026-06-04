@@ -15,6 +15,22 @@ from adscan_internal.workspaces.io import read_json_file, write_json_file
 _LEDGER_FILENAME = "environment_changes.json"
 _SCHEMA_VERSION = "1.0"
 
+# Change lifecycle classes. They govern WHEN/WHETHER a reversible change is
+# reverted at workspace exit:
+#   * AUTO_REVERT        — transient artifacts (uploaded files, Ligolo agents, an
+#                          enabled xp_cmdshell). Reverted automatically by the
+#                          owning service at exit. This is the historical
+#                          default, so every existing caller keeps its behavior
+#                          unchanged.
+#   * OPERATOR_CONFIRMED — durable AD objects/grants ADscan minted (machine
+#                          accounts, RBCD delegation, KeyCredentialLink). NOT
+#                          auto-reverted: a successful run keeps them so the
+#                          operator retains the access and can reuse the asset;
+#                          at exit the operator is prompted whether to revert.
+CHANGE_CLASS_AUTO_REVERT = "auto_revert"
+CHANGE_CLASS_OPERATOR_CONFIRMED = "operator_confirmed"
+_VALID_CHANGE_CLASSES = (CHANGE_CLASS_AUTO_REVERT, CHANGE_CLASS_OPERATOR_CONFIRMED)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -43,6 +59,7 @@ class EnvironmentChangeLedger:
         target: str,
         detail: dict[str, Any],
         method: str,
+        change_class: str = CHANGE_CLASS_AUTO_REVERT,
     ) -> str:
         """Register a new environment change. Returns change_id. Flushes to disk.
 
@@ -52,14 +69,23 @@ class EnvironmentChangeLedger:
             target: Human-readable description of the affected object.
             detail: Arbitrary key-value metadata for the change.
             method: Attack method or technique that caused the change.
+            change_class: Lifecycle class governing exit cleanup. Defaults to
+                ``CHANGE_CLASS_AUTO_REVERT`` (the historical behavior — every
+                existing caller is unaffected). Durable AD objects/grants pass
+                ``CHANGE_CLASS_OPERATOR_CONFIRMED`` so they are kept on success
+                and only reverted on operator confirmation at exit.
 
         Returns:
             Unique change_id string (UUID4).
         """
+        normalized_class = (
+            change_class if change_class in _VALID_CHANGE_CLASSES else CHANGE_CLASS_AUTO_REVERT
+        )
         change_id = str(uuid.uuid4())
         entry: dict[str, Any] = {
             "change_id": change_id,
             "kind": str(kind),
+            "change_class": normalized_class,
             "domain": str(domain),
             "target": str(target),
             "detail": dict(detail),
@@ -80,6 +106,7 @@ class EnvironmentChangeLedger:
             domain=domain,
             target=target,
             revert_status="pending",
+            change_class=normalized_class,
         )
         print_info(
             f"Environment change registered · {kind} · {mark_sensitive(target, 'text')}"
@@ -103,6 +130,30 @@ class EnvironmentChangeLedger:
         emit_event("environment_change_reverted", change_id=change_id, revert_status="reverted")
         print_success(
             f"Reverted · {entry['kind']} · {mark_sensitive(entry['target'], 'text')}"
+        )
+
+    def mark_kept(self, change_id: str) -> None:
+        """Mark an operator_confirmed change as intentionally kept by the operator.
+
+        Used when the operator chooses to retain a durable AD object/grant at
+        exit (or when a successful run keeps it). Distinct from a failed revert:
+        the change is durable on purpose, not because cleanup failed. Flushes to
+        disk.
+
+        Args:
+            change_id: ID returned by register_change.
+        """
+        entry = self._find(change_id)
+        if entry is None:
+            return
+        entry["revert_status"] = "kept"
+        entry["reverted_at"] = None
+        entry["revert_error"] = None
+        self._recompute_summary()
+        self.flush()
+        emit_event("environment_change_kept", change_id=change_id, revert_status="kept")
+        print_info(
+            f"Kept by operator · {entry['kind']} · {mark_sensitive(entry['target'], 'text')}"
         )
 
     def mark_failed(
@@ -197,6 +248,29 @@ class EnvironmentChangeLedger:
         self.flush()
         return str(matched["change_id"])
 
+    def get_operator_confirmed_pending(self) -> list[dict[str, Any]]:
+        """Return durable operator_confirmed changes still standing (deep copies).
+
+        "Still standing" means the change has not been reverted, kept, or marked
+        for manual action yet — i.e. ``revert_status`` is ``pending`` or
+        ``failed``. These are the changes the exit hook offers to revert. Each
+        entry is a shallow copy of the record with a deep-copied ``detail`` so
+        callers can read the prior-state metadata needed to revert.
+
+        Returns:
+            List of operator_confirmed change entry dicts.
+        """
+        out: list[dict[str, Any]] = []
+        for entry in self._state["changes"]:
+            if entry.get("change_class") != CHANGE_CLASS_OPERATOR_CONFIRMED:
+                continue
+            if entry.get("revert_status") not in ("pending", "failed"):
+                continue
+            copy = dict(entry)
+            copy["detail"] = dict(entry.get("detail") or {})
+            out.append(copy)
+        return out
+
     def finalize(self) -> None:
         """Mark scan as complete and flush."""
         self._state["scan_completed_at"] = _utc_now_iso()
@@ -206,7 +280,7 @@ class EnvironmentChangeLedger:
         """Return current summary counts (copy).
 
         Returns:
-            Dictionary with keys: total, reverted, pending, pending_manual, failed.
+            Dictionary with keys: total, reverted, kept, pending, pending_manual, failed.
         """
         return dict(self._state["summary"])
 
@@ -232,6 +306,11 @@ class EnvironmentChangeLedger:
             try:
                 data = read_json_file(self._path)
                 if isinstance(data, dict) and data.get("schema_version") == _SCHEMA_VERSION:
+                    # Backfill change_class on records written before the field
+                    # existed: a missing class is the historical auto_revert.
+                    for entry in data.get("changes", []) or []:
+                        if isinstance(entry, dict) and not entry.get("change_class"):
+                            entry["change_class"] = CHANGE_CLASS_AUTO_REVERT
                     return data
             except Exception as exc:  # pylint: disable=broad-except
                 telemetry.capture_exception(exc)
@@ -241,7 +320,14 @@ class EnvironmentChangeLedger:
             "scan_started_at": _utc_now_iso(),
             "scan_completed_at": None,
             "changes": [],
-            "summary": {"total": 0, "reverted": 0, "pending": 0, "pending_manual": 0, "failed": 0},
+            "summary": {
+                "total": 0,
+                "reverted": 0,
+                "kept": 0,
+                "pending": 0,
+                "pending_manual": 0,
+                "failed": 0,
+            },
         }
 
     def _find(self, change_id: str) -> dict[str, Any] | None:
@@ -255,6 +341,7 @@ class EnvironmentChangeLedger:
         self._state["summary"] = {
             "total": len(changes),
             "reverted": sum(1 for c in changes if c.get("revert_status") == "reverted"),
+            "kept": sum(1 for c in changes if c.get("revert_status") == "kept"),
             "pending": sum(1 for c in changes if c.get("revert_status") == "pending"),
             "pending_manual": sum(1 for c in changes if c.get("revert_status") == "operator_required"),
             "failed": sum(1 for c in changes if c.get("revert_status") == "failed"),

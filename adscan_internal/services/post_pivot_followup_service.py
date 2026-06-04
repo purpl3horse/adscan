@@ -255,8 +255,213 @@ def render_post_pivot_reachability_delta(
     )
 
 
-def _run_owned_user_followup_after_pivot(shell: Any, *, domain: str) -> None:
-    """Re-run owned-user attack-path and post-auth service/share follow-up flows."""
+# Stable option order for the post-pivot newly-reachable sweep scope select.
+# Indices MUST NOT change — the non-interactive default-by-type mapping keys off
+# them.
+_POST_PIVOT_SWEEP_OPTION_ALL_NEW = 0
+_POST_PIVOT_SWEEP_OPTION_DCS_ONLY = 1
+_POST_PIVOT_SWEEP_OPTION_SKIP = 2
+
+
+def _newly_reachable_ip_values(
+    refresh_result: PostPivotRefreshResult,
+) -> list[str]:
+    """Return the ordered, de-duplicated newly-reachable IPs from one refresh."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for entry in refresh_result.newly_reachable_ips or []:
+        if not isinstance(entry, dict):
+            continue
+        ip = str(entry.get("ip") or "").strip()
+        if ip and ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    return ordered
+
+
+def _dc_ips_for_domain(shell: Any, domain: str) -> set[str]:
+    """Return the known DC IPs for *domain* (pdc + dcs), de-duplicated."""
+    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain) or {}
+    dc_ips: set[str] = set()
+    primary = resolve_dc_ip(domain_data)
+    if primary:
+        dc_ips.add(str(primary).strip())
+    for value in domain_data.get("dcs") or []:
+        candidate = str(value or "").strip()
+        if candidate:
+            dc_ips.add(candidate)
+    return {ip for ip in dc_ips if ip}
+
+
+def _already_classified_ips(shell: Any, domain: str) -> set[str]:
+    """Return IPs already holding a positive NTLMv1/NTLMv2 verdict for *domain*.
+
+    Reads the per-host verdict map the sweep persists
+    (``ntlm_auth_type_by_host``). Hosts with a positive verdict are excluded
+    from a re-sweep — the delta scope already excludes pre-pivot-swept hosts in
+    the common case, and this guards the rare overlap where a newly-reachable IP
+    was classified through an earlier path.
+    """
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain) or {}
+    host_map = domain_data.get("ntlm_auth_type_by_host") or {}
+    if not isinstance(host_map, dict):
+        return set()
+    classified: set[str] = set()
+    for ip, record in host_map.items():
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("ntlm_auth_type") or "").strip() in {"NTLMv1", "NTLMv2"}:
+            classified.add(str(ip).strip())
+    return classified
+
+
+def _run_ntlm_sweep_for_newly_reachable_after_pivot(
+    shell: Any,
+    *,
+    context: PivotExecutionContext,
+    refresh_result: PostPivotRefreshResult,
+) -> None:
+    """Sweep NTLMv1 auth-type over hosts the pivot just unblocked, before recalc.
+
+    The post-pivot follow-up re-scans ports and recalculates attack paths against
+    newly-reachable hosts, but the NTLMv1 auth-type sweep is keyed to the
+    pre-pivot reachable set. A host unblocked by the pivot that speaks NTLMv1 is
+    therefore never classified -> never materialized into the attack graph ->
+    cannot appear in the recalculated paths. This helper closes that gap by
+    sweeping the newly-reachable delta (only) and materializing its NTLMv1-relay
+    edges BEFORE the recalc runs.
+
+    Scope is restricted to the newly-reachable IPs, so pre-pivot-swept hosts are
+    not re-coerced; hosts already holding a positive verdict are also skipped.
+    The OPSEC heads-up and the >=2-reachable relay gate inside the sweep stay
+    intact. Best-effort: a sweep failure never aborts the follow-up recalc.
+    """
+    from adscan_core.output import questionary_select_index  # noqa: PLC0415
+    from adscan_internal.cli.ntlm_capture import (  # noqa: PLC0415
+        run_ntlm_auth_type_sweep_for_hosts,
+    )
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    domain = context.domain
+    marked_domain = mark_sensitive(domain, "domain")
+
+    candidate_ips = _newly_reachable_ip_values(refresh_result)
+    if not candidate_ips:
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep: no newly-reachable IPs in the delta for "
+            f"{marked_domain}; nothing to classify."
+        )
+        return
+
+    # Idempotency: never re-coerce a host that already has a positive verdict.
+    already = _already_classified_ips(shell, domain)
+    candidate_ips = [ip for ip in candidate_ips if ip not in already]
+    if not candidate_ips:
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep: every newly-reachable host already has a "
+            f"positive NTLM verdict in {marked_domain}; skipping."
+        )
+        return
+
+    dc_ips = _dc_ips_for_domain(shell, domain)
+    dc_candidates = [ip for ip in candidate_ips if ip in dc_ips]
+
+    options = [
+        f"Sweep newly-reachable hosts ({len(candidate_ips)})",
+        (
+            f"Only DCs among the new hosts ({len(dc_candidates)})"
+            if dc_candidates
+            else "Only DCs among the new hosts (none)"
+        ),
+        "Skip the NTLM auth-type sweep for new hosts",
+    ]
+
+    # Engagement-type default: ctf -> sweep all newly-reachable; audit (and any
+    # non-ctf) -> skip UNLESS a DC is newly reachable, in which case classify the
+    # DC (a quiet, reportable win). Non-interactive/CI auto-resolves to this
+    # default via the centralized helper and NEVER blocks.
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if workspace_type == "ctf":
+        default_idx = _POST_PIVOT_SWEEP_OPTION_ALL_NEW
+    elif dc_candidates:
+        default_idx = _POST_PIVOT_SWEEP_OPTION_DCS_ONLY
+    else:
+        default_idx = _POST_PIVOT_SWEEP_OPTION_SKIP
+
+    print_info(
+        f"The pivot unblocked {len(candidate_ips)} newly-reachable host(s) in "
+        f"{marked_domain}. ADscan can classify their NTLM auth-type (NTLMv1 vs "
+        "NTLMv2) and materialize any coerce-and-relay paths before re-checking "
+        "attack paths."
+    )
+
+    selected_idx = questionary_select_index(
+        title=f"NTLM auth-type sweep scope for newly-reachable hosts in {domain}",
+        options=options,
+        default_idx=default_idx,
+        shell=shell,
+    )
+    if selected_idx is None:
+        selected_idx = default_idx
+
+    if is_non_interactive(shell):
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep scope auto-resolved (non-interactive): "
+            f"idx={selected_idx} domain={marked_domain} type={workspace_type or 'unknown'}"
+        )
+
+    if selected_idx == _POST_PIVOT_SWEEP_OPTION_SKIP:
+        print_info(
+            "Skipping the NTLM auth-type sweep for newly-reachable hosts by "
+            "selection."
+        )
+        return
+
+    if selected_idx == _POST_PIVOT_SWEEP_OPTION_DCS_ONLY:
+        scoped_ips = dc_candidates
+        scope_mode = "dcs"
+    else:
+        scoped_ips = candidate_ips
+        scope_mode = "all"
+
+    if not scoped_ips:
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep: no in-scope hosts after scope selection "
+            f"for {marked_domain}; skipping."
+        )
+        return
+
+    try:
+        run_ntlm_auth_type_sweep_for_hosts(
+            shell,
+            domain,
+            candidate_ips=scoped_ips,
+            scope_mode=scope_mode,
+        )
+    except Exception as exc:  # noqa: BLE001 - sweep failure must not abort recalc
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep over newly-reachable hosts raised: "
+            f"{mark_sensitive(str(exc), 'detail')}"
+        )
+
+
+def _run_owned_user_followup_after_pivot(
+    shell: Any,
+    *,
+    context: PivotExecutionContext,
+    refresh_result: PostPivotRefreshResult,
+) -> None:
+    """Re-run owned-user attack-path and post-auth service/share follow-up flows.
+
+    Order matters: the NTLMv1 auth-type sweep over the newly-reachable delta runs
+    FIRST, so any NTLMv1-relay edges it materializes (and the attack-path artifact
+    invalidation it triggers) are visible to the attack-path recalc that follows.
+    A host unblocked by the pivot that speaks NTLMv1 would otherwise never be
+    classified, never materialized, and never appear in the recalculated paths.
+    """
     from adscan_internal.cli.attack_path_execution import (
         offer_attack_paths_with_non_high_value_fallback,
     )
@@ -264,6 +469,15 @@ def _run_owned_user_followup_after_pivot(shell: Any, *, domain: str) -> None:
     from adscan_internal.services.attack_graph_service import (
         ATTACK_PATHS_MAX_DEPTH_USER,
         get_owned_domain_usernames_for_attack_paths,
+    )
+
+    domain = context.domain
+
+    # Classify NTLMv1 vs NTLMv2 on the hosts the pivot just unblocked BEFORE the
+    # attack-path recalc, so newly-materialized NTLMv1-relay edges are in the
+    # graph when the paths are recomputed.
+    _run_ntlm_sweep_for_newly_reachable_after_pivot(
+        shell, context=context, refresh_result=refresh_result
     )
 
     credentials = shell.domains_data.get(domain, {}).get("credentials", {})
@@ -387,7 +601,9 @@ def maybe_offer_post_pivot_owned_followup(
     if not should_run:
         print_info("Skipping post-pivot owned-user follow-up by user choice.")
         return
-    _run_owned_user_followup_after_pivot(shell, domain=context.domain)
+    _run_owned_user_followup_after_pivot(
+        shell, context=context, refresh_result=refresh_result
+    )
 
 
 def maybe_offer_trust_followup_for_newly_reachable_domains(

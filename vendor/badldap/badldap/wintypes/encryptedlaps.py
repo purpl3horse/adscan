@@ -10,8 +10,9 @@ class EncryptedLAPSBlob:
 		self.asn1blob: ContentInfo
 	
 	def get_keyidentifier(self):
-		sid = self.asn1blob.native['content']['recipient_infos'][0]['kekid']['other']['key_attr']['1']['0']['0']['1']
-		print(sid)
+		# ADSCAN log-hygiene: removed a leftover ``print(sid)`` that dumped the
+		# LAPS KEK recipient key identifier (a credential-recovery secret) to
+		# stdout, bypassing telemetry. The value was debug-only and unused.
 		return LAPS_KEYIDENTIFIER.from_bytes(self.asn1blob.native['content']['recipient_infos'][0]['kekid']['key_identifier'])
 	
 	def from_bytes(data: bytes):

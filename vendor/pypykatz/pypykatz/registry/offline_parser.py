@@ -242,8 +242,7 @@ class OffineRegistry:
 			try:
 				po = OffineRegistry.from_files(system_name, sam_name if 'SAM' in dumped_names else None, security_name if 'SECURITY' in dumped_names else None)
 			except Exception as e:
-				import traceback
-				traceback.print_exc()
+				logger.debug('Offline registry parsing failed: %s' % str(e))
 		else:
 			logger.error('Failed to dump SYSTEM hive, exiting...')
 			

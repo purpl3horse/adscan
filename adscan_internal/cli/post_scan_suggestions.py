@@ -22,12 +22,13 @@ from adscan_internal.cli.shell_commands import (
 )
 
 
-# LITE-friendly next-step commands. Verbs used here must remain available
-# in LITE — they intentionally do not include any deliverable PDF verbs.
+# LITE-friendly next-step commands. Each verb MUST map to a real
+# ``PentestShell.do_<verb>`` method that is usable in LITE — no deliverable
+# PDF verbs (those are PRO-gated and surfaced via the demo line below). The
+# anti-drift test ``tests/unit/cli/test_post_scan_lite_commands_exist.py``
+# fails CI if a verb here has no matching ``do_<verb>`` or is a deliverable.
 _LITE_NEXT_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("findings", "drill into specific findings"),
-    ("attack-paths", "explore the attack graph"),
-    ("report", "re-render the technical report"),
+    ("attack_paths", "explore the attack graph"),
 )
 
 

@@ -70,8 +70,8 @@ class KerberosClientWSNETDirect:
 	async def authenticate(self, authData, flags:ISC_REQ = None, cb_data = None, spn=None, **kwargs):
 		logger.debug('[WSNETDirect][Kerberos][%s] spn: %s' % (self._authid, spn))
 		logger.debug('[WSNETDirect][Kerberos][%s] flags: %s' % (self._authid, flags))
-		logger.debug('[WSNETDirect][Kerberos][%s] cb_data: %s' % (self._authid, cb_data))
-		logger.debug('[WSNETDirect][Kerberos][%s] authData: %s' % (self._authid, authData))
+		logger.debug('[WSNETDirect][Kerberos][%s] cb_data present: %s' % (self._authid, cb_data is not None))  # ADSCAN: do not dump channel-binding data
+		logger.debug('[WSNETDirect][Kerberos][%s] authData present: %s' % (self._authid, authData is not None))  # ADSCAN: do not dump raw auth token bytes
 		
 		try:
 			if self.ksspi is None:
@@ -102,7 +102,7 @@ class KerberosClientWSNETDirect:
 					status, retflags, apreq, err = await self.ksspi.authenticate('KERBEROS', '', spn, 3, flags.value, authdata = b'')
 					logger.debug('[WSNETDirect][Kerberos][%s][Response] Status: %s' % (self._authid, status))
 					logger.debug('[WSNETDirect][Kerberos][%s][Response] Response flags: %s' % (self._authid, retflags))
-					logger.debug('[WSNETDirect][Kerberos][%s][Response] APREQ: %s' % (self._authid, apreq))
+					logger.debug('[WSNETDirect][Kerberos][%s][Response] APREQ constructed' % (self._authid))  # ADSCAN: no raw AP-REQ bytes
 					if err is not None:
 						raise err
 					self.flags = ISC_REQ(retflags)
@@ -114,7 +114,7 @@ class KerberosClientWSNETDirect:
 					status, retflags, data, err = await self.ksspi.authenticate('KERBEROS', '', spn, 3, flags.value, authdata = authData)
 					logger.debug('[WSNETDirect][Kerberos][%s][Response] Status: %s' % (self._authid, status))
 					logger.debug('[WSNETDirect][Kerberos][%s][Response] Response flags: %s' % (self._authid, retflags))
-					logger.debug('[WSNETDirect][Kerberos][%s][Response] Response data: %s' % (self._authid, data))
+					logger.debug('[WSNETDirect][Kerberos][%s][Response] Response data received' % (self._authid))  # ADSCAN: do not dump raw AP_REP bytes
 					if err is not None:
 						return None, None, err
 					self.flags = ISC_REQ(retflags)
@@ -122,8 +122,8 @@ class KerberosClientWSNETDirect:
 					session_key_data, err = await self.ksspi.get_sessionkey()
 					if err is not None:
 						return None, None, err
-					logger.debug('[WSNETDirect][Kerberos][%s][Response] SessionKey: %s' % (self._authid, session_key_data.hex()))
-						
+					logger.debug('[WSNETDirect][Kerberos][%s][Response] session key derived' % (self._authid))  # ADSCAN: no raw session key
+
 					aprep = AP_REP.load(data).native
 					self.session_key = Key(aprep['enc-part']['etype'], session_key_data)
 
@@ -159,7 +159,7 @@ class KerberosClientWSNETDirect:
 				self.flags = ISC_REQ(retflags)
 				logger.debug('[WSNETDirect][Kerberos][%s][Response] Status: %s' % (self._authid, status))
 				logger.debug('[WSNETDirect][Kerberos][%s][Response] Response flags: %s' % (self._authid, self.flags))
-				logger.debug('[WSNETDirect][Kerberos][%s][Response] Response contexttoken: %s' % (self._authid, tokendata.hex()))
+				logger.debug('[WSNETDirect][Kerberos][%s][Response] Response contexttoken received' % (self._authid))  # ADSCAN: do not dump raw AP_REQ context token bytes
 
 				token = InitialContextToken.load(tokendata)
 				apreq = AP_REQ(token.native['innerContextToken'])
@@ -171,7 +171,7 @@ class KerberosClientWSNETDirect:
 				
 				cipher = _enctype_table[int(apreq.native['ticket']['enc-part']['etype'])]()
 				self.session_key = Key(cipher.enctype, session_key_data)
-				logger.debug('[WSNETDirect][Kerberos][%s][Response] SessionKey: %s' % (self._authid, session_key_data.hex()))
+				logger.debug('[WSNETDirect][Kerberos][%s][Response] session key derived' % (self._authid))  # ADSCAN: no raw session key
 				await self.ksspi.disconnect()
 
 				if apreq.native['ticket']['enc-part']['etype'] != 23: #no need for seq number in rc4

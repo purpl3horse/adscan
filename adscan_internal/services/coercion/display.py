@@ -36,13 +36,20 @@ def print_coercion_summary(result: CoercionRunResult) -> None:
     grid.add_column("Error", style="dim red")
 
     for attempt in result.results:
-        if attempt.success:
-            result_cell = "[bold green]✓ triggered[/]"
+        # ``success`` is now reserved for a real, listener-confirmed capture
+        # (which is a run-level fact, not a per-attempt one), so per-row state
+        # reflects the heuristic ``probable_auth_triggered`` hint.
+        if attempt.probable_auth_triggered:
+            result_cell = "[bold yellow]~ probable[/]"
         elif attempt.error_code:
             result_cell = f"[dim]{attempt.error_code}[/]"
         else:
             result_cell = "[dim]–[/]"
-        error_cell = (attempt.error or "")[:80] if (attempt.error and not attempt.success) else ""
+        error_cell = (
+            (attempt.error or "")[:80]
+            if (attempt.error and not attempt.probable_auth_triggered)
+            else ""
+        )
 
         grid.add_row(
             attempt.method_name,
@@ -53,26 +60,28 @@ def print_coercion_summary(result: CoercionRunResult) -> None:
             error_cell,
         )
 
-    if result.success:
+    if result.captured:
         header_style = "bold white on green"
-        title_text = "  Coercion — Authentication Triggered  "
+        title_text = "  Coercion — Authentication Captured  "
     elif result.timed_out:
         header_style = "bold white on yellow"
         title_text = "  Coercion — Timed Out  "
     else:
         header_style = "bold white on dark_orange"
-        title_text = "  Coercion — No Trigger  "
+        title_text = "  Coercion — No Capture  "
 
     title = Text(title_text, style=header_style)
     panel = Panel(grid, title=title, border_style="dim", padding=(1, 1))
     get_console().print(panel)
 
-    if result.success:
-        print_success(f"Coercion triggered outbound authentication from {target}.")
+    if result.captured:
+        print_success(f"Coercion captured inbound authentication from {target}.")
     elif result.timed_out:
         print_warning(
             f"Coercion timed out against {target} — "
             "verify connectivity and that the listener IP is reachable from the target."
         )
     else:
-        print_info(f"Coercion completed against {target}; no method reported a trigger.")
+        print_info(
+            f"Coercion completed against {target}; no inbound authentication was captured."
+        )

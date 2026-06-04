@@ -6,8 +6,10 @@ in this package is 100% native (aiosmb) — no NetExec subprocess.
 
 Two cascades are exposed:
 
-* :data:`STDOUT_CASCADE` — SMBEXEC → ATEXEC. Use for callers that
-  consume process output (the common case).
+* :data:`STDOUT_CASCADE` — SMBEXEC → ATEXEC → WINRM. Use for callers
+  that consume process output (the common case). WinRM is last-resort:
+  it rides a distinct transport (PSRP / 5985) and reaches hosts where
+  the SMB-based methods (445) are blocked or aggressively reset.
 * :data:`DEFAULT_CASCADE` — SMBEXEC → ATEXEC → WMIEXEC → DCOMEXEC.
   Pass with ``require_stdout=False`` for fire-and-forget executions.
 

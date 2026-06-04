@@ -26,6 +26,7 @@ from adscan_internal.rich_output import (
     print_info_verbose,
     print_success,
     print_warning,
+    print_warning_debug,
 )
 from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.cli.dns import (
@@ -307,23 +308,81 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             dns_service = None
 
         partner_hostname_cache: dict[str, str] = {}
+        # Trusted realms whose own A-records are all unreachable from this
+        # vantage. For these, the source domain's DC IP is ONLY a DNS resolver —
+        # never a DC candidate — so ``find_pdc_with_selection(cross_domain=True)``
+        # returns no IP. We record them here so the result handler marks them
+        # discovered-but-unreachable instead of leaking the resolver IP into the
+        # workspace / PDC store / /etc/hosts / unbound (the cross-domain leak).
+        cross_domain_unreachable: set[str] = set()
+        # Pivot-retry breadcrumbs for the realms above. Keyed by trusted-realm
+        # name → a connectivity update carrying the trusted realm's OWN real DC
+        # A-record IP (e.g. pong.htb → 192.168.2.2), NEVER the source resolver IP,
+        # with ``reachable=False``. Persisted via ``merge_domain_connectivity`` so
+        # the Ligolo pivot follow-up can re-probe that IP through the tunnel and,
+        # once reachable, re-trigger authenticated enumeration of the realm. The
+        # ``reachable=False`` gate keeps it out of every authenticated/KDC path
+        # pre-pivot — it is only ever used as a pivot-probe TARGET.
+        cross_domain_breadcrumbs: dict[str, dict[str, Any]] = {}
 
         def _resolve_pdc_ip(trusted_domain: str, resolver_ip: str) -> str | None:
             if not dns_service or not hasattr(dns_service, "find_pdc_with_selection"):
                 return None
-            selected_ip, hostname = dns_service.find_pdc_with_selection(
+            # cross_domain=True: ``resolver_ip`` is the SOURCE domain's DC, used
+            # ONLY as a DNS resolver to query the TRUSTED realm's SRV/A records.
+            # It must NEVER be selected as the trusted realm's PDC (wrong KDC →
+            # KDC_ERR_WRONG_REALM). The flag is the precise fix — keep passing
+            # ``resolver_ip`` so the foreign records can still be resolved.
+            # ``return_selection=True`` surfaces the full DcIpSelection so we can
+            # recover the realm's OWN real A-record IP for the breadcrumb even
+            # when ``selected_ip is None`` (cross-domain-unreachable).
+            result_tuple = dns_service.find_pdc_with_selection(
                 domain=trusted_domain,
                 resolver_ip=resolver_ip,
                 preferred_ips=[resolver_ip],
                 reference_ip=resolver_ip,
+                cross_domain=True,
+                return_selection=True,
             )
+            if len(result_tuple) == 3:
+                selected_ip, hostname, selection = result_tuple
+            else:  # defensive — a stubbed dns_service may ignore the flag
+                selected_ip, hostname = result_tuple
+                selection = None
+            normalized_partner = trusted_domain.strip().lower()
+            partner_fqdn: str | None = None
             if hostname:
-                fqdn = (
-                    hostname
-                    if "." in hostname
-                    else f"{hostname}.{trusted_domain.strip().lower()}"
+                partner_fqdn = (
+                    hostname if "." in hostname else f"{hostname}.{normalized_partner}"
                 )
-                partner_hostname_cache[trusted_domain.strip().lower()] = fqdn
+                partner_hostname_cache[normalized_partner] = partner_fqdn
+            if not selected_ip:
+                # The trusted realm was discovered (SRV/A query answered) but none
+                # of ITS DCs are reachable — mark unreachable and stop. Do NOT fall
+                # back to the resolver IP.
+                cross_domain_unreachable.add(normalized_partner)
+                # Leave a pivot-retry breadcrumb with the realm's OWN real DC IP
+                # (from its A-records — NEVER the source resolver IP). Only when
+                # we actually recovered such an IP; absent it there is nothing
+                # safe to probe later and we record no breadcrumb.
+                breadcrumb_ip = (
+                    str(getattr(selection, "unreachable_dns_ip", "") or "").strip()
+                    if selection is not None
+                    else ""
+                )
+                if breadcrumb_ip and breadcrumb_ip != str(resolver_ip or "").strip():
+                    cross_domain_breadcrumbs[normalized_partner] = {
+                        "domain": normalized_partner,
+                        "source_domain": domain,
+                        "pdc_ip": breadcrumb_ip,
+                        "host": breadcrumb_ip,
+                        "reachable": False,
+                        "status": "cross_domain_unreachable",
+                        "hostname_candidates": (
+                            [partner_fqdn] if partner_fqdn else []
+                        ),
+                        "method": "trust_enum_cross_domain_unreachable",
+                    }
             return selected_ip
 
         def _resolve_dc_hostname(trusted_domain: str, _resolver_ip: str) -> str | None:
@@ -388,7 +447,24 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             source_domain=domain,
             connectivity_updates=result.domain_connectivity,
         )
-        if result.domain_connectivity and hasattr(shell, "save_workspace_data"):
+        # Persist pivot-retry breadcrumbs for cross-domain-unreachable realms.
+        # The trust-enum loop only emits a ``domain_connectivity`` entry when the
+        # partner PDC IP is truthy; with the cross-realm leak fix that IP is None
+        # for an unreachable realm, so without this the realm leaves NO breadcrumb
+        # and the Ligolo pivot follow-up can never re-trigger its enumeration.
+        # These updates carry the realm's OWN real DC A-record IP with
+        # ``reachable=False`` — never the source resolver IP — so they re-arm the
+        # pivot probe without re-introducing the leak (reachable=False keeps the
+        # IP out of every authenticated/KDC path until the tunnel confirms it).
+        if cross_domain_breadcrumbs:
+            merge_domain_connectivity(
+                shell,
+                source_domain=domain,
+                connectivity_updates=cross_domain_breadcrumbs,
+            )
+        if (
+            result.domain_connectivity or cross_domain_breadcrumbs
+        ) and hasattr(shell, "save_workspace_data"):
             try:
                 shell.save_workspace_data()
             except Exception as exc:  # noqa: BLE001
@@ -403,6 +479,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             trusts=result.trusts,
             discovered_domains=result.discovered_domains,
             domain_pdc_mapping=result.domain_controllers,
+            cross_domain_unreachable=cross_domain_unreachable,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -649,14 +726,34 @@ def _handle_trust_enumeration_result(
     trusts: list[Any],
     discovered_domains: list[str],
     domain_pdc_mapping: dict[str, str],
+    cross_domain_unreachable: set[str] | None = None,
 ) -> None:
-    """Process recursive trust enumeration results and update domain state."""
+    """Process recursive trust enumeration results and update domain state.
+
+    Args:
+        cross_domain_unreachable: Lower-cased trusted-realm names that were
+            discovered but whose own DCs are all unreachable from this vantage.
+            These are forced to the discovered-but-unreachable path: no
+            sub-workspace, no persisted PDC, no resolver/hosts entry, not offered
+            for full enumeration — and any prior-run poison line is cleaned.
+    """
+    unreachable_realms = {
+        name.strip().lower()
+        for name in (cross_domain_unreachable or set())
+        if name and name.strip()
+    }
     try:
 
         def _domain_reachable_from_current_vantage(candidate_domain: str) -> bool:
             """Return whether one trusted domain is currently reachable."""
             if candidate_domain == domain:
                 return True
+            # A trusted realm whose own A-records are all unreachable is NOT
+            # reachable, regardless of any stale connectivity summary. This is the
+            # cross-domain leak gate: it keeps the source DC IP out of the
+            # workspace / PDC store / /etc/hosts / unbound / scope offer.
+            if candidate_domain.strip().lower() in unreachable_realms:
+                return False
             domain_state = (
                 shell.domains_data.get(candidate_domain, {})
                 if isinstance(getattr(shell, "domains_data", {}), dict)
@@ -712,6 +809,23 @@ def _handle_trust_enumeration_result(
                     f"Trusted domain discovered but not currently reachable: {marked_domain}"
                     + (f" (PDC/DC {marked_pdc})" if str(marked_pdc).strip() else "")
                 )
+                # Stale-poison cleanup: a prior run may have written a wrong
+                # /etc/hosts line or unbound forward-zone for this realm (e.g. the
+                # source DC IP mapped onto the foreign DC FQDN before this fix).
+                # Strip ADscan's own marker-scoped entries so the poison does not
+                # survive. Only for realms we determined cross-domain-unreachable
+                # this run — never touch a realm we merely have no summary for.
+                if main_domain.strip().lower() in unreachable_realms and hasattr(
+                    shell, "_clean_domain_entries"
+                ):
+                    try:
+                        shell._clean_domain_entries(main_domain)
+                    except Exception as cexc:  # noqa: BLE001
+                        telemetry.capture_exception(cexc)
+                        print_warning_debug(
+                            "cross_domain_cleanup failed for "
+                            f"{mark_sensitive(main_domain, 'domain')}"
+                        )
                 continue
             pdc_ip = domain_pdc_mapping.get(main_domain)
             if (

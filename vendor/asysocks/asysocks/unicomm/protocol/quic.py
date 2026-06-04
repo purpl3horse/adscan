@@ -20,7 +20,7 @@ class QuicTransportClient(QuicConnectionProtocol):
 		self.stream_id = None
 
 	def connection_made(self, transport: asyncio.BaseTransport) -> None:
-		print('Connected!')
+		logger.debug('QUIC connection established')
 		return super().connection_made(transport)
 
 	async def send(self, data:bytes) -> None:

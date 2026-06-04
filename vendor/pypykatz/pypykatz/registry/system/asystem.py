@@ -52,7 +52,7 @@ class SYSTEM:
 		for i in range(len(bootkey_obf)):
 			self.bootkey += bootkey_obf[transforms[i]:transforms[i] + 1]
 		
-		logger.debug('[SYSTEM] bootkey: %s' % self.bootkey.hex())
+		logger.debug('[SYSTEM] bootkey obtained')
 		return self.bootkey
 		
 	async def get_secrets(self):
@@ -93,7 +93,7 @@ class SYSTEM:
 				self.machinename = self.machinename.replace('\x00', '')
 			return self.machinename
 		except Exception as e:
-			print('[SYSTEM] get_machine_name error: %s' % e)
+			logger.debug('[SYSTEM] get_machine_name error: %s' % e)
 			return None
 		
 	def to_dict(self):

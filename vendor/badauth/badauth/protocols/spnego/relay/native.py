@@ -294,8 +294,7 @@ class SPNEGORelay:
 				if neg_token['responseToken'] is None:
 					# https://tools.ietf.org/html/rfc4178#section-5
 					# mechlistmic exchange happening at the end of the authentication
-					print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!111111111111')
-					#print(neg_token_raw.native)
+					# ADscan: removed raw '!!!...' stdout marker (bypassed the bridge).
 					#return self.__server_latest_token, True, None
 					return None, True, None
 				

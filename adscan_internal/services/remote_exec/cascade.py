@@ -6,9 +6,14 @@ deadline is reached.
 
 Two canonical static cascades are exposed:
 
-* :data:`STDOUT_CASCADE` — only backends that capture process stdout
-  (SMBEXEC, ATEXEC). Use this when the caller consumes stdout.
-* :data:`DEFAULT_CASCADE` — all four backends, in the order
+* :data:`STDOUT_CASCADE` — stdout-capturing backends over two distinct
+  transports: SMBEXEC → ATEXEC (both SMB / 445) → WINRM (PSRP / 5985).
+  Use this when the caller consumes stdout. WinRM is last-resort: it
+  reaches hosts where the SMB-based methods are blocked or the DC
+  aggressively resets port-445 sessions, because it rides a completely
+  different transport. The selector auto-skips WinRM when the port is
+  known-closed / creds known-rejected.
+* :data:`DEFAULT_CASCADE` — all four SMB backends, in the order
   SMBEXEC → ATEXEC → WMIEXEC → DCOMEXEC. Use this for fire-and-forget
   executions where output is not needed (set ``require_stdout=False``).
 
@@ -56,9 +61,15 @@ DEFAULT_CASCADE: tuple[ExecMethod, ...] = (
 
 # Stdout-capable subset — recommended default for any caller that reads
 # the result of the command (flag collection, post-ex parsing, etc.).
+# SMBEXEC and ATEXEC both ride SMB (port 445); WINRM rides PSRP (port
+# 5985), a distinct transport. WinRM is intentionally LAST so the cheap
+# SMB methods are tried first, but it is present so a host that resets or
+# blocks every SMB session still has a working stdout path. The selector
+# auto-skips WinRM when the port is known-closed / creds known-rejected.
 STDOUT_CASCADE: tuple[ExecMethod, ...] = (
     ExecMethod.SMBEXEC,
     ExecMethod.ATEXEC,
+    ExecMethod.WINRM,
 )
 
 # Set of methods that do NOT return process stdout. Used by the cascade

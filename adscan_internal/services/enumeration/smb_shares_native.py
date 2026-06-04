@@ -2,10 +2,22 @@
 
 Uses :func:`smb_machine_with_fallback` (posture-aware, auto Kerberos retry)
 to drive ``SMBMachine.list_shares()`` and, for each non-IPC share,
-``tree_connect()`` to read the per-share ``maximal_access`` bitmask. The
-bitmask is the same value the SMB server would compute for a real
-file-system access decision, so it gives a faithful READ/WRITE permission
-view without any guess-and-probe semantics.
+``tree_connect()`` to read the per-share ``maximal_access`` bitmask. That
+bitmask is *share-level only*: it reflects the share ACL alone, NOT the NTFS
+DACL of the share root. On a hardened file server the share ACL frequently
+grants Change/Write while the underlying NTFS DACL denies it, so the
+share-level value over-reports WRITE (e.g. Breach's ``Users`` share reads as
+READ+WRITE at the share level but is READ-only once NTFS is intersected).
+
+For the empirically correct *effective* access (``share ∩ NTFS`` against the
+caller's full token), each non-IPC share root is additionally probed with the
+SMB2 MxAc create context, reusing the same live connection the enum already
+holds (see :func:`query_effective_root_access_on_machine`). When MxAc returns a
+definitive answer we use the effective labels; when MxAc is undetermined
+(server doesn't honour it — e.g. Samba — or a non-ACCESS_DENIED open failure)
+we fall back to the share-level ``maximal_access`` labels, so a server without
+MxAc support never regresses. ACCESS_DENIED on the root open is a definitive
+"no access" signal, not a fallback trigger.
 
 Public surface:
 
@@ -107,6 +119,65 @@ def _translate_maximal_access(mask: Any) -> List[str]:
     return [p for p in perms if not (p in seen or seen.add(p))]
 
 
+def _effective_access_to_labels(effective: Any) -> List[str]:
+    """Translate an :class:`EffectiveAccess` (MxAc result) into permission labels.
+
+    Mirrors :func:`_translate_maximal_access`'s label vocabulary so effective
+    and share-level results are interchangeable downstream. Only called when
+    ``effective.succeeded and effective.has_access``.
+    """
+    perms: List[str] = []
+    if getattr(effective, "can_read", False):
+        perms.append("READ")
+    if getattr(effective, "can_write", False):
+        perms.append("WRITE")
+    if getattr(effective, "can_write_dac", False) or getattr(
+        effective, "can_write_owner", False
+    ):
+        perms.append("WRITE_DAC")
+    if getattr(effective, "can_read_control", False):
+        perms.append("READ_CONTROL")
+    seen = set()
+    return [p for p in perms if not (p in seen or seen.add(p))]
+
+
+def resolve_effective_share_permissions(
+    *,
+    maximal_labels: List[str],
+    effective: Any,
+) -> tuple[List[str], Optional[str]]:
+    """Decide the final permission labels: effective (MxAc) with maximal fallback.
+
+    This is the pure-logic seam for the effective-vs-share-level decision,
+    isolated so it can be unit-tested with a mocked :class:`EffectiveAccess`.
+
+    Contract:
+
+    * ``effective is None`` (MxAc not attempted) → use ``maximal_labels``.
+    * ``effective.succeeded and effective.has_access`` → use the EFFECTIVE
+      labels (``share ∩ NTFS``); this is the authoritative answer.
+    * ``effective.succeeded and not effective.has_access`` → the server
+      definitively DENIED the root open: no access at all → empty labels
+      (this is a real "no access" observation, not a fallback trigger).
+    * ``not effective.succeeded`` (MxAc undetermined: unsupported / transport
+      error / parse failure) → FALL BACK to ``maximal_labels`` so a server
+      without MxAc support never regresses.
+
+    Returns ``(labels, note)`` where ``note`` is an optional short marker for
+    the access source (``"effective"`` / ``"effective:denied"`` /
+    ``"maximal:mxac_undetermined"``) — surfaced under debug only.
+    """
+    if effective is None:
+        return maximal_labels, None
+    if getattr(effective, "succeeded", False):
+        if getattr(effective, "has_access", False):
+            return _effective_access_to_labels(effective), "effective"
+        # Definitive deny: the caller has no effective access to the root.
+        return [], "effective:denied"
+    # Undetermined → fall back to the share-level value.
+    return maximal_labels, "maximal:mxac_undetermined"
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -185,20 +256,47 @@ _SKIP_PROBE_NAMES = {"IPC$"}
 
 
 async def _probe_share_access(
-    machine: Any, share_obj: Any
+    machine: Any, share_obj: Any, host: str
 ) -> tuple[List[str], Optional[str]]:
-    """Tree-connect to ``share_obj`` and translate ``maximal_access``.
+    """Tree-connect to ``share_obj`` and resolve its EFFECTIVE root access.
+
+    First tree-connects (share-level ``maximal_access``), then opens the share
+    root with the SMB2 MxAc create context on the SAME existing connection to
+    obtain the server-computed effective (``share ∩ NTFS``) access for the
+    current token. Falls back to the share-level labels when MxAc is
+    undetermined (see :func:`resolve_effective_share_permissions`).
 
     Returns ``(permissions, error)``. An error here is per-share (one denied
     share does not abort the sweep) and surfaces in :class:`NativeShareEntry`.
     """
+    from adscan_internal.services.smb_effective_access_service import (
+        query_effective_root_access_on_machine,
+    )
+
     try:
         ok, err = await share_obj.connect(machine.connection)
         if err is not None:
             return [], str(err)
         if not ok:
             return [], "tree_connect returned False"
-        return _translate_maximal_access(share_obj.maximal_access), None
+
+        maximal_labels = _translate_maximal_access(share_obj.maximal_access)
+
+        share_name = str(share_obj.name or "")
+        effective = await query_effective_root_access_on_machine(
+            machine=machine,
+            share=share_name,
+            host=host,
+        )
+        labels, note = resolve_effective_share_permissions(
+            maximal_labels=maximal_labels, effective=effective
+        )
+        if note and note != "effective":
+            print_info_debug(
+                f"[native-shares] share={share_name} access source={note} "
+                f"(maximal={maximal_labels} effective_ok={effective.succeeded})"
+            )
+        return labels, None
     except Exception as exc:  # noqa: BLE001 — boundary; re-emit as soft error
         telemetry.capture_exception(exc)
         return [], str(exc)
@@ -230,9 +328,10 @@ async def enumerate_shares_native(
             transport layer; never construct aiosmb URLs by hand.
         timeout: Per-operation timeout in seconds.
         probe_access: When True (default), perform a ``tree_connect`` on
-            every non-IPC share to read ``maximal_access`` and translate to
-            READ/WRITE labels. Set False for fast listing only (e.g. when
-            access checks already happened upstream).
+            every non-IPC share to read ``maximal_access`` and then an MxAc
+            open of the share root to compute EFFECTIVE (``share ∩ NTFS``)
+            access, translated to READ/WRITE labels. Set False for fast
+            listing only (e.g. when access checks already happened upstream).
 
     Returns:
         :class:`NativeSharesResult` — never raises. Auth/connection
@@ -267,7 +366,7 @@ async def enumerate_shares_native(
 
                     if probe_access and name not in _SKIP_PROBE_NAMES:
                         permissions, probe_err = await _probe_share_access(
-                            machine, share_obj
+                            machine, share_obj, host
                         )
                         if probe_err is not None:
                             accessible = False
@@ -453,4 +552,5 @@ __all__ = [
     "enumerate_shares_native_sync",
     "enumerate_sessions_native",
     "enumerate_sessions_native_sync",
+    "resolve_effective_share_permissions",
 ]

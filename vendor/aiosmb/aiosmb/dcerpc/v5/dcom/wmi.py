@@ -3286,73 +3286,27 @@ class IWbemLevel1Login(IRemUnknown):
 		Returns:
 			(IWbemServices, error) - Services interface for WMI operations
 		"""
-		import traceback
 		from aiosmb import logger
-		
-		def safe_repr(obj):
-			"""Safely convert object to string for logging (handles impacket structures)"""
-			if obj is NULL:
-				return 'NULL'
-			if hasattr(obj, 'dump'):
-				# Impacket structure - use dump() but capture output
-				import io
-				import sys
-				old_stdout = sys.stdout
-				sys.stdout = io.StringIO()
-				try:
-					obj.dump()
-					return sys.stdout.getvalue().strip() or repr(obj)
-				except:
-					return f'<{type(obj).__name__}>'
-				finally:
-					sys.stdout = old_stdout
-			try:
-				return repr(obj)
-			except:
-				return f'<{type(obj).__name__}>'
-		
-		logger.debug('NTLMLogin called with:')
-		logger.debug(f'  wszNetworkResource: {safe_repr(wszNetworkResource)}')
-		logger.debug(f'  wszPreferredLocale: {safe_repr(wszPreferredLocale)}')
-		logger.debug(f'  pCtx: {safe_repr(pCtx)}')
-		logger.debug(f'  self._iid: {self._iid.hex() if isinstance(self._iid, bytes) else self._iid}')
-		logger.debug(f'  self.get_iPid(): {self.get_iPid().hex() if isinstance(self.get_iPid(), bytes) else self.get_iPid()}')
-		logger.debug(f'  self.get_cinstance(): {type(self.get_cinstance()).__name__}')
-		
-		if self.get_cinstance() is not None:
-			cinstance = self.get_cinstance()
-			orpc = cinstance.get_ORPCthis()
-			logger.debug(f'  cinstance.get_ORPCthis(): {type(orpc).__name__ if orpc else None}')
-			if orpc is not None and hasattr(orpc, 'fields'):
-				logger.debug(f'  ORPCthis fields: {list(orpc.fields.keys())}')
 		
 		try:
 			request = IWbemLevel1Login_NTLMLogin()
-			logger.debug(f'  Request created: {type(request).__name__}')
-			if hasattr(request, 'fields'):
-				logger.debug(f'  Request fields: {list(request.fields.keys())}')
 			
 			request['wszNetworkResource'] = checkNullString(wszNetworkResource)
 			request['wszPreferredLocale'] = checkNullString(wszPreferredLocale) if wszPreferredLocale != NULL else NULL
 			request['lFlags'] = 0
 			request['pCtx'] = pCtx
 			
-			logger.debug('  Request populated, calling self.request()')
-			
 			resp, err = await self.request(request, iid=self._iid, uuid=self.get_iPid())
 			if err is not None:
 				logger.error(f'NTLMLogin failed: {type(err).__name__}: {err}')
-				logger.debug(f'Traceback:\n{traceback.format_exc()}')
 				return None, Exception(f'NTLMLogin failed: {err}')
 			
-			logger.debug('NTLMLogin succeeded, creating IWbemServices')
 			return IWbemServices(
 				INTERFACE(self.get_cinstance(), b''.join(resp['ppNamespace']['abData']),
 						  self.get_ipidRemUnknown(), target=self.get_target())), None
 						  
 		except Exception as e:
 			logger.error(f'NTLMLogin exception: {type(e).__name__}: {err}')
-			logger.debug(f'Traceback:\n{traceback.format_exc()}')
 			return None, e
 
 from aiosmb.dcerpc.v5.common.connection.authentication import DCERPCAuth

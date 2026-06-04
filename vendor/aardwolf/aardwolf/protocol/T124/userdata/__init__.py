@@ -33,7 +33,6 @@ class TS_UD:
 		end = buff.tell()
 		buff.seek(start)
 		while buff.tell() < end:
-			print(buff.tell())
 			ts = buff.tell()
 			otype = TS_UD_TYPE(int.from_bytes(buff.read(2), byteorder='little', signed=False))
 			olen = int.from_bytes(buff.read(2), byteorder='little', signed=False)

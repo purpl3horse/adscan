@@ -79,7 +79,7 @@ class NTLMClientWSNETDirect:
 			
 			logger.debug('[WSNETDirect][NTLM][%s] spn: %s' % (self._authid, spn))
 			logger.debug('[WSNETDirect][NTLM][%s] flags: %s' % (self._authid, flags))
-			logger.debug('[WSNETDirect][NTLM][%s] cb_data: %s' % (self._authid, cb_data))
+			logger.debug('[WSNETDirect][NTLM][%s] cb_data present: %s' % (self._authid, cb_data is not None))  # ADSCAN: do not dump channel-binding data
 			
 			if self.sspi is None:
 				self.sspi = WSNETDirectAuth(self.credential.subprotocol.get_url())
@@ -94,12 +94,12 @@ class NTLMClientWSNETDirect:
 					raise err
 				logger.debug('[WSNETDirect][NTLM][%s][Response] Status: %s' % (self._authid, status))
 				logger.debug('[WSNETDirect][NTLM][%s][Response] Response flags: %s' % (self._authid, ctxattr))
-				logger.debug('[WSNETDirect][NTLM][%s][Response] Negotiate: %s' % (self._authid, negotiate_raw))
+				logger.debug('[WSNETDirect][NTLM][%s][Response] Negotiate received' % self._authid)  # ADSCAN: do not dump raw NTLM bytes
 				self.iterations += 1
 				self.ntlm_ctx.load_negotiate(negotiate_raw)
 				return negotiate_raw, True, None
 			else:
-				logger.debug('[WSNETDirect][NTLM][%s] Challenge: %s' % (self._authid, authData))
+				logger.debug('[WSNETDirect][NTLM][%s] Challenge received' % self._authid)  # ADSCAN: do not dump raw NTLM bytes
 				self.ntlm_ctx.load_challenge(authData)
 				logger.debug('[WSNETDirect][NTLM][%s] Sending Challenge, getting Authenticate...' % self._authid)
 				status, ctxattr, authenticate_raw, err = await self.sspi.authenticate('NTLM', '', '', 3, flags.value, authdata = authData)
@@ -109,17 +109,17 @@ class NTLMClientWSNETDirect:
 				self.ntlm_ctx.load_authenticate(authenticate_raw)
 				logger.debug('[WSNETDirect][NTLM][%s][Response] Status: %s' % (self._authid, status))
 				logger.debug('[WSNETDirect][NTLM][%s][Response] Response flags: %s' % (self._authid, ctxattr))
-				logger.debug('[WSNETDirect][NTLM][%s][Response] Authenticate: %s' % (self._authid, authenticate_raw))
+				logger.debug('[WSNETDirect][NTLM][%s][Response] Authenticate received' % self._authid)  # ADSCAN: do not dump response hash
 
 				logger.debug('[WSNETDirect][NTLM][%s] Fetching SessionKey...' % self._authid)
 				self.session_key, err = await self.sspi.get_sessionkey()
 				if err is not None:
 					raise err
 				
-				logger.debug('[WSNETDirect][NTLM][%s][Response] SessionKey: %s' % (self._authid, self.session_key.hex()))
+				logger.debug('[WSNETDirect][NTLM][%s][Response] session key derived' % (self._authid))  # ADSCAN: no raw session key
 				self.ntlm_ctx.load_sessionkey(self.get_session_key())
 				
-				logger.debug('[WSNETDirect][NTLM][%s][NTLMINFO] %s' % (self._authid, self.ntlm_ctx.get_extra_info()))
+				logger.debug('[WSNETDirect][NTLM][%s][NTLMINFO] server info parsed' % (self._authid))  # ADSCAN: do not dump NTLMServerInfo (target domain/host/target-info)
 
 				await self.sspi.disconnect()
 				return authenticate_raw, False, None

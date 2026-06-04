@@ -1,5 +1,4 @@
 import asyncio
-import traceback
 from typing import cast, Dict, List
 
 from aardwolf import logger
@@ -126,5 +125,5 @@ class RDPEDYCChannel(Channel):
 
 			return True, False
 		except Exception as e:
-			traceback.print_exc()
+			logger.debug('RDPEDYC channel send raised an exception; returning it to the caller', exc_info=True)
 			return None,e

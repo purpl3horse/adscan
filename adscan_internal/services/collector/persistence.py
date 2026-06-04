@@ -6,6 +6,9 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from adscan_core import telemetry
+from adscan_core.rich_output import print_info_debug, print_warning
+from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import attack_graph_service
 from adscan_internal.services.collector.inventory_persistence import (
     CollectorInventoryPersistence,
@@ -89,6 +92,13 @@ _REPLICATION_RIGHT_RELATIONS: frozenset[str] = frozenset(
 
 _DOMAIN_ADMINS_RID = 512
 _DOMAIN_CONTROLLERS_RID = 516
+
+# Canonical display names for synthesized well-known groups (used only when the
+# real node is absent from the collection result). Keyed by domain-relative RID.
+_WELL_KNOWN_GROUP_LABELS: dict[int, str] = {
+    _DOMAIN_ADMINS_RID: "DOMAIN ADMINS",
+    _DOMAIN_CONTROLLERS_RID: "DOMAIN CONTROLLERS",
+}
 
 # Key Admins (RID 526) and Enterprise Key Admins (RID 527) are only exploitable
 # via shadow credentials + PKINIT, which requires an EnterpriseCA. ACL edges
@@ -324,6 +334,11 @@ class CollectorPersistence:
             result=result,
             sid_to_graph_id=sid_to_graph_id,
         )
+        # SPN-jacking + KCD escalation: derived from delegation + ACL state already
+        # in the graph (runs after the raw ACL edges and AllowedToDelegate are
+        # present). Graph-dict based so the same logic re-derives over an existing
+        # attack_graph.json without a collector re-run.
+        derived_edges += derive_spnjack_edges(graph)
 
         _drop_redundant_direct_compromise_to_domain_edges(graph)
 
@@ -554,7 +569,7 @@ def _persist_derived_attack_steps(
         graph, result=result, sid_to_graph_id=sid_to_graph_id
     )
     created += _persist_esc_compromise_steps(
-        graph, result=result, sid_to_graph_id=sid_to_graph_id
+        graph, domain=domain, result=result, sid_to_graph_id=sid_to_graph_id
     )
     for node in result.nodes.values():
         graph_id = sid_to_graph_id.get(node.object_id.upper())
@@ -918,9 +933,220 @@ def _persist_delegation_steps(
     return created
 
 
+# servicePrincipalName-write capability: any ACE that lets the holder set an
+# SPN on the target object. WriteSPN is the precise right; the three generic
+# property-set writes and ownership transitively grant it too.
+_SPN_WRITE_RELATIONS: frozenset[str] = frozenset(
+    {"writespn", "genericall", "genericwrite", "writedacl", "owns"}
+)
+
+
+def _bfs_memberof_node_ids(
+    memberof_adjacency: dict[str, set[str]], start_id: str
+) -> set[str]:
+    """Return all node ids reachable from ``start_id`` via MemberOf edges (cycle-safe).
+
+    Operates on graph *node ids* (``name:<sam|sid>``), not raw SIDs, so it works
+    against the canonical graph dict at both collector persist-time and standalone
+    re-derivation over an existing ``attack_graph.json``. ``start_id`` is NOT
+    included in the result.
+    """
+    visited: set[str] = set()
+    queue: list[str] = list(memberof_adjacency.get(start_id, set()))
+    while queue:
+        current = queue.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for nxt in memberof_adjacency.get(current, ()):
+            if nxt not in visited:
+                queue.append(nxt)
+    return visited
+
+
+def derive_spnjack_edges(graph: dict[str, Any]) -> int:
+    """Derive ``SPNJack`` escalation edges from collected delegation + ACL state.
+
+    SPN-jacking + KCD with protocol transition. A principal P escalates to a
+    target computer T when **all three** conditions hold:
+
+    1. **KCD + protocol transition (T2A4D):** ``P.hastrustedtoauth`` is True and
+       ``P.allowedtodelegate`` (msDS-AllowedToDelegateTo) is non-empty. T2A4D is
+       required so P can S4U2Self an *arbitrary* user (e.g. Administrator), not
+       only users who authenticate to P.
+    2. **servicePrincipalName-write over a Computer T:** P holds — directly or via
+       transitive group membership — an edge of relation in
+       :data:`_SPN_WRITE_RELATIONS` to a Computer object T. The WriteSPN edges in
+       the wild frequently originate from a *group* P belongs to, so the
+       capability is resolved over P's effective token (self + MemberOf closure).
+    3. **Vehicle SPN is plantable:** at least one SPN S in ``P.allowedtodelegate``
+       is either currently unowned (free) or owned by a computer P can write SPNs
+       on (so P can ``delspn`` S from it before ``addspn`` onto T).
+
+    For each qualifying target T the edge ``P -> SPNJack -> T`` is emitted
+    (``EdgeKind.ESCALATION``, ``direct_target_compromise``, deterministic — no
+    offline crack). Targets that are the current owner of P's vehicle SPN are
+    skipped: P can already delegate to them directly (modelled by the existing
+    ``AllowedToDelegate`` edge), so SPNJack would duplicate it.
+
+    Operates purely on the canonical graph dict (``nodes`` + ``edges``) and is
+    idempotent (``upsert_edge`` keys on ``(from, relation, to)``), so it is safe
+    to run at collector persist-time and to re-derive over an existing graph.
+
+    Returns:
+        Count of SPNJack edges created.
+    """
+    from collections import defaultdict
+
+    nodes = graph.get("nodes")
+    edges = graph.get("edges")
+    if not isinstance(nodes, dict) or not isinstance(edges, list):
+        return 0
+
+    # Index 1 — SPN string (lower) -> owning computer node id. First writer wins;
+    # an SPN is unique in AD so there is at most one owner.
+    spn_owner: dict[str, str] = {}
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict) or str(node.get("kind") or "") != "Computer":
+            continue
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        for spn in props.get("serviceprincipalnames") or []:
+            key = str(spn).strip().lower()
+            if key:
+                spn_owner.setdefault(key, str(node_id))
+
+    # Index 2 — MemberOf adjacency (node id -> set(group node id)).
+    # Index 3 — SPN-write source node id -> set(Computer target node id).
+    # Snapshot existing SPNJack pairs so the created-count stays accurate on a
+    # re-derive (upsert is idempotent but returns the existing edge truthily).
+    memberof_adjacency: dict[str, set[str]] = defaultdict(set)
+    spnwrite_targets_by_source: dict[str, set[str]] = defaultdict(set)
+    existing_spnjack: set[tuple[str, str]] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip().lower()
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if not from_id or not to_id:
+            continue
+        if relation == "memberof":
+            memberof_adjacency[from_id].add(to_id)
+        elif relation == "spnjack":
+            existing_spnjack.add((from_id, to_id))
+        elif relation in _SPN_WRITE_RELATIONS:
+            target_node = nodes.get(to_id)
+            if (
+                isinstance(target_node, dict)
+                and str(target_node.get("kind") or "") == "Computer"
+            ):
+                spnwrite_targets_by_source[from_id].add(to_id)
+
+    created = 0
+    for principal_id, principal in nodes.items():
+        if not isinstance(principal, dict):
+            continue
+        if str(principal.get("kind") or "") not in {"User", "Computer"}:
+            continue
+        props = (
+            principal.get("properties")
+            if isinstance(principal.get("properties"), dict)
+            else {}
+        )
+        # Condition 1 — KCD + T2A4D.
+        if not bool(props.get("hastrustedtoauth")):
+            continue
+        kcd_spns = [
+            str(spn).strip()
+            for spn in (props.get("allowedtodelegate") or [])
+            if str(spn).strip()
+        ]
+        if not kcd_spns:
+            continue
+
+        # Condition 2 — effective SPN-write computer targets (self + groups).
+        effective_token = {str(principal_id)} | _bfs_memberof_node_ids(
+            memberof_adjacency, str(principal_id)
+        )
+        targets: set[str] = set()
+        for sid in effective_token:
+            targets |= spnwrite_targets_by_source.get(sid, set())
+        if not targets:
+            continue
+
+        # Condition 3 — a plantable vehicle SPN (free, or owner P can write).
+        vehicle_spn: str | None = None
+        vehicle_owner: str | None = None
+        kcd_owner_ids: set[str] = set()
+        for spn in kcd_spns:
+            owner = spn_owner.get(spn.lower())
+            if owner is not None:
+                kcd_owner_ids.add(owner)
+            if vehicle_spn is None and (owner is None or owner in targets):
+                vehicle_spn = spn
+                vehicle_owner = owner
+        if vehicle_spn is None:
+            continue
+
+        # Emit SPNJack to each writable computer target, skipping targets P can
+        # already delegate to directly (current owners of P's KCD SPNs) — those
+        # are covered by the AllowedToDelegate edge and would be duplicates.
+        def _label(node_id: str | None) -> str:
+            node = nodes.get(node_id) if node_id else None
+            return str(node.get("label") or node_id or "") if isinstance(node, dict) else (node_id or "")
+
+        owner_label = _label(vehicle_owner) if vehicle_owner is not None else ""
+        vehicle_mode = "free_spn" if vehicle_owner is None else "delspn_from_owner"
+        for target_id in sorted(targets):
+            if target_id == str(principal_id) or target_id in kcd_owner_ids:
+                continue
+            is_new = (str(principal_id), target_id) not in existing_spnjack
+            # Which principal(s) in P's token actually grant the SPN-write on this
+            # target — the precondition the report/UX must surface faithfully so a
+            # group-mediated right is never shown as a direct one. Self when P
+            # holds it directly; otherwise the group(s) in P's membership token.
+            grantors = sorted(
+                _label(sid)
+                for sid in effective_token
+                if target_id in spnwrite_targets_by_source.get(sid, set())
+            )
+            spn_write_via = (
+                "direct"
+                if _label(str(principal_id)) in grantors and len(grantors) == 1
+                else ", ".join(g for g in grantors if g)
+            )
+            edge = attack_graph_service.upsert_edge(
+                graph,
+                from_id=str(principal_id),
+                to_id=target_id,
+                relation="SPNJack",
+                edge_type="native_derived",
+                status="discovered",
+                notes={
+                    "collector_method": "derived_spnjack",
+                    # Precondition chain — kept structured so report/UX can expand
+                    # the single SPNJack edge into the multi-step requirement it
+                    # represents (no over-simplification of a multi-step technique).
+                    "delegated_spn": vehicle_spn,
+                    "vehicle_spn_owner": owner_label,
+                    "vehicle_mode": vehicle_mode,
+                    "spn_write_via": spn_write_via,
+                    "protocol_transition": True,
+                    "source_property": (
+                        "msDS-AllowedToDelegateTo + TrustedToAuthForDelegation"
+                    ),
+                },
+            )
+            if edge and is_new:
+                existing_spnjack.add((str(principal_id), target_id))
+                created += 1
+    return created
+
+
 def _persist_esc_compromise_steps(
     graph: dict[str, Any],
     *,
+    domain: str,
     result: CollectionResult,
     sid_to_graph_id: dict[str, str],
 ) -> int:
@@ -955,6 +1181,39 @@ def _persist_esc_compromise_steps(
     domain_controllers_id = _find_well_known_group_graph_id(
         result, sid_to_graph_id, rid=_DOMAIN_CONTROLLERS_RID
     )
+    domain_sid = _derive_domain_sid_from_result(result)
+
+    def _resolve_well_known_target(graph_id: str, rid: int, relation: str) -> str:
+        """Return the Tier-0 target id, synthesizing the node if absent.
+
+        When the real Domain Admins / Domain Controllers node was not in the
+        collection result, the interpreted ``ADCSESC*`` step would otherwise be
+        dropped silently and the kill chain to the privileged principal lost.
+        Synthesize a Tier-0 node from the domain SID so the path survives.
+        Emit a warning (never a silent drop) when no domain SID is derivable.
+        """
+        if graph_id:
+            return graph_id
+        if not domain_sid:
+            print_warning(
+                "Skipping interpreted ADCS attack step "
+                f"{mark_sensitive(relation, 'domain')}: cannot synthesize the "
+                "privileged target (RID "
+                f"{rid}) because no domain SID was found in the collection "
+                f"result for {mark_sensitive(domain, 'domain')}."
+            )
+            return ""
+        synthesized = _synthesize_well_known_group_node(
+            graph, domain=domain, domain_sid=domain_sid, rid=rid
+        )
+        print_info_debug(
+            "Synthesized Tier-0 target "
+            f"{mark_sensitive(_WELL_KNOWN_GROUP_LABELS.get(rid, str(rid)), 'domain')} "
+            f"(RID {rid}) for interpreted ADCS attack step "
+            f"{mark_sensitive(relation, 'domain')} in "
+            f"{mark_sensitive(domain, 'domain')} (target node absent from collection)."
+        )
+        return synthesized
 
     template_lookup = {oid.upper(): node for oid, node in result.nodes.items()}
     dn_to_graph_id = _build_dn_to_graph_id_map(result, sid_to_graph_id)
@@ -1038,6 +1297,9 @@ def _persist_esc_compromise_steps(
 
         # ESC9/10 special path: derive edges from writers, not from enrollers.
         if relation in _ESC_WRITER_MEDIATED:
+            domain_admins_id = _resolve_well_known_target(
+                domain_admins_id, _DOMAIN_ADMINS_RID, relation
+            )
             if not domain_admins_id:
                 continue
             template_oid = edge.target_object_id.upper()
@@ -1094,10 +1356,16 @@ def _persist_esc_compromise_steps(
 
         target_id = ""
         if relation in _ESC_TO_DOMAIN_ADMINS:
+            domain_admins_id = _resolve_well_known_target(
+                domain_admins_id, _DOMAIN_ADMINS_RID, relation
+            )
             target_id = domain_admins_id
             impersonation_method = "san_arbitrary_subject"
             impersonated_principal_hint = "Administrator"
         elif relation in _ESC_TO_DOMAIN_CONTROLLERS:
+            domain_controllers_id = _resolve_well_known_target(
+                domain_controllers_id, _DOMAIN_CONTROLLERS_RID, relation
+            )
             target_id = domain_controllers_id
             impersonation_method = "ntlm_relay_to_enrollment"
             impersonated_principal_hint = "DC computer account"
@@ -1112,6 +1380,16 @@ def _persist_esc_compromise_steps(
             continue
 
         if not target_id:
+            # _resolve_well_known_target already warned for DA/DC synthesis
+            # failures; ESC13 reaching here means the issuance-policy linked
+            # group DN did not resolve to a known node. Never drop silently.
+            if relation == "ADCSESC13":
+                print_warning(
+                    "Skipping interpreted ADCS attack step "
+                    f"{mark_sensitive(relation, 'domain')}: issuance-policy "
+                    "linked group could not be resolved to a known node in "
+                    f"{mark_sensitive(domain, 'domain')}."
+                )
             continue
         from_id = sid_to_graph_id.get(edge.source_object_id.upper())
         if not from_id:
@@ -1228,6 +1506,74 @@ def _build_dn_to_graph_id_map(
         if graph_id:
             mapping[dn.casefold()] = graph_id
     return mapping
+
+
+def _derive_domain_sid_from_result(result: CollectionResult) -> str:
+    """Return the domain SID (``S-1-5-21-...`` prefix) from any domain object.
+
+    Scans the collection result for the first ``S-1-5-21-`` object SID and
+    strips its trailing relative identifier, yielding the machine/domain SID.
+    Returns an empty string when no domain-scoped object is present.
+    """
+    for object_id in result.nodes:
+        oid_upper = str(object_id or "").upper()
+        if not oid_upper.startswith("S-1-5-21-"):
+            continue
+        head, _, tail = oid_upper.rpartition("-")
+        if head and tail.isdigit():
+            return head
+    return ""
+
+
+def _synthesize_well_known_group_node(
+    graph: dict[str, Any],
+    *,
+    domain: str,
+    domain_sid: str,
+    rid: int,
+) -> str:
+    """Synthesize a Tier-0 well-known group node and return its graph id.
+
+    Used only when the real Domain Admins (RID 512) / Domain Controllers
+    (RID 516) node is absent from the collection result (e.g. the operator
+    lacked read rights over the group, or it fell outside the collected
+    base). Without a target node the interpreted ``ADCSESC*`` attack step
+    would be dropped, breaking the kill-chain semantics ``... -> Domain
+    Admins``. Re-anchoring the derived edge on a synthesized Tier-0 node
+    preserves the path while flagging the node as synthetic for downstream
+    consumers.
+    """
+    object_id = f"{domain_sid.upper()}-{rid}"
+    base_label = _WELL_KNOWN_GROUP_LABELS.get(rid, f"WELL-KNOWN-{rid}")
+    label = f"{base_label}@{domain.upper()}"
+    node_payload = {
+        "kind": "Group",
+        "label": label,
+        "name": label,
+        "objectId": object_id,
+        "highvalue": True,
+        "isTierZero": True,
+        "properties": {
+            "domain": domain.upper(),
+            "name": label,
+            "objectid": object_id,
+            "highvalue": True,
+            "isTierZero": True,
+            "system_tags": "admin_tier_0",
+            "synthetic": True,
+            "source": "synthesized_well_known_group",
+        },
+    }
+    try:
+        attack_graph_service.upsert_nodes(graph, [node_payload])
+        return attack_graph_service._node_id(node_payload)  # noqa: SLF001
+    except Exception as exc:  # pragma: no cover - defensive
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Failed to synthesize Tier-0 target node "
+            f"{mark_sensitive(label, 'domain')}: {exc}"
+        )
+        return ""
 
 
 def _find_well_known_group_graph_id(

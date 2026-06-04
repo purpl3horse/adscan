@@ -75,6 +75,9 @@ _ALLOWED_DERIVED_RELATIONS: frozenset[str] = frozenset(
         "WebDAVEnabled",
         "DropTheMIC",
         "NTLMReflection",
+        # NTLMv1 relay surface marker (sub-project #3) — promoted by the
+        # ntlmv1_relay_graph_builder when an NTLMv1 host is observed.
+        "Ntlmv1Enabled",
     }
 )
 

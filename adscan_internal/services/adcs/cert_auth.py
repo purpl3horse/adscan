@@ -15,6 +15,7 @@ from adscan_core.rich_output import (
     get_console,
     mark_sensitive,
     print_error,
+    print_info_debug,
     print_info_verbose,
     print_warning,
 )
@@ -30,6 +31,14 @@ class CertAuthConfig:
         pfx_path: Path to the PFX containing the certificate and private key.
         pfx_password: Password protecting the PFX.
         username: Override the principal extracted from the certificate CN/SAN.
+        skip_unpac: When True, skip the UnPAC-the-hash U2U round-trip entirely.
+            Posture-aware callers set this when ``NTLM_AUTHENTICATION`` is
+            known-disabled (HIGH confidence): no NTLM credential lives in the
+            PAC on such domains, so the U2U could never recover an NT hash —
+            it would only cost a wasted round-trip. The PKINIT TGT/ccache is
+            the deliverable regardless. Defaults to False (run the U2U) so
+            callers with UNKNOWN / NTLM-enabled / low-confidence posture keep
+            today's behavior (observe-don't-infer).
     """
 
     domain: str
@@ -37,6 +46,7 @@ class CertAuthConfig:
     pfx_path: Path
     pfx_password: str
     username: Optional[str] = None
+    skip_unpac: bool = False
 
 
 @dataclass
@@ -248,13 +258,22 @@ async def _do_authenticate_with_cert(
     ccache_path = output_dir / f"{safe_name}.ccache"
     kcomm.ccache.to_file(str(ccache_path))
 
-    # Attempt UnPAC-the-hash (best-effort, non-fatal)
+    # Attempt UnPAC-the-hash (best-effort, non-fatal). Skipped when posture
+    # reports NTLM is disabled (HIGH): on such domains the PAC carries no NTLM
+    # credential, so the U2U round-trip can never recover a hash — the PKINIT
+    # TGT/ccache is the credential and is returned as success either way.
     nt_hash: Optional[str] = None
-    try:
-        nt_hash = await _extract_nt_hash_u2u(kcomm)
-    except Exception as exc_u2u:
-        telemetry.capture_exception(exc_u2u)
-        print_warning(f"  UnPAC-the-hash attempt failed (non-fatal): {exc_u2u}")
+    if config.skip_unpac:
+        print_info_debug(
+            "  ▸ NTLM disabled by posture — UnPAC-the-hash not applicable; "
+            "PKINIT TGT/ccache is the credential."
+        )
+    else:
+        try:
+            nt_hash = await _extract_nt_hash_u2u(kcomm)
+        except Exception as exc_u2u:
+            telemetry.capture_exception(exc_u2u)
+            print_warning(f"  UnPAC-the-hash attempt failed (non-fatal): {exc_u2u}")
 
     _render_pkinit_result(principal, ccache_path, nt_hash)
 

@@ -248,6 +248,85 @@ def _node_name(node: Mapping[str, Any] | None) -> str:
     return ""
 
 
+# RIDs whose compromise IS a direct domain compromise (Tier 2 of the terminal
+# taxonomy in docs/superpowers/specs/2026-06-03-attack-path-terminal-ordering.md):
+# Administrator account (500), Domain Admins (512), Domain Controllers group
+# (516), Enterprise Admins (519), BUILTIN\Administrators (544), krbtgt (502).
+# DC computer accounts are also direct (handled via the ``is_dc`` flag below).
+#
+# Deliberately EXCLUDED (they are compromise ENABLERS — controlling them needs a
+# further abuse, and the canonical nomenclature table classifies them as
+# Privileged Escalators): Schema Admins (518, schema-write is delayed/indirect),
+# Enterprise/Read-Only DCs (498/521, read-only — partial secrets), and every
+# other Tier-0 group (GPCO, Cert Publishers, DnsAdmins, *Operators, Key Admins,
+# Exchange groups, …).
+_DIRECT_DOMAIN_BREAKER_RIDS: frozenset[int] = frozenset({500, 512, 516, 519, 544, 502})
+
+# Name-based fallback for the same set, for nodes that carry only a name
+# (no resolvable objectid/RID — common in synthesized targets and tests).
+_DIRECT_DOMAIN_BREAKER_NAMES: frozenset[str] = frozenset(
+    name.lower()
+    for name in (
+        "Administrator",
+        "Administrators",
+        "Domain Admins",
+        "Enterprise Admins",
+        "Domain Controllers",
+        "Enterprise Domain Controllers",
+        "krbtgt",
+    )
+)
+
+
+def _node_rid(node: Mapping[str, Any] | None) -> int | None:
+    """Return the RID (trailing SID component) of a node, or ``None``."""
+    if not node:
+        return None
+    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    for value in (
+        props.get("objectid") if isinstance(props, Mapping) else None,
+        props.get("objectId") if isinstance(props, Mapping) else None,
+        node.get("objectid"),
+        node.get("objectId"),
+    ):
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip().upper().rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def _is_direct_domain_breaker_target(node: Mapping[str, Any] | None) -> bool:
+    """Return whether reaching *node* IS a direct domain compromise.
+
+    True for the domain object itself, the canonical direct-compromise
+    principals (:data:`_DIRECT_DOMAIN_BREAKER_RIDS`), and DC computer accounts.
+    A control edge landing here is a real ``DOMAIN_BREAKER``; a control edge to
+    any other Tier-0 group is a ``PRIVILEGED_ESCALATOR`` (compromise enabler).
+    """
+    if not node:
+        return False
+    if str(node.get("kind") or "").strip().lower() == "domain":
+        return True
+    rid = _node_rid(node)
+    if rid is not None and rid in _DIRECT_DOMAIN_BREAKER_RIDS:
+        return True
+    # Name fallback when the node carries no resolvable RID.
+    name = _node_name(node).strip().lower()
+    if name:
+        # Strip a trailing @domain suffix (label form) before matching.
+        bare = name.split("@", 1)[0].strip()
+        if bare in _DIRECT_DOMAIN_BREAKER_NAMES:
+            return True
+    if bool(node.get("is_dc")):
+        return True
+    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    if isinstance(props, Mapping) and bool(props.get("is_dc")):
+        return True
+    return False
+
+
 def _is_privileged_escalator_target(node: Mapping[str, Any] | None) -> bool:
     return _node_name(node).lower() in _PRIVILEGED_ESCALATOR_GROUP_NAMES
 
@@ -318,7 +397,17 @@ def derive_compromise_class_from_path(
 
     if last_kind in {EdgeKind.CONTROL, EdgeKind.DERIVED, EdgeKind.ESCALATION}:
         if target_tier == 0:
-            return CompromiseClass.DOMAIN_BREAKER
+            # A control edge to a Tier-0 asset is a DOMAIN_BREAKER only when the
+            # asset IS a direct domain compromise (the domain object, DA/EA/
+            # Administrators/Schema Admins/DCs/krbtgt). Every other Tier-0 group
+            # (GPCO, Cert Publishers, DnsAdmins, *Operators, …) is a compromise
+            # ENABLER: controlling it requires a further abuse (create GPO, ADCS
+            # ESC, DLL) to actually break the domain, so it must rank below the
+            # direct domain-compromise paths. See spec
+            # 2026-06-03-attack-path-terminal-ordering.md.
+            if _is_direct_domain_breaker_target(target_node):
+                return CompromiseClass.DOMAIN_BREAKER
+            return CompromiseClass.PRIVILEGED_ESCALATOR
         if _is_privileged_escalator_target(target_node):
             return CompromiseClass.PRIVILEGED_ESCALATOR
         # Terminal kind but target is not Tier 0 nor an escalator group:

@@ -103,8 +103,6 @@ class TS_INFO_PACKET:
 		msg.Password = buff.read(msg.cbPassword + 2).decode(encoding).replace('\x00', '')
 		msg.AlternateShell = buff.read(msg.cbAlternateShell + 2).decode(encoding).replace('\x00', '')
 		msg.WorkingDir = buff.read(msg.cbWorkingDir+2).decode(encoding).replace('\x00', '')
-		print(msg)
-		print(buff.read(20))
 		buff.seek(-20,1)
 		msg.extrainfo = TS_EXTENDED_INFO_PACKET.from_buffer(buff)
 		return msg

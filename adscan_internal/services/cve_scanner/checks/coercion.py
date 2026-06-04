@@ -113,9 +113,12 @@ class CoercionCVECheck:
             raise RuntimeError(
                 "ScanContext.listener_host is required for coercion checks."
             )
+        # The CVE scanner has no out-of-band capture listener, so it uses the
+        # per-attempt heuristic (``probable_auth_triggered``) as the
+        # vulnerability indicator and always walks every method. No
+        # ``capture_signal`` is supplied; the engine runs the whole catalog.
         config = NativeCoercionRunConfig(
             listener_host=ctx.listener_host,
-            stop_on_first_success=False,
             protocols=("EFSR", "RPRN", "FSRVP", "EVEN", "DFSNM"),
             show_summary=False,
         )
@@ -203,7 +206,7 @@ def _group_by_technique(
         technique = method_techniques.get(result.method_name)
         if technique is None:
             continue
-        bucket = successes if result.success else failures
+        bucket = successes if result.probable_auth_triggered else failures
         bucket.setdefault(technique, []).append(result)
 
     out: list[CVEResult] = []

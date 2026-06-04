@@ -510,8 +510,9 @@ def _recommended_next_for_execution(
     server = execution.host
     steps: list[tuple[str, str]] = []
     if execution.is_terminal_win:
-        steps.append(("dump lsass", f"adscan loot lsass {server}"))
-        steps.append(("relay attack", f"adscan coerce {server}"))
+        # Credential extraction runs automatically after escalation — do not
+        # surface a phantom `adscan loot` command (no such verb exists).
+        steps.append(("escalate to SYSTEM", f"adscan mssql escalate {server}"))
     elif execution.success:
         steps.append(("escalate to SYSTEM", f"adscan mssql escalate {server}"))
         if sweep and sweep.linked_servers:

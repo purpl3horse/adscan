@@ -237,8 +237,6 @@ class SMBMachine:
 					return await samrpc.enable_account(uhandle)
 
 		except Exception as e:
-			import traceback
-			traceback.print_exc()
 			return None, e
 
 	async def disable_user(self, domain_name:str, user_name:str) -> Awaitable[Tuple[str, Union[Exception, None]]]:
@@ -572,16 +570,11 @@ class SMBMachine:
 							if err is not None:
 								yield None, err
 								return
-							logger.debug('username: %s user_sid: %s' % (username, user_sid))
-							print('[aiosmb-dcsync] trying user=%s sid=%s' % (username, user_sid))
 							#secrets, err = await drsuapi.get_user_secrets(username)
 							secrets, err = await drsuapi.get_user_secrets(user_sid)
 							if err is not None:
-								logger.debug('get_user_secrets failed for %s (sid=%s): %s' % (username, user_sid, err))
-								print('[aiosmb-dcsync] FAILED user=%s sid=%s err=%s' % (username, user_sid, err))
 								yield None, err
 								return
-							logger.debug('secrets: %s' % secrets)
 							yield secrets, None
 
 		except Exception as e:
@@ -650,7 +643,7 @@ class SMBMachine:
 					if self.print_cb is not None:
 						await self.print_cb('[%s] Service created with name: %s' % (self.connection.target.get_hostname_or_ip(), service_name))
 					else:
-						print('[%s] Service created with name: %s' % (self.connection.target.get_hostname_or_ip(), service_name))
+						logger.debug('Service created with name: %s' % service_name)
 				
 				_, err = await rpc.start_service(service_name)
 
@@ -664,7 +657,7 @@ class SMBMachine:
 						if self.print_cb is not None:
 							await self.print_cb('[%s] Dump file is now accessible here: C:\\Windows\\Temp\\%s' % (self.connection.target.get_hostname_or_ip(), lsass_file_name))
 						else:
-							print('[%s] Dump file is now accessible here: C:\\Windows\\Temp\\%s' % (self.connection.target.get_hostname_or_ip(), lsass_file_name))
+							logger.debug('Dump file is now accessible on remote host')
 					return temp, None
 
 				return None, err
@@ -681,13 +674,13 @@ class SMBMachine:
 					if self.print_cb is not None:
 						await self.print_cb('[%s] Failed to remove service: %s' % (self.connection.target.get_hostname_or_ip(), service_name))
 					else:
-						print('[%s] Failed to remove service: %s' % (self.connection.target.get_hostname_or_ip(), service_name))
+						logger.debug('Failed to remove service: %s' % service_name)
 			else:
 				if silent is False:
 					if self.print_cb is not None:
 						await self.print_cb('[%s] Removed service: %s' % (self.connection.target.get_hostname_or_ip(), service_name))
 					else:
-						print('[%s] Removed service: %s' % (self.connection.target.get_hostname_or_ip(), service_name))
+						logger.debug('Removed service: %s' % service_name)
 
 	
 	async def service_cmd_exec(self, command:str, display_name:str = None, service_name:str = None, result_wait_timeout:int = 1) -> AsyncGenerator[Tuple[bytes, Union[Exception, None]], None]:
@@ -985,7 +978,7 @@ class SMBMachine:
 				if self.print_cb is not None:
 					await self.print_cb('[%s] Dumping task created on remote end, now waiting...' % self.connection.target.get_hostname_or_ip())
 				else:
-					print('[%s] Dumping task created on remote end, now waiting...' % self.connection.target.get_hostname_or_ip())
+					logger.debug('Dumping task created on remote end, now waiting...')
 
 			for _ in range(5):
 				await asyncio.sleep(5)
@@ -997,7 +990,7 @@ class SMBMachine:
 					if self.print_cb is not None:
 						await self.print_cb('[%s] Remote file location: C:\\Windows\\Temp\\%s' % (self.connection.target.get_hostname_or_ip() ,lsass_file_name))
 					else:
-						print('[%s] Remote file location: C:\\Windows\\Temp\\%s' % (self.connection.target.get_hostname_or_ip() ,lsass_file_name))
+						logger.debug('Remote file location resolved on remote host')
 				return temp, None
 
 			return None, err
@@ -1014,7 +1007,7 @@ class SMBMachine:
 				if self.print_cb is not None:
 					await self.print_cb('opening printer')
 				else:
-					print('opening printer')
+					logger.debug('opening printer')
 				handle, err = await rpc.open_printer('\\\\%s\x00' % self.connection.target.get_hostname_or_ip())
 				if err is not None:
 					raise err
@@ -1183,7 +1176,7 @@ class SMBMachine:
 						uhandle, err = await samrpc.open_user(dhandle, urid)
 
 					if err is not None:
-						print('User open failed! %s' % err)
+						logger.debug('User open failed! %s' % err)
 						raise err
 				
 				username, err = await samrpc.get_user_username(uhandle)

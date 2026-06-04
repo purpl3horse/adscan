@@ -6,7 +6,7 @@ writes:
 * ``Computer`` node ``properties.smb_shares`` — list of share names.
 * Edges with ``relation in {"ReadShare","WriteShare","FullControlShare"}``,
   source object id = principal SID, target = computer object id, and
-  ``notes={"share_name": ..., "sd_source": ...}``.
+  ``notes={"share_name": ..., "sd_source": ..., "verification": ...}``.
 
 This module is a pure reader — it loads the JSON, finds the Computer node
 matching a host (by DNS hostname, IP, or NetBIOS name), and returns a
@@ -20,6 +20,12 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
+
+from adscan_internal.services.collector.share_ntfs_verification import (
+    VERIFICATION_NTFS_COMPUTED,
+    VERIFICATION_SELF_MXAC,
+    VERIFICATION_SHARE_ACL_ONLY,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -52,11 +58,28 @@ class GraphShareACL:
     share_name: str
     principals: List[GraphSharePrincipal] = field(default_factory=list)
     sd_source: str = "unknown"  # srvsvc502 / smb2_root_sd / registry / unavailable
+    # NTFS-aware effective-access verification tier (the strongest tier seen
+    # across the share's edges). ``ntfs_computed`` means the graph access was
+    # confirmed against the NTFS folder ACL (share ∩ NTFS); ``share_acl_only``
+    # means it is share-ACL-only and NTFS-unverified. Default is the
+    # conservative ``share_acl_only`` for back-compat with graphs collected
+    # before this tag existed.
+    verification: str = VERIFICATION_SHARE_ACL_ONLY
+
+    @property
+    def is_ntfs_verified(self) -> bool:
+        """True when the share's access was confirmed against the NTFS ACL."""
+        return self.verification in (
+            VERIFICATION_NTFS_COMPUTED,
+            VERIFICATION_SELF_MXAC,
+        )
 
     def to_dict(self) -> dict:
         return {
             "share_name": self.share_name,
             "sd_source": self.sd_source,
+            "verification": self.verification,
+            "is_ntfs_verified": self.is_ntfs_verified,
             "principals": [p.to_dict() for p in self.principals],
         }
 
@@ -88,6 +111,14 @@ _RELATION_TO_PERMISSION = {
     "ReadShare": "READ",
     "WriteShare": "WRITE",
     "FullControlShare": "FULL_CONTROL",
+}
+
+# Verification tier strength ranking (higher = stronger evidence). Used to keep
+# the strongest tier seen across a share's edges.
+_VERIFICATION_RANK = {
+    VERIFICATION_SHARE_ACL_ONLY: 0,
+    VERIFICATION_NTFS_COMPUTED: 1,
+    VERIFICATION_SELF_MXAC: 2,
 }
 
 
@@ -154,6 +185,15 @@ def load_graph_share_snapshot(
         # across edge ordering.
         if acl.sd_source in {"unknown", "unavailable"} and notes.get("sd_source"):
             acl.sd_source = notes["sd_source"]
+
+        # Verification tier: keep the STRONGEST tier seen across the share's
+        # edges (a single ntfs_computed edge means the NTFS ACL was read).
+        edge_verification = str(notes.get("verification") or "").strip()
+        if edge_verification in _VERIFICATION_RANK:
+            if _VERIFICATION_RANK[edge_verification] > _VERIFICATION_RANK.get(
+                acl.verification, -1
+            ):
+                acl.verification = edge_verification
 
         sid = str(edge.get("source_object_id", "")).strip().upper()
         principal_node = nodes.get(sid)

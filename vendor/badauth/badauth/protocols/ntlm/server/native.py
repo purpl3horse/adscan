@@ -244,7 +244,7 @@ class NTLMServerNative:
 				self.crypthandle_server = RC4(self.SealKey_server)
 		
 		if sealkey is not None:
-			logger.debug('Setting %s sealkey to %s' % (mode, sealkey.hex()))
+			logger.debug('Setting %s sealkey' % mode)  # ADSCAN: do not dump raw sealkey hex
 		return sealkey
 		
 	def calc_signkey(self, mode = 'Client'):
@@ -262,12 +262,12 @@ class NTLMServerNative:
 			
 		if mode == 'Client':
 			if signkey is not None:
-				logger.debug('Setting client signkey to %s' % signkey.hex())
+				logger.debug('Setting client signkey')  # ADSCAN: do not dump raw signkey hex
 			self.SignKey_client = signkey
 
 		else:
 			if signkey is not None:
-				logger.debug('Setting server signkey to %s' % signkey.hex())
+				logger.debug('Setting server signkey')  # ADSCAN: do not dump raw signkey hex
 			self.SignKey_server = signkey
 		
 		return signkey
@@ -291,7 +291,7 @@ class NTLMServerNative:
 		logger.debug('Setting up crypto')
 		if not self.RandomSessionKey:
 			self.RandomSessionKey = os.urandom(16)
-			logger.debug('RandomSessionKey: %s' % self.RandomSessionKey.hex())
+			logger.debug('RandomSessionKey generated')  # ADSCAN: do not dump raw session key hex
 		
 		
 		if self.credential.is_guest == True:
@@ -300,7 +300,7 @@ class NTLMServerNative:
 				
 			rc4 = RC4(self.KeyExchangeKey)
 			self.EncryptedRandomSessionKey = rc4.encrypt(self.RandomSessionKey)
-			logger.debug('EncryptedRandomSessionKey: %s' % self.EncryptedRandomSessionKey.hex())
+			logger.debug('EncryptedRandomSessionKey computed')  # ADSCAN: do not dump raw key hex
 
 		else:
 			if is_remote is False:
@@ -310,7 +310,7 @@ class NTLMServerNative:
 			
 				rc4 = RC4(self.KeyExchangeKey)
 				self.EncryptedRandomSessionKey = rc4.encrypt(self.RandomSessionKey)
-				logger.debug('EncryptedRandomSessionKey: %s' % self.EncryptedRandomSessionKey.hex())
+				logger.debug('EncryptedRandomSessionKey computed')  # ADSCAN: do not dump raw key hex
 		
 		self.calc_sealkey('Client')
 		self.calc_sealkey('Server')
@@ -398,7 +398,7 @@ class NTLMServerNative:
 				flags = flags
 			)
 			
-			logger.debug('Negotiate: %s' % self.ntlmNegotiate)
+			logger.debug('Negotiate message constructed')  # ADSCAN: do not dump full NTLM message
 			self.ntlmChallenge_raw = self.ntlmChallenge.to_bytes()
 			return self.ntlmChallenge_raw, True, None
 			
@@ -406,7 +406,7 @@ class NTLMServerNative:
 			#client authenticate incoming
 			self.ntlmAuthenticate_raw = authData
 			self.ntlmAuthenticate = NTLMAuthenticate.from_bytes(authData)
-			logger.debug('Authenticate: %s' % self.ntlmAuthenticate)
+			logger.debug('Authenticate message received')  # ADSCAN: do not dump full NTLM message
 				
 			##################flags = self.ntlmChallenge.NegotiateFlags
 				
@@ -431,7 +431,7 @@ class NTLMServerNative:
 						encrypted_session = self.EncryptedRandomSessionKey,
 						workstationname=target.hostname if target is not None else None
 					)
-					logger.debug('NTLMv1 Guest - NTLMAuthenticate: %s' % self.ntlmAuthenticate)
+					logger.debug('NTLMv1 Guest - NTLMAuthenticate constructed')  # ADSCAN: do not dump response hash
 					return self.ntlmAuthenticate.to_bytes(), False, None
 						
 				if flags & NegotiateFlags.NEGOTIATE_EXTENDED_SESSIONSECURITY:
@@ -449,7 +449,7 @@ class NTLMServerNative:
 						encrypted_session = self.EncryptedRandomSessionKey,
 						workstationname=target.hostname if target is not None else None
 					)
-					logger.debug('NTLMv1 with extended security - NTLMAuthenticate: %s' % self.ntlmAuthenticate)
+					logger.debug('NTLMv1 with extended security - NTLMAuthenticate constructed')  # ADSCAN: do not dump response hash
 				else:
 					self.ntlm_credentials = netntlm.construct(self.ntlmChallenge.ServerChallenge, self.credential)
 						
@@ -463,7 +463,7 @@ class NTLMServerNative:
 						encrypted_session = self.EncryptedRandomSessionKey,
 						workstationname=target.hostname if target is not None else None
 					)
-					logger.debug('NTLMv1 - NTLMAuthenticate: %s' % self.ntlmAuthenticate)
+					logger.debug('NTLMv1 - NTLMAuthenticate constructed')  # ADSCAN: do not dump response hash
 							
 							
 			else:
@@ -482,7 +482,7 @@ class NTLMServerNative:
 					#	encrypted_session = self.EncryptedRandomSessionKey,
 					#	workstationname=target.hostname if target is not None else None
 					#)						
-					#logger.debug('NTLMv2 Guest - NTLMAuthenticate: %s' % self.ntlmAuthenticate)
+					#logger.debug('NTLMv2 Guest - NTLMAuthenticate constructed')  # ADSCAN: do not dump response hash
 					#return self.ntlmAuthenticate.to_bytes(), False, None
 						
 				else:
@@ -502,7 +502,7 @@ class NTLMServerNative:
 						
 					self.ntlm_credentials = netntlmv2.construct(self.ntlmChallenge.ServerChallenge, self.challenge, ti, self.credential, timestamp = self.timestamp)
 					self.KeyExchangeKey = self.ntlm_credentials.calc_key_exchange_key()
-					logger.debug('NTLMv2 - KeyExchangeKey: %s' % self.KeyExchangeKey.hex())				
+					logger.debug('NTLMv2 - KeyExchangeKey derived')  # ADSCAN: do not dump raw key hex				
 					self.setup_crypto()
 						
 					#TODO: if "ti" / targetinfo in the challenge message has "MsvAvFlags" type and the bit for MIC is set (0x00000002) we need to send a MIC. probably...
@@ -520,7 +520,7 @@ class NTLMServerNative:
 						mic = mic,
 					)
 				
-					logger.debug('NTLMv2 - NTLMAuthenticate: %s' % self.ntlmAuthenticate)
+					logger.debug('NTLMv2 - NTLMAuthenticate constructed')  # ADSCAN: do not dump response hash
 			self.ntlmAuthenticate_raw = self.ntlmAuthenticate.to_bytes()
 			return self.ntlmAuthenticate_raw, False, None
 	

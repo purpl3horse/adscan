@@ -316,10 +316,24 @@ def analyze_implicit_well_known_memberships(result: "CollectionResult") -> int:
                     added += 1
 
         # ── (2) Primary-group membership via primaryGroupID ─────────────
-        # Skip highvalue nodes — same reason as auth groups above.  DC01$
-        # having an outgoing primary_group edge to Domain Controllers also
-        # extends paths past the terminal and causes sub-sequence filtering.
-        if primary_group_id is not None and not node.highvalue:
+        # Normally skipped for highvalue (Tier-0) nodes — an outgoing
+        # primary-group edge extends paths past the terminal and causes
+        # sub-sequence filtering (same reason as the auth groups above).
+        #
+        # EXCEPTION — a DC machine account's primary group IS a
+        # domain-takeover group (Domain Controllers 516 / RODC 521).  That
+        # membership is the canonical kill-chain link
+        # ``DC$ -> Domain Controllers -> DCSync -> Domain``: it is how
+        # "compromise the DC = own the domain" is expressed.  Without it the
+        # most fundamental AD attack path is unrepresentable — the DC$ node
+        # has no path to the domain at all (primaryGroup membership is implicit
+        # in AD, never present in the group's ``member`` attribute, so the
+        # explicit memberOf collection cannot supply it).  So we emit it even
+        # for the highvalue DC when the primary group is a DC group.
+        emit_primary_group = primary_group_id is not None and (
+            not node.highvalue or primary_group_id in _DC_PRIMARY_GROUP_RIDS
+        )
+        if emit_primary_group:
             domain_prefix = _domain_sid_prefix(source_sid)
             if domain_prefix:
                 primary_group_sid = f"{domain_prefix}-{primary_group_id}"

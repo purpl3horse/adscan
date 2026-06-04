@@ -417,10 +417,10 @@ class MsvDecryptor(PackageDecryptor):
 		if not encrypted_credential_data:
 			return
 		
-		self.log('Encrypted credential data \n%s' % hexdump(encrypted_credential_data))
+		self.log('Encrypted credential data located')
 		self.log('Decrypting credential structure')
 		dec_data, raw_dec = self.decrypt_password(encrypted_credential_data, bytes_expected = True)
-		self.log('%s: \n%s' % (self.decryptor_template.decrypted_credential_struct.__name__, hexdump(dec_data)))
+		self.log('Decrypted credential structure: %s' % self.decryptor_template.decrypted_credential_struct.__name__)
 
 		struct_reader = GenericReader(dec_data, self.sysinfo.architecture)
 		if len(dec_data) == MSV1_0_PRIMARY_CREDENTIAL_STRANGE_DEC.size and dec_data[4:8] == b'\xcc\xcc\xcc\xcc':

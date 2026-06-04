@@ -19,8 +19,11 @@ Design notes (post flapping incident on HTB Forest):
   retry with linear backoff. ``NOT_FOUND`` and ``ACCESS_DENIED`` are
   definitive — no retry.
 * If the SMB session itself is dead (≥2 consecutive ``NETWORK_ERROR``
-  outcomes), the collector reconnects **once** per run and continues
-  with the remaining candidates.
+  outcomes), the collector reconnects a small bounded number of times per
+  run (``max_reconnects``), waiting a brief settle between attempts so the
+  fresh aiosmb session is ready, then re-probes the still-pending candidates
+  (conventional Desktop paths first). This survives DCs that aggressively
+  reset SMB sessions mid-batch.
 * aiosmb prints ``socket.send() raised exception.`` straight to stderr
   via bare ``print()`` calls. We capture the entire SMB block's stderr
   and re-emit captured lines via ``print_info_debug`` — the user TTY
@@ -368,24 +371,61 @@ def _candidate_paths(users: Iterable[str]) -> list[tuple[str, FlagKind, str]]:
     return out
 
 
+def _prioritize_conventional_first(
+    candidates: list[tuple[str, "FlagKind", str]],
+) -> list[tuple[str, "FlagKind", str]]:
+    r"""Reorder candidates so conventional Desktop paths are probed first.
+
+    Used on reconnect: when an SMB session dies mid-batch we want the
+    highest-value standard locations (the conventional ``Users\<user>\
+    Desktop\*.txt`` paths) re-probed on the fresh session before any
+    lower-value paths, so a tight
+    reconnect budget is never spent on long-shot paths while the actual
+    flag location goes unread. Order within each group is preserved (stable).
+    """
+    desktop: list[tuple[str, "FlagKind", str]] = []
+    other: list[tuple[str, "FlagKind", str]] = []
+    for entry in candidates:
+        path = entry[0] or ""
+        normalized = path.replace("\\", "/").lower()
+        if _CONVENTIONAL_DESKTOP_RE.match(normalized):
+            desktop.append(entry)
+        else:
+            other.append(entry)
+    return desktop + other
+
+
 # ---------------------------------------------------------------------------
 # Validation + parsing helpers
 # ---------------------------------------------------------------------------
 
 
-def _normalise_flag_value(raw: bytes) -> str | None:
-    """Validate raw bytes as a flag and return the canonical token.
+def _normalise_flag_value(raw: bytes | str) -> str | None:
+    """Validate raw bytes/str as a flag and return the canonical token.
+
+    Accepts BOTH ``bytes`` (SMB byte-read, or WinRM stdout the caller already
+    ``.encode()``-ed) AND ``str`` (an already-decoded value, e.g. the JSON
+    ``content`` field from the PowerShell-search fallback). The str path is the
+    one that bit us: when this body was bytes-only, a str caller hit
+    ``str.decode`` → ``AttributeError`` → swallowed by the bare ``except`` →
+    EVERY ps_search flag silently rejected as "not a valid flag", losing flags
+    only reachable via that fallback (e.g. domain-suffixed user profiles the
+    SMB walk times out on). Handling both types here fixes it at the right
+    layer and kills the whole class of bug.
 
     Returns:
-        The validated token, or ``None`` if the bytes do not look like
+        The validated token, or ``None`` if the input does not look like
         a flag (multi-line, too short/long, non-printable).
     """
     if not raw:
         return None
-    try:
-        text = raw.decode("utf-8", errors="replace").strip()
-    except Exception:  # noqa: BLE001
-        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+    else:
+        try:
+            text = raw.decode("utf-8", errors="replace").strip()
+        except Exception:  # noqa: BLE001
+            return None
     if not text:
         return None
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
@@ -665,7 +705,9 @@ async def _smb_byte_read_strategy(
     path_timeout_seconds: float,
     host: str,
     max_attempts: int = 3,
-    max_reconnects: int = 1,
+    max_reconnects: int = 4,
+    reconnect_settle_seconds: float = 0.5,
+    total_budget_seconds: float = 24.0,
     discovered_via: "FlagDiscoveryStrategy" = None,  # type: ignore[assignment]
 ) -> tuple[
     list[FlagHit],
@@ -683,6 +725,23 @@ async def _smb_byte_read_strategy(
     * ``probe_errors`` — :class:`FlagProbeError` for every non-SUCCESS
       probe (including NOT_FOUND, useful for the panel).
     * ``errors`` — non-recoverable connection-level issues (panel footer).
+
+    Resilience model (hardened for DCs that aggressively reset SMB
+    sessions): when the live session looks dead the loop reconnects up to
+    ``max_reconnects`` times, sleeping ``reconnect_settle_seconds`` between
+    attempts so the fresh aiosmb session has settled before re-probing.
+    Paths that errored with ``NETWORK_ERROR`` on a dead session are NOT
+    terminal — they are re-probed on the new session, with the highest-value
+    conventional Desktop paths re-prioritised first. Remaining candidates are
+    only marked ``NETWORK_ERROR`` once the reconnect budget is genuinely
+    exhausted.
+
+    ``total_budget_seconds`` is a wall-clock cap on the whole strategy
+    (connect + probes + every reconnect). It guarantees the reconnect loop
+    actually gets to re-probe the pending Desktop paths instead of letting a
+    single dead path consume the caller's hard cap via the per-path retry
+    budget — the root cause of the "conventional probed=0" symptom against a
+    DC that aggressively resets SMB sessions.
     """
     if discovered_via is None:
         discovered_via = FlagDiscoveryStrategy.CONVENTIONAL
@@ -693,6 +752,18 @@ async def _smb_byte_read_strategy(
 
     pending: list[tuple[str, FlagKind, str]] = list(candidates)
     reconnects_used = 0
+    # Wall-clock deadline for the whole strategy (connect + probes +
+    # reconnects). Without this guard the per-path retry budget
+    # (max_attempts x path_timeout) could burn the caller's hard cap on a
+    # single dead path before any reconnect re-probes the pending Desktop
+    # paths — the root cause of the "conventional probed=0" bug on a
+    # reset-happy DC.
+    strategy_started = asyncio.get_event_loop().time()
+
+    def _budget_remaining() -> float:
+        return total_budget_seconds - (
+            asyncio.get_event_loop().time() - strategy_started
+        )
 
     stderr_buf = io.StringIO()
 
@@ -704,11 +775,37 @@ async def _smb_byte_read_strategy(
         Returns ``(session_died, remaining)``:
 
         * ``session_died=True`` if the session looks dead (≥2 consecutive
-          NETWORK_ERROR outcomes) — caller may try one reconnect.
-        * ``remaining`` — candidates not yet processed when the session
-          aborted; empty if everything was probed.
+          NETWORK_ERROR / TIMEOUT outcomes) — caller may try one reconnect.
+        * ``remaining`` — candidates that still need a verdict: the unprobed
+          tail plus any path that failed with NETWORK_ERROR / TIMEOUT during
+          the consecutive run that tripped the death detector. Those
+          transient failures are NOT recorded as terminal here — a fresh
+          session gets to re-probe them. Empty if everything was probed to a
+          definitive verdict.
         """
         consecutive_net_errors = 0
+        # Paths that failed with NETWORK_ERROR / TIMEOUT in the *current*
+        # consecutive run. They are held back (no terminal probe_error) so a
+        # reconnect can re-probe them; flushed to terminal probe_errors only
+        # when the run is broken by a definitive outcome (the failures were
+        # isolated, session is healthy) or by the caller once the reconnect
+        # budget is exhausted.
+        consecutive_net_paths: list[tuple[str, FlagKind, str]] = []
+
+        def _flush_transient_as_terminal() -> None:
+            """Record held-back transient failures as terminal NETWORK_ERROR."""
+            for _p, _k, _o in consecutive_net_paths:
+                probe_errors.append(
+                    FlagProbeError(
+                        path=_p, owner=_o or None, kind=_k,
+                        outcome=FlagProbeOutcome.NETWORK_ERROR,
+                        detail="transient SMB failure on a healthy session",
+                        attempts=max_attempts,
+                        discovered_via=discovered_via,
+                    )
+                )
+            consecutive_net_paths.clear()
+
         try:
             async with smb_machine_with_fallback(config) as machine:
                 while candidate_slice:
@@ -721,6 +818,7 @@ async def _smb_byte_read_strategy(
                     )
                     if res.outcome is FlagProbeOutcome.SUCCESS:
                         consecutive_net_errors = 0
+                        _flush_transient_as_terminal()
                         token = _normalise_flag_value(res.data)
                         if token is None:
                             probe_errors.append(
@@ -753,6 +851,7 @@ async def _smb_byte_read_strategy(
 
                     if res.outcome is FlagProbeOutcome.ACCESS_DENIED:
                         consecutive_net_errors = 0
+                        _flush_transient_as_terminal()
                         denied.append((path, kind, owner, res.detail))
                         probe_errors.append(
                             FlagProbeError(
@@ -767,6 +866,7 @@ async def _smb_byte_read_strategy(
 
                     if res.outcome is FlagProbeOutcome.NOT_FOUND:
                         consecutive_net_errors = 0
+                        _flush_transient_as_terminal()
                         probe_errors.append(
                             FlagProbeError(
                                 path=path, owner=owner or None, kind=kind,
@@ -779,54 +879,123 @@ async def _smb_byte_read_strategy(
                         continue
 
                     # NETWORK_ERROR / TIMEOUT / OTHER_ERROR after exhausting
-                    # retries — record and decide whether the session is dead.
-                    probe_errors.append(
-                        FlagProbeError(
-                            path=path, owner=owner or None, kind=kind,
-                            outcome=res.outcome, detail=res.detail,
-                            attempts=res.attempts,
-                            discovered_via=discovered_via,
-                        )
-                    )
-                    candidate_slice.pop(0)
+                    # per-path retries — decide whether the session is dead.
                     if res.outcome in (
                         FlagProbeOutcome.NETWORK_ERROR,
                         FlagProbeOutcome.TIMEOUT,
                     ):
+                        # Hold the path back instead of recording a terminal
+                        # probe_error: if the session turns out to be dead, a
+                        # reconnect must get to re-probe it. Only flushed to
+                        # terminal once it is clearly an isolated transient
+                        # (healthy session) or the reconnect budget is spent.
+                        candidate_slice.pop(0)
+                        consecutive_net_paths.append((path, kind, owner))
                         consecutive_net_errors += 1
-                        if consecutive_net_errors >= 2 and candidate_slice:
-                            return True, candidate_slice
+                        if consecutive_net_errors >= 2:
+                            # Session looks dead — carry the suspect transient
+                            # failures AND the unprobed tail to the reconnect.
+                            return True, consecutive_net_paths + candidate_slice
                     else:
+                        # OTHER_ERROR — a real per-path failure, not a transport
+                        # death signal. Record terminal and treat the prior
+                        # transient run as isolated/healthy.
                         consecutive_net_errors = 0
+                        _flush_transient_as_terminal()
+                        probe_errors.append(
+                            FlagProbeError(
+                                path=path, owner=owner or None, kind=kind,
+                                outcome=res.outcome, detail=res.detail,
+                                attempts=res.attempts,
+                                discovered_via=discovered_via,
+                            )
+                        )
+                        candidate_slice.pop(0)
         except SMBAuthError:
             raise
         except SMBAccessDeniedError as exc:
             errors.append(f"connection denied: {exc}")
+            _flush_transient_as_terminal()
             return False, candidate_slice
         except SMBTransportError as exc:
             errors.append(f"connection failed: {exc}")
-            # Treat as session death if there are still candidates.
-            return bool(candidate_slice), candidate_slice
+            # Transport death — carry held-back transient failures and the
+            # unprobed tail to the reconnect; do not record them terminal yet.
+            carry = consecutive_net_paths + candidate_slice
+            return bool(carry), carry
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             errors.append(f"unexpected error: {exc}")
-            return bool(candidate_slice), candidate_slice
+            carry = consecutive_net_paths + candidate_slice
+            return bool(carry), carry
+        # Drained the slice without tripping the death detector. Any lingering
+        # single transient failure is isolated → record it terminal now.
+        _flush_transient_as_terminal()
         return False, candidate_slice
 
     # Capture aiosmb's bare `print()` noise (`socket.send() raised exception.`)
     # to debug only — it must never reach the user TTY.
     with contextlib.redirect_stderr(stderr_buf):
         session_died, pending = await _run_session(pending)
-        while session_died and pending and reconnects_used < max_reconnects:
+        # Reconnect while the session keeps dying AND there are still
+        # pending (unread) paths AND both the reconnect budget and the
+        # wall-clock budget have headroom. Honouring the wall-clock budget
+        # is what lets the FULL reconnect budget actually be used: a single
+        # dead path can no longer monopolise the cap before the Desktop
+        # paths are re-probed on a fresh session.
+        while (
+            session_died
+            and pending
+            and reconnects_used < max_reconnects
+            and _budget_remaining() > (reconnect_settle_seconds + 1.0)
+        ):
             reconnects_used += 1
+            # Re-prioritise: the highest-value conventional Desktop paths get
+            # re-probed first on the fresh session, before any (now larger)
+            # reconnect budget can be exhausted. Paths that errored as
+            # NETWORK_ERROR on a dead session are NOT terminal here — the
+            # fresh session gets a real chance to read them.
+            pending = _prioritize_conventional_first(pending)
+            to_reprobe = len(pending)
+            desktop_reprobe = sum(
+                1
+                for entry in pending
+                if _CONVENTIONAL_DESKTOP_RE.match(
+                    (entry[0] or "").replace("\\", "/").lower()
+                )
+            )
             print_info_debug(
                 f"[ctf-flags] SMB session looked dead — reconnecting "
-                f"({reconnects_used}/{max_reconnects}) with {len(pending)} "
-                "path(s) remaining"
+                f"({reconnects_used}/{max_reconnects}) after "
+                f"{reconnect_settle_seconds:.1f}s settle; re-probing "
+                f"{to_reprobe} path(s) on the fresh session "
+                f"({desktop_reprobe} Desktop path(s) first, "
+                f"{_budget_remaining():.1f}s budget left)"
             )
+            # Let the new aiosmb session settle before re-probing — mirrors
+            # the walk-race settle fix. Bounded by the wall-clock budget.
+            if reconnect_settle_seconds > 0:
+                await asyncio.sleep(reconnect_settle_seconds)
+            probes_before = len(probe_errors) + len(hits) + len(denied)
             session_died, pending = await _run_session(pending)
-        # If we ran out of reconnects with pending candidates, mark the rest
-        # as NETWORK_ERROR so the panel renders something honest.
+            probes_after = len(probe_errors) + len(hits) + len(denied)
+            print_info_debug(
+                f"[ctf-flags] reconnect {reconnects_used}/{max_reconnects} "
+                f"resolved {probes_after - probes_before} path(s) to a "
+                f"definitive verdict; {len(pending)} still pending"
+            )
+        if pending and reconnects_used >= max_reconnects:
+            print_info_debug(
+                f"[ctf-flags] reconnect budget ({max_reconnects}) exhausted "
+                f"with {len(pending)} path(s) still pending"
+            )
+        elif pending and session_died:
+            print_info_debug(
+                f"[ctf-flags] wall-clock budget exhausted with {len(pending)} "
+                "path(s) still pending"
+            )
+        # Any path still pending after the loop is marked NETWORK_ERROR so
+        # the panel renders something honest (and so `probed=N` reflects it).
         for path, kind, owner in pending:
             probe_errors.append(
                 FlagProbeError(
@@ -1122,45 +1291,27 @@ async def collect_ctf_flags(
     errors: list[str] = []
     auth_failed = False
 
-    # Three strategies in parallel — independent SMB sessions, each owns
-    # its own connection. Hard global timeout of 25s (per spec).
-    conv_task = asyncio.create_task(
-        probe_conventional(
-            config=config,
-            candidates=candidates,
-            host=host,
-            path_timeout_seconds=effective_timeout,
-        ),
-        name="ctf_flags:conventional",
-    )
-    alt_task = asyncio.create_task(
-        probe_alternative(
-            config=config,
-            users=users,
-            host=host,
-            path_timeout_seconds=effective_timeout,
-        ),
-        name="ctf_flags:alternative",
-    )
-    walk_task = asyncio.create_task(
-        smb_walk_bounded(
-            config=config,
-            host=host,
-            path_timeout_seconds=effective_timeout,
-        ),
-        name="ctf_flags:walk",
-    )
-    strategy_tasks = [conv_task, alt_task, walk_task]
+    # Strategy scheduling — reduce the SMB connection storm that makes a
+    # reset-happy DC drop sessions. Each strategy opens its OWN connection
+    # (one shared session across three concurrent reads corrupted aiosmb
+    # state on Forest — see ctf_flag_collector_strategies module docstring),
+    # so the lever is HOW MANY run at once, not sharing a connection.
+    #
+    # Conventional (Desktop — where user.txt / root.txt live) is the
+    # highest-value path, so it runs FIRST and ALONE: it gets a clean,
+    # uncontended shot at the DC and its built-in reconnect budget is not
+    # competing with the walk / alternative connections. Only then do the
+    # two lower-value strategies (alternative byte-read + recursive walk)
+    # run together (2 sessions, not 4+). A single 25s deadline is shared
+    # across both phases (per spec).
+    started_strategies = asyncio.get_event_loop().time()
 
-    done, pending = await asyncio.wait(
-        strategy_tasks, timeout=25.0, return_when=asyncio.ALL_COMPLETED
-    )
-    for t in pending:
-        t.cancel()
-        errors.append(f"strategy {t.get_name()} cancelled at 25s timeout")
+    def _remaining_budget() -> float:
+        elapsed = asyncio.get_event_loop().time() - started_strategies
+        return max(0.0, 25.0 - elapsed)
 
-    def _outcome(task):
-        if task in pending or task.cancelled():
+    def _outcome(task, pending_set):
+        if task in pending_set or task.cancelled():
             return None
         exc = task.exception()
         if exc is not None:
@@ -1169,9 +1320,63 @@ async def collect_ctf_flags(
             return None
         return task.result()
 
-    conv_out = _outcome(conv_task)
-    alt_out = _outcome(alt_task)
-    walk_out = _outcome(walk_task)
+    # Phase 1 — conventional alone (Desktop paths, with reconnect budget).
+    conv_task = asyncio.create_task(
+        probe_conventional(
+            config=config,
+            candidates=candidates,
+            host=host,
+            path_timeout_seconds=effective_timeout,
+            total_budget_seconds=max(1.0, _remaining_budget()),
+        ),
+        name="ctf_flags:conventional",
+    )
+    conv_done, conv_pending = await asyncio.wait(
+        [conv_task], timeout=_remaining_budget(), return_when=asyncio.ALL_COMPLETED
+    )
+    for t in conv_pending:
+        t.cancel()
+        errors.append(f"strategy {t.get_name()} cancelled at 25s timeout")
+    conv_out = _outcome(conv_task, conv_pending)
+
+    # Phase 2 — alternative byte-read + recursive walk together (2 sessions).
+    # Skipped entirely if the deadline is already spent.
+    alt_out = None
+    walk_out = None
+    budget_left = _remaining_budget()
+    if budget_left > 0.5:
+        alt_task = asyncio.create_task(
+            probe_alternative(
+                config=config,
+                users=users,
+                host=host,
+                path_timeout_seconds=effective_timeout,
+                total_budget_seconds=max(1.0, budget_left),
+            ),
+            name="ctf_flags:alternative",
+        )
+        walk_task = asyncio.create_task(
+            smb_walk_bounded(
+                config=config,
+                host=host,
+                path_timeout_seconds=effective_timeout,
+            ),
+            name="ctf_flags:walk",
+        )
+        phase2_tasks = [alt_task, walk_task]
+        _done2, pending2 = await asyncio.wait(
+            phase2_tasks, timeout=budget_left, return_when=asyncio.ALL_COMPLETED
+        )
+        for t in pending2:
+            t.cancel()
+            errors.append(f"strategy {t.get_name()} cancelled at 25s timeout")
+        alt_out = _outcome(alt_task, pending2)
+        walk_out = _outcome(walk_task, pending2)
+    else:
+        errors.append(
+            "strategies ctf_flags:alternative / ctf_flags:walk skipped "
+            "(25s budget spent by conventional phase)"
+        )
 
     hits_conv: list[FlagHit] = list(conv_out.hits) if conv_out else []
     hits_alt: list[FlagHit] = list(alt_out.hits) if alt_out else []
@@ -1257,20 +1462,25 @@ async def collect_ctf_flags(
             f"[ctf-flags] ps_search triggered: missing kinds {sorted(missing_kinds)}"
         )
         try:
+            # Per-method budget 15s: SMB-exec methods fail fast on a
+            # reset-happy DC, leaving room for the cascade to fall through
+            # to WinRM (PSRP / 5985, distinct transport) within the outer
+            # cap. Bounded last-resort — runs only after every SMB
+            # byte-read strategy missed.
             ps_out = await asyncio.wait_for(
                 powershell_search(
                     config=config,
                     shell=shell,
                     host=host,
-                    timeout_seconds=30,
+                    timeout_seconds=15,
                 ),
-                timeout=35.0,
+                timeout=50.0,
             )
             hits_ps = list(ps_out.hits)
             probe_errors.extend(ps_out.probe_errors)
             errors.extend(ps_out.errors)
         except asyncio.TimeoutError:
-            errors.append("ps_search cancelled at 35s timeout")
+            errors.append("ps_search cancelled at 50s timeout")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             errors.append(f"ps_search raised: {exc}")

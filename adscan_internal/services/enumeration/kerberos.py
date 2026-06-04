@@ -60,6 +60,15 @@ from adscan_internal.services.kerberos_transport import (
     asreproast_users,
 )
 from adscan_internal import telemetry
+from adscan_core.interaction import is_non_interactive
+from adscan_core.tui.patience_notice import (
+    PatienceNoticeConfig,
+    maybe_show_patience_notice,
+)
+from adscan_core.tui.progress_dashboard import (
+    ProgressDashboard,
+    ProgressDashboardConfig,
+)
 
 
 _UF_ACCOUNTDISABLE = 0x0002
@@ -92,6 +101,92 @@ def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess
             env=cmd_env,
         )
     )
+
+
+def _build_userenum_dashboard() -> ProgressDashboard:
+    """Indeterminate user-enumeration dashboard (kerbrute stdout is opaque).
+
+    kerbrute's ``exec_fn`` contract is blocking and exposes no live stdout
+    stream, so a determinate X/N bar is impossible without a guessed (lying)
+    ETA. Indeterminate mode shows a spinner + elapsed + "found N so far",
+    refreshed by counting VALID lines in the ``-o`` output file.
+    """
+    return ProgressDashboard(
+        ProgressDashboardConfig(
+            title="Kerberos user enumeration",
+            total=None,  # indeterminate -- spinner + elapsed + "found N"
+            unit="users",
+            last_item_type="user",
+        )
+    )
+
+
+def _run_userenum_with_dashboard(
+    exec_fn: "CommandExecutor",
+    cmd: str,
+    timeout: int,
+    count_found: Callable[[], int],
+) -> "subprocess.CompletedProcess[str]":
+    """Run the blocking kerbrute ``exec_fn`` under an indeterminate dashboard.
+
+    The blocking call runs in a single worker thread so the dashboard spinner
+    and "found N" line can tick while kerbrute blocks. The thread is always
+    joined (the ``with`` on the pool blocks until the future resolves), so it
+    never leaks. ``fut.result()`` re-raises any exception (including
+    ``subprocess.TimeoutExpired``) from the worker, preserving the caller's
+    existing error handling exactly.
+
+    FAIL-SAFE: if the dashboard cannot be built / driven, the blocking call is
+    still executed directly so user enumeration always runs and returns.
+
+    Args:
+        exec_fn: Blocking executor ``(cmd, timeout) -> CompletedProcess``.
+        cmd: Fully-built kerbrute command string.
+        timeout: Subprocess timeout in seconds.
+        count_found: Callable returning the current "found N" count from the
+            ``-o`` output file.
+
+    Returns:
+        The :class:`subprocess.CompletedProcess` returned by ``exec_fn``.
+    """
+    import concurrent.futures
+    import time as _time
+
+    try:
+        dashboard = _build_userenum_dashboard()
+    except Exception:  # noqa: BLE001 -- dashboard build must never block the scan
+        return exec_fn(cmd, timeout)
+
+    def _safe_update(dash: "ProgressDashboard") -> None:
+        try:
+            dash.update(done=count_found())
+        except Exception:  # noqa: BLE001 -- a render error must not abort the run
+            pass
+
+    # Submit the blocking call to its own worker thread. ``call_started`` flips
+    # to True the instant the future is created, so we can tell a dashboard /
+    # LiveSession setup failure (fail-safe fallback) apart from a failure raised
+    # by ``exec_fn`` itself (must propagate to the caller -- never re-run it).
+    call_started = False
+    try:
+        with dashboard.live_session():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(exec_fn, cmd, timeout)
+                call_started = True
+                while not fut.done():
+                    _safe_update(dashboard)
+                    _time.sleep(0.25)
+                result = fut.result()  # re-raises worker exceptions here
+                _safe_update(dashboard)
+                return result
+    except Exception:  # noqa: BLE001
+        if call_started:
+            # ``exec_fn`` (or its worker plumbing) raised -- propagate to the
+            # caller's existing try/except. Do NOT re-run kerbrute.
+            raise
+        # Dashboard / LiveSession failed before the call started -- fall back to
+        # a plain blocking call so enumeration still completes.
+        return exec_fn(cmd, timeout)
 
 
 def _format_auth_mode(password: Optional[str], hashes: Optional[str]) -> str:
@@ -419,8 +514,52 @@ class KerberosEnumerationMixin:
             extra={"domain": domain, "pdc": pdc},
         )
 
+        # Upfront patience notice -- threshold-gated on the wordlist size.
+        # Silent for small lists; a single line under non-interactive runs.
         try:
-            result = exec_fn(cmd, timeout)
+            candidate_count = sum(
+                1
+                for _ in open(wordlist, encoding="utf-8", errors="ignore")
+            )
+        except OSError:
+            candidate_count = 0
+
+        try:
+            maybe_show_patience_notice(
+                PatienceNoticeConfig(
+                    operation="Kerberos user enumeration",
+                    unit="candidate usernames",
+                    threshold=5000,
+                    env_var="ADSCAN_PATIENCE_THRESHOLD_USERENUM",
+                ),
+                count=candidate_count,
+                non_interactive=is_non_interactive(),
+            )
+        except Exception:  # noqa: BLE001 -- notice must never abort the scan
+            pass
+
+        def _count_found() -> int:
+            """Count VALID-USERNAME lines kerbrute streams into the -o file."""
+            try:
+                return sum(
+                    1
+                    for line in output_file.read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).splitlines()
+                    if "@" in line
+                )
+            except OSError:
+                return 0
+
+        try:
+            # Indeterminate live dashboard. The blocking ``exec_fn`` runs in a
+            # worker thread so the spinner + "found N" tick while it blocks;
+            # LiveSession falls back to inline logging on non-TTY/CI itself.
+            # FAIL-SAFE: a dashboard render/update error must never abort the
+            # enumeration -- the helper falls back to a direct blocking call.
+            result = _run_userenum_with_dashboard(
+                exec_fn, cmd, timeout, _count_found
+            )
         except subprocess.TimeoutExpired:
             self.logger.error(
                 "Kerberos user enumeration timed out",

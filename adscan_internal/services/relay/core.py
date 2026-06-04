@@ -69,6 +69,10 @@ class RelayRunConfig:
     max_authentications: int = 1
     timeout_seconds: float = 120.0
     stop_on_first_success: bool = True
+    # Set the instant a target succeeds so a coordinating coercion loop can stop
+    # firing immediately (prevents stray coerced connections piling up on the
+    # listener after the one-shot relay has already completed).
+    success_event: "asyncio.Event | None" = None
 
 
 @dataclass(frozen=True)
@@ -127,12 +131,16 @@ class RelayEngine:
             for target in self.targets:
                 result = await self._run_target(target, authentication)
                 results.append(result)
-                if result.success and self.config.stop_on_first_success:
-                    return RelayRunResult(
-                        results=tuple(results),
-                        timed_out=False,
-                        authentications_seen=authentications_seen,
-                    )
+                if result.success:
+                    # Tell a coordinating coercion to stop firing right now.
+                    if self.config.success_event is not None:
+                        self.config.success_event.set()
+                    if self.config.stop_on_first_success:
+                        return RelayRunResult(
+                            results=tuple(results),
+                            timed_out=False,
+                            authentications_seen=authentications_seen,
+                        )
 
         return RelayRunResult(
             results=tuple(results),

@@ -945,6 +945,7 @@ def handle_auth_and_optional_privs(
     force_authenticated_enumeration: bool = False,
     prompt_when_already_authenticated: bool = False,
     allow_empty_credentials: bool = False,
+    force_recheck_user_privs: bool = False,
 ) -> None:
     """Ensure authenticated enumeration and optionally ask for user privileges.
 
@@ -963,6 +964,10 @@ def handle_auth_and_optional_privs(
         allow_empty_credentials: When True, treat an empty string as an explicit
             credential value (for example: valid blank-password logons) instead
             of discarding it as missing input.
+        force_recheck_user_privs: When True, bypass the per-session "privileges
+            already assessed" dedup guard so a user whose privileges just changed
+            (for example: an existing account that was just promoted to Domain
+            Admins) is re-enumerated even if it was assessed earlier this session.
     """
     marked_domain = mark_sensitive(domain, "domain")
     current_auth_status = shell.domains_data.get(domain, {}).get("auth", "")
@@ -1640,7 +1645,16 @@ def handle_auth_and_optional_privs(
             _assessed: set[str] = _by_domain.setdefault(domain, set())
             setattr(shell, "_privs_assessed_users_by_domain", _by_domain)
             _user_key = normalize_samaccountname(user).lower()
-            if _user_key in _assessed:
+            if _user_key in _assessed and force_recheck_user_privs:
+                # Caller explicitly requested a re-check (e.g. the user was just
+                # promoted to Domain Admins and its privileges changed). Drop the
+                # dedup marker so the standard flow below re-enumerates.
+                _assessed.discard(_user_key)
+                print_info_debug(
+                    f"[creds] force_recheck_user_privs: re-running privilege "
+                    f"enumeration for {_user_key!r} despite prior assessment"
+                )
+            elif _user_key in _assessed:
                 # Use the canonical DA-or-high-value resolver: layered fallback
                 # of (1) is_user_tier0_or_high_value (graph + snapshot + cached
                 # lists) and (2) is_well_known_da_name (localized Administrator
@@ -2055,6 +2069,7 @@ def add_credential(
     credential_origin: str | None = None,
     local_account_rid: str | None = None,
     metadata: "CredentialMetadata | None" = None,
+    force_recheck_user_privs: bool = False,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -2116,6 +2131,10 @@ def add_credential(
         local_account_rid: Optional RID for local-account credentials. RID 500
             combined with LAPS provenance suppresses local reuse prompts because
             LAPS-managed built-in Administrator passwords are per-host secrets.
+        force_recheck_user_privs: When True, bypass the per-session "privileges
+            already assessed" dedup guard so a user whose privileges just changed
+            (for example: an existing account just promoted to Domain Admins) is
+            re-enumerated even if it was assessed earlier this session.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -2677,6 +2696,7 @@ def add_credential(
                 force_authenticated_enumeration=force_authenticated_enumeration,
                 prompt_when_already_authenticated=prompt_when_already_authenticated,
                 allow_empty_credentials=allow_empty_credential,
+                force_recheck_user_privs=force_recheck_user_privs,
             )
 
         elif not credential_persisted and not store_update_skipped and not ui_silent:

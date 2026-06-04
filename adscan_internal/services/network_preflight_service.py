@@ -45,16 +45,30 @@ class RouteAssessment:
 
 @dataclass(frozen=True)
 class TargetReachabilityAssessment:
-    """Result of evaluating route + TCP port reachability for one target IP."""
+    """Result of evaluating route + TCP port reachability for one target IP.
+
+    ``closed_ports`` and ``filtered_ports`` are kept distinct on purpose:
+    a TCP RST (``closed``) is a definitive "nothing is listening here"
+    answer, while a timeout/ICMP-unreachable (``filtered``) is inconclusive
+    ("my probe budget expired"). Consumers that must not infer a negative
+    verdict from a transient timeout (observe-vs-infer doctrine) rely on
+    this distinction. ``closed_ports`` therefore contains ONLY explicitly
+    refused ports; filtered/timeout ports live in ``filtered_ports``.
+    """
 
     target_ip: str
     route: RouteAssessment
     open_ports: tuple[int, ...]
     closed_ports: tuple[int, ...]
+    filtered_ports: tuple[int, ...] = ()
 
     def is_port_open(self, port: int) -> bool:
         """Return whether a specific TCP port is reachable."""
         return port in self.open_ports
+
+    def is_port_filtered(self, port: int) -> bool:
+        """Return whether a port was inconclusive (timeout/filtered, not RST)."""
+        return port in self.filtered_ports
 
 
 def get_interface_ipv4_addresses(interface: str) -> list[str]:
@@ -177,15 +191,20 @@ def assess_target_reachability(
             route=route,
             open_ports=(),
             closed_ports=(),
+            filtered_ports=(),
         )
     batch = run_async_sync(
         tcp_probe_batch(target_ip, list(tcp_ports), timeout=timeout_seconds)
     )
     open_ports = tuple(sorted(p for p, r in batch.items() if r.status == "open"))
-    closed_ports = tuple(sorted(p for p, r in batch.items() if r.status != "open"))
+    closed_ports = tuple(sorted(p for p, r in batch.items() if r.status == "closed"))
+    filtered_ports = tuple(
+        sorted(p for p, r in batch.items() if r.status not in ("open", "closed"))
+    )
     return TargetReachabilityAssessment(
         target_ip=target_ip,
         route=route,
         open_ports=open_ports,
         closed_ports=closed_ports,
+        filtered_ports=filtered_ports,
     )

@@ -62,7 +62,7 @@ class SAM:
 		DIGITS = b"0123456789012345678901234567890123456789\0"
 		
 		F = self.hive.get_value(r'SAM\Domains\Account\F')[1]
-		logger.log(1,'[SAM] F key value: %s' % F)
+		logger.log(1, '[SAM] F key obtained')
 		
 		domain_properties = DOMAIN_ACCOUNT_F.from_bytes(F)
 		
@@ -83,7 +83,7 @@ class SAM:
 			for block in [domain_properties.key_0.data[i:i+n] for i in range(0, len(domain_properties.key_0.data), n)]:  #terrible, terrible workaround
 				self.hashed_bootkey += cipher.decrypt(block)
 			
-		logger.debug('[SAM] HBootkey: %s' % self.hashed_bootkey.hex())
+		logger.debug('[SAM] HBootkey computed')
 		return self.hashed_bootkey
 		
 	def get_machine_sid(self):
@@ -97,8 +97,7 @@ class SAM:
 			p3 = int.from_bytes(uac_data[8:12], 'little', signed = False)
 			self.machine_sid = '%s-%s-%s-%s' % ('S-1-5-21', p1, p2, p3)
 		except Exception as e:
-			import traceback
-			traceback.print_exc()
+			logger.debug('[SAM] get_machine_sid failed: %s' % str(e))
 		return self.machine_sid
 		
 	def get_secrets(self):

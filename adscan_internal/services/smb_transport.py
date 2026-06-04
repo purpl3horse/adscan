@@ -548,6 +548,99 @@ def _emit_smb_success_posture(
 
 
 # ---------------------------------------------------------------------------
+# Pre-auth NEGOTIATE signing read (auth-independent)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SMBSigningNegotiation:
+    """Result of a pre-auth SMB NEGOTIATE round-trip.
+
+    ``signing_required`` reflects the server's ``SecurityMode`` REQUIRED bit as
+    read from the NEGOTIATE response — observed BEFORE any session-setup, so it
+    is independent of whether NTLM or Kerberos would authenticate. ``dialect``
+    is the selected SMB dialect (informational; may be ``None`` if aiosmb did
+    not expose it).
+    """
+
+    signing_required: bool
+    dialect: Optional[Any] = None
+
+
+async def smb_negotiate_signing(config: SMBConfig) -> SMBSigningNegotiation:
+    """Pre-auth: TCP connect + SMB NEGOTIATE only; read the server SecurityMode.
+
+    Performs ``connect()`` -> ``negotiate()`` -> read ``signing_required`` ->
+    ``disconnect()``. It NEVER calls ``session_setup()`` / ``login()``, so the
+    returned signing verdict is independent of NTLM/Kerberos — it reflects the
+    server's negotiated ``SecurityMode`` REQUIRED flag, which the DC sends in
+    the NEGOTIATE response before any credential is presented.
+
+    This is the single source of truth for "what SMB signing policy did the DC
+    negotiate" without authenticating. The A4 posture probe uses it as its
+    primary path (it cannot hang on an NTLM-disabled DC, because the NEGOTIATE
+    precedes the auth that would block). Any caller that needs the negotiated
+    signing policy without authenticating can reuse it.
+
+    The auth scheme baked into the URL is never exercised (no session-setup is
+    performed), so credentials are irrelevant — the function works even with no
+    credential material at all.
+
+    Args:
+        config: The :class:`SMBConfig` whose ``target_ip`` / ``port`` /
+            ``timeout`` are used to open the TCP connection. ``timeout`` bounds
+            the connect; the caller is expected to wrap the whole call in an
+            ``asyncio.wait_for`` budget for a hard ceiling.
+
+    Returns:
+        An :class:`SMBSigningNegotiation` describing the observed policy.
+
+    Raises:
+        SMBConnectionError: TCP connect failed, or NEGOTIATE returned an error.
+            The caller (the posture probe) treats this as UNKNOWN/LOW and does
+            NOT emit a posture signal (observe-don't-infer).
+    """
+    try:
+        from aiosmb.commons.connection.factory import SMBConnectionFactory
+    except ImportError as exc:
+        telemetry.capture_exception(exc)
+        raise SMBConnectionError(
+            f"aiosmb is not available in this runtime environment: {exc}"
+        ) from exc
+
+    url = _build_smb_url(config)  # auth scheme is irrelevant; never exercised
+    print_info_debug(
+        f"[smb-transport] pre-auth NEGOTIATE to "
+        f"{config.target_ip}:{config.port} (no session-setup)"
+    )
+    connection = SMBConnectionFactory.from_url(url).get_connection()
+
+    _, err = await connection.connect()  # TCP only — no auth
+    if err is not None:
+        telemetry.capture_exception(err)
+        raise SMBConnectionError(
+            f"SMB connect to {config.target_ip} failed during NEGOTIATE probe: {err}"
+        ) from err
+
+    try:
+        _, err = await connection.negotiate()  # sets connection.signing_required
+        if err is not None:
+            telemetry.capture_exception(err)
+            raise SMBConnectionError(
+                f"SMB NEGOTIATE to {config.target_ip} failed: {err}"
+            ) from err
+        return SMBSigningNegotiation(
+            signing_required=bool(getattr(connection, "signing_required", False)),
+            dialect=getattr(connection, "selected_dialect", None),
+        )
+    finally:
+        try:
+            await connection.disconnect()
+        except Exception as disc_exc:  # noqa: BLE001
+            telemetry.capture_exception(disc_exc)
+
+
+# ---------------------------------------------------------------------------
 # SMBMachine context manager
 # ---------------------------------------------------------------------------
 

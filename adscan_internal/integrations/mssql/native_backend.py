@@ -1091,6 +1091,61 @@ class ImpacketMSSQLBackend:
             method="enable_xp_cmdshell_native" + ("_linked" if linked_server else ""),
         )
 
+    def disable_xp_cmdshell(
+        self,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        restore_advanced_options: bool = False,
+        timeout: int = 60,
+    ) -> NativeMSSQLQueryResult:
+        """Toggle ``xp_cmdshell`` back off locally and restore advanced options.
+
+        Symmetric counterpart of :meth:`enable_xp_cmdshell`, used by cleanup
+        paths to revert a configuration change ADscan made itself (e.g. an
+        enable that turned out not to be usable by the current principal).
+        ``xp_cmdshell`` is always set to ``0``; ``show advanced options`` is
+        restored to ``restore_advanced_options`` -- pass the value observed
+        BEFORE the enable so a box that already had advanced options on is
+        left exactly as it was found.
+
+        Args:
+            domain: Authentication domain for the current credential.
+            username: sAMAccountName / login used for the connection.
+            secret: Password, NT hash, or ``.ccache`` path (Kerberos).
+            restore_advanced_options: Final state for ``show advanced
+                options`` (``True`` to leave it on, ``False`` to turn it off).
+            timeout: Per-query timeout in seconds.
+
+        Returns:
+            The :class:`NativeMSSQLQueryResult` of the revert batch.
+        """
+        advanced_final = 1 if restore_advanced_options else 0
+        # Advanced options must be on to toggle xp_cmdshell, so we flip it on,
+        # disable xp_cmdshell, then restore advanced options to its prior value.
+        query = (
+            "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; "
+            "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE; "
+            f"EXEC sp_configure 'show advanced options', {advanced_final}; RECONFIGURE;"
+        )
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=query,
+            timeout=timeout,
+        )
+        return NativeMSSQLQueryResult(
+            success=result.success,
+            query=result.query,
+            rows=result.rows,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            error_message=result.error_message,
+            method="disable_xp_cmdshell_native",
+        )
+
     def execute_command(
         self,
         *,

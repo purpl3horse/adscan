@@ -145,19 +145,124 @@ _CONTEXT_TRANSPARENT_KEYS: frozenset[str] = frozenset(
 )
 
 
+# ── Access-edge gating — arrival != ownership ──────────────────────────────
+# Spec: docs/superpowers/specs/2026-06-01-access-edge-gating-followups-design.md
+#
+# An access edge (EdgeKind.AUTH: CanPSRemote, CanRDP, ExecuteDCOM, AdminTo,
+# SQLAdmin, SQLAccess) terminates in a *session on a host*.  It does NOT confer
+# the host principal's outbound graph privileges.  After an access-edge arrival
+# the host's raw outbound *control / escalation / membership* edges are withheld;
+# the path may continue only via a follow-up the access type unlocks.
+#
+# The ONLY follow-up that re-enables the host's own outbound control edges is the
+# self-credential DumpLSA bridge (reads the host machine account secret →
+# "becomes" the host Computer principal).  It is unlocked ONLY by LOCAL-ADMIN
+# access (AdminTo / ReadLAPSPassword), never by a user-level WinRM / RDP session.
+#
+# Implementation note on the AdminTo case: a *direct* host control edge after a
+# bare AdminTo (no DumpLSA) is already blocked by the credential-context guard
+# (AdminTo provides local_admin_session; a control edge requires user_credentials,
+# which local_admin_session does not satisfy), and the implicit DumpLSA overlay
+# re-enables it.  The gate below closes the remaining gap: the *user-level* access
+# edges (CanPSRemote / CanRDP / ExecuteDCOM / SQLAccess) were context-transparent,
+# so a credential recovered BEFORE the access edge leaked the host's control edges
+# straight through the pivot.  This is the HTB Pirate false-positive factory:
+#   ReadGMSAPassword → CanPSRemote → DC01$ → ADCSESC7 → DOMAIN ADMINS.
+#
+# EdgeKinds that represent traversing the HOST's own outbound privileges (and so
+# must be withheld after a non-self-credential access arrival).  AUTH and TRUST
+# edges are not host-control traversals; DERIVED edges are follow-ups (handled by
+# the self-credential bridge logic), so they are not gated here.
+_HOST_CONTROL_GATED_EDGE_KINDS: frozenset[str] = frozenset(
+    {"control", "escalation", "membership"}
+)
+
+
+def _candidate_is_host_control_edge(candidate_relation: str) -> bool:
+    """Return True when the candidate edge traverses a host's outbound privilege.
+
+    These are the edges that must be withheld after a non-self-credential access
+    arrival (control / escalation / membership EdgeKinds).  Imported lazily to
+    respect the documented ``edge_kind`` import-cycle avoidance in this module.
+    """
+    from adscan_internal.services.edge_kind import classify_edge_kind  # noqa: PLC0415
+
+    return classify_edge_kind(candidate_relation).value in _HOST_CONTROL_GATED_EDGE_KINDS
+
+
+def _host_control_withheld_after_access(
+    path_relations: list[str],
+    candidate_relation: str,
+) -> bool:
+    """Return True when ``candidate_relation`` must be withheld as a host-control
+    edge traversed off a host reached via an access edge that has not "become"
+    the host.
+
+    Walks back from the end of ``path_relations``.  If a self-credential DumpLSA
+    follow-up is seen before any access edge, the path has already "become" the
+    host machine account, so the candidate is allowed.  If a LOCAL-ADMIN access
+    edge that unlocks the self-credential bridge is seen, the candidate is allowed
+    (the credential-context guard + DumpLSA overlay handle that lane).  If a
+    user-level access edge (which does NOT unlock the bridge) is the most recent
+    access-relevant relation, the host-control candidate is withheld.
+    """
+    from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
+        access_unlocks_self_credential,
+        get_access_lane,
+        is_self_credential_followup,
+    )
+
+    if not _candidate_is_host_control_edge(candidate_relation):
+        return False
+
+    for rel in reversed(path_relations):
+        # A self-credential follow-up "becomes" the host machine account →
+        # the host's own outbound control edges are legitimately available.
+        if is_self_credential_followup(rel):
+            return False
+        lane = get_access_lane(rel)
+        if lane is None:
+            continue
+        # First (most recent) access edge encountered with no intervening
+        # self-credential follow-up.  LOCAL-ADMIN access that unlocks the
+        # self-credential bridge is allowed through here (the credential-context
+        # guard + DumpLSA overlay enforce the correct DumpLSA step); a user-level
+        # access edge withholds the host-control candidate.
+        return not access_unlocks_self_credential(rel)
+
+    # No access edge in the path → the principal still owns its own privileges.
+    return False
+
+
 def _edges_chain_ok(
     path_relations: list[str],
     candidate_relation: str,
 ) -> bool:
     """Return True when ``candidate_relation`` may extend the current path.
 
-    Walks back through ``path_relations`` skipping transparent-context edges
-    (MemberOf, LocalAdminPassReuse) which change principal identity but not
-    what credentials the attacker holds. Returns True for an empty path
-    (start of traversal) because the initial principal always has their own
-    ``user_credentials``.
+    Two independent gates:
+
+    1. **Access-edge host-control gate** (arrival != ownership) — a host-control
+       edge (control / escalation / membership EdgeKind) traversed off a host
+       reached via a user-level access edge is withheld unless a self-credential
+       DumpLSA follow-up has "become" the host.  Evaluated FIRST and for ALL
+       candidate kinds, including the otherwise context-transparent ``MemberOf``.
+
+    2. **Credential-context gate** — walks back through ``path_relations``
+       skipping transparent-context edges (MemberOf, LocalAdminPassReuse,
+       CanPSRemote, CanRDP, SQLAdmin, SQLAccess) which change principal identity
+       (or lateral-pivot the host) but not what credentials the attacker holds.
+       Returns True for an empty path (start of traversal) because the initial
+       principal always has their own ``user_credentials``.
     """
     cand_rel = str(candidate_relation or "").strip().lower()
+
+    # Gate 1 — access-edge host-control withholding (runs before the transparent
+    # early-return so a host's own MemberOf is also gated after a user-level
+    # access arrival).
+    if _host_control_withheld_after_access(path_relations, cand_rel):
+        return False
+
     if cand_rel in _CONTEXT_TRANSPARENT_KEYS:
         return True  # transparent edges are never blocked
 
@@ -295,6 +400,47 @@ def _is_excluded_share_access_edge(edge: dict[str, Any]) -> bool:
     """
     relation_key = str(edge.get("relation") or "").strip().lower()
     return relation_key in _SHARE_ACCESS_RELATION_KEYS
+
+
+def _is_nontraversable_attack_edge(
+    edge: dict[str, Any],
+    nodes_map: dict[str, Any] | None,
+) -> bool:
+    """Return True for edges that exist in the graph but must not enter DFS adjacency.
+
+    Single source of truth for "edge is persisted in ``attack_graph.json`` but is
+    not a traversable compromise transition". Two classes:
+
+    * **Share-access edges** (ReadShare / WriteShare / FullControlShare) — see
+      :func:`_is_excluded_share_access_edge`; an exposure finding, not a
+      host-compromise edge.
+    * **``WriteSPN`` on a Computer target** — write access to a machine account's
+      ``servicePrincipalName`` grants only a kerberoastable ticket, and a machine
+      account password (120 random bytes) is uncrackable, so the kerberoast has no
+      compromise value. The *real* escalation a computer-targeted SPN write enables
+      is SPN-jacking + KCD, modelled as the derived ``SPNJack`` edge
+      (:func:`adscan_internal.services.collector.persistence.derive_spnjack_edges`).
+      The raw ``WriteSPN → Computer$`` edge is kept in the graph (reporting +
+      SPNJack derivation read it) but is non-traversable here. ``WriteSPN → User``
+      stays traversable as targeted Kerberoast; only the Computer class is gated.
+
+    Args:
+        edge: One graph edge dict.
+        nodes_map: The graph ``nodes`` dict (id → node). When ``None`` the
+            class-aware ``WriteSPN`` check is skipped (share-access still applies),
+            so callers without node context degrade safely.
+    """
+    if _is_excluded_share_access_edge(edge):
+        return True
+    if str(edge.get("relation") or "").strip().lower() == "writespn":
+        if isinstance(nodes_map, dict):
+            target_node = nodes_map.get(str(edge.get("to") or "").strip())
+            if (
+                isinstance(target_node, dict)
+                and str(target_node.get("kind") or "").strip().lower() == "computer"
+            ):
+                return True
+    return False
 
 
 # ── Well-known SIDs that expand to the low-priv authenticated population ─────
@@ -1282,6 +1428,23 @@ _LOCAL_ADMIN_ACCESS_RELATIONS: frozenset[str] = frozenset(
     {
         "adminto",           # SMB local-admin shell — deterministic local admin
         "readlapspassword",  # recovers the local admin password — AdminTo-equivalent
+        # NTLMv1 coerce→relay→RBCD (sub-project #3): the relay writes RBCD on the
+        # victim, then S4U2Self+Proxy mints an Administrator ccache → a genuine
+        # local-admin session on the victim, AdminTo-equivalent. Its catalog
+        # semantics are access_capability_only (→ local_admin_session), so it
+        # belongs in the same DumpLSA-bridge set as AdminTo / ReadLAPSPassword.
+        # (Ntlmv1RelayShadowCreds / CrackNTLMv1 are credential_access_only →
+        # credential_recovered, so they deliberately do NOT appear here — the
+        # machine hash is already the credential, no DumpLSA needed.)
+        "ntlmv1relayrbcd",
+        # SPN-jacking + KCD: S4U2Self+S4U2Proxy mints an Administrator service
+        # ticket against the target computer (altservice CIFS), i.e. a genuine
+        # local-admin session on it — AdminTo-equivalent, so it bridges to
+        # DumpLSA exactly like Ntlmv1RelayRBCD. For a DC target the headline
+        # remains DC$ -> Domain Controllers -> DCSync -> Domain (higher-class,
+        # the engine ranks it first); the DumpLSA self-loop is the
+        # post-ex continuation for non-DC targets (SPNJack -> SRV01 -> DumpLSA).
+        "spnjack",
         # NOT included:
         #   canpsremote / canrdp — user-level sessions, no admin guarantee
         #   executedcom         — COM execution context; SYSTEM not guaranteed
@@ -1291,15 +1454,53 @@ _LOCAL_ADMIN_ACCESS_RELATIONS: frozenset[str] = frozenset(
 )
 
 
+def _edge_grants_local_admin_session(
+    edge: dict[str, Any], nodes_map: dict[str, Any]
+) -> bool:
+    """Return True when this edge yields a deterministic local-admin session.
+
+    Two classes qualify for the implicit DumpLSA bridge:
+
+    * Relations in :data:`_LOCAL_ADMIN_ACCESS_RELATIONS` — flat, unconditional
+      local-admin grants (AdminTo, ReadLAPSPassword, Ntlmv1RelayRBCD, SPNJack).
+    * ``AllowedToDelegate`` (constrained delegation) **only when the source has
+      protocol transition** (``hastrustedtoauth`` / TrustedToAuthForDelegation).
+      With T2A4D the source can S4U2Self an arbitrary admin, S4U2Proxy to the
+      delegated SPN on the target host, and altservice-rewrite the sname to CIFS
+      — a local-admin session on the target (the ticket is accepted on the
+      target's own key, so any delegated SPN class works via altservice).
+      Without T2A4D the source can only impersonate users who authenticate to
+      it — NOT a deterministic admin session — so the bridge is gated on the
+      source node's flag, which a flat relation set cannot express. This mirrors
+      the SPNJack gate (which also requires T2A4D); SPNJack covers SPN-relocated
+      targets, this covers the SPN's current owner host that SPNJack defers.
+    """
+    rel_lower = str(edge.get("relation") or "").strip().lower()
+    if rel_lower in _LOCAL_ADMIN_ACCESS_RELATIONS:
+        return True
+    if rel_lower == "allowedtodelegate":
+        source_node = nodes_map.get(str(edge.get("from") or "").strip())
+        if isinstance(source_node, dict):
+            props = (
+                source_node.get("properties")
+                if isinstance(source_node.get("properties"), dict)
+                else {}
+            )
+            return bool(props.get("hastrustedtoauth"))
+    return False
+
+
 def _build_implicit_dumplsa_overlay(
     graph: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
     """Build virtual DumpLSA self-loop edges for local-admin Computer targets.
 
-    For every Computer node reachable via a LOCAL-ADMIN access edge
-    (AdminTo, ReadLAPSPassword, ExecuteDCOM, SQLAdmin), injects a synthetic
-    self-loop ``DumpLSA`` edge that bridges local_admin_session to
-    credential_recovered (machine account hash via T1003.004 — LSA secrets).
+    For every Computer node reachable via a deterministic local-admin access
+    edge (see :func:`_edge_grants_local_admin_session` — AdminTo,
+    ReadLAPSPassword, Ntlmv1RelayRBCD, SPNJack, and AllowedToDelegate with
+    protocol transition), injects a synthetic self-loop ``DumpLSA`` edge that
+    bridges local_admin_session to credential_recovered (machine account hash
+    via T1003.004 — LSA secrets).
 
     DumpLSA is deterministic: HKLM\\SECURITY\\Policy\\Secrets\\$MACHINE.ACC
     always contains the machine account hash when the caller has local admin.
@@ -1319,8 +1520,7 @@ def _build_implicit_dumplsa_overlay(
     for edge in graph.get("edges") or []:
         if not isinstance(edge, dict):
             continue
-        rel_lower = str(edge.get("relation") or "").strip().lower()
-        if rel_lower not in _LOCAL_ADMIN_ACCESS_RELATIONS:
+        if not _edge_grants_local_admin_session(edge, nodes_map):
             continue
         to_id = str(edge.get("to") or "").strip()
         if not to_id or to_id in seen_computer_targets:
@@ -2036,7 +2236,7 @@ def compute_maximal_attack_paths(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        if _is_excluded_share_access_edge(edge):
+        if _is_nontraversable_attack_edge(edge, nodes_map):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
@@ -2277,7 +2477,7 @@ def compute_maximal_attack_paths_from_start(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        if _is_excluded_share_access_edge(edge):
+        if _is_nontraversable_attack_edge(edge, nodes_map):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")

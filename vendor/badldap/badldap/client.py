@@ -61,6 +61,20 @@ class MSLDAPClient:
 		# ADSCAN PATCH (2026-05-29) — opt-in StartTLS-before-bind, mirrored
 		# onto the inner connection in ``connect()``. See connection.py.
 		self._use_starttls = False
+		# ADSCAN PATCH (2026-05-31) — opt-in BIND-ONLY connect. When True,
+		# ``connect()`` performs the TCP/TLS handshake and the LDAP bind and
+		# then RETURNS, skipping the post-bind rootDSE discovery
+		# (``get_serverinfo`` / ``get_ad_info`` / ``get_domain_name`` /
+		# keepalive). Posture probes need the raw BIND result code
+		# (``strongerAuthRequired`` vs success) to classify LDAP signing /
+		# channel-binding policy. The post-bind rootDSE SEARCH is a separate
+		# operation that a RestrictAnonymous DC answers with
+		# ``operationsError (ERROR_NOT_AUTHENTICATED)`` — which masks the bind
+		# answer entirely. Bind-only keeps the probe on the bind layer.
+		# Wired by ADscan's posture probes via
+		# services/ldap_transport_service.async_connect_with_ldap_fallback.
+		# Defaults to False so normal callers keep the full discovery.
+		self._bind_only = False
 		if self.target is not None:
 			self.ldap_query_page_size = self.target.ldap_query_page_size
 		
@@ -101,7 +115,9 @@ class MSLDAPClient:
 			return
 
 		except Exception as e:
-			print('Keepalive exception: %s' % e)
+			# ADSCAN log-hygiene: route through the bridged logger instead of a
+			# raw stdout print that bypasses telemetry.
+			logger.debug('Keepalive exception: %s' % e)
 			await self.disconnect()
 	
 	async def disconnect(self):
@@ -151,11 +167,20 @@ class MSLDAPClient:
 						return False, err
 				else:
 					logger.debug('Skipping bind for no auth!')
+			# ADSCAN PATCH (2026-05-31) — BIND-ONLY short-circuit. The bind
+			# (or the anonymous no-bind path) completed without error. Return
+			# now WITHOUT the post-bind rootDSE discovery so posture probes read
+			# the bind result directly. See ``self._bind_only`` in ``__init__``.
+			# ``get_serverinfo``/``get_ad_info`` would raise ``operationsError
+			# (ERROR_NOT_AUTHENTICATED)`` on a RestrictAnonymous DC and mask the
+			# policy answer.
+			if self._bind_only is True:
+				return True, None
 			res, err = await self._con.get_serverinfo()
 			if err is not None:
 				raise err
 			if res is None:
-				print('RootDSE is empty! You will need to find the tree manually!')
+				logger.debug('RootDSE is empty! You will need to find the tree manually!')
 			else:
 				self._serverinfo = res
 				self._tree = res['defaultNamingContext']
@@ -227,7 +252,7 @@ class MSLDAPClient:
 		logger.debug('Paged search, filter: %s attributes: %s' % (query, ','.join(attributes)))
 		if self._con.status != MSLDAPClientStatus.RUNNING:
 			if self._con.status == MSLDAPClientStatus.ERROR:
-				print('There was an error in the connection!')
+				logger.debug('There was an error in the connection!')
 				return
 
 		if tree is None:

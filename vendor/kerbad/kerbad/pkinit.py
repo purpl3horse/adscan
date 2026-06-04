@@ -183,7 +183,6 @@ class PKINIT:
 					raise Exception('Could\'t find proper domain name in the certificate! Please set it manually!')
 		
 		if dh_params is None:
-			print('Generating DH params...')
 			# Or maybe use set_dhparams?
 			# Generate DH parameters
 			parameters = generate_parameters(generator=2, key_size=1024)
@@ -194,7 +193,6 @@ class PKINIT:
 			}
 			# Use the generated parameters
 			self.diffie = DirtyDH.from_dict(dh_params)
-			print('DH params generated.')
 		else:
 			#print('Loading default DH params...')
 			if isinstance(dh_params, dict):

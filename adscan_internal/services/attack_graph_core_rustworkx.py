@@ -29,7 +29,7 @@ from adscan_internal.services.attack_graph_core import (  # noqa: PLC2701
     _build_local_reuse_useful_node_ids,
     _count_actionable_edges,
     _edges_chain_ok,
-    _is_excluded_share_access_edge,
+    _is_nontraversable_attack_edge,
     _is_same_local_reuse_cluster_chain,
     _LOCAL_REUSE_RELATION_KEY,
     _MAX_STRUCTURAL_HOPS,
@@ -86,7 +86,7 @@ def _build_rustworkx_graph(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        if _is_excluded_share_access_edge(edge):
+        if _is_nontraversable_attack_edge(edge, nodes_map):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
@@ -208,7 +208,7 @@ def compute_maximal_attack_paths_rustworkx(
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        if _is_excluded_share_access_edge(edge):
+        if _is_nontraversable_attack_edge(edge, nodes_map):
             continue
         from_id = str(edge.get("from") or "")
         to_id = str(edge.get("to") or "")
