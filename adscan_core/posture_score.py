@@ -37,6 +37,14 @@ Bands:
     40-59 : "Elevated"     — amber
     < 40  : "Critical"     — red
 
+Critical floor (overrides the band math):
+    If there is >= 1 reachable path to Domain Admin (``paths_to_da >= 1``) OR
+    >= 1 exposed Tier-0 asset (``tier0_exposed >= 1``) — regardless of whether
+    those paths were exploited, attempted, or only theoretical — the score is
+    capped into the Critical band (at ``CRITICAL_BAND_TOP``) and the label
+    becomes "Critical". A reachable path to Domain Admin IS the risk; the
+    finding-load budget must never paint over it with an "Acceptable" headline.
+
 Why this is better than the prior weighted-only formulas
 (``RISK_SATURATION = 200``, weights 25/12/5/1, no path/tier-0 terms):
 
@@ -82,6 +90,12 @@ TIER0_PENALTY_CAP: int = 10
 BAND_HEALTHY: int = 80
 BAND_ACCEPTABLE: int = 60
 BAND_ELEVATED: int = 40
+
+# Highest numeric score still inside the Critical band. ``BAND_ELEVATED`` is
+# the inclusive lower bound of Elevated, so Critical tops out one below it.
+# Used by the path-to-Domain-Admin floor so the number and the label agree
+# (never "63/100 Acceptable" sitting next to N paths to Domain Admin).
+CRITICAL_BAND_TOP: int = BAND_ELEVATED - 1
 
 
 @dataclass(frozen=True)
@@ -169,6 +183,22 @@ def compute_posture_score(inputs: PostureInputs) -> PostureScore:
     score = int(round(100.0 - total_penalty))
     score = max(0, min(100, score))
 
+    # --- Critical floor: any reachable path to Domain Admin / Tier-0 -------
+    # A single reachable path to Domain Admin (or any exposed Tier-0 asset)
+    # IS the risk — it doesn't matter whether it was EXPLOITED, ATTEMPTED, or
+    # merely THEORETICAL (derived from config). The weighted-finding budget
+    # (70 pts) dominates the path/tier-0 penalties (20+10), so a "weak"
+    # finding profile could otherwise leave the score in the Acceptable band
+    # (e.g. 63/100) while the same report shows 16 paths to Domain Admin —
+    # self-contradictory. When such exposure exists we FLOOR the posture into
+    # the Critical band: cap the numeric score at the top of the Critical band
+    # so the headline number and the band label always agree. The component
+    # breakdown is preserved (auditable) and a ``critical_floor_applied`` flag
+    # records that the floor fired.
+    critical_floor_applied = paths > 0 or tier0 > 0
+    if critical_floor_applied and score > CRITICAL_BAND_TOP:
+        score = CRITICAL_BAND_TOP
+
     return PostureScore(
         score=score,
         label=_band_label(score),
@@ -177,6 +207,7 @@ def compute_posture_score(inputs: PostureInputs) -> PostureScore:
             "paths_penalty": round(paths_penalty, 2),
             "tier0_penalty": round(tier0_penalty, 2),
             "total_penalty": round(total_penalty, 2),
+            "critical_floor_applied": float(critical_floor_applied),
         },
     )
 
@@ -185,6 +216,7 @@ __all__ = (
     "BAND_ACCEPTABLE",
     "BAND_ELEVATED",
     "BAND_HEALTHY",
+    "CRITICAL_BAND_TOP",
     "PATHS_PENALTY_CAP",
     "PATHS_PENALTY_PER_PATH",
     "PostureInputs",

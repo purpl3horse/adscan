@@ -34,6 +34,7 @@ from adscan_launcher.docker_pull_diagnostics import (
 from adscan_launcher.docker_runtime import (
     DockerRunConfig,
     build_adscan_run_command,
+    probe_and_warn_reduced_runtime,
     docker_access_denied,
     docker_available,
     docker_needs_sudo,
@@ -3386,6 +3387,9 @@ def handle_start_docker(
         if tui:
             adscan_args.append("--tui")
 
+        # Non-blocking: warn (premium panel) if the runtime is rootless/userns,
+        # so the operator sees what's degraded instead of a cryptic kernel EPERM.
+        probe_and_warn_reduced_runtime(cfg)
         cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
         print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")
         try:
@@ -3543,6 +3547,7 @@ def handle_ci_docker(
             if report_theme:
                 adscan_args.extend(["--report-theme", report_theme])
 
+        probe_and_warn_reduced_runtime(cfg)
         cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
         print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
         try:
@@ -3697,6 +3702,7 @@ def run_adscan_passthrough_docker(
         if debug:
             container_args.append("--debug")
 
+        probe_and_warn_reduced_runtime(cfg)
         cmd = build_adscan_run_command(cfg, adscan_args=container_args)
         print_info_debug(f"[docker] passthrough: {shell_quote_cmd(cmd)}")
         try:

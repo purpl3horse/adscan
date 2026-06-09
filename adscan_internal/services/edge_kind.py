@@ -158,6 +158,12 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         "DumpLSASS",
         "DumpSAM",
         "DumpDPAPI",
+        # HasSession session-impersonation follow-up — virtual self-loop minted
+        # by attack_graph_core._build_implicit_session_followup_overlay. Models
+        # "become the session user" by registering a Task Scheduler task whose
+        # principal IS the session user (InteractiveToken); the DumpLSASS variant
+        # is the credential-theft alternative. Derived → not host-control-gated.
+        "ScheduledTask",
         # RODC post-exploitation chain (extract krbtgt → forge golden ticket)
         "PrepareRODCCredentialCaching",
         "ExtractRODCKrbtgtSecret",

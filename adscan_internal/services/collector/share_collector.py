@@ -185,6 +185,12 @@ class _ShareInfo:
     # bytes for both layers so the host-collector can intersect them.
     share_sd_bytes: bytes = b""  # share-level SD (SRVSVC 502 or SMB2 share root)
     ntfs_sd_bytes: bytes = b""  # NTFS folder-root SD (SMB2 directory QueryInfo)
+    # Scanning-identity effective-access mask at the share root, from an MxAc
+    # (MAXIMUM_ALLOWED) probe. Populated ONLY when the NTFS root SD was
+    # unreadable (the share_acl_only fallback) so the classifier can tag the
+    # broad-group edge ``self_mxac`` with the real effective mask instead of the
+    # over-reported raw share grant. ``None`` when not probed / no access.
+    self_effective_mask: int | None = None
 
 
 def _sd_object_to_bytes(sd_object: object) -> bytes:
@@ -381,17 +387,23 @@ async def collect_shares_for_host(
     machine: Any,
     config: ShareCollectorConfig,
     target_host: str,
-) -> list[_ShareInfo]:
+) -> tuple[list[_ShareInfo], str | None]:
     """Enumerate shares and their SDs for a single connected host.
 
     Strategy: one SRVSVC session, try level 502 first (shares + SDs in one
     round-trip, admin only) then fall back to level 1 (names only, always
     works).  This avoids opening a second RPC pipe over the same connection.
+
+    Returns ``(shares, error_reason)``. ``error_reason`` is ``None`` on success
+    and the failure string otherwise (e.g. a connection abort) — surfaced so the
+    caller's per-stage outcome telemetry can tell a permission denial from a
+    connection drop instead of silently counting a swallowed failure as "ok".
     """
     from aiosmb.dcerpc.v5.interfaces.srvsmgr import srvsrpc_from_smb
     from aiosmb.dcerpc.v5 import srvs
 
     shares: list[_ShareInfo] = []
+    error_reason: str | None = None
 
     try:
         async with srvsrpc_from_smb(machine.connection) as rpc:
@@ -469,6 +481,7 @@ async def collect_shares_for_host(
                     )
 
     except Exception as exc:
+        error_reason = f"{type(exc).__name__}: {exc}"
         print_info_debug(f"[share-collector] list_shares failed: {exc}")
 
     # Always attempt the NTFS folder-root SD read so effective-access
@@ -487,7 +500,54 @@ async def collect_shares_for_host(
                 f"aces={stats['aces']} ntfs_sd={stats['ntfs_sd']}"
             )
 
-    return shares
+    # MxAc fallback (MAXIMUM_ALLOWED): for shares whose NTFS root SD we could
+    # NOT read — the cases that otherwise stay share_acl_only and over-report a
+    # broad-group grant (e.g. Authenticated Users: Full Control on NETLOGON when
+    # NTFS actually restricts to Read) — ask the server for OUR effective access
+    # at the share root. Cheap: one MxAc open, root-only, reusing the live
+    # connection; runs only on the fallback shares. The mask is metadata; the
+    # classifier applies it to broad-group edges (which the scanning identity
+    # belongs to) as the self_mxac tier. Best-effort — never breaks collection.
+    # Fire MxAc for any share that grants a BROAD authentication group
+    # (Authenticated Users / Everyone / Users / Domain Users). Those edges are
+    # the over-reported false positives: the broad SIDs are OS-computed and have
+    # no confident group-closure, so their edges stay share_acl_only forever even
+    # when BOTH SDs are readable — so a "missing SD" trigger misses them (the bug
+    # this replaces). The scanning identity provably belongs to these groups, so
+    # its MxAc self-effective access is the right correction.
+    from adscan_internal.services.collector.share_ntfs_verification import (
+        is_broad_auth_sid,
+    )
+
+    needs_mxac = [
+        s for s in shares if any(is_broad_auth_sid(sid) for sid, _ in s.aces)
+    ]
+    if needs_mxac:
+        from adscan_internal.services.smb_effective_access_service import (
+            query_effective_root_access_on_machine,
+        )
+
+        # winacl FILE access bits (mirrors share_ntfs_verification constants).
+        _READ, _WRITE, _FULL = 0x00000001, 0x00000002, 0x001F01FF
+        for share in needs_mxac:
+            try:
+                ea = await query_effective_root_access_on_machine(
+                    machine=machine, share=share.name, host=target_host
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort metadata probe
+                print_info_debug(f"[share-collector] MxAc probe failed: {exc}")
+                continue
+            if ea.succeeded and ea.has_access:
+                mask = 0
+                if ea.can_read:
+                    mask |= _READ
+                if ea.can_write:
+                    mask |= _WRITE
+                if ea.can_write_dac or ea.can_write_owner:
+                    mask |= _FULL
+                share.self_effective_mask = mask
+
+    return shares, error_reason
 
 
 async def _enrich_ntfs_root_sds(

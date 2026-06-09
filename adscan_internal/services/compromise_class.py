@@ -67,7 +67,7 @@ _DISPLAY_LABELS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Domain Breaker",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Privileged Escalator",
     CompromiseClass.COMPROMISE_ENABLER: "Compromise Enabler",
-    CompromiseClass.TIER0_FOOTHOLD: "Acceso a activo crítico (post-ex pendiente)",
+    CompromiseClass.TIER0_FOOTHOLD: "Critical Asset Access (post-exploitation pending)",
     CompromiseClass.UNAUTHENTICATED_PRINCIPAL: "Unauthenticated Principal (null session)",
     CompromiseClass.NONE: "Standard",
 }
@@ -327,8 +327,34 @@ def _is_direct_domain_breaker_target(node: Mapping[str, Any] | None) -> bool:
     return False
 
 
+# Public aliases — consumed by tier_lattice (SSOT for per-target tier). The
+# underscore-prefixed originals stay for in-module use; these expose the same
+# logic as a stable public API across the services package.
+def node_tier(node: Mapping[str, Any] | None) -> int | None:
+    """Public wrapper for :func:`_node_tier` — see its docstring."""
+    return _node_tier(node)
+
+
+def is_direct_domain_breaker_target(node: Mapping[str, Any] | None) -> bool:
+    """Public wrapper for :func:`_is_direct_domain_breaker_target`."""
+    return _is_direct_domain_breaker_target(node)
+
+
 def _is_privileged_escalator_target(node: Mapping[str, Any] | None) -> bool:
     return _node_name(node).lower() in _PRIVILEGED_ESCALATOR_GROUP_NAMES
+
+
+def is_privileged_escalator_target(node: Mapping[str, Any] | None) -> bool:
+    """Public wrapper for :func:`_is_privileged_escalator_target`.
+
+    A privileged-escalator group (DnsAdmins, Backup/Server/Account/Print
+    Operators, Cert Publishers, Key Admins, Exchange groups, ...) is a domain
+    compromise *enabler* — controlling it requires a further abuse to reach the
+    domain object. Consumed by ``tier_lattice.domain_compromise_tier`` as the
+    Tier-2 detector (mirrors how :func:`is_direct_domain_breaker_target` is the
+    Tier-3/4 detector). The underscore-prefixed original stays for in-module use.
+    """
+    return _is_privileged_escalator_target(node)
 
 
 def _last_real_edge(edges: Iterable[Mapping[str, Any]]) -> Mapping[str, Any] | None:

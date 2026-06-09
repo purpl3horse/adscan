@@ -1762,7 +1762,7 @@ def run_show_attack_paths(
         """Interactive selection loop over attack paths.
 
         Share-credential-hunt selection used to live in this menu but moved
-        to its own dedicated phase ("Share Credential Hunt", after Password
+        to its own dedicated phase ("SMB Share Exposure", after Password
         Spraying) so the attack-paths UX stays focused on path execution.
         """
         from adscan_internal.interaction import is_non_interactive as _is_non_interactive
@@ -1845,11 +1845,16 @@ def run_show_attack_paths(
             #     menu iteration. The cost is one materialised-cache
             #     hit on the prepared runtime graph; the DFS itself is
             #     bounded by the same depth/scope as the initial run.
-            # In CTF workspaces, once the domain is compromised there is
-            # nothing left to compute — skip the recompute + re-display so
-            # the operator lands cleanly on the post-compromise flow
-            # (flags, cleanup) without an extra engine-selection prompt or
-            # path list.
+            # In CTF AND audit workspaces, once the domain is compromised the
+            # owned-scope path list is exhausted — skip the recompute +
+            # re-display so the operator lands cleanly on the post-compromise
+            # flow without an extra engine-selection prompt or path list.
+            # CTF: post-compromise is flags/cleanup. Audit: the holistic
+            # remaining-paths view is rendered later from the DOMAIN scope by
+            # the "Audit Post-Compromise: Remaining Attack Paths" block in
+            # run_enumeration (paths to domain compromise from ANY low-priv,
+            # not just from owned users) — re-offering owned-scope paths here
+            # would be redundant and misleading.
             _now_pwned = (
                 str(
                     getattr(shell, "domains_data", {})
@@ -1861,7 +1866,7 @@ def run_show_attack_paths(
                 .lower()
                 == "pwned"
             )
-            if getattr(shell, "type", None) == "ctf" and _now_pwned:
+            if _now_pwned and getattr(shell, "type", None) in ("ctf", "audit"):
                 return
             # Symmetry with the CI/non-interactive flow: drop every
             # attack-path cache layer before recomputing so the operator
@@ -1908,7 +1913,7 @@ def run_show_attack_paths(
                     path_refs[:] = _sorted
 
         # `_handle_share_scan` used to live here. The share credential hunt
-        # moved to its own dedicated phase (Phase 5: Share Credential Hunt,
+        # moved to its own dedicated phase (Phase 7: SMB Share Exposure,
         # after Password Spraying), so the attack-paths menu no longer
         # offers it — keeping the UX focused on path execution only.
 
@@ -2002,8 +2007,12 @@ def run_show_attack_paths(
                 if isinstance(result, str) and result.startswith("path:"):
                     idx = int(result.split(":", 1)[1])
                     _handle_path_detail(attack_paths[idx], idx + 1)
-                    # In CTF mode, if the execution just compromised the domain,
-                    # exit the selection loop — nothing left to do.
+                    # CTF and audit: if the execution just compromised the
+                    # domain, exit the owned-scope selection loop. The audit
+                    # holistic remaining-paths view is rendered later from the
+                    # DOMAIN scope by the post-compromise block in
+                    # run_enumeration; re-offering owned-scope paths here is
+                    # redundant once the domain is owned.
                     _pwned_after = (
                         str(
                             getattr(shell, "domains_data", {})
@@ -2015,7 +2024,7 @@ def run_show_attack_paths(
                         .lower()
                         == "pwned"
                     )
-                    if getattr(shell, "type", None) == "ctf" and _pwned_after:
+                    if _pwned_after and getattr(shell, "type", None) in ("ctf", "audit"):
                         return
                     continue
 
@@ -2048,7 +2057,7 @@ def run_show_attack_paths(
                             .lower()
                             == "pwned"
                         )
-                        if getattr(shell, "type", None) == "ctf" and _pwned_after:
+                        if _pwned_after and getattr(shell, "type", None) in ("ctf", "audit"):
                             return
                     continue
 
@@ -2211,8 +2220,8 @@ def run_show_attack_paths(
         f"membership_reloads={snapshot_delta['reloads']} membership_loaded={snapshot_delta['loaded']}"
     )
 
-    # Share-exposure data is computed and displayed by the dedicated Phase 5
-    # "Share Credential Hunt" (see ``run_ask_for_share_credential_hunt``)
+    # Share-exposure data is computed and displayed by the dedicated Phase 7
+    # "SMB Share Exposure" (see ``share_exposure_phase.run_smb_share_exposure_phase``)
     # rather than mixed into the attack-paths UX. The attack-paths flow
     # now stays focused on path execution only.
 

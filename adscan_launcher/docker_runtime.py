@@ -32,6 +32,7 @@ from adscan_launcher.docker_pull_diagnostics import (
 )
 from adscan_launcher.output import (
     print_info_debug,
+    print_panel,
     print_warning,
     print_warning_verbose,
     print_instruction,
@@ -778,6 +779,82 @@ def _make_docker_accessible_url(url: str) -> str:
         "host-gateway",
         url,
     )
+
+
+def _render_reduced_runtime_panel(verdict) -> None:
+    """Render the premium 'reduced network mode' notice for a rootless runtime."""
+    ipv6_ok = bool(getattr(verdict, "net_raw", False))
+    tun_ok = bool(getattr(verdict, "net_admin", False))
+    ok = "[status.success]✓[/status.success]"
+    warn = "[status.warning]⚠[/status.warning]"
+    rows = [
+        f"  {ok}  Core assessment    LDAP · SMB · Kerberos · RPC · attack paths",
+        f"  {ok}  Recon              port / service discovery (TCP connect)",
+        f"  {ok if ipv6_ok else warn}  IPv6 poisoning     "
+        + ("available" if ipv6_ok else "mitm6 (DHCPv6/RA) — requires NET_RAW"),
+        f"  {ok if tun_ok else warn}  Tunnel pivoting    "
+        + ("available" if tun_ok else "ligolo-ng TUN — requires NET_ADMIN"),
+    ]
+    body = (
+        "Rootless / user-namespaced runtime detected (rootless Docker or Podman). "
+        "The full AD assessment runs normally — the optional offensive extras "
+        "below are unavailable in this runtime.\n\n"
+        + "\n".join(rows)
+        + "\n\n[bold]Full features[/bold] → run on a standard (rootful) Docker daemon.\n"
+        "                no sudo: add your user to the [bold]docker[/bold] group."
+    )
+    print_panel(
+        body,
+        title="⚠  Reduced Network Mode · rootless container runtime",
+        title_align="left",
+        border_style="status.warning",
+    )
+
+
+def probe_and_warn_reduced_runtime(cfg: DockerRunConfig) -> None:
+    """Detect a rootless / user-namespaced runtime and warn (NON-blocking).
+
+    ADscan still runs — the entrypoint strips the file capabilities so the
+    binaries can exec — but in reduced network mode (core assessment unaffected;
+    ICMP discovery and ligolo TUN pivoting unavailable). Surfacing a clear panel
+    here replaces the cryptic kernel "Operation not permitted" the operator would
+    otherwise hit, and points at the real fix (rootful daemon / 'docker' group).
+
+    Best-effort and fail-open: any probe failure is swallowed so a flaky daemon
+    never blocks the run. The image must already be present (pulled in preflight).
+    """
+    try:
+        from adscan_launcher.runtime_capability_check import (  # noqa: PLC0415
+            probe_runtime_capability,
+        )
+
+        cap_add = ["SYS_TIME"]
+        if Path("/dev/net/tun").exists():
+            cap_add.append("NET_ADMIN")
+        verdict = probe_runtime_capability(
+            image=cfg.image,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            cap_add=tuple(cap_add),
+        )
+        if not verdict.probe_ok:
+            return  # inconclusive — say nothing (fail-open)
+        if verdict.supported and not verdict.degraded:
+            return  # full capabilities — nothing to warn about
+        print_info_debug(
+            "[docker] reduced-runtime verdict: "
+            f"supported={verdict.supported} degraded={verdict.degraded} "
+            f"userns_remapped={verdict.userns_remapped} "
+            f"net_raw={verdict.net_raw} net_admin={verdict.net_admin}"
+        )
+        _render_reduced_runtime_panel(verdict)
+    except Exception as exc:  # noqa: BLE001 — never block the run on a probe error
+        try:
+            from adscan_core import telemetry  # noqa: PLC0415
+
+            telemetry.capture_exception(exc)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def build_adscan_run_command(

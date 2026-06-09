@@ -67,7 +67,7 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
     ScanPhase(
         phase_id="domain_analysis",
         title="Domain Intelligence",
-        subtitle="Host inventory, identities, and ADCS discovery.",
+        subtitle="Host inventory and identity enumeration.",
     ),
     ScanPhase(
         phase_id="attack_paths_discovery",
@@ -86,8 +86,8 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
     ),
     ScanPhase(
         phase_id="share_credential_hunt",
-        title="Share Credential Hunt",
-        subtitle="Scan exposed SMB shares for embedded credentials.",
+        title="SMB Share Exposure",
+        subtitle="Capture hashes on writable shares; hunt credentials on readable ones.",
     ),
     ScanPhase(
         phase_id="unauthenticated_attack_surface",

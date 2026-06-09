@@ -7230,8 +7230,15 @@ def execute_selected_attack_path(
                             resolved_target_host=target_host,
                         )
 
+                    # Single-responsibility (mirrors the ACE terminal-gate at the
+                    # offer_followups site): the access followup runs DumpSAM/
+                    # DumpLSA/DumpDPAPI/DumpLSASS, each of which is its OWN graph
+                    # edge. Only chain it when this access step is the LAST
+                    # executable step — for an intermediate AdminTo the path
+                    # runner executes the dump edge next, so chaining here would
+                    # double-run the dump (and double-prompt).
                     followup = getattr(shell, f"ask_for_{service}_access", None)
-                    if callable(followup):
+                    if callable(followup) and idx == last_executable_idx:
                         followup(domain, target_host, exec_username, password)
                 continue
 
@@ -11150,6 +11157,12 @@ def execute_selected_attack_path(
                         username=exec_username,
                         password=password,
                         delegation_to=delegated_spn,
+                        # Single-responsibility: this step ONLY mints the S4U
+                        # service ticket. The path runner executes the DCSync
+                        # edge as the next step (scoped-ticket-first), so never
+                        # chain DCSync internally here (it would double-run and
+                        # use the ambient ccache instead of the minted ticket).
+                        chain_dcsync_followup=False,
                     )
                 continue
 

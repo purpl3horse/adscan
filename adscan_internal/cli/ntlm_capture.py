@@ -2003,11 +2003,9 @@ def run_ntlm_auth_type_sweep(shell: NtlmCaptureShell, domain: str) -> dict[str, 
     )
     if scope_mode is None:
         print_info(
-            f"[~] NTLM auth-type sweep skipped by operator in {marked_domain}; "
-            "running DC-only classification instead."
+            f"[~] NTLM auth-type sweep skipped by operator in {marked_domain}."
         )
         summary["sweep_skipped_reason"] = "operator_skipped"
-        run_ntlm_auth_type_quick_win(shell, domain)
         return summary
 
     candidates = _candidates_for_scope_mode(

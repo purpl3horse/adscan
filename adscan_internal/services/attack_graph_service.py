@@ -63,6 +63,10 @@ from adscan_internal.services.attack_step_catalog import (
 from adscan_internal.services.domain_controller_classifier import node_is_rodc_computer
 from adscan_internal.services.edge_kind import classify_edge_kind
 from adscan_internal.services.compromise_class import apply_path_based_classification
+from adscan_internal.services.tier_lattice import (
+    stamp_records_domain_compromise_tier,
+    stamp_records_target_tier,
+)
 from adscan_internal.services.membership_snapshot import (
     load_membership_snapshot as _load_membership_snapshot_impl,
     membership_snapshot_path as _membership_snapshot_path,
@@ -8121,25 +8125,33 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             group_names=[group_name],
         )
         normalized_group_name = normalize_group_name(group_name)
+        # Terminate the synthetic escalation follow-up at the REAL domain object
+        # node (not a "Domain Control" placeholder) so the annotation phase — which
+        # resolves the terminal node by label — classifies it against the domain
+        # object and the canonical target_mode="object" ordering surfaces it in the
+        # Domain Compromised tier.
+        domain_label = attack_graph_core._resolve_membership_followup_domain_label(  # noqa: SLF001
+            graph, target_node
+        )
         if membership.dns_admins:
             return {
                 "relation": "DnsAdminAbuse",
                 "status": "blocked",
-                "to": "Domain Control",
+                "to": domain_label,
                 "reason": "Production-impacting DNS modification is blocked by design",
             }
         if membership.backup_operators:
             return {
                 "relation": "BackupOperatorEscalation",
                 "status": "theoretical",
-                "to": "Domain Control",
+                "to": domain_label,
                 "reason": "Backup Operators can enable a follow-up path to domain compromise",
             }
         if normalized_group_name == "print operators":
             return {
                 "relation": "PrintOperatorAbuse",
                 "status": "unsupported",
-                "to": "Domain Control",
+                "to": domain_label,
                 "reason": "Print Operators exposure is modeled, but ADscan has no automated follow-up yet",
             }
         return None
@@ -8283,7 +8295,15 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         ),
         "source": nodes[0] if nodes else "",
         "target": nodes[-1] if nodes else "",
-        "terminal_target_label": label(path.target_id),
+        # When a synthetic escalation follow-up extends the path past the group
+        # to the domain object, the terminal IS that domain object — the
+        # annotation phase must resolve the domain node, not the group, so the
+        # path is classified/ordered as a domain-compromise terminal.
+        "terminal_target_label": (
+            str(synthetic_followup["to"])
+            if synthetic_followup is not None
+            else label(path.target_id)
+        ),
         "status": derived_status,
         "steps": steps_for_ui,
     }
@@ -12337,6 +12357,23 @@ def _apply_local_postprocessing_pipeline(
         f"dedup: [exact key safety-net, all scopes]"
     )
 
+    # Per-stage wall-clock so the aggregate ``post=…`` (logged by the caller) can
+    # be attributed to the stage that actually spends it. Always on under
+    # --debug (one monotonic() delta per stage; negligible cost). On the dense
+    # Exchange-ACL graphs that explode to tens of thousands of paths, the
+    # post-processing — minimize (O(L²) rewrites) and the contained /
+    # prefix-dominated filters (O(L²) per path) — dominates total compute, so
+    # this breakdown is what tells you which stage to optimise.
+    _stage_mark = [time.monotonic()]
+
+    def _stage_done(label: str, current_records: list[dict[str, Any]]) -> None:
+        now = time.monotonic()
+        print_info_debug(
+            f"[local-pipeline] stage {label}: {now - _stage_mark[0]:.3f}s "
+            f"(records={len(current_records)})"
+        )
+        _stage_mark[0] = now
+
     scope_filtered_records: list[dict[str, Any]] = []
     scope_terminal_removed = 0
     for rec in records:
@@ -12359,6 +12396,7 @@ def _apply_local_postprocessing_pipeline(
     _maybe_print_attack_paths_summary_debug(
         domain, records, stage_label="1/6 · raw local-dfs"
     )
+    _stage_done("input+scope-filter", records)
 
     # Stage 2: Non-terminal MemberOf filter — mirrors BH CE _build_non_terminal_memberof_filter.
     #   Runs BEFORE minimize so redundant_memberof cannot strip a trailing MemberOf and hide
@@ -12432,6 +12470,7 @@ def _apply_local_postprocessing_pipeline(
         records,
         stage_label=f"2/6 · after terminal-memberof filter [{target!r}]",
     )
+    _stage_done("terminal-memberof", records)
 
     # Stage 2b: Owned-terminal filter.
     # Placed here — after the terminal-MemberOf trim (which can change the final
@@ -12492,6 +12531,7 @@ def _apply_local_postprocessing_pipeline(
         records,
         stage_label=f"3/6 · after minimize (scope={scope}, {n_minimized} record(s) modified)",
     )
+    _stage_done("minimize", records)
 
     # Stage 4: Safety-net dedup.
     seen: set[tuple[Any, ...]] = set()
@@ -12522,12 +12562,14 @@ def _apply_local_postprocessing_pipeline(
         records,
         stage_label=f"4/6 · after dedup [{scope}] ({n_dedup_removed} removed)",
     )
+    _stage_done("dedup", records)
 
     # Stage 5: affected-user metadata (shell-aware, no BH CE graph required).
     records = _apply_affected_user_metadata(shell, domain, records)
     _maybe_print_attack_paths_summary_debug(
         domain, records, stage_label=f"5/6 · after annotate_affected_users [{scope}]"
     )
+    _stage_done("annotate-affected-users", records)
 
     # Stage 6: Containment filter.
     #
@@ -12572,6 +12614,17 @@ def _apply_local_postprocessing_pipeline(
     #   display_friendly, scope != "domain", domain target mode
     #     → keep_longest: collapse Compromise Enabler / Foothold sub-paths
     #       into the longest Domain Breaker kill chain for compact display.
+    # Stamp record["target_tier"] at the central choke-point — right before the
+    # display filters consume it. _label_to_node is already built above; the
+    # stamp lets the tier-aware filters keep higher-tier (Domain object) paths
+    # from being trimmed against lower-tier ones.
+    stamp_records_target_tier(records, label_to_node=_label_to_node)
+    # Stamp the 4-tier domain-compromise rank (F5) on the SAME choke-point so the
+    # prefix/contained filters can collapse redundant domain-tier subpaths (e.g. a
+    # path truncated at the Domain Controllers group inside the full DCSync→Domain
+    # chain) using the total order T4(object) > T3(breaker group) > T2(enabler) >
+    # T1(host). _label_to_node is required here to recognize the Domain object as T4.
+    stamp_records_domain_compromise_tier(records, label_to_node=_label_to_node)
     if not display_friendly:
         result, n_contained = (
             attack_graph_core.filter_contained_paths_for_domain_listing(
@@ -12658,6 +12711,7 @@ def _apply_local_postprocessing_pipeline(
                 f"6/6 · after contained filter [keep_longest, domain] ({n_contained} removed)"
             ),
         )
+    _stage_done("contained-filter", records)
 
     # Stage 6c: deduplicate paths with identical attack core but different
     # trailing contextual edges (MemberOf, Contains…).  Must run BEFORE 6b so
@@ -12689,6 +12743,7 @@ def _apply_local_postprocessing_pipeline(
             f"removed {_n_ctx_dedup} path(s) sharing same attack core "
             f"→ {len(records)} remain (was {_pre_6c})"
         )
+    _stage_done("contextual-dedup-6c", records)
 
     # Stage 6b: cross-target prefix-dominated-by-super-path elimination.
     # If path A is a strict contiguous prefix of path B and rank(B) >= rank(A),
@@ -12705,6 +12760,7 @@ def _apply_local_postprocessing_pipeline(
             f"removed {_n_prefix_dominated} path(s) covered by higher-class super-paths "
             f"→ {len(records)} remain (was {_pre_6b})"
         )
+    _stage_done("prefix-dominated-6b", records)
 
     # Stage 7: target-priority tagging using ADscan-owned semantics.
     _adcs_available = domain_has_adcs_for_attack_steps(shell, domain)

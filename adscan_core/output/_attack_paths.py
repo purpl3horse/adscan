@@ -457,7 +457,7 @@ def render_smb_exposed_resources_panel(
     rows: list[dict[str, object]],
     domain: str = "",
 ) -> None:
-    """Render the SMB exposed-resources surface for Phase 5: Share Credential Hunt.
+    """Render the SMB exposed-resources surface for Phase 7: SMB Share Exposure.
 
     Premium-aligned with the rest of the product's phase UX:
 
@@ -574,7 +574,7 @@ def render_smb_exposed_resources_panel(
         )
 
     print_operation_header(
-        "Share Credential Hunt",
+        "SMB Share Exposure",
         header_details,
         icon="📂",
     )

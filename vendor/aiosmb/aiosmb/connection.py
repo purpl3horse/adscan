@@ -468,18 +468,27 @@ class SMBConnection:
 		"""
 		if self.status == SMBConnectionStatus.CLOSED:
 			return
-		
+
 		self.status = SMBConnectionStatus.CLOSED
-		
+
+		# Cancel ALL internal tasks BEFORE the (awaitable, can-hang-on-a-dead-socket)
+		# network close. keepalive_task.cancel() used to run AFTER
+		# `await network_connection.close()`; on an aborted / half-open socket that
+		# close hangs, the enclosing wait_for (terminate/__aexit__) cancels
+		# disconnect() AT that await, so keepalive_task was never cancelled and
+		# leaked as a 'pending' task forever (it sleeps in a loop). At scale
+		# (thousands of CONNECTION_ABORTED hosts in one collection) the leaked
+		# tasks bloat the event loop and degrade the whole run. Cancelling first
+		# makes cleanup independent of the network close completing.
 		if self.incoming_task is not None:
 			self.incoming_task.cancel()
-		
+
+		if self.keepalive_task is not None:
+			self.keepalive_task.cancel()
+
 		if self.network_connection is not None:
 			await self.network_connection.close()
 			await asyncio.sleep(0)
-		
-		if self.keepalive_task is not None:
-			self.keepalive_task.cancel()
 		
 		
 

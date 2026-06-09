@@ -55,6 +55,21 @@ VERIFICATION_SELF_MXAC = "self_mxac"
 #: Default tag for back-compat when nothing else applies.
 DEFAULT_VERIFICATION = VERIFICATION_SHARE_ACL_ONLY
 
+#: SIDs every authenticated domain principal provably belongs to. For share
+#: edges sourced from one of these, the scanning identity's MxAc self-effective
+#: access is a valid effective floor — so we (a) trigger the MxAc probe when a
+#: share grants one of them, and (b) tag the resulting edge ``self_mxac`` with
+#: the server-confirmed mask instead of the over-reported raw share grant. These
+#: principals never have a confident group-closure (they are OS-computed, not in
+#: the membership snapshot), so their edges otherwise stay share_acl_only forever.
+_BROAD_AUTH_SIDS = frozenset({"S-1-5-11", "S-1-1-0", "S-1-5-32-545"})
+
+
+def is_broad_auth_sid(sid: str) -> bool:
+    """True for Authenticated Users / Everyone / Users / Domain Users (RID 513)."""
+    s = (sid or "").strip().upper()
+    return s in _BROAD_AUTH_SIDS or s.endswith("-513")
+
 # File-access mask bits (winacl FILE_ACCESS_MASK / generic mapping). Mirrors
 # the constants in share_collector.py; duplicated here to keep this module
 # import-light (no winacl import required for the pure-logic helpers).

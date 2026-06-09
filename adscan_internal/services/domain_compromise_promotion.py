@@ -273,6 +273,20 @@ def promote_to_pwned(
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
 
+        # Audit post-compromise hook (symmetric with the CTF branch above).
+        # QUEUE — do not run inline: promote_to_pwned frequently fires mid
+        # attack-path execution (e.g. DCSync as a terminal step), and the
+        # audit pipeline re-runs the attack-path engine, which must not run
+        # re-entrantly. A safe checkpoint drains the queue (graph re-collection
+        # AS the obtained DA + host credential-harvesting campaign).
+        if getattr(shell, "type", None) == "audit":
+            try:
+                shell._queue_audit_post_compromise_actions(
+                    domain, username, credential or ""
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+
     return True
 
 

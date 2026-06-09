@@ -49,10 +49,12 @@ from adscan_internal.services.collector.share_collector import (
 )
 from adscan_internal.services.collector.share_ntfs_verification import (
     VERIFICATION_NTFS_COMPUTED,
+    VERIFICATION_SELF_MXAC,
     VERIFICATION_SHARE_ACL_ONLY,
     build_sid_group_closure,
     compute_effective_file_mask,
     decide_verification_tier,
+    is_broad_auth_sid,
     is_closure_confident,
 )
 from adscan_internal.services.collector.smb_collector import (
@@ -63,6 +65,20 @@ from adscan_internal.services.collector.smb_collector import (
 
 _HOST_CONCURRENCY_DEFAULT = 20
 _HOST_TIMEOUT_DEFAULT = 20
+
+# Hard per-host wall-clock SAFETY NET for the full collection of one host
+# (negotiate + auth-connect + SAMR + shares). Every per-op step is already a hard
+# ``asyncio.wait_for`` bound EXCEPT the authenticated connect, which relies on the
+# transport's soft ``timeout=`` param; this generous ceiling guarantees a hung
+# host can never hold a worker slot indefinitely, WITHOUT cutting a host that
+# respects the intended per-op limits (their worst-case sum, ~140s with the
+# fallback, sits below this). It is a safety net, not a perf knob — tune it DOWN
+# via the env var only once a measured per-host duration distribution is in hand.
+_HOST_BUDGET_DEFAULT = 180
+
+# Emit a running per-host-phase progress line every N completed hosts, so a slow
+# run surfaces its duration distribution live instead of only at the end.
+_HOST_PROGRESS_TICK = 250
 
 # Phase 2 reachability gate (445/tcp) -- pre-filter unreachable hosts before
 # paying the full per-host SMB collection timeout. The connect probe is cheap,
@@ -112,6 +128,11 @@ class HostCollectorConfig:
             "ADSCAN_COLLECTOR_PER_HOST_TIMEOUT", _HOST_TIMEOUT_DEFAULT
         )
     )  # seconds; applied per SMB host operation (negotiate + SAMR + shares combined)
+    per_host_budget: int = field(
+        default_factory=lambda: _env_int(
+            "ADSCAN_COLLECTOR_PER_HOST_BUDGET", _HOST_BUDGET_DEFAULT
+        )
+    )  # seconds; hard wall-clock ceiling for the WHOLE per-host collection (safety net)
     gate_concurrency: int = field(
         default_factory=lambda: max(
             _GATE_CONCURRENCY_FLOOR,
@@ -159,10 +180,151 @@ class HostPhaseTiming:
     candidate_count: int = 0
     reachable_445_count: int = 0
     timeouts_avoided_estimate: float = 0.0
+    # Per-host MEASUREMENT (observability for the perf investigation — not a knob).
+    # Wall-clock duration of each collect_one_host, a single-bucket outcome
+    # histogram, and the count of hosts the safety net had to abandon. These let
+    # us SEE the real duration distribution (p50/p95/max) instead of guessing
+    # where the time goes.
+    per_host_durations: list[float] = field(default_factory=list)
+    outcome_counts: dict[str, int] = field(default_factory=dict)
+    host_budget_timeouts: int = 0
+    # Per-STAGE outcome counters, counted ONLY for hosts we reached with a live
+    # connection (connect/auth failures live in outcome_counts above). This is
+    # what tells us whether a stage's failures are `denied` (permission — normal,
+    # nothing to fix) vs `abort` (connection dropped — maybe transient/recoverable)
+    # vs `timeout` — the exact split needed to decide a shares reconnect-retry.
+    stage_outcomes: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {"sessions": {}, "localadmins": {}, "shares": {}}
+    )
 
     @property
     def total(self) -> float:
         return self.negotiate + self.samr + self.shares
+
+
+def _classify_host_outcome(errors: dict[str, str]) -> str:
+    """Map one host's per-op error dict to a single outcome bucket.
+
+    Pure helper for the per-host outcome histogram. Order matters: hard failures
+    (budget / connect / auth) are checked first; then the per-STAGE errors
+    (sessions / localadmins / shares) are aggregated via the same classifier so
+    a swallowed-but-recorded permission denial lands in ``access_denied`` (the
+    expected no-local-admin case) rather than ``other_error``, and a connection
+    abort/timeout during a stage surfaces as such.
+    """
+    if not errors:
+        return "ok"
+    if "host_budget" in errors:
+        return "budget_timeout"
+    if "connect" in errors:
+        return "connect_fail"
+    if str(errors.get("auth", "")).startswith("access_denied"):
+        return "access_denied"  # cred is not local admin — fast + expected
+    if errors.get("auth"):
+        return "auth_error"
+    buckets = {
+        _classify_stage_error(errors.get(k))
+        for k in ("sessions", "builtin_groups", "shares")
+        if errors.get(k)
+    }
+    if "abort" in buckets:
+        return "rpc_abort"  # 445 open but the connection dropped mid-RPC
+    if "timeout" in buckets:
+        return "rpc_timeout"  # 445 open but RPC stalled to the per-op timeout
+    if "denied" in buckets:
+        return "access_denied"  # no local admin on this host — expected, not a failure
+    return "other_error"
+
+
+# Outcomes that are NOT host failures: a clean collect, or the expected
+# no-local-admin denial (we still got whatever the share/SID layer allows). The
+# dashboard ✓/⚠ split uses this so denied-but-collected hosts read as success.
+_NON_FAILURE_OUTCOMES = frozenset({"ok", "access_denied"})
+
+
+def _classify_stage_error(err: str | None) -> str:
+    """Bucket one stage's error string: ok / timeout / denied / abort / other.
+
+    Pure helper. ``err`` is the value stored in ``HostCollectionResult.errors``
+    for a stage (``None`` when the stage succeeded). Distinguishes a permission
+    denial (normal, unfixable) from a connection drop (maybe transient) so the
+    per-stage histogram can answer "would a reconnect-retry recover shares?".
+    """
+    if not err:
+        return "ok"
+    e = err.lower()
+    if e == "timeout" or "timeout" in e:
+        return "timeout"
+    if "access_denied" in e or "access denied" in e:
+        return "denied"
+    if (
+        "connection_aborted" in e
+        or "connection aborted" in e
+        or "connectionterminated" in e
+        or "connection closed" in e
+        or "connection reset" in e
+    ):
+        return "abort"
+    return "other"
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Nearest-rank percentile of ``values`` (pure; 0.0 on empty)."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+    idx = max(0, min(len(ordered) - 1, idx))
+    return ordered[idx]
+
+
+def _log_host_phase_stats(timing: HostPhaseTiming, total_hosts: int) -> None:
+    """Emit the measured per-host duration distribution + outcome histogram.
+
+    This is the data that answers 'where does the SMB-collection time actually
+    go' — p50/p95/max wall-clock per host, the single-bucket outcome counts, and
+    the slowest durations (no host labels: keeps the line free of sensitive
+    hostnames/IPs while still revealing the tail shape).
+    """
+    durations = timing.per_host_durations
+    if not durations:
+        return
+    hist = ", ".join(f"{k}={v}" for k, v in sorted(timing.outcome_counts.items()))
+    print_info_debug(
+        f"collector-timing host-phase: {len(durations)}/{total_hosts} hosts · "
+        f"per-host wall-clock p50={_percentile(durations, 50):.1f}s "
+        f"p95={_percentile(durations, 95):.1f}s max={max(durations):.1f}s · "
+        f"budget_timeouts={timing.host_budget_timeouts} · outcomes: {hist or 'none'}"
+    )
+    slowest = sorted(durations, reverse=True)[:10]
+    if slowest:
+        print_info_debug(
+            "collector-timing slowest per-host durations (s): "
+            + ", ".join(f"{d:.0f}" for d in slowest)
+        )
+    # WHERE the time goes, by stage (sums across hosts; concurrent so they
+    # overlap — read the RATIO, not the absolute). `connection-overhead` = total
+    # host-work minus the three RPC stages = authenticated connect + teardown +
+    # event-loop scheduling. If overhead dominates → the bottleneck is the
+    # connection layer (setup/teardown — where the abort/leak lived), NOT the RPC
+    # enumeration; if `shares` (or `samr`) dominates → that stage is the cost.
+    stage_sum = timing.negotiate + timing.samr + timing.shares
+    wall_sum = sum(durations)
+    overhead = max(0.0, wall_sum - stage_sum)
+    print_info_debug(
+        "collector-timing stage time (host-work sums): "
+        f"negotiate={timing.negotiate:.0f}s samr={timing.samr:.0f}s "
+        f"shares={timing.shares:.0f}s · connection-overhead≈{overhead:.0f}s "
+        f"· total host-work={wall_sum:.0f}s"
+    )
+    # Per-stage outcomes (live-connection hosts only). `denied` = permission
+    # (normal, nothing to fix); `abort` = connection dropped (the recoverable
+    # case — decides whether a shares reconnect-retry is worth adding).
+    for _stage in ("sessions", "localadmins", "shares"):
+        _counts = timing.stage_outcomes.get(_stage) or {}
+        if _counts:
+            _line = ", ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+            print_info_debug(f"collector-timing stage {_stage}: {_line}")
 
 
 async def _do_negotiate(
@@ -199,10 +361,15 @@ async def _do_samr(
     t = time.monotonic()
     try:
         try:
-            sessions = await asyncio.wait_for(
+            sessions, sess_err = await asyncio.wait_for(
                 collect_sessions(machine), timeout=per_host_timeout
             )
             out.session_usernames = sessions
+            if sess_err:
+                # Failure the collector handled gracefully (denial / connection
+                # drop). Record it so the per-stage outcome telemetry is accurate
+                # — without it, a swallowed abort would miscount as "ok".
+                out.errors["sessions"] = sess_err
         except asyncio.TimeoutError:
             out.errors["sessions"] = "timeout"
         except Exception as exc:  # noqa: BLE001
@@ -210,10 +377,12 @@ async def _do_samr(
             out.errors["sessions"] = f"{type(exc).__name__}: {exc}"
 
         try:
-            builtin_groups = await asyncio.wait_for(
+            builtin_groups, builtin_err = await asyncio.wait_for(
                 collect_builtin_group_members(machine), timeout=per_host_timeout
             )
             out.builtin_groups = builtin_groups
+            if builtin_err:
+                out.errors["builtin_groups"] = builtin_err
         except asyncio.TimeoutError:
             out.errors["builtin_groups"] = "timeout"
         except Exception as exc:  # noqa: BLE001
@@ -237,11 +406,17 @@ async def _do_shares(
 
     t = time.monotonic()
     try:
-        shares = await asyncio.wait_for(
+        shares, shares_err = await asyncio.wait_for(
             collect_shares_for_host(machine, share_cfg, target_ip),
             timeout=per_host_timeout * 2,
         )
         out.shares = shares
+        if shares_err:
+            # Failure the share collector handled gracefully (e.g. a connection
+            # abort, or level-1 also denied). Record it so the per-stage outcome
+            # telemetry distinguishes denied vs abort — the exact signal that
+            # decides whether a shares reconnect-retry is worth adding.
+            out.errors["shares"] = shares_err
     except asyncio.TimeoutError:
         out.errors["shares"] = "timeout"
     except Exception as exc:  # noqa: BLE001
@@ -373,6 +548,13 @@ def _resolve_share_verification(
         per_principal_eval_possible=eval_possible,
     )
     if tier != VERIFICATION_NTFS_COMPUTED:
+        # Couldn't intersect NTFS. For the broad authentication groups the
+        # scanning identity belongs to, prefer the server-confirmed MxAc
+        # self-effective mask (no admin / no NTFS-SD-read needed) over the
+        # over-reported raw share grant — this is what stops NETLOGON/SYSVOL
+        # showing Full Control / Write when the effective access is Read.
+        if share.self_effective_mask is not None and is_broad_auth_sid(sid_upper):
+            return VERIFICATION_SELF_MXAC, int(share.self_effective_mask)
         return VERIFICATION_SHARE_ACL_ONLY, None
 
     group_sids = list(group_closure.get(sid_upper, frozenset()))
@@ -526,17 +708,22 @@ async def _gate_reachable_445(
     node list so coverage is never reduced below the no-gate behavior.
     """
     from adscan_internal.services.host_reachability_filter import (
+        ReachabilityFilterResult,
         filter_reachable_hosts,
         print_reachability_summary,
     )
 
     try:
-        # A2 -- candidate IP set (dedup, one probe per IP).
+        # A2 -- candidate IP set (dedup, one probe per IP). Nodes massdns could
+        # not resolve have no IP to probe or connect to; count them so the
+        # summary can surface them instead of silently dropping them.
         ip_to_nodes: dict[str, list[Any]] = {}
+        no_ip_count = 0
         for node in nodes:
             target_ip = resolve_target_ip(node)
             if not target_ip:
-                continue  # skipped today anyway -- no resolved IP
+                no_ip_count += 1
+                continue
             ip_to_nodes.setdefault(target_ip, []).append(node)
         candidate_ips = list(ip_to_nodes.keys())
         if not candidate_ips:
@@ -561,11 +748,13 @@ async def _gate_reachable_445(
             reachable_ips = set(reach.reachable) | set(reach2.reachable)
         else:
             reachable_ips = set(reach.reachable)
-        print_reachability_summary(reach, service_label="SMB")
-
-        # A4 -- partition; mark offline nodes; dispatch reachable only.
+        # A4 -- partition into reachable vs offline HOST NODES. Reachability is
+        # probed once per unique IP (deduped above), but collection runs per host
+        # node, so the partition and every operator-facing count below is in
+        # host-node units. Offline nodes stay in the graph (marked) with no SMB
+        # edges.
         reachable_nodes: list[Any] = []
-        offline_count = 0
+        offline_nodes: list[Any] = []
         for ip, ip_nodes in ip_to_nodes.items():
             if ip in reachable_ips:
                 reachable_nodes.extend(ip_nodes)
@@ -575,27 +764,50 @@ async def _gate_reachable_445(
                     # node so the marker survives into the graph (the node stays,
                     # just gets no SMB edges).
                     node.properties["smb_gate"] = "445 closed/filtered"
-                    offline_count += 1
+                    offline_nodes.append(node)
+        offline_count = len(offline_nodes)
 
-        # A5 -- per-collector timing telemetry (dual channel: structured + debug).
+        # Premium operator line, in host-node units with the FINAL elapsed (incl.
+        # the VPN-loss re-probe). Reuses the shared summary vocabulary; the IP
+        # dedup detail is kept to the debug line below so the operator sees one
+        # consistent unit (hosts). reachable + offline always reconcile.
+        print_reachability_summary(
+            ReachabilityFilterResult(
+                port=_GATE_PORT,
+                reachable=tuple(str(id(n)) for n in reachable_nodes),
+                offline=tuple(str(id(n)) for n in offline_nodes),
+                elapsed_ms=gate_probe_ms,
+                raw_results={},
+            ),
+            service_label="SMB",
+        )
+
+        # A5 -- per-collector timing telemetry (structured + debug). All counts
+        # are host-node units; the unique-IP count is surfaced as an explicit,
+        # labeled detail so the numbers always reconcile (reachable + offline =
+        # total hosts), and timeouts-avoided is one skipped SMB attempt per
+        # offline host (not per IP).
         timing.gate_probe_ms = gate_probe_ms
         timing.candidate_count = len(candidate_ips)
-        timing.reachable_445_count = len(reachable_ips)
-        timing.timeouts_avoided_estimate = (
-            len(candidate_ips) - len(reachable_ips)
-        ) * config.per_host_timeout
+        timing.reachable_445_count = len(reachable_nodes)
+        timing.timeouts_avoided_estimate = offline_count * config.per_host_timeout
         avoided_min = timing.timeouts_avoided_estimate / 60.0
+        total_hosts = len(reachable_nodes) + offline_count
+        no_ip_note = (
+            f"; {no_ip_count} unresolved (no IP), skipped" if no_ip_count else ""
+        )
         print_info_debug(
-            f"[collector-timing] gate: {len(reachable_ips)}/{len(candidate_ips)} "
-            f"reachable on {_GATE_PORT} in {gate_probe_ms / 1000:.1f}s "
-            f"({offline_count} hosts skipped, "
-            f"~{avoided_min:.0f}min of timeouts avoided)"
+            f"collector-timing gate: {len(reachable_nodes)}/{total_hosts} hosts "
+            f"reachable on {_GATE_PORT}/tcp in {gate_probe_ms / 1000:.1f}s "
+            f"({offline_count} offline, skipped; "
+            f"~{avoided_min:.0f}min of SMB timeouts avoided; "
+            f"deduped to {len(candidate_ips)} unique IPs probed{no_ip_note})"
         )
         return reachable_nodes
     except Exception as exc:  # noqa: BLE001 -- FAIL-OPEN: never reduce coverage
         telemetry.capture_exception(exc)
         print_info_debug(
-            f"[collector-timing] gate failed open ({type(exc).__name__}: {exc}); "
+            f"collector-timing gate failed open ({type(exc).__name__}: {exc}); "
             "collecting all hosts (no coverage loss)"
         )
         return nodes
@@ -703,11 +915,31 @@ async def _collect_domain_hosts_async(
         target_hostname = resolve_target_hostname(node)
         progress["inflight"] += 1
         _safe_update(in_flight=progress["inflight"])
+        host_data = HostCollectionResult()
+        host_t0 = 0.0
         try:
             async with sem:
-                host_data = await collect_one_host(
-                    target_ip, target_hostname, config, timing
-                )
+                # Start the per-host clock AFTER acquiring the slot, so the
+                # measured duration is the actual collection WORK, not the time
+                # spent queueing for a free worker.
+                host_t0 = time.monotonic()
+                try:
+                    # SAFETY NET: hard wall-clock ceiling for the whole host. Every
+                    # per-op step is already wait_for-bounded EXCEPT the authed
+                    # connect (soft transport timeout), so this guarantees a hung
+                    # host can never hold a worker slot indefinitely. The budget is
+                    # generous (well above the intended per-op sum) → it never cuts
+                    # a host that behaves; it only kills genuine hangs.
+                    host_data = await asyncio.wait_for(
+                        collect_one_host(target_ip, target_hostname, config, timing),
+                        timeout=config.per_host_budget,
+                    )
+                except asyncio.TimeoutError:
+                    host_data = HostCollectionResult()
+                    host_data.errors["host_budget"] = (
+                        f"exceeded {config.per_host_budget}s total budget"
+                    )
+                    timing.host_budget_timeouts += 1
             n_s, n_a, n_sh, src_counts = _merge_host_into_graph(
                 node, host_data, sid_to_node, samaccount_to_node, result, group_closure
             )
@@ -718,10 +950,55 @@ async def _collect_domain_hosts_async(
             totals["share"] += n_sh
             for k, v in src_counts.items():
                 sd_source_counts[k] = sd_source_counts.get(k, 0) + v
-            had_error = bool(host_data.errors)
         finally:
             progress["inflight"] -= 1
+            # Per-host MEASUREMENT (observability). RMW is safe: no await between
+            # here and the dashboard update below. host_t0 stays 0.0 if the slot
+            # was never acquired (cancelled while queueing) — skip those so the
+            # distribution only reflects hosts we actually worked.
+            if host_t0:
+                timing.per_host_durations.append(time.monotonic() - host_t0)
+            _errors = host_data.errors
+            _outcome = _classify_host_outcome(_errors)
+            timing.outcome_counts[_outcome] = timing.outcome_counts.get(_outcome, 0) + 1
+            # Dashboard ✓/⚠: a host is only a FAILURE for hard problems — an
+            # expected no-local-admin denial (or a clean collect) is success.
+            # This keeps denied-but-collected hosts (shares/admins gathered) as ✓
+            # instead of flipping to ⚠ now that denials are recorded.
+            had_error = _outcome not in _NON_FAILURE_OUTCOMES
+            # Per-stage outcomes, ONLY for hosts we reached with a live connection
+            # (connect/auth/budget failures never attempted the stages and are
+            # already in outcome_counts). For those hosts, the absence of a stage
+            # key means that stage succeeded.
+            _conn_failed = bool(
+                {"auth", "connect", "host_budget"} & set(_errors)
+            )
+            if not _conn_failed:
+                _stage_keys = []
+                if config.collect_samr:
+                    _stage_keys += [("sessions", "sessions"), ("localadmins", "builtin_groups")]
+                if config.collect_shares:
+                    _stage_keys += [("shares", "shares")]
+                for _stage, _err_key in _stage_keys:
+                    _o = _classify_stage_error(_errors.get(_err_key))
+                    _bucket = timing.stage_outcomes[_stage]
+                    _bucket[_o] = _bucket.get(_o, 0) + 1
         progress["done"] += 1
+        if progress["done"] % _HOST_PROGRESS_TICK == 0:
+            # live_tasks is the leak gauge: if it climbs monotonically with hosts
+            # processed (rather than staying ~flat at ~concurrency), per-host
+            # internal tasks are leaking — the signature of the aiosmb teardown
+            # bug fixed in vendor/aiosmb (disconnect cancels before the close).
+            try:
+                live_tasks = len(asyncio.all_tasks())
+            except RuntimeError:
+                live_tasks = -1
+            print_info_debug(
+                f"collector-timing progress: {progress['done']}/{len(dispatch_nodes)} "
+                f"hosts · p95={_percentile(timing.per_host_durations, 95):.1f}s · "
+                f"budget_timeouts={timing.host_budget_timeouts} · "
+                f"live_tasks={live_tasks}"
+            )
         if had_error:
             progress["err"] += 1
         else:
@@ -746,6 +1023,10 @@ async def _collect_domain_hosts_async(
         if isinstance(r, Exception):
             telemetry.capture_exception(r)
             print_info_debug(f"[host-collector] task raised: {type(r).__name__}: {r}")
+
+    # Measured per-host duration distribution + outcome histogram (the data that
+    # tells us where the SMB-collection time actually went).
+    _log_host_phase_stats(timing, len(dispatch_nodes))
 
     relation_counts = Counter(e.relation for e in result.edges)
     signing_required = sum(

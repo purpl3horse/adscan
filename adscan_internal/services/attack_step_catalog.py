@@ -395,6 +395,23 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "hassession",
         support_kind="supported",
         support_reason="Executable via schtask_as session abuse workflow",
+        # ACCESS edge (EdgeKind.AUTH): arriving at the session user is NOT
+        # ownership — you can only LEVERAGE the session once you have local admin
+        # on the host. The actual compromise is a follow-up the session unlocks
+        # (ScheduledTask-as-user or DumpLSASS), modelled as a derived self-loop on
+        # the session user by _build_implicit_session_followup_overlay. So the
+        # semantics is access_capability_only (provides local_admin_session →
+        # the follow-up chains), NOT a credential-bearing compromise on its own.
+        compromise_semantics="access_capability_only",
+        # Abusing a session (schtask-as-user / LSASS dump of the session) needs
+        # LOCAL ADMIN on the host. So HasSession chains DIRECTLY off a local-admin
+        # access (AdminTo, AllowedToDelegate, Ntlmv1RelayRBCD, ReadLAPSPassword —
+        # all access_capability_only → provide local_admin_session), as a sibling
+        # of the DumpLSA host bridge — NOT after DumpLSA (a redundant prerequisite)
+        # and NOT after a user-level CanRDP/CanPSRemote session (those are
+        # context-transparent, so the guard evaluates HasSession against the
+        # pre-pivot context, which does not provide local_admin_session).
+        source_context_requirement="local_admin_session",
         category="privilege",
         description=(
             "High-value user session observed on a non-Tier-0 computer that can be "
@@ -516,7 +533,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "allowedtodelegate",
         support_kind="supported",
         support_reason="Kerberos constrained delegation enumeration/exploitation",
-        source_context_requirement="machine_credential",
+        compromise_semantics="access_capability_only",
+        source_context_requirement="user_credentials",
         category="delegation",
         description="Abuse AllowedToDelegate paths to impersonate users to delegated services",
         vuln_key="constrained_delegation",
@@ -1991,6 +2009,37 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="OS Credential Dumping: LSASS Memory",
         detection_event_ids=("4656",),
         bh_cypher_names=("DumpLSASS",),
+    ),
+    _entry(
+        "scheduledtask",
+        support_kind="supported",
+        support_reason=(
+            "Executable via native Task Scheduler RPC (hassession_native): registers "
+            "a hidden task whose Principal IS the session user (InteractiveToken), "
+            "running code under the user's existing logon session."
+        ),
+        # Session-impersonation follow-up unlocked by HasSession. "Becomes" the
+        # session user (you run code AS them) → direct_target_compromise. Requires
+        # local-admin on the host (to register a task as another principal), which
+        # the preceding HasSession arrival provides → local_admin_session.
+        compromise_semantics="direct_target_compromise",
+        source_context_requirement="local_admin_session",
+        category="privilege",
+        description=(
+            "Impersonate a logged-on user by registering a scheduled task whose "
+            "principal is that user's interactive logon session"
+        ),
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Restrict Domain Admin logons to Tier 0 assets only (PAW/ESAE). "
+            "Prohibit privileged logons on member servers/workstations and monitor "
+            "Task Scheduler task registration (Event ID 4698) on tier-zero-adjacent hosts."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1053.005",
+        mitre_technique_name="Scheduled Task/Job: Scheduled Task",
+        detection_event_ids=("4698", "4624", "4672"),
+        bh_cypher_names=("ScheduledTask",),
     ),
     # ── Coercion ─────────────────────────────────────────────────────────────
     _entry(

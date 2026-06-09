@@ -12,6 +12,7 @@ from typing import Protocol
 from adscan_internal import (
     print_exception,
     print_info,
+    print_info_debug,
     print_panel,
     print_warning,
     telemetry,
@@ -36,6 +37,10 @@ class PostDAShell(Protocol):
     ) -> list[str]: ...
 
     def do_attack_paths(self, args: str) -> None: ...
+
+    def ask_for_post_da_host_dumps(
+        self, domain: str, username: str, password: str
+    ) -> None: ...
 
 
 def get_domain_post_da_state(shell: PostDAShell, domain: str) -> dict[str, object]:
@@ -184,15 +189,20 @@ def run_audit_post_da_graph_refresh(
     )
 
     try:
+        # Re-collect the relationship graph with Domain-Admin visibility — the
+        # valuable part: more ACLs/objects become visible as the DA. We do NOT
+        # re-run attack-path discovery here. The domain is compromised at this
+        # point, so the owned-scope discovery is exhausted; the holistic
+        # remaining-paths view (DOMAIN scope, from any low-priv) is computed,
+        # displayed and re-offered later by the "Audit Post-Compromise:
+        # Remaining Attack Paths" block in run_enumeration. Re-running
+        # owned-scope discovery here would be a redundant compute + offer.
         shell.do_graph_collection(
             domain,
             auth_username=username,
             auth_password=password,
             auth_domain=domain,
         )
-
-        print_info("Re-running Attack Paths Discovery with refreshed data.")
-        shell.do_attack_paths(domain)
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_warning(
@@ -230,9 +240,184 @@ def run_audit_post_da_bloodhound_refresh(
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Audit post-compromise queue/flush — mirror of the CTF post-compromise
+# mechanism (adscan.py:_ctf_queue/_execute_post_compromise_actions).
+#
+# When a domain is promoted to "pwned" (e.g. a Domain Admin credential
+# obtained via DCSync as a terminal attack-path step), audit mode must run the
+# full post-compromise pipeline: re-collect the relationship graph AS the
+# obtained DA + re-run attack-path analysis, then offer the host
+# credential-harvesting campaign (SAM/LSA/DPAPI).
+#
+# That pipeline re-runs the attack-path engine (``do_attack_paths``), so it
+# MUST NOT execute re-entrantly while an attack-path execution is still active
+# — and ``promote_to_pwned`` frequently fires mid-execution (the DCSync step
+# runs inside Phase 2). The robust design is therefore queue-on-promote /
+# drain-at-a-safe-checkpoint: the queue is populated when the domain is
+# promoted, and drained at points where no attack-path execution is active
+# (top of ``run_enumeration``, after each enumeration step, and the
+# privileged-group membership branch). Idempotent: the pipeline runs at most
+# once per domain.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _get_audit_pending(shell: PostDAShell) -> dict[str, dict[str, str]]:
+    """Lazily-initialised per-domain queue of pending post-compromise actions."""
+    pending = getattr(shell, "_audit_post_compromise_pending", None)
+    if not isinstance(pending, dict):
+        pending = {}
+        shell._audit_post_compromise_pending = pending  # type: ignore[attr-defined]
+    return pending
+
+
+def _get_audit_dispatched(shell: PostDAShell) -> set:
+    """Lazily-initialised set of domains whose pipeline has already dispatched."""
+    dispatched = getattr(shell, "_audit_post_compromise_dispatched", None)
+    if not isinstance(dispatched, set):
+        dispatched = set()
+        shell._audit_post_compromise_dispatched = dispatched  # type: ignore[attr-defined]
+    return dispatched
+
+
+def _pick_best_da_credential(
+    shell: PostDAShell, domain: str, fallback_user: str, fallback_secret: str
+) -> tuple[str, str]:
+    """Return the highest-tier admin credential known for ``domain``.
+
+    The queued/explicit credential may be an NT hash, a low-priv account, or a
+    ccache. Mirror the CTF picker so the graph re-collection and host dumps run
+    with a credential that actually has the required access. Falls back to the
+    provided credential when the picker yields nothing.
+    """
+    try:
+        from adscan_internal.services.credentials import (
+            pick_credential_for_local_admin,
+        )
+
+        domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {})
+        pdc_host = domain_data.get("pdc_hostname") or domain_data.get("pdc")
+        best = pick_credential_for_local_admin(
+            shell, domain=domain, target_host=pdc_host
+        )
+        if best is not None:
+            picked_user, picked_secret, _kind = best
+            return picked_user, picked_secret
+    except Exception as exc:  # noqa: BLE001 — best effort, never block the flow
+        telemetry.capture_exception(exc)
+    return fallback_user, fallback_secret
+
+
+def queue_audit_post_compromise(
+    shell: PostDAShell,
+    domain: str,
+    username: str,
+    credential: str,
+) -> None:
+    """Queue the audit post-compromise pipeline for a pwned ``domain``.
+
+    No-op outside audit mode and for a domain already dispatched. Drained later
+    by :func:`execute_audit_post_compromise` at a safe (non-re-entrant)
+    checkpoint.
+    """
+    if getattr(shell, "type", None) != "audit":
+        return
+    if domain in _get_audit_dispatched(shell):
+        return
+    _get_audit_pending(shell)[domain] = {
+        "username": str(username or ""),
+        "credential": str(credential or ""),
+    }
+
+
+def execute_audit_post_compromise(
+    shell: PostDAShell,
+    domain: str,
+    username: str | None = None,
+    credential: str | None = None,
+) -> None:
+    """Drain the audit post-compromise pipeline for ``domain`` when safe.
+
+    Args:
+        shell: Active shell.
+        domain: Target domain key.
+        username: Explicit DA credential (privileged-group membership branch).
+            When ``None`` the queued credential is used (DCSync attack-path
+            case).
+        credential: Explicit secret matching ``username``.
+
+    Behaviour:
+        * No-op outside audit mode.
+        * Defers (stays queued, runs nothing) while an attack-path execution is
+          active — the graph refresh re-runs the attack-path engine and must
+          not re-enter.
+        * No-op when there is nothing queued and no explicit credential was
+          passed (speculative checkpoint drain).
+        * Runs the full pipeline at most once per domain.
+    """
+    if getattr(shell, "type", None) != "audit":
+        return
+
+    pending = _get_audit_pending(shell)
+    has_pending = domain in pending
+    if username is None and credential is None and not has_pending:
+        return  # speculative drain with an empty queue — nothing to do
+
+    from adscan_internal.services.attack_graph_runtime_service import (
+        is_attack_path_execution_active,
+    )
+
+    if is_attack_path_execution_active(shell):
+        print_info_debug(
+            "[audit-post-compromise] deferring "
+            f"{mark_sensitive(domain, 'domain')} (attack-path execution active)"
+        )
+        return
+
+    dispatched = _get_audit_dispatched(shell)
+    ctx = pending.pop(domain, {})
+    if domain in dispatched:
+        return
+    dispatched.add(domain)
+
+    resolved_user = username or str(ctx.get("username") or "")
+    resolved_secret = credential or str(ctx.get("credential") or "")
+    picked_user, picked_secret = _pick_best_da_credential(
+        shell, domain, resolved_user, resolved_secret
+    )
+    print_info_debug(
+        "[audit-post-compromise] dispatching for "
+        f"{mark_sensitive(domain, 'domain')} as "
+        f"{mark_sensitive(picked_user or resolved_user, 'user')}"
+    )
+
+    # 1) Re-collect the relationship graph AS the obtained DA + re-run analysis.
+    try:
+        run_audit_post_da_graph_refresh(
+            shell=shell,
+            domain=domain,
+            username=picked_user,
+            password=picked_secret,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Audit post-compromise graph refresh failed. "
+            "Continuing with the host dump campaign."
+        )
+
+    # 2) Host credential-harvesting campaign (SAM/LSA/DPAPI).
+    try:
+        shell.ask_for_post_da_host_dumps(domain, picked_user, picked_secret)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+
 __all__ = [
     "collect_attack_path_snapshot_counts",
     "get_domain_post_da_state",
+    "queue_audit_post_compromise",
+    "execute_audit_post_compromise",
     "run_audit_post_da_graph_refresh",
     "run_audit_post_da_bloodhound_refresh",
 ]

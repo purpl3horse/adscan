@@ -423,3 +423,27 @@ def record_control_evidence(
             _append_unique(entry["evidence"], item)
 
     _save_technical_report(shell, report)
+
+
+def record_exposure_score(
+    shell: ReportShell,
+    domain: str,
+    *,
+    exposure: dict[str, Any],
+) -> None:
+    """Persist the AD Exposure Score for *domain* into ``technical_report.json``.
+
+    Write-side single source of truth for the headline metric so the JSON export
+    carries it (spec §8c) and downstream consumers — notably ``adscan_web``,
+    which ingests ``domains[<domain>]["exposure_score"]`` — read the engine value
+    instead of recomputing it. ``exposure`` is ``ExposureScore.to_dict()``
+    (``overall_pct``, ``proven_pct``, ``by_class``, ``reachable_tier0``,
+    ``total_tier0``, ``top_contributors``, ``explanation``, …). Best-effort:
+    ignores a missing/invalid payload and never raises into the caller.
+    """
+    if not domain or not isinstance(exposure, dict) or "overall_pct" not in exposure:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["exposure_score"] = exposure
+    _save_technical_report(shell, report)

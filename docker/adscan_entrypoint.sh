@@ -652,5 +652,29 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ── Rootless / user-namespaced runtime: strip file-capabilities so the run user
+#    can exec our network binaries ──────────────────────────────────────────────
+# In a remapped user namespace (rootless Docker / Podman) the kernel refuses to
+# exec a file-capability-bearing binary for the non-root `gosu` run user with
+# EPERM ("Operation not permitted"), so ADscan never starts. Those caps
+# (cap_net_raw / cap_net_admin / cap_net_bind_service on the venv python; the
+# ligolo proxy) cannot be honoured in that namespace anyway, so we strip them
+# here — the binary then execs and ADscan runs in reduced network mode (core
+# LDAP/SMB/Kerberos/attack-path assessment unaffected; only ICMP discovery and
+# ligolo TUN pivoting are lost). Rootful runs map container-root → host-root
+# (uid_map "0 0 …") and keep their caps untouched. We run as container-root here
+# (before the gosu drop), which holds CAP_SETFCAP over the image files.
+if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]' /proc/self/uid_map 2>/dev/null; then
+  _ep_log "rootless/user-namespaced runtime detected — stripping file-capabilities so ADscan can start (reduced network mode: no ICMP discovery / TUN pivoting)"
+  if command -v setcap >/dev/null 2>&1; then
+    _venv_python="$(readlink -f /opt/adscan/venv/bin/python 2>/dev/null || true)"
+    for _capbin in "${_venv_python}" /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy; do
+      if [[ -n "${_capbin}" && -e "${_capbin}" ]]; then
+        setcap -r "${_capbin}" 2>/dev/null || true
+      fi
+    done
+  fi
+fi
+
 # Run ADscan in the foreground so it keeps a functional TTY (Prompts, selection UIs).
 gosu "${uid}:${gid}" /usr/local/bin/adscan "$@"

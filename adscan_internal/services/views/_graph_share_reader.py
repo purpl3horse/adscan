@@ -25,6 +25,7 @@ from adscan_internal.services.collector.share_ntfs_verification import (
     VERIFICATION_NTFS_COMPUTED,
     VERIFICATION_SELF_MXAC,
     VERIFICATION_SHARE_ACL_ONLY,
+    effective_mask_relations,
 )
 
 
@@ -198,8 +199,28 @@ def load_graph_share_snapshot(
         sid = str(edge.get("source_object_id", "")).strip().upper()
         principal_node = nodes.get(sid)
         principal = _find_or_create_principal(acl.principals, sid, principal_node)
-        if permission not in principal.permissions:
-            principal.permissions.append(permission)
+        # When the edge is VERIFIED (ntfs_computed or self_mxac) and carries an
+        # effective mask, the principal's real permissions are that mask — NOT the
+        # raw share-grant relation. A share grant (e.g. Authenticated Users: Full
+        # Control on NETLOGON) over-reports access the NTFS ACL restricts to Read;
+        # using the effective mask is what stops the false "writable/full-control"
+        # on NETLOGON/SYSVOL for a non-admin. Unverified (share_acl_only) edges
+        # keep the raw relation as the (flagged) lead.
+        eff_mask = notes.get("effective_mask")
+        if (
+            edge_verification in (VERIFICATION_NTFS_COMPUTED, VERIFICATION_SELF_MXAC)
+            and eff_mask is not None
+        ):
+            contributed = [
+                _RELATION_TO_PERMISSION[r]
+                for r in effective_mask_relations(int(eff_mask))
+                if r in _RELATION_TO_PERMISSION
+            ]
+        else:
+            contributed = [permission]
+        for perm in contributed:
+            if perm not in principal.permissions:
+                principal.permissions.append(perm)
 
     if not shares:
         return None

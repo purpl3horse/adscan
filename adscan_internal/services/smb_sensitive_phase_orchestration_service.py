@@ -50,6 +50,11 @@ def select_sensitive_scan_phases(
     with the three lighter phases pre-ticked so the operator can opt in/out of
     any combination — including heavy artifacts — before any fetching begins.
 
+    Non-interactive runs (CI / pipe / auto mode) mirror the interactive defaults:
+    CTF auto-selects all phases; audit auto-selects the three lighter phases and
+    excludes heavy artifacts (ZIP/DMP/PCAP/VDI deep analysis) to bound unattended
+    runtime and OPSEC exposure on real client environments.
+
     Returns an empty frozenset when the domain is already pwned (CTF) or when
     the user cancels the prompt.
     """
@@ -63,12 +68,19 @@ def select_sensitive_scan_phases(
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
 
     # Non-interactive (CI / pipe / auto mode): skip the checkbox entirely.
+    # Defaults mirror the interactive defaults (single source of truth):
+    # CTF wants maximum coverage (all phases); audit excludes the heavy-artifact
+    # phase (ZIP/DMP/PCAP/VDI deep analysis) to bound unattended runtime/OPSEC
+    # on real clients — the operator opts into it interactively.
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
     if _is_non_interactive(shell):
+        ci_phases = _ALL_PHASES if workspace_type == "ctf" else _DEFAULT_SELECTED_PHASES
         print_info_debug(
-            f"{transport_label} phase selection: auto-selecting all phases"
+            f"{transport_label} phase selection: auto-selecting "
+            + ("all phases" if workspace_type == "ctf"
+               else "default phases (heavy artifacts excluded)")
         )
-        return _ALL_PHASES
+        return ci_phases
 
     all_phases = get_production_sensitive_scan_phase_sequence()
     phase_labels = [

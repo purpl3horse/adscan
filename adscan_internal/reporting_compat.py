@@ -160,6 +160,7 @@ _CORE_REPORT_ATTRS: frozenset[str] = frozenset(
         "record_technical_finding",
         "record_technical_event",
         "record_control_evidence",
+        "record_exposure_score",
         "initialize_technical_report",
         "TECHNICAL_REPORT_FILENAME",
         "TECHNICAL_REPORT_SCHEMA_VERSION",

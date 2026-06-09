@@ -553,8 +553,43 @@ class SMBMachine:
 					#async with drsuapi:
 					logger.debug('Using domain: %s' % target_domain)
 					if len(target_users) > 0:
+						# Resolve a bare sAMAccountName to a domain-scoped SID via SAMR (the
+						# DC's OWN domain) before DRSUAPI. A bare name such as 'administrator'
+						# or 'krbtgt' exists in every domain of a FOREST, so DsCrackNames on it
+						# is ambiguous: DS_NT4_ACCOUNT_NAME_SANS_DOMAIN returns NOT_UNIQUE and
+						# the DS_UNKNOWN_NAME fallback resolves the WRONG domain's object, so
+						# DRSGetNCChanges returns 0 rows. SAMR is scoped to THIS DC's domain, so
+						# the RID->SID it returns is always the correct local object. Mirrors the
+						# full-replication branch below, which is already SID-based.
+						_samr_sid = None
+						_samr_handle = None
+						try:
+							_nb = None
+							async for _d, _e in samrpc.list_domains():
+								if _e is not None:
+									break
+								if _d == 'Builtin':
+									continue
+								_nb = _d
+								break
+							if _nb is not None:
+								_samr_sid, _e = await samrpc.get_domain_sid(_nb)
+								if _e is None and _samr_sid:
+									_samr_handle, _e = await samrpc.open_domain(_samr_sid)
+									if _e is not None:
+										_samr_handle = None
+						except Exception:
+							_samr_sid = None
+							_samr_handle = None
 						for username in target_users:
-							secrets, err = await drsuapi.get_user_secrets(username)
+							resolved = username
+							_u = str(username or '')
+							_qualified = ('@' in _u) or ('\\' in _u) or _u.upper().startswith('CN=') or ('S-1-5-' in _u.upper())
+							if (not _qualified) and _samr_handle is not None and _samr_sid:
+								_rid, _e = await samrpc.get_user_rid_by_name(_samr_handle, _u)
+								if _e is None and _rid:
+									resolved = '%s-%d' % (_samr_sid, int(_rid))
+							secrets, err = await drsuapi.get_user_secrets(resolved)
 							yield secrets, err
 									
 					else:

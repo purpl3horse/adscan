@@ -4572,7 +4572,7 @@ def _enumerate_ntlm_bait_targets(
         except Exception as exc:  # noqa: BLE001 — enumeration must never break the offer
             telemetry.capture_exception(exc)
             print_info_debug(
-                f"[ntlmv2-share-capture] writable-folder enumeration failed on "
+                f"ntlmv2-share-capture: writable-folder enumeration failed on "
                 f"{mark_sensitive(share, 'share')}: {exc}. Falling back to root drop."
             )
             targets.append(DropTarget(share=share, directory_path=""))
@@ -4623,28 +4623,26 @@ def _render_ntlm_bait_targets_panel(targets: list[Any], target_host: str) -> Non
     )
 
 
-def _offer_ntlmv2_share_drop_capture(
+def run_ntlmv2_capture_for_writable_shares(
     shell: Any,
     *,
     domain: str,
+    host: str,
+    writable_share_names: Any,
     username: str,
     credential: str,
-    host: str,
-    views: Any,
 ) -> None:
-    """Offer an NTLM share-drop capture when >=1 share has EFFECTIVE WRITE.
+    """Single-source NTLMv2 share-drop capture core — name-driven, no ShareViews.
 
-    Dedicated follow-up to the credential-hunt offer (loot=READ and bait=WRITE
-    are independent). Gated strictly on the live, MxAc-verified writable set
-    (``ShareView.is_writable_live`` — the operator's own token already passed
-    share & NTFS); NTFS-unverified / share-ACL-only leads do NOT qualify.
+    This is the canonical capture implementation reused by both the live
+    interactive flow (called via :func:`_offer_ntlmv2_share_drop_capture` after
+    reducing ``ShareView`` objects to names) and the SMB Share Exposure scan
+    phase (which already has writable share names from the collector, without
+    needing ``ShareView`` objects).
 
-    Granular per-FOLDER targeting (root-only was insufficient — e.g. VulnLab
-    Breach captured only when the bait landed in the ``transfer`` sub-folder
-    users browse, not the share root). For each writable share we MxAc-enumerate
-    the writable folders (root + sub-folders) and select drop targets by
-    workspace type:
-
+    Gating:
+    * **listener IP** (``shell.myip``) must be set — no listener, no capture.
+    * **target host** must be a non-empty string.
     * **CTF** (``shell.type == "ctf"``): drop in ALL writable folders.
       Interactive presents them with ALL pre-selected (operator can trim);
       non-interactive (CI) auto-selects ALL with no prompt — this is what makes
@@ -4654,16 +4652,25 @@ def _offer_ntlmv2_share_drop_capture(
       pre-selected and root + others left unselected; the operator decides.
       Non-interactive (audit CI): SKIP entirely — never drop unattended on a
       real client.
+
+    Args:
+        shell: The active ``PentestShell`` (or equivalent namespace); must have
+            ``myip``, ``type``, and ``auto`` attributes.
+        domain: Target AD domain (used for Kerberos realm + credential dict).
+        host: Target host name or IP (SMB connection + bait destination).
+        writable_share_names: Iterable of share names confirmed writable. Empty
+            or blank names are silently skipped; an empty result returns early.
+        username: Authenticating username.
+        credential: Password or NT hash for the authenticating principal.
     """
-    writable_views = _ntlm_bait_writable_share_views(views)
-    writable_share_names = [str(v.name).strip() for v in writable_views]
+    writable_share_names = [str(n).strip() for n in (writable_share_names or []) if str(n).strip()]
     if not writable_share_names:
         return
 
     listener_ip = str(getattr(shell, "myip", "") or "").strip()
     if not listener_ip:
         print_info_debug(
-            "[ntlmv2-share-capture] writable share(s) found but no listener IP "
+            "ntlmv2-share-capture: writable share(s) found but no listener IP "
             "(shell.myip unset); skipping the bait offer."
         )
         return
@@ -4671,7 +4678,7 @@ def _offer_ntlmv2_share_drop_capture(
     target_host = str(host or "").strip()
     if not target_host:
         print_info_debug(
-            "[ntlmv2-share-capture] writable share(s) found but no target host; "
+            "ntlmv2-share-capture: writable share(s) found but no target host; "
             "skipping the bait offer."
         )
         return
@@ -4683,7 +4690,7 @@ def _offer_ntlmv2_share_drop_capture(
     # Audit + non-interactive: never drop bait unattended on a real client.
     if not is_ctf and non_interactive:
         print_info_debug(
-            "[ntlmv2-share-capture] audit + non-interactive session; skipping the "
+            "ntlmv2-share-capture: audit + non-interactive session; skipping the "
             "bait offer (never drop unattended on a real client)."
         )
         return
@@ -4693,6 +4700,24 @@ def _offer_ntlmv2_share_drop_capture(
         "password": str(credential or "").strip(),
         "auth_domain": domain,
     }
+
+    from adscan_internal.rich_output import confirm_ask  # noqa: PLC0415
+
+    # Confirm INTENT before any folder enumeration. A decline does ZERO
+    # enumeration — the writable-folder MxAc walk (the only live work this step
+    # does; the writable SHARES already come from the Phase 2 collector) runs
+    # only once the operator commits to dropping bait. Type-aware default: CTF
+    # defaults to YES (autonomy — htb-regression auto-proceeds and the
+    # non-interactive confirm resolves to this default → auto-all), audit
+    # defaults to NO (explicit opt-in on a real client). Audit + non-interactive
+    # already returned above, so this confirm is interactive-audit or any CTF.
+    if not confirm_ask(
+        "Drop an NTLM-capture bait on the writable share(s) to harvest hashes "
+        "when a privileged user browses them? Writable folders will then be "
+        "enumerated (SMB2 MxAc) to choose drop targets.",
+        default=is_ctf,
+    ):
+        return
 
     # ── Part 1: enumerate writable folders (root + sub-folders) per share ────
     print_info(
@@ -4714,7 +4739,6 @@ def _offer_ntlmv2_share_drop_capture(
         return
 
     from adscan_internal.rich_output import (  # noqa: PLC0415
-        confirm_ask,
         questionary_checkbox_values,
     )
     from adscan_internal.services.post_exploitation.ntlmv2_share_capture_service import (  # noqa: PLC0415
@@ -4750,15 +4774,10 @@ def _offer_ntlmv2_share_drop_capture(
                 if _ntlm_bait_target_label(t.share, t.directory_path) in chosen
             ]
     else:
-        # Audit interactive: heuristic pre-select browse-likely folders; root +
-        # others left unselected. Operator decides.
+        # Audit interactive: intent already confirmed before enumeration (above);
+        # here the operator just picks WHICH writable folders to bait. Heuristic
+        # pre-select browse-likely folders; root + others left unselected.
         _render_ntlm_bait_targets_panel(targets, target_host)
-        if not confirm_ask(
-            "One or more writable folders found. Drop an NTLM-capture bait to "
-            "harvest hashes when a user browses them?",
-            default=False,
-        ):
-            return
         options = [_ntlm_bait_target_label(t.share, t.directory_path) for t in targets]
         preselect = [
             _ntlm_bait_target_label(t.share, t.directory_path)
@@ -4848,6 +4867,35 @@ def _offer_ntlmv2_share_drop_capture(
     # runs confirm_ask auto-resolves to the default and run_cracking is itself
     # CI-safe (default wordlist + bounded hashcat timeout), so CI never hangs.
     _offer_crack_for_captured_netntlm(shell, domain=domain, result=capture_result)
+
+
+def _offer_ntlmv2_share_drop_capture(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+    host: str,
+    views: Any,
+) -> None:
+    """Live-flow wrapper: reduce ShareViews → writable names, then delegate.
+
+    Gated strictly on the live, MxAc-verified writable set
+    (``ShareView.is_writable_live``); all capture logic + gating lives in
+    :func:`run_ntlmv2_capture_for_writable_shares` (single source of truth).
+    """
+    writable_views = _ntlm_bait_writable_share_views(views)
+    writable_share_names = [str(v.name).strip() for v in writable_views]
+    if not writable_share_names:
+        return
+    run_ntlmv2_capture_for_writable_shares(
+        shell,
+        domain=domain,
+        host=host,
+        writable_share_names=writable_share_names,
+        username=username,
+        credential=credential,
+    )
 
 
 def _offer_crack_for_captured_netntlm(
@@ -14820,139 +14868,6 @@ def run_ask_for_smb_scan(shell: Any, *, domain: str) -> None:
 def ask_for_smb_scan(shell: Any, *, domain: str) -> None:
     """Alias for run_ask_for_smb_scan for backward compatibility."""
     return run_ask_for_smb_scan(shell, domain=domain)
-
-
-def run_ask_for_share_credential_hunt(shell: Any, *, domain: str) -> None:
-    """Phase 5 — Share Credential Hunt.
-
-    Reads share-exposure data from the attack graph built during Phase 1
-    collection, displays the SMB Exposed Resources panel, and offers a
-    credential scan on the discovered shares.
-
-    In non-interactive / CI mode all writable shares are auto-selected.
-    In interactive mode the operator picks which shares to scan.
-    Exits silently when no share data is available in the graph.
-    """
-    if getattr(shell, "_is_ctf_domain_pwned", lambda _d: False)(domain):
-        return
-
-    from adscan_internal.interaction import is_non_interactive
-    from adscan_internal.services.attack_graph_service import load_attack_graph
-    from adscan_internal.services.attack_graph_core import collect_share_exposures_from_graph
-
-    try:
-        raw_graph = load_attack_graph(shell, domain)
-    except Exception:
-        raw_graph = None
-
-    if not raw_graph:
-        return
-
-    try:
-        domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-        domain_sid = str(domain_data.get("domain_sid", "") or "").strip() or None
-        shares = collect_share_exposures_from_graph(raw_graph, domain_sid=domain_sid)
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        return
-
-    if not shares:
-        return
-
-    # Filter out shares globally excluded by the shared SMB policy
-    # (IPC$/ADMIN$/print$/fax$/drive letters/CertEnroll) so the picker
-    # matches the panel above — no surprises between what we render and
-    # what we offer to scan.
-    from adscan_core.smb_exclusion_policy import is_globally_excluded_smb_share
-    shares = [
-        s for s in shares
-        if not is_globally_excluded_smb_share(str(s.get("share") or ""))
-    ]
-    if not shares:
-        print_info_verbose(
-            "No scannable shares after global exclusion policy filter — skipping credential hunt."
-        )
-        return
-
-    try:
-        from adscan_core.output._attack_paths import render_smb_exposed_resources_panel
-        render_smb_exposed_resources_panel(shares, domain=domain)
-    except Exception:
-        pass
-
-    writable = [
-        s for s in shares
-        if any(a in {"Write", "Full Control"} for a in s.get("access", []))
-    ]
-    if not writable:
-        print_info_verbose("No writable shares found — skipping credential hunt.")
-        return
-
-    non_interactive = is_non_interactive(shell)
-
-    if non_interactive:
-        selected = writable
-        print_info(
-            f"Non-interactive: auto-selecting {len(selected)} writable share(s) for credential scan."
-        )
-    else:
-        checkbox = getattr(shell, "_questionary_checkbox", None)
-        if not callable(checkbox):
-            selected = writable
-        else:
-            def _canonical_access_label(access: object) -> str:
-                """Return the same severity-coded label used by the resources panel.
-
-                Collapses overlapping access flags into a single canonical
-                label so the picker reads ``[Full Control]`` instead of the
-                redundant ``[Full Control+Read+Write]``.
-                """
-                if isinstance(access, set):
-                    access_set = {str(a) for a in access if str(a).strip()}
-                elif isinstance(access, (list, tuple)):
-                    access_set = {str(a) for a in access if str(a).strip()}
-                else:
-                    return "?"
-                if "Full Control" in access_set:
-                    return "Full Control"
-                if "Write" in access_set and "Read" in access_set:
-                    return "Read+Write"
-                if "Write" in access_set:
-                    return "Write"
-                if "Read" in access_set:
-                    return "Read Only"
-                return "?"
-
-            share_options = [
-                f"\\\\{s['host']}\\{s['share']}  "
-                f"[{_canonical_access_label(s.get('access'))}]  ←  "
-                + ", ".join(sorted(s.get("principals", []))[:3])
-                for s in shares
-            ]
-            writable_defaults = [
-                opt
-                for opt, s in zip(share_options, shares)
-                if any(a in {"Write", "Full Control"} for a in s.get("access", []))
-            ]
-            selected_opts = checkbox(
-                "Select shares to scan for credentials:",
-                share_options,
-                default_values=writable_defaults or share_options,
-            )
-            if not selected_opts:
-                return
-            selected = [
-                s for s, opt in zip(shares, share_options) if opt in selected_opts
-            ]
-
-    if not selected:
-        return
-
-    run_smb_share_credential_hunt(
-        shell,
-        domain=domain,
-        targets=[{"host": s["host"], "share": s["share"]} for s in selected],
-    )
 
 
 def run_netexec_auth_shares_from_args(shell: Any, args: str) -> None:

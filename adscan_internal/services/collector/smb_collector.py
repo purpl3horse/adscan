@@ -167,12 +167,16 @@ async def negotiate_only(ip: str, port: int, timeout: int) -> dict[str, Any]:
         return {}
 
 
-async def collect_sessions(machine: Any) -> list[tuple[str, str]]:
-    """Return list of (username, ip_addr) active sessions via SRVSVC."""
+async def collect_sessions(machine: Any) -> tuple[list[tuple[str, str]], str | None]:
+    """Return ``(sessions, error_reason)`` — (username, ip_addr) active sessions
+    via SRVSVC. ``error_reason`` is ``None`` on success, else the failure string
+    (denial vs connection drop), surfaced for per-stage outcome telemetry."""
     sessions: list[tuple[str, str]] = []
+    error_reason: str | None = None
     try:
         async for sess, err in machine.list_sessions(level=10):
             if err is not None:
+                error_reason = str(err)
                 break
             if sess is not None:
                 uname = str(getattr(sess, "username", "") or "").strip()
@@ -180,8 +184,9 @@ async def collect_sessions(machine: Any) -> list[tuple[str, str]]:
                 if uname and not uname.startswith("\\"):
                     sessions.append((uname, ip))
     except Exception as exc:
+        error_reason = f"{type(exc).__name__}: {exc}"
         print_info_debug(f"[smb-collector] sessions error: {exc}")
-    return sessions
+    return sessions, error_reason
 
 
 # BUILTIN group RIDs relevant for attack paths
@@ -192,20 +197,28 @@ _BUILTIN_GROUPS: dict[int, str] = {
 }
 
 
-async def collect_builtin_group_members(machine: Any) -> dict[str, list[str]]:
-    """Return {relation: [sid, ...]} for all three BUILTIN groups via the consolidated SAMR service."""
+async def collect_builtin_group_members(
+    machine: Any,
+) -> tuple[dict[str, list[str]], str | None]:
+    """Return ``({relation: [sid, ...]}, error_reason)`` for all three BUILTIN
+    groups via the consolidated SAMR service. ``error_reason`` is ``None`` when
+    the enumeration completed, else ``"<status>: <err>"`` (e.g. an access denial
+    or connection drop), surfaced so per-stage outcome telemetry is accurate
+    instead of counting a swallowed denial as "ok"."""
     from adscan_internal.services.native_samr_service import enumerate_alias_members_via
 
     result: dict[str, list[str]] = {rel: [] for rel in _BUILTIN_GROUPS.values()}
+    error_reason: str | None = None
     members_by_rid, status, err = await enumerate_alias_members_via(
         machine, builtin_alias_rids=list(_BUILTIN_GROUPS.keys())
     )
     if status != "done":
+        error_reason = f"{status}: {err}"
         print_info_debug(f"[smb-collector] BUILTIN groups: status={status} err={err}")
         # Fall through — partial members per RID may still be present.
     for rid, relation in _BUILTIN_GROUPS.items():
         result[relation] = [m.sid for m in members_by_rid.get(rid, [])]
-    return result
+    return result, error_reason
 
 
 # ---------------------------------------------------------------------------

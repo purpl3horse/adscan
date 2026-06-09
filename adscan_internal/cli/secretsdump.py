@@ -843,6 +843,18 @@ def _render_dcsync_batch_cracking_summary(
         )
 
 
+def _select_dcsync_ccache(
+    explicit_ccache: str | None, workspace_ccache: str | None
+) -> str | None:
+    """Return the ccache DCSync should authenticate with, honouring the
+    documented priority: an EXPLICIT caller-passed ccache (priority 1, e.g. a
+    minted S4U service ticket handed to this call) beats a by-username workspace
+    ccache found in ``kerberos_tickets`` (priority 2). An explicitly-passed
+    ticket must never be silently overridden by a TGT matched only by username.
+    """
+    return explicit_ccache or workspace_ccache
+
+
 def execute_dcsync_native(
     shell: Any,
     domain: str,
@@ -995,7 +1007,7 @@ def execute_dcsync_native(
             if _candidate and os.path.exists(_candidate):
                 _workspace_ccache = _candidate
                 print_info_debug(
-                    f"[dcsync-native] found workspace ccache for "
+                    f"dcsync-native: found workspace ccache for "
                     f"{mark_sensitive(username, 'user')}: "
                     f"{mark_sensitive(_candidate, 'path')}"
                 )
@@ -1022,25 +1034,26 @@ def execute_dcsync_native(
             if os.path.exists(_tgt_ccache):
                 _workspace_ccache = _tgt_ccache
                 print_info_debug(
-                    f"[dcsync-native] obtained fresh TGT for "
+                    f"dcsync-native: obtained fresh TGT for "
                     f"{mark_sensitive(username, 'user')} → using explicit ccache"
                 )
         except Exception as _tgt_exc:  # noqa: BLE001
             print_info_debug(
-                f"[dcsync-native] TGT acquisition failed for "
+                f"dcsync-native: TGT acquisition failed for "
                 f"{mark_sensitive(username, 'user')} ({type(_tgt_exc).__name__}: {_tgt_exc}); "
                 "falling back to NTLM plaintext — KRB5CCNAME contamination risk"
             )
 
     _krb5ccname_at_dcsync = os.environ.get("KRB5CCNAME", "<unset>")
     print_info_debug(
-        f"[dcsync-native] KRB5CCNAME at DCSync entry: "
+        f"dcsync-native: KRB5CCNAME at DCSync entry: "
         f"{mark_sensitive(_krb5ccname_at_dcsync, 'path')} | "
         f"workspace_ccache={'yes' if _workspace_ccache else 'no'} | "
         f"is_hash={is_hash} is_ccache={is_ccache}"
     )
 
-    _use_ccache = _workspace_ccache or (password if is_ccache else None)
+    _explicit_ccache = password if is_ccache else None
+    _use_ccache = _select_dcsync_ccache(_explicit_ccache, _workspace_ccache)
     smb_config = SMBConfig(
         target_ip=pdc_ip,
         target_hostname=pdc_hostname,
@@ -1055,7 +1068,7 @@ def execute_dcsync_native(
         kdc_ip=pdc_ip,
     )
     print_info_debug(
-        f"[dcsync-native] SMBConfig: use_kerberos={smb_config.use_kerberos} "
+        f"dcsync-native: SMBConfig: use_kerberos={smb_config.use_kerberos} "
         f"has_hash={bool(smb_config.nt_hash)} has_ccache={bool(smb_config.ccache_path)} "
         f"target={smb_config.target_ip} hostname={smb_config.target_hostname}"
     )
@@ -1110,7 +1123,7 @@ def execute_dcsync_native(
         nonlocal errors_seen, krbtgt_found, builtin_admin_account
         svc = NativeDumpService()
         print_info_debug(
-            f"[dcsync-native] config: target={smb_config.target_ip} "
+            f"dcsync-native: config: target={smb_config.target_ip} "
             f"domain={smb_config.domain} auth_domain={smb_config.auth_domain} "
             f"user={smb_config.username} "
             f"has_hash={bool(smb_config.nt_hash)} has_pass={bool(smb_config.password)} "
@@ -1125,7 +1138,7 @@ def execute_dcsync_native(
                 errors_seen += 1
                 _stream_error_types.append(type(err).__name__)
                 print_info_debug(
-                    f"[dcsync-native] stream error: {type(err).__name__}: {err}"
+                    f"dcsync-native: stream error: {type(err).__name__}: {err}"
                 )
                 continue
             if secret is None:
@@ -1616,7 +1629,7 @@ def execute_dcsync_native(
         )
     except Exception as _exc:  # noqa: BLE001
         telemetry.capture_exception(_exc)
-        print_info_debug(f"[dcsync-native] inventory dump failed: {_exc}")
+        print_info_debug(f"dcsync-native: inventory dump failed: {_exc}")
 
     tier0_rids = {500, 512, 518, 519}
     tier0_count = sum(

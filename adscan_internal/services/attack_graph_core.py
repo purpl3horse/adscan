@@ -24,6 +24,7 @@ from typing import Any
 
 from adscan_internal.services.domain_controller_classifier import (
     RODC_TARGET_PRIORITY_RANK,
+    classify_computer_node_role,
     node_is_rodc_computer,
 )
 from adscan_internal.services.adcs_target_filter import is_adcs_tier_zero_group
@@ -46,6 +47,14 @@ from adscan_internal.services.attack_step_catalog import (
 from adscan_internal.services.smb_exclusion_policy import is_globally_excluded_smb_share
 from adscan_internal.workspaces import read_json_file, write_json_file
 from adscan_internal.workspaces.state import migrate_legacy_attack_graph
+from adscan_internal.services.tier_lattice import (
+    AttackCore,
+    attack_core_is_prefix,
+    attack_core_is_subsequence,
+    attack_core_signature,
+    domain_compromise_tier_from_record,
+    edge_grants_local_admin_session as _edge_grants_local_admin_session,
+)
 
 _LOCAL_REUSE_RELATION_KEY = "localadminpassreuse"
 _SHARE_ACCESS_RELATION_KEYS = {"readshare", "writeshare", "fullcontrolshare"}
@@ -234,9 +243,31 @@ def _host_control_withheld_after_access(
     return False
 
 
+def _candidate_is_dc_dcsync_bridge(candidate_edge: dict[str, Any] | None) -> bool:
+    """Return True for the synthetic direct-DCSync overlay edge (F6).
+
+    Identifies the ``Computer -> DCSync -> Domain`` edge minted by
+    :func:`_build_implicit_dc_dcsync_overlay`.  This edge models the DIRECT
+    replication capability an admin/SYSTEM context already has on a writable DC,
+    so it must bypass the arrival-!=-ownership gates that (correctly) withhold a
+    REAL DCSync edge until the DumpLSA self-loop has "become" the machine
+    account.  Only the synthetic edge — recognised by its ``synthesized_from``
+    marker — is exempted; real DCSync edges remain fully gated.
+    """
+    if not isinstance(candidate_edge, dict):
+        return False
+    notes = candidate_edge.get("notes")
+    return (
+        isinstance(notes, dict)
+        and notes.get("synthesized_from") == "implicit_dc_dcsync_bridge"
+    )
+
+
 def _edges_chain_ok(
     path_relations: list[str],
     candidate_relation: str,
+    *,
+    candidate_edge: dict[str, Any] | None = None,
 ) -> bool:
     """Return True when ``candidate_relation`` may extend the current path.
 
@@ -254,14 +285,50 @@ def _edges_chain_ok(
        (or lateral-pivot the host) but not what credentials the attacker holds.
        Returns True for an empty path (start of traversal) because the initial
        principal always has their own ``user_credentials``.
+
+    The synthetic direct-DCSync overlay edge (F6, see
+    :func:`_candidate_is_dc_dcsync_bridge`) bypasses Gate 2 (credential-context)
+    only; Gate 1 (host-control withholding) stays active — so the synthetic edge
+    is reachable only off a LOCAL-ADMIN arrival on the DC and is withheld after a
+    user-level session.  It models the direct replication capability an admin
+    session already holds on a writable DC.  Real DCSync edges
+    (``candidate_edge=None`` or no synthesized marker) stay fully gated.
     """
     cand_rel = str(candidate_relation or "").strip().lower()
 
     # Gate 1 — access-edge host-control withholding (runs before the transparent
     # early-return so a host's own MemberOf is also gated after a user-level
-    # access arrival).
+    # access arrival).  This gate is intentionally LEFT ACTIVE for the synthetic
+    # DCSync bridge too: it is exactly what restricts the direct DCSync to a
+    # LOCAL-ADMIN arrival on the DC (AdminTo / AllowedToDelegate+T2A4D / SPNJack /
+    # NTLMv1RelayRBCD) and withholds it after a user-level CanRDP / CanPSRemote
+    # session — which has no replication capability.
     if _host_control_withheld_after_access(path_relations, cand_rel):
         return False
+
+    # F6 — the synthetic direct-DCSync bridge IS the modeled direct replication
+    # capability an admin session already holds on a writable DC.  It passes Gate
+    # 1 above (so it is reachable only off a local-admin arrival), but Gate 2
+    # below would block it because a bare local_admin_session does not satisfy
+    # DCSync's user_credentials requirement.  The whole point of this edge is
+    # that on a DC you DO NOT need to first dump the machine credential — running
+    # as SYSTEM / impersonating a DA replicates immediately — so bypass Gate 2
+    # for this synthetic edge ONLY.  Real DCSync edges remain fully gated.
+    #
+    # But ONLY take the shortcut when no DumpLSA self-credential follow-up has
+    # already run on this path: the direct edge models the "skip DumpLSA" route.
+    # Once DumpLSA has "become" the machine account, the canonical continuation
+    # is the host's own MemberOf -> Domain Controllers -> DCSync (the existing
+    # DumpLSA path).  Suppressing the synthetic edge in that case avoids a
+    # redundant ``...,DumpLSA,DCSync`` variant alongside the real DumpLSA path.
+    if _candidate_is_dc_dcsync_bridge(candidate_edge):
+        from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
+            is_self_credential_followup,
+        )
+
+        if any(is_self_credential_followup(rel) for rel in path_relations):
+            return False
+        return True
 
     if cand_rel in _CONTEXT_TRANSPARENT_KEYS:
         return True  # transparent edges are never blocked
@@ -461,6 +528,15 @@ _SHARE_ACCESS_LABEL: dict[str, str] = {
     "writeshare": "Write",
     "fullcontrolshare": "Full Control",
 }
+# Map the effective-mask relation kinds (from
+# ``share_ntfs_verification.effective_mask_relations``) to the same access
+# labels used above. Used to downgrade a raw share grant to the access the
+# scanning identity *effectively* has when an NTFS/MxAc measurement exists.
+_EFFECTIVE_RELATION_TO_LABEL: dict[str, str] = {
+    "ReadShare": "Read",
+    "WriteShare": "Write",
+    "FullControlShare": "Full Control",
+}
 
 
 def _share_node_is_tier0(node: dict[str, Any]) -> bool:
@@ -480,7 +556,7 @@ def collect_share_exposures_from_graph(
     graph: dict[str, Any],
     *,
     domain_sid: str | None = None,
-    limit: int = 20,
+    limit: int | None = 20,
 ) -> list[dict[str, Any]]:
     """Build a share exposure inventory directly from the attack graph.
 
@@ -495,7 +571,7 @@ def collect_share_exposures_from_graph(
         graph: Raw attack graph dict (``nodes`` + ``edges``).
         domain_sid: Optional domain SID (``S-1-5-21-...``). When supplied,
             ``<domain_sid>-513`` is recognised as ``Domain Users``.
-        limit: Maximum number of rows to return (ranked by risk).
+        limit: Maximum number of rows to return (ranked by risk). ``None`` means unbounded (return every share-access row).
 
     Returns:
         List of share exposure dicts compatible with
@@ -503,6 +579,15 @@ def collect_share_exposures_from_graph(
         ``share``, ``access`` (set), ``principals`` (set), ``choke`` (bool),
         ``impact_rank`` (int 0-3), ``admin_share`` (bool).
     """
+    # Deferred import: ``collector`` package ``__init__`` pulls in
+    # ``persistence`` → ``attack_graph_service`` → this module, so a top-level
+    # import would create a cycle. ``share_ntfs_verification`` itself is a leaf.
+    from adscan_internal.services.collector.share_ntfs_verification import (
+        VERIFICATION_NTFS_COMPUTED,
+        VERIFICATION_SELF_MXAC,
+        effective_mask_relations,
+    )
+
     nodes_map: dict[str, Any] = graph.get("nodes") or {}
     edges: list[Any] = graph.get("edges") or []
 
@@ -559,11 +644,33 @@ def collect_share_exposures_from_graph(
                 "choke": False,
                 "impact_rank": 0,
                 "admin_share": False,
+                # Internal accumulators (resolved into ``access`` after the
+                # edge loop). ``_verified_access`` holds the scanning
+                # identity's effective access proven by an NTFS/MxAc
+                # measurement; ``_raw_access`` holds the unverified
+                # share-grant lead. When any verified edge exists, the
+                # effective access is authoritative — a raw "Full Control"
+                # share grant that NTFS restricts to Read must NOT mark the
+                # share writable (the NETLOGON/SYSVOL false positive).
+                "_verified_access": set(),
+                "_raw_access": set(),
+                "_has_verified": False,
             },
         )
 
-        access_label = _SHARE_ACCESS_LABEL[rel_key]
-        row["access"].add(access_label)  # type: ignore[union-attr]
+        verification = str(notes.get("verification") or "").strip()
+        eff_mask = notes.get("effective_mask")
+        if (
+            verification in (VERIFICATION_NTFS_COMPUTED, VERIFICATION_SELF_MXAC)
+            and eff_mask is not None
+        ):
+            row["_has_verified"] = True  # type: ignore[index]
+            for rel in effective_mask_relations(int(eff_mask)):
+                label = _EFFECTIVE_RELATION_TO_LABEL.get(rel)
+                if label:
+                    row["_verified_access"].add(label)  # type: ignore[union-attr]
+        else:
+            row["_raw_access"].add(_SHARE_ACCESS_LABEL[rel_key])  # type: ignore[union-attr]
         row["principals"].add(_principal_label(from_id))  # type: ignore[union-attr]
 
         if bool(notes.get("is_choke_point")):
@@ -577,8 +684,28 @@ def collect_share_exposures_from_graph(
         else:
             row["impact_rank"] = max(int(row.get("impact_rank") or 0), 1)
 
+    # Resolve each row's authoritative access. When the share carries any
+    # NTFS/MxAc-verified effective measurement for the scanning identity, that
+    # effective access wins outright — raw share-grant leads from other
+    # principals (e.g. a "Creator Owner: Full Control" ACE) describe a
+    # different identity and must not re-inflate the row to "writable". Only
+    # when NO verified measurement exists do we fall back to the raw grant as
+    # an explicitly unverified lead. A verified-but-no-effective-access row is
+    # not an exposure for the scanning identity — drop it.
+    resolved: list[dict[str, Any]] = []
+    for row in exposures.values():
+        if row.get("_has_verified"):
+            row["access"] = set(row.get("_verified_access") or set())
+        else:
+            row["access"] = set(row.get("_raw_access") or set())
+        for internal in ("_verified_access", "_raw_access", "_has_verified"):
+            row.pop(internal, None)
+        if not row["access"]:
+            continue
+        resolved.append(row)
+
     ranked = sorted(
-        exposures.values(),
+        resolved,
         key=lambda r: (
             int(r.get("impact_rank") or 0),
             _SHARE_ACCESS_RANK.get(
@@ -594,7 +721,9 @@ def collect_share_exposures_from_graph(
         ),
         reverse=True,
     )
-    return ranked[:max(0, limit)]
+    if limit is None:
+        return ranked
+    return ranked[: max(0, limit)]
 
 
 def _display_record_exact_signature(
@@ -871,19 +1000,26 @@ def filter_contained_paths_for_domain_listing(
             to exploitation from already-compromised principals.
         is_hv_terminal: Optional callable returning True when a record's
             terminal node is high-value / tier-0.  Only used with
-            ``keep_shortest=True``.  When provided the sort key becomes
-            ``(not is_hv_terminal(rec), length)`` so that HV-terminal paths are
-            processed before non-HV paths of the same or greater length.  This
-            prevents a shorter non-HV path from shadowing a longer HV path:
-            e.g.  ``A→B`` (non-HV) would otherwise mark ``A→B→C→HV`` as a
-            super-path and drop it.
-        preserve_prefix_paths: When True (non-domain scopes), a longer path is
-            only considered redundant if the matching sub-sequence ends at the
-            **same terminal node** as the longer path.  This prevents dropping
-            ``A→B`` just because ``A→B→C`` exists — B and C are different
-            exploitable targets.  When False (domain scope), all sub-sequences
-            are marked as covered/shadowed regardless of their terminal, giving
-            the most compact holistic view.
+            ``keep_shortest=True``.  In that mode (F5) matching is
+            CONTEXT-INSENSITIVE (records are compared on their non-contextual
+            attack core — MemberOf/structural relations stripped, ``X→DumpLSA→X``
+            self-loops collapsed) and dominance follows the 4-tier
+            domain-compromise total order (T4 Domain object > T3 direct-breaker
+            group > T2 enabler > T1 host) via ``domain_compromise_tier_from_record``.
+            The sort processes the highest domain-compromise tier first, then
+            ``is_hv_terminal``, then shorter length, so a truncated lower-tier
+            subpath never shadows the longer higher-tier kill chain, and a
+            Domain-object (T4) prefix is never trimmed against a lower-tier
+            super-path.  An HV terminal is never dropped in Pass 2.
+        preserve_prefix_paths: When True (non-domain scopes) in the ``keep_longest``
+            branch, a longer path is only considered redundant if the matching
+            sub-sequence ends at the **same terminal node** as the longer path.
+            This prevents dropping ``A→B`` just because ``A→B→C`` exists — B and C
+            are different exploitable targets.  When False (domain scope), all
+            sub-sequences are marked as covered/shadowed regardless of their
+            terminal, giving the most compact holistic view.  In the
+            ``keep_shortest`` branch this flag no longer gates matching — the
+            attack-core comparison already ignores context hops.
     """
     if len(records) <= 1:
         return records, 0
@@ -933,76 +1069,103 @@ def filter_contained_paths_for_domain_listing(
                         covered.add((nodes_t[start : end + 1], rels_t[start:end]))
         return kept, removed
     else:
-        # Owned/principals multi-user mode: keep the most direct path within
-        # each contained group.  Sort key:
-        #   (not is_hv, length)
-        # HV-terminal paths get priority (False < True), then shorter within
-        # the same HV category.  This ensures:
-        #   • A shorter HV path beats a longer HV path              → keep shorter HV
-        #   • A longer HV path beats a shorter non-HV path          → keep HV even if longer
-        #   • Neither is HV → keep shorter                          → most direct route
+        # Owned/principals multi-user mode: keep the most direct path within each
+        # contained group, while never collapsing a higher domain-compromise tier
+        # into a lower one.  Matching is CONTEXT-INSENSITIVE (F5 Fix #1): two paths
+        # are compared on their non-contextual attack core (``attack_core_signature``
+        # — MemberOf/structural relations stripped, ``X→DumpLSA→X`` self-loops
+        # collapsed), NOT the literal node/rel arrays.  Dominance uses the 4-tier
+        # domain-compromise total order (F5 Fix #2): T4 Domain object > T3
+        # direct-breaker group > T2 enabler > T1 host.
         #
-        # preserve_prefix_paths=True  (production path): a candidate is a
-        #   super-path only when the shadowing sub-sequence ends at the same
-        #   terminal.  These are the strict suffixes of the candidate — O(L).
-        #
-        # preserve_prefix_paths=False: any sub-sequence match suffices — O(L²).
-        if is_hv_terminal is not None:
-            normalized.sort(
-                key=lambda item: (not is_hv_terminal(item[2]), len(item[1]))
-            )
-        else:
-            normalized.sort(key=lambda item: len(item[1]))
-        kept_sigs: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
-        # Store tuples so Pass 2 can access node/rel sequences without re-parsing.
-        kept_entries: list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]] = []
+        # Sort key (process the record that should be KEPT first):
+        #   (-domain_compromise_tier, not is_hv, length)
+        # Highest domain-compromise tier first (a T4 Domain-object path is kept
+        # before any truncated T3/T1 subpath can shadow it), then the legacy
+        # ``is_hv_terminal`` flag, then shorter length wins the tie.
+        def _entry_core(record: dict[str, Any]) -> AttackCore | None:
+            nodes = record.get("nodes")
+            rels = record.get("relations")
+            if not isinstance(nodes, list) or not isinstance(rels, list):
+                return None
+            return attack_core_signature(nodes, rels)
+
+        cores_by_id: dict[int, AttackCore | None] = {}
+        tiers_by_id: dict[int, int] = {}
+        for _nt, _rt, record in normalized:
+            cores_by_id[id(record)] = _entry_core(record)
+            tiers_by_id[id(record)] = domain_compromise_tier_from_record(record)
+
+        def _sort_key(
+            item: tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]],
+        ) -> tuple[int, bool, int]:
+            record = item[2]
+            dct = tiers_by_id[id(record)]
+            not_hv = (not is_hv_terminal(record)) if is_hv_terminal is not None else True
+            return (-dct, not_hv, len(item[1]))
+
+        normalized.sort(key=_sort_key)
+        # Pass 1 — drop a candidate B when an already-kept A's attack core is a
+        # contiguous sub-sequence (or prefix) of B's, UNLESS B reaches a strictly
+        # higher domain-compromise tier than the kept A (then B carries genuinely
+        # more domain impact and is preserved — the kept A becomes a redundant
+        # prefix removed in Pass 2 instead).  ``preserve_prefix_paths`` only
+        # influences the legacy literal mode; on the attack core a prefix and a
+        # same-terminal suffix coincide because context hops are already stripped.
+        kept_entries: list[tuple[AttackCore | None, dict[str, Any]]] = []
         removed_multi = 0
         for nodes_t, rels_t, record in normalized:
-            rel_len = len(rels_t)
+            cand_core = cores_by_id[id(record)]
+            cand_tier = tiers_by_id[id(record)]
             is_super_path = False
-            if preserve_prefix_paths:
-                # O(L): check only strict suffixes of the candidate — these end at
-                # the same terminal by construction, so no per-iteration node check.
-                # s=0 would be the full path (not a strict sub-path) — start from 1.
-                for s in range(1, rel_len):
-                    if (nodes_t[s:], rels_t[s:]) in kept_sigs:
-                        is_super_path = True
-                        break
-            else:
-                # O(L²): check all strict sub-sequences regardless of terminal.
-                for start in range(0, rel_len):
-                    for end in range(start + 1, rel_len + 1):
-                        if end - start >= rel_len:
-                            continue
-                        if (nodes_t[start : end + 1], rels_t[start:end]) in kept_sigs:
-                            is_super_path = True
-                            break
-                    if is_super_path:
-                        break
+            if cand_core is not None:
+                for kept_core, kept_rec in kept_entries:
+                    if kept_core is None:
+                        continue
+                    contained = attack_core_is_prefix(
+                        kept_core, cand_core
+                    ) or attack_core_is_subsequence(kept_core, cand_core)
+                    if not contained:
+                        continue
+                    # Keep the longer candidate when it reaches a strictly higher
+                    # domain-compromise tier than the kept sub-path.
+                    if cand_tier > tiers_by_id[id(kept_rec)]:
+                        continue
+                    is_super_path = True
+                    break
             if is_super_path:
                 removed_multi += 1
             else:
-                kept_entries.append((nodes_t, rels_t, record))
-                kept_sigs.add((nodes_t, rels_t))
+                kept_entries.append((cand_core, record))
 
-        # Pass 2 — Case 1: remove strict prefixes (same source, different target).
-        # Builds a set of every prefix sub-sequence (starting at index 0) that exists
-        # inside a longer kept path.  A shorter path whose full signature appears in
-        # this set is a strict prefix of some longer path and adds no information —
-        # the intermediate node is already visible in the longer chain.
-        #
-        # HV-terminal paths are never dropped, even if they happen to be a prefix of
-        # a longer non-HV path (e.g. "A→HV" survives when "A→HV→X" also exists).
-        covered_prefixes: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
-        for nodes_t, rels_t, _rec in kept_entries:
-            for end in range(1, len(rels_t)):  # strict prefix: end < full length
-                covered_prefixes.add((nodes_t[: end + 1], rels_t[:end]))
-
+        # Pass 2 — remove a kept path A when a kept super-path B strictly contains
+        # A's attack core as a prefix/sub-sequence AND B's domain-compromise tier is
+        # >= A's (the 4-tier total order, F5 Fix #2 — replaces the lane-based
+        # ``tier_dominates`` guard).  Carve-out: an HV terminal is never dropped
+        # (legacy ``is_hv_terminal``).  Effects:
+        #   • a T3 ``…→Domain Controllers`` prefix is dropped by the T4
+        #     ``…→DCSync→Domain`` super-path it prefixes (4 >= 3);
+        #   • a T4 Domain-object prefix is NEVER dropped by a longer T1-host
+        #     super-path (1 >= 4 is False) — preserves the F2 anti-regression.
         pass2_kept: list[dict[str, Any]] = []
         pass2_removed = 0
-        for nodes_t, rels_t, record in kept_entries:
+        for a_core, record in kept_entries:
+            a_tier = tiers_by_id[id(record)]
             rec_is_hv = is_hv_terminal(record) if is_hv_terminal is not None else False
-            if (nodes_t, rels_t) in covered_prefixes and not rec_is_hv:
+            dominated = False
+            if a_core is not None and not rec_is_hv:
+                for b_core, other in kept_entries:
+                    if other is record or b_core is None:
+                        continue
+                    if not (
+                        attack_core_is_prefix(a_core, b_core)
+                        or attack_core_is_subsequence(a_core, b_core)
+                    ):
+                        continue
+                    if tiers_by_id[id(other)] >= a_tier:
+                        dominated = True
+                        break
+            if dominated:
                 pass2_removed += 1
             else:
                 pass2_kept.append(record)
@@ -1034,62 +1197,67 @@ def _outcome_class_rank(record: dict[str, Any]) -> int:
 def filter_prefix_paths_dominated_by_super_path(
     records: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
-    """Remove paths that are strict contiguous prefixes of a higher/equal-class super-path.
+    """Remove paths that are prefixes of a domain-tier-dominating super-path.
 
-    Rule: if path A is a strict contiguous prefix of path B (same source, A's
-    node/rel sequence appears at the start of B's), AND rank(B) >= rank(A),
-    eliminate A — the super-path already communicates everything A does, plus more.
+    Matching (F5 Fix #1 — context-insensitive): "A is a prefix of B" is decided on
+    the **non-contextual attack core** (``attack_core_signature``) — MemberOf and
+    the other structural relations are stripped and ``X→DumpLSA→X`` self-loops are
+    collapsed — NOT on the literal node/rel arrays. This is what lets a path
+    truncated at the Domain Controllers group be recognized as a prefix of the full
+    ``…→DCSync→Domain`` kill chain even though the full path's rendered arrays carry
+    an extra DumpLSA self-loop node and a different terminal. The DISPLAYED records
+    are untouched; only the matching key is context-insensitive.
 
-    Exception: if rank(B) < rank(A) (B goes *beyond* A to a less valuable target),
-    A is kept — it terminates at a more important node.
+    Dominance (F5 Fix #2 — 4-tier total order): a prefix A is dropped by a
+    containing super-path B iff A's core is a strict prefix of B's core AND
+    ``domain_compromise_tier(B) >= domain_compromise_tier(A)`` on the operator-defined
+    total order ``T4 Domain object > T3 direct-breaker group > T2 enabler > T1 host``.
+    This:
 
-    This is applied *after* the within-target contained-path filter so that it only
-    deals with cross-target prefix relationships (different terminal nodes).
+    * collapses redundant domain-tier prefixes (a T3 ``…→Domain Controllers`` path is
+      dropped in favour of the T4 ``…→DCSync→Domain`` super-path it prefixes);
+    * preserves the F1 anti-regression — a T4 Domain-object prefix is NEVER dropped by
+      a longer lower-tier super-path (``1 >= 4`` is False), so the headline
+      domain-compromise path always survives a host-terminal extension.
+
+    The legacy ``_outcome_class_rank`` guard is intentionally NOT re-applied here: the
+    4-tier domain-compromise order is the finer, authoritative dominance for domain
+    outcomes (e.g. it distinguishes the Domain object from a direct-breaker group,
+    which both map to outcome rank 100 and would otherwise tie). This runs *after* the
+    within-target contained-path filter, so it only deals with cross-target prefix
+    relationships (different terminal nodes).
     """
     if len(records) <= 1:
         return records, 0
 
-    normalized: list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]] = []
+    # Pre-compute the context-insensitive attack core + 4-tier rank for each record.
+    cores: list[tuple[AttackCore | None, int, dict[str, Any]]] = []
     for record in records:
-        # Use nodes/relations directly — the cached _exact_signature may reflect
-        # a longer path variant picked by an earlier deduplication stage and would
-        # give a signature inconsistent with what this record currently displays.
         nodes = record.get("nodes")
         rels = record.get("relations")
-        if not isinstance(nodes, list) or not isinstance(rels, list) or not nodes or not rels:
-            normalized.append(((), (), record))
-            continue
-        nodes_t = tuple(str(n) for n in nodes)
-        rels_t = tuple(str(r) for r in rels)
-        normalized.append((nodes_t, rels_t, record))
-
-    # Build a set of (nodes_prefix, rels_prefix, max_rank) from all records so
-    # we can check whether a shorter path's full signature appears as a prefix of
-    # some longer, higher/equal-ranked path.
-    prefix_max_rank: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
-    for nodes_t, rels_t, record in normalized:
-        rank = _outcome_class_rank(record)
-        rel_len = len(rels_t)
-        if rel_len < 2:
-            continue
-        # Register every strict prefix (length 1..rel_len-1) of this path.
-        for end in range(1, rel_len):
-            key = (nodes_t[: end + 1], rels_t[:end])
-            existing = prefix_max_rank.get(key, -1)
-            if rank > existing:
-                prefix_max_rank[key] = rank
+        core = (
+            attack_core_signature(nodes, rels)
+            if isinstance(nodes, list) and isinstance(rels, list)
+            else None
+        )
+        cores.append((core, domain_compromise_tier_from_record(record), record))
 
     kept: list[dict[str, Any]] = []
     removed = 0
-    for nodes_t, rels_t, record in normalized:
-        if not rels_t:
+    for a_core, a_tier, record in cores:
+        if a_core is None:
             kept.append(record)
             continue
-        sig = (nodes_t, rels_t)
-        super_rank = prefix_max_rank.get(sig, -1)
-        own_rank = _outcome_class_rank(record)
-        if super_rank >= own_rank:
-            # A higher/equal-class super-path covers this record — drop it.
+        dominated = False
+        for b_core, b_tier, other in cores:
+            if other is record or b_core is None:
+                continue
+            # A is dropped only by a super-path B that strictly contains A's core as a
+            # leading prefix AND whose domain-compromise tier is >= A's.
+            if attack_core_is_prefix(a_core, b_core) and b_tier >= a_tier:
+                dominated = True
+                break
+        if dominated:
             removed += 1
         else:
             kept.append(record)
@@ -1414,82 +1582,6 @@ def _build_local_reuse_useful_node_ids(
     return useful
 
 
-
-# Relations that confer LOCAL ADMIN on the target Computer.  Only these
-# justify injecting a virtual DumpLSA self-loop: DumpLSA reads
-# HKLM\SECURITY\Policy\Secrets\$MACHINE.ACC, which requires local-admin
-# privileges on the host (MITRE T1003.004).
-#
-# NOT included here: CanPSRemote, CanRDP — those give a user-level WinRM /
-# RDP session, not local-admin.  An attacker arriving via CanPSRemote cannot
-# dump LSA secrets without first escalating, so a speculative DumpLSA bridge
-# for those edges would produce false-positive paths.
-_LOCAL_ADMIN_ACCESS_RELATIONS: frozenset[str] = frozenset(
-    {
-        "adminto",           # SMB local-admin shell — deterministic local admin
-        "readlapspassword",  # recovers the local admin password — AdminTo-equivalent
-        # NTLMv1 coerce→relay→RBCD (sub-project #3): the relay writes RBCD on the
-        # victim, then S4U2Self+Proxy mints an Administrator ccache → a genuine
-        # local-admin session on the victim, AdminTo-equivalent. Its catalog
-        # semantics are access_capability_only (→ local_admin_session), so it
-        # belongs in the same DumpLSA-bridge set as AdminTo / ReadLAPSPassword.
-        # (Ntlmv1RelayShadowCreds / CrackNTLMv1 are credential_access_only →
-        # credential_recovered, so they deliberately do NOT appear here — the
-        # machine hash is already the credential, no DumpLSA needed.)
-        "ntlmv1relayrbcd",
-        # SPN-jacking + KCD: S4U2Self+S4U2Proxy mints an Administrator service
-        # ticket against the target computer (altservice CIFS), i.e. a genuine
-        # local-admin session on it — AdminTo-equivalent, so it bridges to
-        # DumpLSA exactly like Ntlmv1RelayRBCD. For a DC target the headline
-        # remains DC$ -> Domain Controllers -> DCSync -> Domain (higher-class,
-        # the engine ranks it first); the DumpLSA self-loop is the
-        # post-ex continuation for non-DC targets (SPNJack -> SRV01 -> DumpLSA).
-        "spnjack",
-        # NOT included:
-        #   canpsremote / canrdp — user-level sessions, no admin guarantee
-        #   executedcom         — COM execution context; SYSTEM not guaranteed
-        #   sqladmin            — SQL sysadmin; SYSTEM requires SeImpersonatePrivilege
-        #                         (modelled separately via MssqlSeImpersonateEscalation)
-    }
-)
-
-
-def _edge_grants_local_admin_session(
-    edge: dict[str, Any], nodes_map: dict[str, Any]
-) -> bool:
-    """Return True when this edge yields a deterministic local-admin session.
-
-    Two classes qualify for the implicit DumpLSA bridge:
-
-    * Relations in :data:`_LOCAL_ADMIN_ACCESS_RELATIONS` — flat, unconditional
-      local-admin grants (AdminTo, ReadLAPSPassword, Ntlmv1RelayRBCD, SPNJack).
-    * ``AllowedToDelegate`` (constrained delegation) **only when the source has
-      protocol transition** (``hastrustedtoauth`` / TrustedToAuthForDelegation).
-      With T2A4D the source can S4U2Self an arbitrary admin, S4U2Proxy to the
-      delegated SPN on the target host, and altservice-rewrite the sname to CIFS
-      — a local-admin session on the target (the ticket is accepted on the
-      target's own key, so any delegated SPN class works via altservice).
-      Without T2A4D the source can only impersonate users who authenticate to
-      it — NOT a deterministic admin session — so the bridge is gated on the
-      source node's flag, which a flat relation set cannot express. This mirrors
-      the SPNJack gate (which also requires T2A4D); SPNJack covers SPN-relocated
-      targets, this covers the SPN's current owner host that SPNJack defers.
-    """
-    rel_lower = str(edge.get("relation") or "").strip().lower()
-    if rel_lower in _LOCAL_ADMIN_ACCESS_RELATIONS:
-        return True
-    if rel_lower == "allowedtodelegate":
-        source_node = nodes_map.get(str(edge.get("from") or "").strip())
-        if isinstance(source_node, dict):
-            props = (
-                source_node.get("properties")
-                if isinstance(source_node.get("properties"), dict)
-                else {}
-            )
-            return bool(props.get("hastrustedtoauth"))
-    return False
-
-
 def _build_implicit_dumplsa_overlay(
     graph: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1548,6 +1640,226 @@ def _build_implicit_dumplsa_overlay(
     return overlay
 
 
+def _build_implicit_dc_dcsync_overlay(
+    graph: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build virtual direct ``DCSync`` edges for admin-ticket arrivals on a DC.
+
+    For every **writable Domain Controller** Computer node reached via a
+    deterministic local-admin access edge (see
+    :func:`_edge_grants_local_admin_session` — AdminTo, ReadLAPSPassword,
+    Ntlmv1RelayRBCD, SPNJack, and AllowedToDelegate with protocol transition),
+    injects a synthetic ``Computer -> DCSync -> <Domain object>`` edge.
+
+    AD rationale: an admin/SYSTEM context on a writable DC can DCSync directly.
+    Running as SYSTEM IS the DC machine account, which is a member of Domain
+    Controllers and holds DS-Replication-Get-Changes / -All on the domain head;
+    impersonating Administrator (RID 500) likewise yields a Domain Admin with
+    replication rights. So the admin ticket replicates the domain credentials
+    *immediately*, without first dumping the machine account from LSA secrets.
+
+    This is injected IN ADDITION to (never replacing) the DumpLSA self-loop from
+    :func:`_build_implicit_dumplsa_overlay`. The two are distinct techniques:
+    the direct edge is the fastest domain compromise; the DumpLSA path also
+    extracts the durable machine-account credential (persistence / offline /
+    cross-host reuse). Their attack cores diverge (``...,DCSync`` vs
+    ``...,DumpLSA,...,DCSync``) so both survive the display filters.
+
+    Scoped to **writable** DCs only — an RODC machine account holds only partial
+    secrets and no full GetChangesAll, so it keeps DumpLSA-only.
+
+    The overlay is computed once per DFS call and never persisted to disk.
+    """
+    nodes_map: dict[str, Any] = graph.get("nodes") or {}
+
+    # Map every Domain-object node by its domain SID (a domain object's objectid
+    # IS the domain SID ``S-1-5-21-X-Y-Z``).  A writable DC only holds GetChanges
+    # / GetChangesAll on ITS OWN domain head, so each DC's synthetic DCSync edge
+    # must point at the matching domain node — NEVER a foreign domain.  In a
+    # multi-domain / forest graph, pointing every DC at a single first-found
+    # domain node would mint a false ``DC-A -> DCSync -> DOMAIN-B`` edge.
+    domain_node_by_sid: dict[str, str] = {}
+    domain_node_ids: list[str] = []
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict) or not _node_is_domain(node):
+            continue
+        nid = str(node_id)
+        domain_node_ids.append(nid)
+        dom_sid = _node_domain_sid(node)
+        if dom_sid and dom_sid not in domain_node_by_sid:
+            domain_node_by_sid[dom_sid] = nid
+    if not domain_node_ids:
+        return {}
+
+    # Single-domain fallback target: when exactly one domain node exists, an
+    # unresolved DC domain SID still maps unambiguously to it (the common,
+    # currently-validated case — preserves today's single-domain behaviour).
+    single_domain_node_id: str | None = (
+        domain_node_ids[0] if len(domain_node_ids) == 1 else None
+    )
+
+    overlay: dict[str, list[dict[str, Any]]] = {}
+    seen_dc_targets: set[str] = set()
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        if not _edge_grants_local_admin_session(edge, nodes_map):
+            continue
+        to_id = str(edge.get("to") or "").strip()
+        if not to_id or to_id in seen_dc_targets:
+            continue
+        target_node = nodes_map.get(to_id)
+        if not isinstance(target_node, dict):
+            continue
+        if str(target_node.get("kind") or "").strip().lower() != "computer":
+            continue
+        # Writable DC only — RODCs hold partial secrets / no full replication.
+        if classify_computer_node_role(target_node) != "writable_dc":
+            continue
+        seen_dc_targets.add(to_id)
+
+        # Per-DC domain resolution (the canonical AD mapping):
+        #   (a) the DC's own domain SID resolves to a domain node -> use it;
+        #   (b) else exactly one domain node in the graph -> use it (single-
+        #       domain workspace, preserves today's behaviour);
+        #   (c) else (multiple domains, no SID match) -> SKIP this DC. A false
+        #       cross-domain DCSync edge is worse than a missing one.
+        dc_domain_sid = _node_domain_sid(target_node)
+        domain_node_id: str | None = None
+        if dc_domain_sid is not None:
+            domain_node_id = domain_node_by_sid.get(dc_domain_sid)
+        if domain_node_id is None:
+            domain_node_id = single_domain_node_id
+        if domain_node_id is None:
+            continue
+
+        overlay.setdefault(to_id, []).append(
+            {
+                "from": to_id,
+                "to": domain_node_id,
+                "relation": "DCSync",
+                "kind": "derived",
+                "notes": {
+                    "virtual": True,
+                    "theoretical": True,
+                    "synthesized_from": "implicit_dc_dcsync_bridge",
+                },
+            }
+        )
+
+    return overlay
+
+
+def _build_implicit_session_followup_overlay(
+    graph: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build virtual session-impersonation follow-up self-loops for HasSession.
+
+    ``HasSession`` is an ACCESS edge (``EdgeKind.AUTH``): ``Computer ->
+    HasSession -> User`` means a logon session of ``User`` exists on the host.
+    Arriving at the user is NOT ownership — you must LEVERAGE the session to
+    "become" the user. Two techniques do so, both modelled here as a derived
+    self-loop on the session-user node (``User -> <technique> -> User``):
+
+      * ``ScheduledTask`` — register a Task Scheduler task whose principal IS the
+        session user (``InteractiveToken``), running code under their existing
+        logon session (the implemented native path, ``hassession_native``).
+      * ``DumpLSASS`` — dump the session user's credentials from the host LSASS.
+
+    Both carry ``compromise_semantics=direct_target_compromise`` (provides
+    ``credential_recovered``), so after the follow-up the path may traverse the
+    session user's OWN outbound edges (``MemberOf -> Administrators -> DCSync ->
+    Domain``, etc.).
+
+    Self-gating — the credential-context guard only lets these chain when the
+    immediately-preceding non-transparent edge produced ``local_admin_session``.
+    Among edges that target a USER node that is uniquely ``HasSession``
+    (``access_capability_only``); control edges that land on a user (GenericAll,
+    ForceChangePassword, ...) produce ``credential_recovered``, which does NOT
+    satisfy ``local_admin_session``, so the guard withholds the follow-ups there.
+    The follow-ups also cannot self-chain (after one runs the context is
+    ``credential_recovered``, not ``local_admin_session``), so exactly the two
+    divergent variants are generated, never an explosion.
+
+    CRITICAL — this is intentionally the ONLY follow-up set ``HasSession``
+    unlocks. It does NOT receive the host self-credential follow-ups (``DumpLSA``
+    / ``DumpDPAPI`` / ``DumpSAM``) that a local-admin Computer arrival gets:
+    those are minted by :func:`_build_implicit_dumplsa_overlay` on COMPUTER nodes
+    only, never on the user nodes this overlay targets.
+
+    The overlay is computed once per DFS call and never persisted to disk.
+    """
+    nodes_map: dict[str, Any] = graph.get("nodes") or {}
+    overlay: dict[str, list[dict[str, Any]]] = {}
+    seen_session_users: set[str] = set()
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip().lower() != "hassession":
+            continue
+        to_id = str(edge.get("to") or "").strip()
+        if not to_id or to_id in seen_session_users:
+            continue
+        target_node = nodes_map.get(to_id)
+        if not isinstance(target_node, dict):
+            continue
+        # HasSession targets a session principal (User). Skip anything else.
+        if str(target_node.get("kind") or "").strip().lower() != "user":
+            continue
+        seen_session_users.add(to_id)
+        for technique in ("ScheduledTask", "DumpLSASS"):
+            overlay.setdefault(to_id, []).append(
+                {
+                    "from": to_id,
+                    "to": to_id,
+                    "relation": technique,
+                    "kind": "derived",
+                    "notes": {
+                        "virtual": True,
+                        "theoretical": True,
+                        "synthesized_from": "implicit_session_followup_bridge",
+                    },
+                }
+            )
+
+    return overlay
+
+
+def _build_implicit_path_overlays(
+    graph: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Merge every synthetic per-node overlay the DFS traverses into one map.
+
+    Single entry point for the DFS so new overlays can be added without
+    threading another argument through three DFS sites and the worker globals.
+    Currently merges:
+
+    * the DumpLSA self-loop bridge (:func:`_build_implicit_dumplsa_overlay`) —
+      ``Computer -> DumpLSA -> Computer`` for any deterministic local-admin
+      arrival on a Computer;
+    * the direct DCSync bridge (:func:`_build_implicit_dc_dcsync_overlay`) —
+      ``Computer -> DCSync -> Domain`` for an admin-ticket arrival on a writable
+      DC, in addition to (not replacing) the DumpLSA self-loop;
+    * the session-impersonation follow-up
+      (:func:`_build_implicit_session_followup_overlay`) —
+      ``User -> ScheduledTask -> User`` and ``User -> DumpLSASS -> User`` for the
+      session user a ``HasSession`` edge lands on, so the path can "become" the
+      session user and traverse their outbound edges.
+    """
+    merged: dict[str, list[dict[str, Any]]] = {}
+    for builder in (
+        _build_implicit_dumplsa_overlay,
+        _build_implicit_dc_dcsync_overlay,
+        _build_implicit_session_followup_overlay,
+    ):
+        for node_id, edges in builder(graph).items():
+            merged.setdefault(node_id, []).extend(edges)
+    return merged
+
+
+
 def _iter_outgoing_edges_with_virtual_local_reuse(
     current: str,
     *,
@@ -1556,7 +1868,7 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
     local_reuse_by_node: dict[str, list[dict[str, Any]]],
     local_reuse_existing_pairs: set[tuple[str, str]],
     local_reuse_useful_nodes: set[str],
-    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]] | None = None,
+    implicit_edge_overlay: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return real + virtual outgoing edges for traversal.
 
@@ -1577,7 +1889,7 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
     if not clusters:
         # Virtual implicit DumpLSA self-loops — append even when there are no
         # local-reuse clusters so the early-return path does not skip them.
-        for edge in (implicit_dumplsa_overlay or {}).get(current, []):
+        for edge in (implicit_edge_overlay or {}).get(current, []):
             next_edges.append(edge)
         return next_edges
 
@@ -1628,7 +1940,7 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
     # Virtual implicit DumpLSA self-loops — append last so they have lowest
     # traversal priority. The DFS context guard will only allow them to chain
     # when the previous edge produced local_admin_session.
-    for edge in (implicit_dumplsa_overlay or {}).get(current, []):
+    for edge in (implicit_edge_overlay or {}).get(current, []):
         next_edges.append(edge)
 
     return next_edges
@@ -1829,7 +2141,7 @@ _W_LOCAL_REUSE_BY_NODE: dict[str, list[dict[str, Any]]] = {}
 _W_LOCAL_REUSE_EXISTING_PAIRS: set[tuple[str, str]] = set()
 _W_LOCAL_REUSE_USEFUL_NODES: set[str] = set()
 _W_TERMINAL_SET: set[str] = set()
-_W_IMPLICIT_DUMPLSA_OVERLAY: dict[str, list[dict[str, Any]]] = {}
+_W_IMPLICIT_EDGE_OVERLAY: dict[str, list[dict[str, Any]]] = {}
 
 
 def _dfs_worker_init(
@@ -1838,18 +2150,18 @@ def _dfs_worker_init(
     local_reuse_existing_pairs: set[tuple[str, str]],
     local_reuse_useful_nodes: set[str],
     terminal_set: set[str],
-    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]],
+    implicit_edge_overlay: dict[str, list[dict[str, Any]]],
 ) -> None:
     """Populate per-worker globals. Called once per worker process by the pool initializer."""
     global _W_ADJACENCY, _W_LOCAL_REUSE_BY_NODE  # noqa: PLW0603
     global _W_LOCAL_REUSE_EXISTING_PAIRS, _W_LOCAL_REUSE_USEFUL_NODES, _W_TERMINAL_SET  # noqa: PLW0603
-    global _W_IMPLICIT_DUMPLSA_OVERLAY  # noqa: PLW0603
+    global _W_IMPLICIT_EDGE_OVERLAY  # noqa: PLW0603
     _W_ADJACENCY = adjacency
     _W_LOCAL_REUSE_BY_NODE = local_reuse_by_node
     _W_LOCAL_REUSE_EXISTING_PAIRS = local_reuse_existing_pairs
     _W_LOCAL_REUSE_USEFUL_NODES = local_reuse_useful_nodes
     _W_TERMINAL_SET = terminal_set
-    _W_IMPLICIT_DUMPLSA_OVERLAY = implicit_dumplsa_overlay
+    _W_IMPLICIT_EDGE_OVERLAY = implicit_edge_overlay
 
 
 def _dfs_sources_batch_worker(
@@ -1870,7 +2182,7 @@ def _dfs_sources_batch_worker(
     local_reuse_existing_pairs = _W_LOCAL_REUSE_EXISTING_PAIRS
     local_reuse_useful_nodes = _W_LOCAL_REUSE_USEFUL_NODES
     terminal_set = _W_TERMINAL_SET
-    implicit_dumplsa_overlay = _W_IMPLICIT_DUMPLSA_OVERLAY
+    implicit_edge_overlay = _W_IMPLICIT_EDGE_OVERLAY
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
@@ -1915,7 +2227,7 @@ def _dfs_sources_batch_worker(
             local_reuse_by_node=local_reuse_by_node,
             local_reuse_existing_pairs=local_reuse_existing_pairs,
             local_reuse_useful_nodes=local_reuse_useful_nodes,
-            implicit_dumplsa_overlay=implicit_dumplsa_overlay,
+            implicit_edge_overlay=implicit_edge_overlay,
         )
         if not next_edges:
             emit(acc_steps)
@@ -1933,7 +2245,7 @@ def _dfs_sources_batch_worker(
             # AdminTo → AllowedToDelegate that look valid syntactically but
             # require an unstated post-exploitation step.
             _cand_rel = str(edge.get("relation") or "").strip().lower()
-            if not _edges_chain_ok(_path_rels, _cand_rel):
+            if not _edges_chain_ok(_path_rels, _cand_rel, candidate_edge=edge):
                 continue
             # ── End guard ────────────────────────────────────────────────────
 
@@ -2004,7 +2316,7 @@ def _run_parallel_domain_dfs(
     max_depth: int,
     max_paths_cap: int | None,
     n_workers: int,
-    implicit_dumplsa_overlay: dict[str, list[dict[str, Any]]] | None = None,
+    implicit_edge_overlay: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[AttackPath]:
     """Distribute the DFS over *n_workers* spawn-context processes.
 
@@ -2037,7 +2349,7 @@ def _run_parallel_domain_dfs(
                 local_reuse_existing_pairs,
                 local_reuse_useful_nodes,
                 terminal_set,
-                implicit_dumplsa_overlay or {},
+                implicit_edge_overlay or {},
             ),
         ) as pool:
             futures = [
@@ -2257,7 +2569,7 @@ def compute_maximal_attack_paths(
         nodes_map, edges
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
-    implicit_dumplsa_overlay = _build_implicit_dumplsa_overlay(graph)
+    implicit_edge_overlay = _build_implicit_path_overlays(graph)
 
     mode = normalize_target_mode(terminal_mode)
 
@@ -2326,7 +2638,7 @@ def compute_maximal_attack_paths(
             max_depth,
             max_paths_cap,
             n_workers,
-            implicit_dumplsa_overlay,
+            implicit_edge_overlay,
         )
         if parallel_paths or not sources:
             return parallel_paths
@@ -2382,7 +2694,7 @@ def compute_maximal_attack_paths(
             local_reuse_by_node=local_reuse_by_node,
             local_reuse_existing_pairs=local_reuse_existing_pairs,
             local_reuse_useful_nodes=local_reuse_useful_nodes,
-            implicit_dumplsa_overlay=implicit_dumplsa_overlay,
+            implicit_edge_overlay=implicit_edge_overlay,
         )
         if not next_edges:
             emit(acc_steps)
@@ -2401,7 +2713,7 @@ def compute_maximal_attack_paths(
             # AdminTo → AllowedToDelegate that look valid syntactically but
             # require an unstated post-exploitation step.
             _cand_rel = str(edge.get("relation") or "").strip().lower()
-            if not _edges_chain_ok(_path_rels, _cand_rel):
+            if not _edges_chain_ok(_path_rels, _cand_rel, candidate_edge=edge):
                 continue
             # ── End guard ────────────────────────────────────────────────────
 
@@ -2491,7 +2803,7 @@ def compute_maximal_attack_paths_from_start(
         nodes_map, edges
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
-    implicit_dumplsa_overlay = _build_implicit_dumplsa_overlay(graph)
+    implicit_edge_overlay = _build_implicit_path_overlays(graph)
     allowed_reachable_ids: set[str] = (
         {str(node_id) for node_id in reachable_node_ids if str(node_id).strip()}
         if reachable_node_ids
@@ -2556,7 +2868,7 @@ def compute_maximal_attack_paths_from_start(
             local_reuse_by_node=local_reuse_by_node,
             local_reuse_existing_pairs=local_reuse_existing_pairs,
             local_reuse_useful_nodes=local_reuse_useful_nodes,
-            implicit_dumplsa_overlay=implicit_dumplsa_overlay,
+            implicit_edge_overlay=implicit_edge_overlay,
         )
         if not next_edges:
             emit(acc_steps)
@@ -2575,7 +2887,7 @@ def compute_maximal_attack_paths_from_start(
             # AdminTo → AllowedToDelegate that look valid syntactically but
             # require an unstated post-exploitation step.
             _cand_rel = str(edge.get("relation") or "").strip().lower()
-            if not _edges_chain_ok(_path_rels, _cand_rel):
+            if not _edges_chain_ok(_path_rels, _cand_rel, candidate_edge=edge):
                 continue
             # ── End guard ────────────────────────────────────────────────────
 
@@ -2717,25 +3029,31 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             group_names=[group_name],
         )
         normalized_group_name = normalize_group_name(group_name)
+        # Terminate the synthetic escalation follow-up at the REAL domain object
+        # node (not a "Domain Control" placeholder) so the annotation phase — which
+        # resolves the terminal node by label — classifies it against the domain
+        # object and the canonical target_mode="object" ordering surfaces it in the
+        # Domain Compromised tier.
+        domain_label = _resolve_membership_followup_domain_label(graph, target_node)
         if membership.dns_admins:
             return {
                 "relation": "DnsAdminAbuse",
                 "status": "blocked",
-                "to": "Domain Control",
+                "to": domain_label,
                 "reason": "Production-impacting DNS modification is blocked by design",
             }
         if membership.backup_operators:
             return {
                 "relation": "BackupOperatorEscalation",
                 "status": "theoretical",
-                "to": "Domain Control",
+                "to": domain_label,
                 "reason": "Backup Operators can enable a follow-up path to domain compromise",
             }
         if normalized_group_name == "print operators":
             return {
                 "relation": "PrintOperatorAbuse",
                 "status": "unsupported",
-                "to": "Domain Control",
+                "to": domain_label,
                 "reason": "Print Operators exposure is modeled, but ADscan has no automated follow-up yet",
             }
         return None
@@ -2845,7 +3163,15 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         ),
         "source": nodes[0] if nodes else "",
         "target": nodes[-1] if nodes else "",
-        "terminal_target_label": label(path.target_id),
+        # When a synthetic escalation follow-up extends the path past the group
+        # to the domain object, the terminal IS that domain object — the
+        # annotation phase must resolve the domain node, not the group, so the
+        # path is classified/ordered as a domain-compromise terminal.
+        "terminal_target_label": (
+            str(synthetic_followup["to"])
+            if synthetic_followup is not None
+            else label(path.target_id)
+        ),
         "status": derived_status,
         "steps": steps_for_ui,
     }
@@ -2925,6 +3251,46 @@ def resolve_domain_node_labels(graph: dict[str, Any]) -> tuple[str, ...]:
     return tuple(labels)
 
 
+def _resolve_membership_followup_domain_label(
+    graph: dict[str, Any],
+    group_node: dict[str, Any] | None,
+) -> str:
+    """Return the label of the domain object a privileged-group escalation reaches.
+
+    A synthetic escalation follow-up (``BackupOperatorEscalation``,
+    ``DnsAdminAbuse``, ``PrintOperatorAbuse``) must terminate at the **real**
+    domain object node (e.g. ``BABY.VL``), not at a synthetic ``"Domain Control"``
+    placeholder string. Only a real domain-object terminal is resolvable by the
+    annotation phase (which looks the terminal node up by label), so the path is
+    classified against the domain object — surfacing it in the *Domain Compromised*
+    tier via the canonical ``target_mode="object"`` domain-object-first ordering
+    instead of as an unresolved follow-up placeholder.
+
+    Multi-domain safe: with a single domain node, return its label; with several,
+    prefer the one matching the group's ``properties.domain``; fall back to the
+    legacy ``"Domain Control"`` placeholder only when no domain node resolves.
+    """
+    labels = resolve_domain_node_labels(graph)
+    if len(labels) == 1:
+        return labels[0]
+    if not labels:
+        return "Domain Control"
+    group_domain = ""
+    if isinstance(group_node, dict):
+        props = (
+            group_node.get("properties")
+            if isinstance(group_node.get("properties"), dict)
+            else {}
+        )
+        group_domain = str((props or {}).get("domain") or "").strip().lower()
+    if group_domain:
+        for lbl in labels:
+            normalized = lbl.strip().lower()
+            if normalized == group_domain or normalized.endswith("@" + group_domain):
+                return lbl
+    return "Domain Control"
+
+
 def _extract_node_sid_and_rid(node: dict[str, Any]) -> tuple[str | None, int | None]:
     """Return normalized SID and RID for one graph node when available."""
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
@@ -2951,6 +3317,33 @@ def _extract_node_sid_and_rid(node: dict[str, Any]) -> tuple[str | None, int | N
     except Exception:
         rid = None
     return sid_upper, rid
+
+
+def _node_domain_sid(node: dict[str, Any]) -> str | None:
+    """Return the AD *domain SID* a node belongs to, or ``None``.
+
+    A domain object's normalized SID (``S-1-5-21-X-Y-Z``) IS its domain SID, so
+    it is returned unchanged. For any account/computer node whose SID carries a
+    trailing RID (``S-1-5-21-X-Y-Z-<RID>``), the trailing ``-<RID>`` component is
+    stripped to recover the SID of the domain that account belongs to. This is
+    the canonical AD mapping used to point a DC's synthetic DCSync edge at its
+    OWN domain head (never a foreign domain in a multi-domain / forest graph).
+
+    Reuses :func:`_extract_node_sid_and_rid` for the normalized objectid lookup
+    so the parser stays single-sourced. Guards against malformed / missing SIDs
+    (returns ``None`` rather than raising).
+    """
+    sid_upper, _rid = _extract_node_sid_and_rid(node)
+    if not sid_upper or not sid_upper.startswith("S-1-5-21-"):
+        return None
+    if _node_is_domain(node):
+        # A Domain object's SID is already the domain SID.
+        return sid_upper
+    # Strip the trailing RID component to recover the parent domain's SID.
+    head, _, tail = sid_upper.rpartition("-")
+    if not head or not tail.isdigit():
+        return None
+    return head
 
 
 def _node_is_tier0(node: dict[str, Any]) -> bool:

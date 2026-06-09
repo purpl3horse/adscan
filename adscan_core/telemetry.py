@@ -1191,10 +1191,90 @@ else:
         id_dir.mkdir(parents=True, exist_ok=True)
         id_file.write_text(TELEMETRY_ID, encoding="utf-8")
 
-# Partner tag — baked into PRO images at build time via ADSCAN_PARTNER_TAG env var.
-# Identifies which partner/beta tester the image was built for (e.g. "glenn-mssp-beta1").
-# Empty string for LITE and untagged builds — never sent when absent.
-PARTNER_TAG: str = os.getenv("ADSCAN_PARTNER_TAG", "").strip()
+# Partner tag — identifies which partner/beta tester this install belongs to
+# (e.g. "glenn-mssp"). Used as a telemetry dimension and as the PRO entitlement
+# marker for the shared registry image.
+#
+# Resolution order (single source of truth — `resolve_partner_tag`):
+#   1. env var ADSCAN_PARTNER_TAG (override for CI / power-users / legacy baked
+#      images that still carry `ENV ADSCAN_PARTNER_TAG`)
+#   2. persisted file in the volume (`get_adscan_home()/partner.json`,
+#      field "partner_tag") — written once at runtime by the PRO start gate and
+#      surviving across `docker run` because the volume is bind-mounted
+#   3. "" when neither is present
+#
+# This mirrors the TELEMETRY_ID pattern above (env override → volume file → fall
+# back). The volume path is the same `~/.adscan` ↔ `/opt/adscan` mount, so the
+# tag persists between containers and is only re-asked if the volume is wiped.
+_PARTNER_TAG_FILENAME = "partner.json"
+_PARTNER_TAG_FIELD = "partner_tag"
+
+
+def _read_persisted_partner_tag() -> str:
+    """Return the partner tag persisted in the volume, or "" when absent.
+
+    Reads ``get_adscan_home()/partner.json`` and extracts the
+    ``partner_tag`` field. Any read/parse failure is swallowed and treated as
+    "no persisted tag" — resolution then falls through to the empty default.
+    """
+    try:
+        partner_file = get_adscan_home() / _PARTNER_TAG_FILENAME
+        if not partner_file.exists():
+            return ""
+        data = json.loads(partner_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get(_PARTNER_TAG_FIELD, "") or "").strip()
+
+
+def resolve_partner_tag() -> str:
+    """Resolve the partner tag using env override → volume file → "".
+
+    Returns:
+        The resolved partner tag, or an empty string when neither the
+        ``ADSCAN_PARTNER_TAG`` env var nor a persisted volume file is present.
+    """
+    env_tag = os.getenv("ADSCAN_PARTNER_TAG", "").strip()
+    if env_tag:
+        return env_tag
+    return _read_persisted_partner_tag()
+
+
+def persist_partner_tag(partner_tag: str) -> None:
+    """Persist the partner tag to the volume so it survives across containers.
+
+    Writes ``get_adscan_home()/partner.json`` with the ``partner_tag`` field.
+    The caller is responsible for validating the tag format before calling this.
+
+    Args:
+        partner_tag: The partner tag to persist (already validated).
+    """
+    partner_dir = get_adscan_home()
+    partner_dir.mkdir(parents=True, exist_ok=True)
+    partner_file = partner_dir / _PARTNER_TAG_FILENAME
+    partner_file.write_text(
+        json.dumps({_PARTNER_TAG_FIELD: partner_tag.strip()}),
+        encoding="utf-8",
+    )
+
+
+# Resolved at import for the telemetry dimension. The PRO start gate may persist
+# a tag and then refresh this via `refresh_partner_tag()` within the same
+# process so the first session after onboarding is attributed correctly.
+PARTNER_TAG: str = resolve_partner_tag()
+
+
+def refresh_partner_tag() -> str:
+    """Re-resolve PARTNER_TAG (e.g. after the start gate persists it).
+
+    Returns:
+        The freshly resolved partner tag.
+    """
+    global PARTNER_TAG  # noqa: PLW0603 — module-level telemetry dimension
+    PARTNER_TAG = resolve_partner_tag()
+    return PARTNER_TAG
 
 _SANITIZATION_KEY: Optional[bytes] = None
 _SANITIZED_VALUES: set[str] = set()

@@ -20,6 +20,15 @@ from adscan_internal.services import attack_graph_core
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
+from adscan_internal.services.tier_lattice import (
+    TargetTier,
+    classify_target_tier,
+    comparability_key,
+    record_domain_compromise_tier,
+    stamp_records_target_tier,
+    target_tier_from_record,
+    tier_dominates,
+)
 
 # ---------------------------------------------------------------------------
 # Parallel principals infrastructure
@@ -1605,6 +1614,22 @@ def minimize_display_paths(
         else set()
     )
 
+    # Minimal label→node resolver for tier classification inside the redundant-
+    # MemberOf minimizer. At minimization time the records are NOT yet stamped
+    # with ``target_tier`` (stamp_records_target_tier runs AFTER minimization in
+    # the pipeline) and we have no full node index here — but the one signal that
+    # drives the strip-to-group decision is whether the terminal IS the Domain
+    # object. The terminal Domain node renders with the bare domain FQDN as its
+    # label, so synthesize a ``kind="Domain"`` node for that label; everything
+    # else resolves to a name-only node (sufficient for relation-driven tiers).
+    _domain_fqdn_lower = str(domain or "").strip().lower()
+
+    def _label_to_node(label: str) -> dict[str, Any]:
+        bare = str(label or "").strip().lower().split("@", 1)[0]
+        if _domain_fqdn_lower and bare == _domain_fqdn_lower:
+            return {"name": str(label), "kind": "Domain"}
+        return {"name": str(label)}
+
     def canonical_label(value: str) -> str:
         cached = canonical_label_cache.get(value)
         if cached is not None:
@@ -1695,6 +1720,11 @@ def minimize_display_paths(
             principal_group_closure_by_label=principal_group_closure_by_label,
             is_membership_principal=is_membership_principal,
             canonical_label=canonical_label,
+            label_to_node=_label_to_node,
+            # Same scope rule as leading-memberof: a single queried principal IS
+            # the point of interest, so its prefix must never be stripped to a
+            # group. (domain / multi-principal views keep the strip-to-group.)
+            preserve_source=not _apply_leading_memberof,
         )
         if updated is None:
             if debug_enabled:
@@ -1869,6 +1899,8 @@ def _minimize_display_record_by_redundant_memberof(
     principal_group_closure_by_label: Callable[[str], set[str]],
     is_membership_principal: Callable[[str], bool],
     canonical_label: Callable[[str], str],
+    label_to_node: Callable[[str], dict[str, Any]] | None = None,
+    preserve_source: bool = False,
 ) -> dict[str, Any] | None:
     """Eliminate display records that contain redundant MemberOf prefix pivots.
 
@@ -1884,15 +1916,46 @@ def _minimize_display_record_by_redundant_memberof(
     current node's groups to ``satisfied_groups``.  This prevents a principal
     from making its *own* outgoing ``MemberOf`` look redundant (which would
     incorrectly strip the selected principal from the display).
+
+    ``preserve_source``: when True (single-principal scopes — ``user`` and a
+    single ``owned``/``principals`` query), the queried source principal is the
+    point of interest, so the record must NEVER be re-rooted at a group. The
+    strip-to-group branch is suppressed and the record is truncated to its
+    source-preserving prefix instead. Without this, the strip emits an
+    orphan ``GROUP → … → Domain`` path that does not start at the queried
+    principal — nonsensical for a "what can <principal> do" query (e.g. a
+    ``from khal.drogo`` query returning ``ADMINISTRATORS → DCSync → Domain``).
     """
     nodes = record.get("nodes")
     rels = record.get("relations")
     if not isinstance(nodes, list) or not isinstance(rels, list) or not nodes:
         return record
 
+    _resolve_node = label_to_node or (lambda lbl: {"name": str(lbl)})
+
+    # Tier of the edge ARRIVING at nodes[rel_idx]. The start node has no incoming
+    # edge → context floor. classify_target_tier is relation-driven for the cases
+    # that matter here (DumpLSA self-cred, access lanes, EdgeKind control/cred
+    # fallback); the resolver also flags the Domain terminal so a Domain arrival
+    # is classified into the top "domain" lane.
+    def _incoming_tier(rel_idx: int) -> TargetTier:
+        if rel_idx <= 0:
+            return TargetTier(lane="context", level=0)
+        return classify_target_tier(
+            relation=str(rels[rel_idx - 1]),
+            source_node=_resolve_node(str(nodes[rel_idx - 1])),
+            target_node=_resolve_node(str(nodes[rel_idx])),
+            prior_path_relations=[str(r) for r in rels[: rel_idx - 1]],
+        )
+
     satisfied_groups: set[str] = set()
     seen_principals: set[str] = set()
     redundant_memberof_indices: list[int] = []
+    # Per canonical object: the tier of the incoming edge at the point its group
+    # closure was first added to ``satisfied_groups``. Used by the
+    # tier-monotonicity carve-out (Change A): re-arriving at the same object at a
+    # strictly-higher or incomparable tier re-enables its membership hops.
+    satisfied_at_tier: dict[str, TargetTier] = {}
 
     for rel_idx, rel in enumerate(rels):
         if rel_idx >= len(nodes):
@@ -1916,8 +1979,30 @@ def _minimize_display_record_by_redundant_memberof(
         # nested membership topology and are load-bearing in domain-mode kill
         # chains — never flag those as redundant or the rule deletes paths
         # routed deliberately by the priority-membership-suppression filter.
+        #
+        # TIER-MONOTONICITY CARVE-OUT (Change A — generalizes the old self-loop
+        # heuristic): re-arriving at an object whose groups were already satisfied
+        # is NOT redundant when arriving at the CURRENT node represents a tier
+        # INCREASE on that object since the group was satisfied. The DumpLSA
+        # self-loop (session → machine-account credentials) is ONE instance:
+        # the post-DumpLSA arrival carries an os/LOCAL_ADMIN self-cred tier that
+        # does not dominate-and-is-not-dominated-by the pre-credential arrival, so
+        # the first occurrence's group closure no longer masks the second. Any
+        # higher-or-incomparable re-arrival tier on the same object qualifies (not
+        # only the literal consecutive-identical-label self-loop), so kill-chains
+        # like AllowedToDelegate/GenericAll → host → DumpLSA/CanPSRemote → host →
+        # MemberOf → host_group → DCSync → Domain are never incorrectly truncated.
+        _arrived_at_higher_tier = False
+        if canonical and canonical in satisfied_at_tier:
+            prior_tier = satisfied_at_tier[canonical]
+            current_tier = _incoming_tier(rel_idx)
+            # Higher OR incomparable (cross-lane) re-arrival → not dominated by the
+            # tier at which the group was satisfied → a genuine tier increase.
+            if not tier_dominates(prior_tier, current_tier):
+                _arrived_at_higher_tier = True
         if (
             is_principal
+            and not _arrived_at_higher_tier
             and str(rel or "").strip().lower() == "memberof"
             and rel_idx + 1 < len(nodes)
         ):
@@ -1932,6 +2017,7 @@ def _minimize_display_record_by_redundant_memberof(
         if is_principal and canonical and canonical not in seen_principals:
             seen_principals.add(canonical)
             satisfied_groups.update(principal_group_closure_by_label(current))
+            satisfied_at_tier[canonical] = _incoming_tier(rel_idx)
 
     if not redundant_memberof_indices:
         return record
@@ -1953,8 +2039,106 @@ def _minimize_display_record_by_redundant_memberof(
         # Entire path starts with a redundant hop — no valuable prefix to keep.
         return None
 
-    # Truncate nodes to the principal BEFORE the redundant MemberOf, and rels
-    # to exclude everything from the redundant index onwards.
+    # DECIDE HOW TO MINIMIZE (Change B — tier-aware):
+    #
+    #   ... → SRC →MemberOf(redundant)→ GROUP → <tail> → <terminal>
+    #          ^prefix terminal (nodes[first_redundant])     ^full terminal
+    #
+    # The historic behavior TRUNCATES-TO-PREFIX: keep nodes[:first_redundant+1]
+    # and drop the tail. That is correct ONLY when the prefix terminal already
+    # dominates whatever the tail reaches — otherwise it DROPS a strictly-higher
+    # (or incomparable) terminal, the canonical case being a tail that reaches
+    # ``DCSync → Domain`` (lane "domain") while the prefix terminal is a plain
+    # user/object. To preserve that higher-tier terminal we instead STRIP-TO-GROUP:
+    # re-root the record at the satisfied GROUP (``nodes[first_redundant + 1]``),
+    # keeping ``GROUP → <tail> → <higher-tier terminal>`` and relying on the
+    # downstream dedup stage to fold any duplicate group-rooted path.
+    _l2n = {
+        str(label): _resolve_node(str(label))
+        for label in nodes
+        if isinstance(label, str) or label is not None
+    }
+    # F5: use the 4-tier domain-compromise total order (T4 Domain object > T3
+    # direct-breaker group > T2 enabler > T1 host) for the strip-to-group decision
+    # so the Domain object out-tiers a direct-breaker group consistently with the
+    # prefix/contained filters — the lane-based ``tier_dominates`` treated both as
+    # cross-lane-incomparable and could mis-decide object-vs-group. The tail
+    # out-tiers the prefix when its domain-compromise tier is strictly higher.
+    prefix_subrecord = {
+        "nodes": list(nodes)[: first_redundant + 1],
+        "relations": list(rels)[:first_redundant],
+    }
+    full_dct = record_domain_compromise_tier(record, label_to_node=_l2n)
+    prefix_dct = record_domain_compromise_tier(prefix_subrecord, label_to_node=_l2n)
+    tail_out_tiers_prefix = full_dct > prefix_dct
+
+    # In single-principal scopes the queried source is fixed and must be kept:
+    # never re-root at a group (which would orphan the source). Truncate to the
+    # source-preserving prefix instead — the higher-tier tail is reachable in the
+    # holistic domain-scope view, not in a "what can <this principal> do" query.
+    if tail_out_tiers_prefix and not preserve_source:
+        # STRIP-TO-GROUP: re-root at the satisfied group, preserving the tail and
+        # its higher-tier terminal (e.g. DCSync → Domain).
+        group_index = first_redundant + 1
+        if group_index >= len(nodes) - 1 or group_index > len(rels):
+            # No actionable tail beyond the group — nothing to preserve.
+            return None
+        stripped = dict(record)
+        stripped_nodes = list(nodes)[group_index:]
+        stripped_rels = list(rels)[group_index:]
+        if len(stripped_nodes) < 2 or not stripped_rels:
+            return None
+        stripped["nodes"] = stripped_nodes
+        stripped["relations"] = stripped_rels
+        stripped["_exact_signature"] = (
+            _string_tuple([str(n) for n in stripped_nodes]),
+            _string_tuple([str(r) for r in stripped_rels]),
+        )
+        if "length" in stripped:
+            stripped["length"] = sum(
+                1
+                for rel in stripped_rels
+                if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
+            )
+        if "source" in stripped:
+            stripped["source"] = str(stripped_nodes[0])
+        if "target" in stripped:
+            stripped["target"] = str(stripped_nodes[-1])
+        orig_steps = record.get("steps")
+        if isinstance(orig_steps, list) and orig_steps:
+            stripped_steps = [dict(s) for s in orig_steps[group_index:] if isinstance(s, dict)]
+            for i, s in enumerate(stripped_steps, start=1):
+                s["step"] = i
+            stripped["steps"] = stripped_steps
+        else:
+            stripped["steps"] = [
+                {
+                    "step": i + 1,
+                    "action": str(stripped_rels[i]),
+                    "from": str(stripped_nodes[i]),
+                    "to": str(stripped_nodes[i + 1]),
+                    "status": record.get("status", "theoretical"),
+                }
+                for i in range(len(stripped_rels))
+                if i + 1 < len(stripped_nodes)
+            ]
+        _meta = stripped.get("meta")
+        if not isinstance(_meta, dict):
+            _meta = {}
+            stripped["meta"] = _meta
+        _meta.setdefault("full_length", record.get("length"))
+        _meta["minimized"] = True
+        _meta["minimized_reason"] = "strip_to_group_redundant_memberof"
+        _meta["minimized_start_label"] = str(stripped_nodes[0])
+        return stripped
+
+    # ELSE: the prefix terminal dominates the tail — no higher-tier terminal at
+    # risk. Keep the historic TRUNCATE-TO-PREFIX behavior: keep nodes up to the
+    # principal BEFORE the redundant MemberOf, drop everything from the redundant
+    # index onwards. This preserves the non-redundant prefix — e.g. "USER1 →
+    # ForceChangePassword → USER2 → MemberOf → Group[redundant]" becomes "USER1 →
+    # ForceChangePassword → USER2", a valuable step otherwise silently dropped.
+    # The dedup stage handles any duplicates produced by truncation.
     truncated_nodes = list(nodes)[: first_redundant + 1]
     truncated_rels = list(rels)[:first_redundant]
 
@@ -1965,8 +2149,16 @@ def _minimize_display_record_by_redundant_memberof(
     truncated = dict(record)
     truncated["nodes"] = truncated_nodes
     truncated["relations"] = truncated_rels
+    truncated["_exact_signature"] = (
+        _string_tuple([str(n) for n in truncated_nodes]),
+        _string_tuple([str(r) for r in truncated_rels]),
+    )
     if "length" in truncated:
-        truncated["length"] = len(truncated_rels)
+        truncated["length"] = sum(
+            1
+            for rel in truncated_rels
+            if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
+        )
     # Preserve source/target: source stays the same, target is now the node
     # just before the first redundant hop.
     if "target" in truncated and len(truncated_nodes) > 1:
@@ -1997,6 +2189,14 @@ def _minimize_display_record_by_redundant_memberof(
             for i in range(len(truncated_rels))
             if i + 1 < len(truncated_nodes)
         ]
+    _meta = truncated.get("meta")
+    if not isinstance(_meta, dict):
+        _meta = {}
+        truncated["meta"] = _meta
+    _meta.setdefault("full_length", record.get("length"))
+    _meta["minimized"] = True
+    _meta["minimized_reason"] = "truncate_redundant_memberof"
+    _meta["minimized_start_label"] = str(truncated_nodes[0])
     return truncated
 
 
@@ -2122,10 +2322,24 @@ def _minimize_display_record_by_leading_memberof(
 def filter_shortest_paths_for_principals(
     records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Keep one representative record per terminal triple PER COMPARABLE TIER LANE.
+
+    Tier-aware de-dup (F3). The group key is the terminal triple
+    ``(terminal_from, terminal_rel, terminal_to)`` combined with the tier lane
+    (``comparability_key``). Records that are tier-INCOMPARABLE for the same
+    terminal triple (different lanes — e.g. os/admin vs mssql) therefore land in
+    SEPARATE groups and BOTH survive. WITHIN a group (same triple + same lane) the
+    tier-DOMINANT record is kept (``tier_dominates``); ties (equal tier) break by
+    min ``length`` — the original tier-blind behavior. A higher-tier record always
+    wins over a shorter lower-tier one in the same lane, so a stronger standing on
+    a terminal is never shadowed by a shorter weaker path to it.
+    """
     if len(records) <= 1:
         return records
 
-    best_by_key: dict[tuple[str, str, str], tuple[int, int]] = {}
+    # Per group: (best_length, best_idx, best_tier). best_tier is the tier of the
+    # currently-kept record, used to decide tier dominance against challengers.
+    best_by_key: dict[tuple[str, str, str, tuple[str, ...]], tuple[int, int, TargetTier]] = {}
     for idx, record in enumerate(records):
         nodes = record.get("nodes")
         rels = record.get("relations")
@@ -2152,15 +2366,34 @@ def filter_shortest_paths_for_principals(
                 for rel in rels
                 if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
             )
-        key = (terminal_from, terminal_rel, terminal_to)
+        # Precondition: stamp_records_target_tier() must have been called on this
+        # list (both compute_display_paths_for_* callers do, immediately before
+        # this filter). The fallback in target_tier_from_record lacks
+        # label_to_node and degrades domain-node classification to name-only
+        # heuristics, which could mis-key a domain terminal into the wrong lane.
+        tier = target_tier_from_record(record)
+        key = (terminal_from, terminal_rel, terminal_to, comparability_key(tier))
         existing = best_by_key.get(key)
-        if existing is None or length < existing[0]:
-            best_by_key[key] = (length, idx)
+        if existing is None:
+            best_by_key[key] = (length, idx, tier)
+            continue
+        existing_length, _existing_idx, existing_tier = existing
+        # Same triple + same lane → comparable. Keep the strictly tier-dominant
+        # record; on equal tier fall back to the original min-length tie-break.
+        challenger_dominates = tier_dominates(tier, existing_tier)
+        incumbent_dominates = tier_dominates(existing_tier, tier)
+        if challenger_dominates and not incumbent_dominates:
+            best_by_key[key] = (length, idx, tier)
+        elif incumbent_dominates and not challenger_dominates:
+            continue  # incumbent strictly stronger — keep it regardless of length
+        elif length < existing_length:
+            # Equal tier (mutual dominance) — original behavior: shortest wins.
+            best_by_key[key] = (length, idx, tier)
 
     if not best_by_key:
         return records
 
-    keep_indices = {idx for _, idx in best_by_key.values()}
+    keep_indices = {idx for _, idx, _ in best_by_key.values()}
     return [record for idx, record in enumerate(records) if idx in keep_indices]
 
 
@@ -2648,6 +2881,14 @@ def compute_display_paths_for_start_node(
     )
     _debug_paths_checkpoint("after apply_affected_user_metadata", annotated)
     if filter_shortest_paths:
+        # Stamp per-record tier so the shortest-path filter is tier-aware.
+        # Key by label only — must match path_to_display_record's label() and _build_snapshot_label_to_node.
+        _l2n = {
+            str(n.get("label") or nid): n
+            for nid, n in (runtime_graph.get("nodes") or {}).items()
+            if isinstance(n, dict)
+        }
+        stamp_records_target_tier(annotated, label_to_node=_l2n)
         filtered_started_at = time.monotonic()
         filtered = filter_shortest_paths_for_principals(annotated)
         _log_phase_timing(
@@ -2843,6 +3084,14 @@ def compute_display_paths_for_principals(
         records=annotated,
     )
     if filter_shortest_paths:
+        # Stamp per-record tier so the shortest-path filter is tier-aware.
+        # Key by label only — must match path_to_display_record's label() and _build_snapshot_label_to_node.
+        _l2n = {
+            str(n.get("label") or nid): n
+            for nid, n in (graph.get("nodes") or {}).items()
+            if isinstance(n, dict)
+        }
+        stamp_records_target_tier(annotated, label_to_node=_l2n)
         filtered_started_at = time.monotonic()
         filtered = filter_shortest_paths_for_principals(annotated)
         _log_phase_timing(

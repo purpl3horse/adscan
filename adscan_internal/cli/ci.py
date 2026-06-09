@@ -129,6 +129,16 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     license_mode = deps.resolve_license_mode(config.requested_pro)
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
+
+    # PRO partner-tag gate (non-interactive path): the env var ADSCAN_PARTNER_TAG
+    # must satisfy it; otherwise refuse to start PRO rather than hang on stdin.
+    # LITE is never gated. Placed after session_command_type="ci" so the
+    # non-interactive predicate resolves correctly.
+    from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
+
+    if not ensure_partner_tag_for_pro(getattr(shell, "license_mode", None)):
+        return 1
+
     shell.preflight_check_passed = bool(preflight_result.passed)
     shell.preflight_check_fix_attempted = bool(preflight_result.fix_attempted)
     shell.preflight_check_overridden = bool(preflight_result.overridden)
@@ -509,9 +519,10 @@ def run_generate_report(
         print_error(f"Invalid format '{report_format}'. Valid formats: word, pdf")
         return None
     report_profile_lower = report_profile.lower()
-    if report_profile_lower not in {"full", "technical", "executive"}:
+    if report_profile_lower not in {"full", "technical", "executive", "sample"}:
         print_error(
-            f"Invalid profile '{report_profile}'. Valid profiles: full, technical, executive"
+            f"Invalid profile '{report_profile}'. "
+            "Valid profiles: full, technical, executive, sample"
         )
         return None
 

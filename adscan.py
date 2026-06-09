@@ -9021,6 +9021,41 @@ class PentestShell:
             password=password,
         )
 
+    def _queue_audit_post_compromise_actions(
+        self,
+        domain: str,
+        username: str,
+        credential: str,
+    ) -> None:
+        """Queue the audit post-compromise pipeline for a pwned domain.
+
+        Drained at a safe (non-re-entrant) checkpoint by
+        :meth:`_execute_audit_post_compromise_actions`. Mirror of the CTF
+        ``_ctf_queue_post_compromise_actions`` mechanism.
+        """
+        from adscan_internal.cli.post_da import queue_audit_post_compromise
+
+        queue_audit_post_compromise(self, domain, username, credential)
+
+    def _execute_audit_post_compromise_actions(
+        self,
+        domain: str,
+        username: str | None = None,
+        credential: str | None = None,
+    ) -> None:
+        """Drain the audit post-compromise pipeline for a domain when safe.
+
+        Re-collects the relationship graph AS the obtained DA, re-runs
+        attack-path analysis, then offers the host credential-harvesting
+        campaign. Defers while an attack-path execution is active and runs at
+        most once per domain. ``username``/``credential`` are passed explicitly
+        by the privileged-group membership branch; the DCSync attack-path case
+        relies on the queued credential.
+        """
+        from adscan_internal.cli.post_da import execute_audit_post_compromise
+
+        execute_audit_post_compromise(self, domain, username, credential)
+
     def _curses_select(self, title: str, options: list[str], default_idx: int = 0):
         """Simple curses menu to choose an option.
         Returns the index of the selected option or None if cancelled.
@@ -10303,6 +10338,15 @@ class PentestShell:
         # double-execution when _flush_ctf_post_compromise_queue is called
         # from multiple places (inline from attack step + post-Phase flow).
         self._ctf_post_compromise_dispatched: set[str] = set()
+
+        # Audit post-compromise queue — mirror of the CTF mechanism above.
+        # promote_to_pwned() queues; the queue is drained at safe checkpoints
+        # (top of run_enumeration, after each enumeration step, and the
+        # privileged-group membership branch) so the graph re-collection +
+        # attack-path re-analysis never runs RE-ENTRANTLY inside an active
+        # attack-path execution (the DCSync terminal step fires mid-Phase-2).
+        self._audit_post_compromise_pending: dict[str, dict[str, str]] = {}
+        self._audit_post_compromise_dispatched: set[str] = set()
 
         # Session tracking for telemetry (Hormozi Give:Ask ratio monitoring)
         self._session_start_time = None  # Will be set when session_start is captured
@@ -15194,10 +15238,10 @@ class PentestShell:
         return is_hash(cred)
 
     def ask_for_share_credential_hunt(self, domain):
-        """Phase 5: offer a credential scan on writable shares discovered during collection."""
-        from adscan_internal.cli.smb import run_ask_for_share_credential_hunt
+        """Phase 7: SMB Share Exposure — write-share NTLMv2 capture + read-share credential hunt."""
+        from adscan_internal.cli.share_exposure_phase import run_smb_share_exposure_phase
 
-        return run_ask_for_share_credential_hunt(self, domain=domain)
+        return run_smb_share_exposure_phase(self, domain=domain)
 
     def ask_for_smb_scan(self, domain):
         """Prompt user to perform unauthenticated SMB service scan."""
@@ -15458,28 +15502,6 @@ class PentestShell:
             source_context=source_context,
         )
 
-    def _detect_adcs_metadata(
-        self,
-        domain,
-        *,
-        silent=False,
-        emit_telemetry=True,
-        force=False,
-        source_context=None,
-    ):
-        """Resolve ADCS metadata using BloodHound with LDAP fallback."""
-        from adscan_internal.cli.adcs import ensure_adcs_metadata
-
-        return ensure_adcs_metadata(
-            self,
-            domain=domain,
-            silent=silent,
-            emit_telemetry=emit_telemetry,
-            force=force,
-            allow_ldap_fallback=True,
-            source_context=source_context,
-        )
-
     def do_search_adcs(self, domain):
         """Thin wrapper → adscan_internal.cli.adcs.do_search_adcs"""
         from adscan_internal.cli.adcs import do_search_adcs as _do_search_adcs
@@ -15541,6 +15563,11 @@ class PentestShell:
         if self._is_ctf_domain_pwned(domain):
             self._ctf_execute_post_compromise_actions(domain)
             return
+
+        # Audit: drain any queued post-compromise actions (graph re-collection
+        # AS the DA + host dump campaign). No-op when nothing is queued. Audit
+        # does NOT short-circuit the pipeline — it keeps mapping afterwards.
+        self._execute_audit_post_compromise_actions(domain)
 
         # Run workspace migrations before Phase 1 starts (idempotent).
         try:
@@ -15713,6 +15740,14 @@ class PentestShell:
             if self._is_ctf_domain_pwned(domain):
                 self._ctf_execute_post_compromise_actions(domain)
                 return True
+
+            # Audit: if a step compromised the domain (e.g. DCSync as the
+            # terminal step of an attack path executed during Phase 2), drain
+            # the post-compromise queue now — the step has returned and the
+            # attack-path execution has unwound, so the graph re-collection
+            # (which re-runs the attack-path engine) is no longer re-entrant.
+            # No-op when nothing is queued. Audit keeps mapping (no early stop).
+            self._execute_audit_post_compromise_actions(domain)
             return False
 
         def _phase1_outputs_ready() -> bool:
@@ -15760,21 +15795,14 @@ class PentestShell:
                 "Host Inventory",
                 status="skipped",
                 step_number=1,
-                total_steps=3,
+                total_steps=2,
                 details="Using existing Phase 1 results",
             )
             print_step_status(
                 "Identity Inventory",
                 status="skipped",
                 step_number=2,
-                total_steps=3,
-                details="Using existing Phase 1 results",
-            )
-            print_step_status(
-                "ADCS Discovery",
-                status="skipped",
-                step_number=3,
-                total_steps=3,
+                total_steps=2,
                 details="Using existing Phase 1 results",
             )
         else:
@@ -15782,7 +15810,7 @@ class PentestShell:
                 "Host Inventory",
                 lambda: self.do_host_inventory(domain),
                 step_number=1,
-                total_steps=4,
+                total_steps=3,
             ):
                 return
 
@@ -15792,19 +15820,7 @@ class PentestShell:
                 "Identity Inventory",
                 lambda: self.do_identity_inventory(domain),
                 step_number=2,
-                total_steps=4,
-            ):
-                return
-
-            if _run_step(
-                "ADCS Discovery",
-                lambda: self._detect_adcs_metadata(
-                    domain,
-                    force=True,
-                    source_context="authenticated_enum_phase1",
-                ),
-                step_number=3,
-                total_steps=4,
+                total_steps=3,
             ):
                 return
 
@@ -15828,8 +15844,8 @@ class PentestShell:
             if _run_step(
                 "NTLM Auth-Type Sweep",
                 _run_ntlm_auth_type_sweep_step,
-                step_number=4,
-                total_steps=4,
+                step_number=3,
+                total_steps=3,
             ):
                 return
 
@@ -15885,14 +15901,21 @@ class PentestShell:
             return
 
         # ========== PHASE 2: Attack Paths Discovery ==========
-        # In CTF workspaces the objective is foothold → DA → flags.  Once the
-        # domain transitions to "pwned" there is nothing left to calculate —
-        # re-running attack paths would just produce a redundant "Owned →
-        # Domain" graph that the operator has already exploited.  In audit
-        # workspaces this phase still runs post-compromise because the client
-        # deliverable needs the full attack-path view including post-ex paths.
+        # Once the domain transitions to "pwned" the OWNED-scope discovery this
+        # phase performs is exhausted — re-running it would just reproduce the
+        # "Owned → Domain" graph the operator already exploited.
+        #   - CTF: objective was foothold → DA → flags; nothing left here.
+        #   - Audit: the holistic post-compromise view (paths to domain
+        #     compromise from ANY low-priv, DOMAIN scope) is rendered later by
+        #     the "Audit Post-Compromise: Remaining Attack Paths" block at the
+        #     end of run_enumeration — strictly richer than re-running the
+        #     owned-scope discovery here.
+        # So both engagement types skip Phase 2 when the domain is already
+        # pwned at entry. (Mid-phase compromise — e.g. DCSync as a terminal
+        # attack-path step — is handled by the pwned-exit in
+        # attack_graph_reports.run_attack_paths.)
         _domain_already_pwned = (
-            self.type == "ctf"
+            self.type in ("ctf", "audit")
             and str(
                 getattr(self, "domains_data", {}).get(domain, {}).get("auth") or ""
             ).strip().lower() == "pwned"
@@ -16004,15 +16027,15 @@ class PentestShell:
         if stop_after_phase == 4:
             return
 
-        # ========== PHASE 5: Share Credential Hunt ==========
+        # ========== PHASE 7: SMB Share Exposure ==========
         # Runs for both CTF and audit. Reads share exposure data already built
         # during Phase 1 collection (attack graph edges), displays the SMB
         # resources panel, and offers a credential scan on writable shares.
         # In non-interactive / CI mode it auto-selects all writable shares.
-        _enter_phase("Share Credential Hunt")
+        _enter_phase("SMB Share Exposure")
         emit_phase("share_credential_hunt")
         if _run_step(
-            "Share Credential Hunt",
+            "SMB Share Exposure",
             lambda: self.ask_for_share_credential_hunt(domain),
             step_number=1,
             total_steps=1,
@@ -17432,12 +17455,6 @@ class PentestShell:
 
         run_relay_rbcd(self, args)
 
-    def ask_for_dc_ntlm_auth_type_quick_win(self, target_domain):
-        """Run the Phase 3 DC NTLM auth-type quick win."""
-        from adscan_internal.cli.ntlm_capture import run_ntlm_auth_type_quick_win
-
-        return run_ntlm_auth_type_quick_win(self, target_domain)
-
     def ask_for_ntlm_auth_type_sweep(self, target_domain):
         """Run the per-host NTLMv1 sweep (Domain Intelligence phase).
 
@@ -17447,36 +17464,6 @@ class PentestShell:
         from adscan_internal.cli.ntlm_capture import run_ntlm_auth_type_sweep
 
         return run_ntlm_auth_type_sweep(self, target_domain)
-
-    def _phase3_sweep_classified_dc(self, target_domain) -> bool:
-        """Return ``True`` when the Phase 3 NTLM sweep already classified the DC.
-
-        Avoids running the DC NTLM auth-type check twice in one pipeline. The
-        sweep classifies the DC either by setting ``dc_ntlm_auth_type`` (its
-        decline / <2-reachable fallbacks invoke the DC-only quick-win) or by
-        persisting a non-``unknown`` per-host verdict for the DC IP in
-        ``ntlm_auth_type_by_host`` (the full per-host sweep path).
-        """
-        domain_state = self.domains_data.get(target_domain) or {}
-        if not isinstance(domain_state, dict):
-            return False
-        if domain_state.get("dc_ntlm_auth_type"):
-            return True
-        host_map = domain_state.get("ntlm_auth_type_by_host") or {}
-        if not isinstance(host_map, dict) or not host_map:
-            return False
-        try:
-            from adscan_internal.models.domain import resolve_dc_ip as _resolve_dc_ip
-
-            dc_ip = _resolve_dc_ip(domain_state)
-        except Exception:  # noqa: BLE001 - best effort; fall back to no-skip
-            dc_ip = None
-        if not dc_ip:
-            return False
-        verdict = host_map.get(dc_ip)
-        if not isinstance(verdict, dict):
-            return False
-        return verdict.get("ntlm_auth_type") in {"NTLMv1", "NTLMv2"}
 
     def ask_for_asreproast(self, target_domain, *, auto_crack: bool = True):
         """Prompt user to perform AS-REP Roasting attack."""
@@ -19389,7 +19376,7 @@ class PentestShell:
         try:
             dashboard = ProgressDashboard(
                 ProgressDashboardConfig(
-                    title="Share Credential Hunt",
+                    title="Readable-Share Credential Hunt",
                     total=None,  # indeterminate -- spinner + elapsed (opaque subprocess)
                     unit="hosts",
                 )
@@ -22225,12 +22212,14 @@ class PentestShell:
                 return privileged_groups
             self.ask_for_dcsync(domain, username, password)
             if self.type == "audit":
-                self._run_audit_post_da_graph_refresh(
-                    domain,
-                    username,
-                    password,
+                # Single source of truth: route the audit post-compromise
+                # pipeline (graph re-collection AS the DA + host dump campaign)
+                # through the shared orchestrator. Idempotent — if the DCSync
+                # attack-path already dispatched it for this domain, this is a
+                # no-op; otherwise it runs here with the membership credential.
+                self._execute_audit_post_compromise_actions(
+                    domain, username, password
                 )
-                self.ask_for_post_da_host_dumps(domain, username, password)
             self.ask_for_raise_child(domain, username, password)
             return privileged_groups
 

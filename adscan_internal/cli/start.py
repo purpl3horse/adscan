@@ -2618,6 +2618,15 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
         license_mode = deps.resolve_license_mode(config.requested_pro)
         shell = deps.create_shell(deps.console, license_mode)
         setattr(shell, "session_command_type", "start")
+
+        # PRO partner-tag gate: under the shared-image model the partner tag is
+        # asked once at runtime and persisted to the volume. Refuse to start PRO
+        # without it (interactive prompt here; LITE is never gated).
+        from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
+
+        if not ensure_partner_tag_for_pro(getattr(shell, "license_mode", None)):
+            return
+
         if not _ensure_workspace_selected_for_start(shell):
             return
 

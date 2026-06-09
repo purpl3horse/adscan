@@ -384,6 +384,8 @@ def exploit_delegation_constrained(
     username: str,
     password: str,
     delegation_to: str,
+    *,
+    chain_dcsync_followup: bool = True,
 ) -> None:
     from adscan_internal.rich_output import mark_sensitive
 
@@ -432,6 +434,7 @@ def exploit_delegation_constrained(
             target_user=target_user or "",
             service_spn=delegation_to,
             owner_principal=username,
+            chain_dcsync_followup=chain_dcsync_followup,
         )
 
     except Exception as e:
@@ -490,7 +493,14 @@ def _handle_constrained_native_result(
     target_user: str,
     service_spn: str = "",
     owner_principal: str = "",
+    chain_dcsync_followup: bool = True,
 ) -> None:
+    # ``chain_dcsync_followup`` is the single-responsibility gate: during
+    # attack-PATH execution it MUST be False — DCSync is its own graph edge that
+    # the path runner executes as the next step, so chaining it here would
+    # double-execute it (and the internal call resolves the ambient ccache, not
+    # the just-minted service ticket). Standalone/manual delegation keeps the
+    # convenience followup (default True).
     from adscan_internal.rich_output import mark_sensitive
 
     if result.success:
@@ -543,7 +553,7 @@ def _handle_constrained_native_result(
                 marked_ticket_path=mark_sensitive(result.ticket_path, "path"),
                 next_hint=next_hint,
             )
-            if target_is_dc:
+            if target_is_dc and chain_dcsync_followup:
                 shell.dcsync(domain, target_user, result.ticket_path)
         else:
             # Native call returned success but no ticket was produced; this is
